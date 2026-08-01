@@ -1,0 +1,20 @@
+{
+  "schema": "inkdrop.history_taxonomy_fixture.v2",
+  "events": [
+    {"id":"h-slskd-live","at":10,"record":"download_task","task_id":"dt-slskd-live","client":"slskd","status":"transfer_in_progress","state":"downloading","expected":"activity"},
+    {"id":"h-slskd-stale","at":20,"record":"download_task","task_id":"dt-slskd-stale","client":"slskd","status":"transfer_stale_unknown","state":"failed","expected":"failed"},
+    {"id":"h-torrent-queued","at":30,"record":"source_attempt","attempt_id":"sa-torrent-queued","source":"download_client","client":"qbittorrent","status":"sent","lifecycle_phase":"downloading","expected":"activity"},
+    {"id":"h-torrent-complete","at":40,"record":"download_task","task_id":"dt-torrent-complete","client":"qbittorrent","status":"completed_in_client","state":"import_ready","expected":"completed"},
+    {"id":"h-torrent-importing","at":45,"record":"download_task","task_id":"dt-torrent-importing","client":"qbittorrent","status":"verification_pending","state":"importing","expected":"completed"},
+    {"id":"h-usenet-live","at":50,"record":"download_task","task_id":"dt-usenet-live","client":"sabnzbd","status":"downloading","state":"downloading","expected":"activity"},
+    {"id":"h-usenet-failed","at":60,"record":"download_task","task_id":"dt-usenet-failed","client":"sabnzbd","status":"failed_download","state":"failed","expected":"failed"},
+    {"id":"h-legacy-slskd-failed","at":65,"record":"source_attempt","attempt_id":"sa-legacy-slskd-failed","source":"slskd","client":"slskd","status":"transfer_failed","lifecycle_phase":"failed_candidate","expected":"failed"},
+    {"id":"h-sparse-legacy-slskd-failed","at":66,"record":"source_attempt","attempt_id":"sa-sparse-legacy-slskd-failed","source":"","history_source":"","history_raw":{},"client":"slskd","status":"transfer_failed","lifecycle_phase":"failed_candidate","expected":"failed"},
+    {"id":"h-empty-legacy-slskd-failed","at":67,"record":"source_attempt","attempt_id":"sa-empty-legacy-slskd-failed","source":"","history_source":"","history_raw":{"source":"","provider_id":"","download_client":"","status":"transfer_failed","lifecycle_phase":"failed_candidate"},"client":"slskd","status":"transfer_failed","lifecycle_phase":"failed_candidate","expected":"failed"},
+    {"id":"h-whitespace-legacy-slskd-failed","at":68,"record":"source_attempt","attempt_id":"sa-whitespace-legacy-slskd-failed","source":"","history_source":" ","history_raw":{"source":" \t","provider_id":"  ","download_client":"\n","status":" \t","state":" ","lifecycle_phase":"\n","outcome":"  "},"client":"slskd","typed_source":" \tslskd\n","typed_client":" slskd\t","typed_provider":"\nslskd ","typed_protocol":" slskd\r","status":"transfer_failed","typed_status":" transfer_failed\n","lifecycle_phase":"failed_candidate","typed_lifecycle_phase":"\tfailed_candidate ","expected":"failed"},
+    {"id":"h-direct-success","at":70,"record":"download_task","task_id":"dt-direct-success","client":"inkdrop_direct","status":"verified","state":"verified","expected":"completed"},
+    {"id":"h-direct-live","at":80,"record":"source_attempt","attempt_id":"sa-direct-live","source":"download_client","client":"inkdrop_direct","status":"download_started","lifecycle_phase":"downloading","expected":"activity"},
+    {"id":"h-import","at":90,"record":"import_result","status":"imported","expected":"imports"},
+    {"id":"h-late-linked-failure","at":100,"record":"source_attempt","attempt_id":"sa-late-linked","source":"download_client","client":"qbittorrent","status":"failed_download","lifecycle_phase":"failed_candidate","linked_task_id":"dt-late-linked","expected":"activity"}
+  ]
+}

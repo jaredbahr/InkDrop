@@ -1,0 +1,32 @@
+# Local runtime data
+.env
+.env.*
+!.env.example
+config/
+state/
+staging/
+manual-inbox/
+library/
+backups/
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.log
+*.bak
+*.tmp
+
+# Comics and manga never belong in the repository
+*.cbz
+*.cbr
+*.pdf
+*.epub
+*.zip
+*.rar
+*.7z
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

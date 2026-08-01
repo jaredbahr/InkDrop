@@ -1,0 +1,9 @@
+# Release-gate-only override.
+#
+# Strict preflight and preflight-only healthcheck do not need network access.
+# This avoids consuming a Docker bridge network on crowded self-hosted Docker
+# hosts while keeping the normal public docker-compose.yml networking intact.
+services:
+  inkdrop:
+    network_mode: "none"
+    ports: []
