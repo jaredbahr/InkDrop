@@ -35781,11 +35781,14 @@ def comicvine_result_score(query, item, quality_settings=None):
         elif query_words:
             hits = sum(1 for word in query_words if word in name_words)
             coverage = hits / max(1, len(query_words))
-            if coverage >= 0.85:
+            if hits == 0:
+                score -= 25
+                notes.append("no title match")
+            elif coverage >= 0.85:
                 score += int(coverage * 76)
                 notes.append("title words match")
             else:
-                score += int(coverage * 16)
+                score += int(coverage * 76)
                 notes.append("partial title match")
         extra_words = [word for word in name_words if word not in query_words and word not in {"naoki", "urasawa", "s"}]
         if query_key in name_key:
@@ -36187,8 +36190,15 @@ def mangadex_result_score(query, title, attributes, preferred_languages=None):
         elif query_words:
             hits = sum(1 for word in query_words if word in title_words)
             coverage = hits / max(1, len(query_words))
-            score += int(coverage * 74)
-            notes.append("title words match" if coverage >= 0.75 else "partial title match")
+            if hits == 0:
+                score -= 25
+                notes.append("no title match")
+            elif coverage >= 0.75:
+                score += int(coverage * 74)
+                notes.append("title words match")
+            else:
+                score += int(coverage * 74)
+                notes.append("partial title match")
     languages = {str(lang or "").lower() for lang in attributes.get("availableTranslatedLanguages") or []}
     preferred = {str(lang or "").lower() for lang in preferred_languages or []}
     if languages & (preferred or {"en"}):
