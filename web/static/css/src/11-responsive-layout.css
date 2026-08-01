@@ -1,0 +1,1545 @@
+@media (min-width: 520px) and (max-width: 1099px) {
+      body.activity-dock-visible main > .arr-nav-shell {
+        padding-bottom: 8px;
+      }
+      main > .arr-nav-shell > .activity-region {
+        position: static;
+        left: auto;
+        right: auto;
+        bottom: auto;
+        width: 100%;
+        max-height: none;
+        margin-top: auto;
+        padding-top: 8px;
+        border-top: 1px solid var(--line-soft);
+        gap: 5px;
+        z-index: auto;
+        pointer-events: auto;
+      }
+      body.activity-dock-visible .arr-content-shell {
+        padding-bottom: 0;
+      }
+      .activity-region .activity-status,
+      .activity-region .activity-dock,
+      .activity-region .toast {
+        padding: 6px;
+        border-radius: 6px;
+        box-shadow: none;
+      }
+      .activity-region .toast {
+        max-height: 58px;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.2;
+      }
+      .activity-region .toast-message {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+      }
+      .activity-region .toast-action {
+        margin-top: 2px;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.15;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .activity-region .toast-destination {
+        display: none;
+      }
+      .activity-region .activity-status {
+        min-height: 34px;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 5px;
+      }
+      .activity-region .activity-status-action,
+      .activity-region .activity-status-text > .activity-status-detail {
+        display: none;
+      }
+      .activity-region .activity-dock {
+        max-height: min(30vh, 220px);
+      }
+      .activity-region .activity-dock.compact {
+        max-height: 118px;
+      }
+      .activity-region .activity-dock-head,
+      .activity-region .activity-dock.compact .activity-dock-head {
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        gap: 4px;
+        margin-bottom: 3px;
+      }
+      .activity-region .activity-dock-head strong {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+      }
+      .activity-region .activity-dock-title > span,
+      .activity-region .activity-dock.compact .activity-dock-title > span,
+      .activity-region .activity-count,
+      .activity-region .activity-dock.compact .activity-count,
+      .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-toggle {
+        display: none;
+      }
+      .activity-region .activity-dock[data-activity-dock-forced="dense-route"] {
+        max-height: 82px;
+        width: 100%;
+      }
+      .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > span {
+        display: none;
+        min-width: 0;
+        color: var(--muted);
+        font-size: 10px;
+        line-height: 1.2;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-head {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-action {
+        display: inline-flex;
+        grid-column: 1 / -1;
+        align-items: center;
+        justify-content: center;
+        justify-self: stretch;
+        width: 100%;
+        max-width: none;
+        height: 22px;
+        min-height: 22px;
+        margin-top: 0;
+        padding: 2px 6px;
+        font-size: 9px;
+        line-height: 1;
+      }
+      .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-compact-target:not([hidden]) {
+        max-height: 42px;
+      }
+      .activity-region .activity-dock-toggle {
+        min-height: 21px;
+        max-width: 48px;
+        padding: 2px 5px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 8px;
+      }
+      .activity-region .activity-dock.compact .activity-dock-compact-target:not([hidden]) {
+        max-height: 58px;
+        margin-top: 2px;
+        overflow: hidden;
+      }
+      .activity-region .activity-compact-target-button {
+        height: 40px;
+        min-height: 40px;
+        padding: 5px 6px;
+      }
+      .activity-region .activity-compact-target-facts {
+        display: none;
+      }
+      .activity-region .activity-compact-target-kicker {
+        width: 8px;
+        min-width: 8px;
+        height: 8px;
+        min-height: 8px;
+      }
+      .activity-region .activity-compact-target-main strong {
+        font-size: 11px;
+      }
+      .activity-region .activity-compact-target-status {
+        font-size: 10px;
+        line-height: 1.25;
+      }
+      .activity-region .activity-dock.compact .activity-lane-strip,
+      .activity-region .activity-dock.compact .activity-route-strip {
+        display: none;
+      }
+      .activity-region .activity-operator-board {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 519px) {
+      body[data-inkdrop-view="series"] .arr-nav-shell {
+        margin-bottom: 4px;
+        padding: 3px 0 4px;
+      }
+      body[data-inkdrop-view="series"] .arr-nav,
+      body[data-inkdrop-view="series"] .arr-nav-secondary {
+        gap: 3px;
+      }
+      body[data-inkdrop-view="series"] .arr-nav-secondary {
+        margin-top: 3px;
+      }
+      body[data-inkdrop-view="series"] .arr-nav button {
+        min-height: 26px;
+        padding: 3px 6px;
+        font-size: 11px;
+      }
+      body[data-inkdrop-view="series"] .arr-nav-secondary button {
+        min-height: 24px;
+        padding: 3px 6px;
+        font-size: 10px;
+      }
+      body[data-inkdrop-view="series"] .arr-nav-actions {
+        margin-top: 3px;
+      }
+      body[data-inkdrop-view="series"] .arr-nav-add {
+        min-height: 26px;
+        padding: 4px 8px;
+        font-size: 11px;
+      }
+      body[data-inkdrop-view="series"] .series-library-toolbar {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 5px 6px;
+        margin-bottom: 6px;
+        padding: 6px;
+        border-radius: 4px;
+      }
+      body[data-inkdrop-view="series"] .series-library-title {
+        gap: 1px;
+      }
+      body[data-inkdrop-view="series"] .series-library-title strong {
+        font-size: 12px;
+      }
+      body[data-inkdrop-view="series"] .series-library-title span {
+        display: none;
+      }
+      body[data-inkdrop-view="series"] .series-library-actions {
+        flex-wrap: nowrap;
+        gap: 4px;
+        justify-content: flex-end;
+        justify-self: end;
+        max-width: 100%;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="series"] .series-library-tool {
+        flex: 0 0 auto;
+        width: auto;
+        min-width: max-content;
+        min-height: 28px;
+        overflow: visible;
+        padding: 4px 7px;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="series"] .series-library-tool span {
+        display: inline;
+      }
+      body[data-inkdrop-view="series"] .series-library-mobile-drawer {
+        padding-top: 3px;
+        border-top: 0;
+      }
+      body[data-inkdrop-view="series"] .series-library-mobile-drawer > summary {
+        min-height: 25px;
+        padding: 4px 7px;
+        font-size: 10px;
+      }
+      body[data-inkdrop-view="settings"] .arr-nav-shell {
+        margin-bottom: 4px;
+        padding: 3px 0 4px;
+      }
+      body[data-inkdrop-view="settings"] .arr-nav-actions,
+      body[data-inkdrop-view="settings"] .arr-nav-secondary,
+      body[data-inkdrop-view="settings"] main > .arr-nav-shell > .activity-region {
+        display: none !important;
+      }
+      body[data-inkdrop-view="settings"] main > .arr-content-shell {
+        padding-top: 4px;
+      }
+      body[data-inkdrop-view="settings"] #inkdropSettings {
+        border-color: transparent;
+        padding: 0;
+        background: transparent;
+        box-shadow: none;
+      }
+      body[data-inkdrop-view="settings"] #inkdropSettings > summary {
+        display: none;
+      }
+      body[data-inkdrop-view="settings"] .settings-body {
+        gap: 6px;
+        padding: 0;
+      }
+      body[data-inkdrop-view="settings"] .settings-actions {
+        justify-content: flex-start;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="settings"] .settings-actions button {
+        /* `auto` basis, not a fixed 74px: the row already wraps, and a fixed
+           basis narrower than the label leaves "Show Advanced" and
+           "Test All Indexers" spilling outside their own border. The 76px
+           min-width above still holds the short buttons to a common floor. */
+        flex: 0 0 auto;
+        width: auto;
+        min-height: 44px;
+        padding: 4px 8px;
+      }
+      body[data-inkdrop-view="settings"] .settings-overview {
+        display: none;
+      }
+      body[data-inkdrop-view="settings"] #inkdropSettingsGrid {
+        gap: 6px;
+      }
+      body[data-inkdrop-view="settings"] .settings-provider-grid > .settings-group-body {
+        grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+        gap: 8px;
+      }
+      body[data-inkdrop-view="settings"] .settings-provider-grid .settings-card:not([open]) > .settings-card-head {
+        min-height: 76px;
+        padding: 10px 9px 8px;
+      }
+      body[data-inkdrop-view="settings"] .settings-provider-grid .settings-card h3 {
+        font-size: 15px;
+      }
+      body[data-inkdrop-view="settings"] .settings-provider-grid .settings-card[open] > .settings-card-head {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      body[data-inkdrop-view="settings"] .settings-metadata-source-credit {
+        grid-template-columns: 1fr;
+        gap: 10px;
+        min-height: 0;
+      }
+      body[data-inkdrop-view="series"] .series-poster-shelf-full .series-poster-grid,
+      body[data-inkdrop-view="series"] .series-loading-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      body[data-inkdrop-view="activity"] .arr-content-shell {
+        padding-top: 0;
+      }
+      body[data-inkdrop-view="activity"] #inkdropSectionPanel > .section-commandbar {
+        margin-bottom: 3px;
+        padding-bottom: 3px;
+      }
+      body[data-inkdrop-view="activity"] #inkdropSectionPanel .section-heading h3 {
+        font-size: 16px;
+      }
+      body[data-inkdrop-view="activity"] #inkdropSectionPanel .section-active-filter {
+        display: none;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-shell {
+        gap: 6px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now {
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 5px 7px;
+        padding: 7px 8px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now .activity-spinner,
+      body[data-inkdrop-view="activity"] .activity-page-now .activity-status-dot {
+        width: 9px;
+        min-width: 9px;
+        height: 9px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now-main {
+        gap: 2px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now-main strong {
+        overflow: hidden;
+        font-size: 13px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now-main span {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.25;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now-facts {
+        gap: 3px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-now-facts .activity-route-fact {
+        max-width: 100%;
+        min-height: 20px;
+        padding: 2px 7px;
+        font-size: 9px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-actions {
+        grid-column: 1 / -1;
+        flex-wrap: nowrap;
+        justify-content: flex-start;
+        gap: 4px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 1px;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-actions[data-activity-page-hero-actions="primary-refresh"] {
+        grid-column: 2;
+        overflow: hidden;
+        padding-bottom: 0;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-actions button {
+        flex: 0 0 auto;
+        min-height: 24px;
+        padding: 2px 6px;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-subviews {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 4px;
+        overflow: visible;
+        padding-bottom: 6px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-subview {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        justify-content: stretch;
+        min-width: 0;
+        width: 100%;
+        min-height: 24px;
+        padding: 3px 6px;
+        font-size: 10px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-subview-count {
+        min-width: 20px;
+        padding: 1px 5px;
+        font-size: 9px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-current-row {
+        min-height: 0;
+        padding: 7px 8px 7px 10px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-current-main {
+        gap: 2px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-current-main strong {
+        overflow: hidden;
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-current-detail {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 1;
+        overflow: hidden;
+        font-size: 10px;
+      }
+      body[data-inkdrop-view="activity"] .activity-page-current-action button {
+        min-height: 24px;
+        max-width: 96px;
+        padding: 2px 6px;
+        font-size: 10px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
+        grid-template-columns: auto minmax(0, 1fr);
+        grid-template-areas:
+          "item item"
+          "detail actions";
+        gap: 4px 7px;
+        min-height: 0;
+        padding: 6px 32px 6px 9px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-state,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-state {
+        display: none;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-detail,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-detail {
+        grid-area: detail;
+        align-self: center;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-detail:has(.section-table-detail-drawer[open]),
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-detail:has(.section-table-detail-drawer[open]) {
+        grid-column: 1 / -1;
+        width: 100%;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-actions,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-actions {
+        grid-area: actions;
+        align-self: center;
+        justify-self: end;
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-with-art,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-with-art {
+        grid-template-columns: 46px minmax(0, 1fr);
+        gap: 9px;
+        align-items: center;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .series-art.table,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .series-art.table {
+        width: 46px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 3px;
+        justify-items: start;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line > strong,
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line > .section-table-series-link,
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line > .section-table-series-link > strong,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line > strong {
+        font-size: 12px;
+        line-height: 1.18;
+      }
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line > .section-table-series-link,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line > .section-table-series-link > strong {
+        font-size: 12px;
+        line-height: 1.18;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-bucket-badge,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-bucket-badge {
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-context,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-context {
+        margin-top: 0;
+      }
+      body[data-inkdrop-view="queue"] .queue-cause-strip[data-operator-control="queue-cause-strip"],
+      body[data-inkdrop-view="wanted"] .queue-cause-strip[data-operator-control="wanted-cause-strip"] {
+        display: none;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-strip {
+        display: flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 7px;
+        min-height: 32px;
+        margin-bottom: 6px;
+        overflow: hidden;
+        padding: 5px 7px;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-strip .section-table-context-main {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-strip .section-table-context-main strong {
+        display: block;
+        overflow: hidden;
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-strip .section-table-context-main span {
+        display: none;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-actions {
+        flex: 0 0 auto;
+        gap: 4px;
+        max-width: 138px;
+        overflow: hidden;
+        padding-bottom: 0;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-actions button {
+        min-height: 22px;
+        padding: 2px 6px;
+        font-size: 9px;
+      }
+      body[data-inkdrop-view="queue"] .transfer-import-drain-actions button:nth-of-type(n+2) {
+        display: none;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-compact,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-compact {
+        grid-template-columns: auto;
+        justify-items: start;
+        gap: 0;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer {
+        justify-self: start;
+        max-width: 26px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer[open],
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer[open] {
+        max-width: none;
+        width: 100%;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer > summary,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer > summary {
+        justify-content: center;
+        width: 26px;
+        min-width: 26px;
+        min-height: 23px;
+        padding: 0;
+        font-size: 0;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer > summary::after,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer > summary::after {
+        margin-left: 0;
+        font-size: 13px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"],
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] {
+        flex-wrap: nowrap;
+        justify-content: flex-end;
+        gap: 4px;
+        overflow: visible;
+        padding-bottom: 0;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail .section-table-action-group-buttons,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail .section-table-action-group-buttons {
+        justify-content: flex-end;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail button,
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-action-more > summary,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail button,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-action-more > summary {
+        min-height: 23px;
+        padding: 0 6px;
+        font-size: 10px;
+      }
+      body[data-inkdrop-view="settings"] .settings-category-rail {
+        grid-template-columns: 1fr;
+      }
+      body[data-inkdrop-view="settings"] .settings-category-button {
+        grid-template-columns: minmax(0, 1fr) auto;
+        min-height: 34px;
+      }
+      body[data-inkdrop-view="settings"] .settings-category-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="settings"] .settings-hub-tile em {
+        max-width: 62px;
+      }
+      body[data-inkdrop-view="system"] .system-page {
+        gap: 9px;
+      }
+      body[data-inkdrop-view="system"] .system-page-head {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 7px;
+      }
+      body[data-inkdrop-view="system"] .system-page-head h2 {
+        font-size: 18px;
+      }
+      body[data-inkdrop-view="system"] .system-page-grid {
+        gap: 14px;
+      }
+      body[data-inkdrop-view="system"] .system-section-title strong {
+        font-size: 15px;
+      }
+      body[data-inkdrop-view="system"] .system-section-title span {
+        display: none;
+      }
+      body[data-inkdrop-view="system"] .system-table-row,
+      body[data-inkdrop-view="system"] .system-table-row[data-system-columns="3"],
+      body[data-inkdrop-view="system"] .system-table-row[data-system-columns="5"] {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 3px;
+        min-height: 0;
+        padding: 8px 2px;
+      }
+      body[data-inkdrop-view="system"] .system-table-row.head {
+        display: none;
+      }
+      body[data-inkdrop-view="system"] .system-meter {
+        grid-template-columns: minmax(0, 88px) minmax(90px, 1fr);
+      }
+      body[data-inkdrop-view="manual_review"] .section-table.section-table-operational.section-table-manual_review .section-table-head {
+        display: none;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table.section-table-operational.section-table-manual_review .section-table-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+          "item"
+          "state"
+          "detail"
+          "actions";
+        gap: 6px;
+        min-height: 0;
+        padding: 8px 34px 8px 10px;
+        align-items: start;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row > .section-table-item {
+        grid-area: item;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row > .section-table-state {
+        grid-area: state;
+        justify-self: start;
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row > .section-table-detail {
+        grid-area: detail;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row > .section-table-actions {
+        grid-area: actions;
+        min-width: 0;
+        width: 100%;
+        max-width: 100%;
+        justify-items: stretch;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-select {
+        top: 8px;
+        right: 8px;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-title-line {
+        flex-wrap: nowrap;
+        gap: 5px;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-title-line > strong {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        font-size: 13px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-bucket-badge {
+        flex: 0 0 auto;
+        max-width: 118px;
+        min-height: 18px;
+        overflow: hidden;
+        padding: 2px 5px;
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-context {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 1;
+        margin-top: 2px;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.25;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-state-stack {
+        justify-content: flex-start;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 1px;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-actions.compact-action-rail {
+        justify-content: stretch;
+        justify-items: stretch;
+        overflow: visible;
+        padding-bottom: 0;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-actions.compact-action-rail .section-table-action-group {
+        width: 100%;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-actions.compact-action-rail .section-table-action-group-buttons {
+        justify-content: flex-start;
+        width: 100%;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-actions.compact-action-rail button {
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-compact,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-compact {
+        grid-template-columns: auto;
+        justify-items: start;
+        gap: 3px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary-inline,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary-inline {
+        display: none;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary-detail,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary-detail {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 6px;
+        overflow: visible;
+        padding: 6px 0 0;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary-detail .section-table-micro-chip,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary-detail .section-table-micro-chip {
+        flex: 1 1 132px;
+        max-width: 100%;
+      }
+      main > .arr-nav-shell > .activity-region {
+        position: static;
+        top: auto;
+        left: auto;
+        right: auto;
+        bottom: auto;
+        width: 100%;
+        max-height: none;
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid var(--line-soft);
+        gap: 6px;
+        z-index: auto;
+        pointer-events: auto;
+      }
+      body.activity-dock-visible .arr-content-shell {
+        padding-bottom: 0;
+      }
+      main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] {
+        justify-self: stretch;
+        width: 100%;
+        max-height: 84px;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region {
+        margin-top: 3px;
+        padding-top: 3px;
+        border-top: 0;
+        gap: 0;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-status {
+        display: none;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] {
+        max-height: 54px;
+        min-height: 0;
+        padding: 6px 7px;
+        overflow: hidden;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-head {
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: center;
+        gap: 5px;
+        margin-bottom: 0;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-spinner {
+        width: 8px;
+        min-width: 8px;
+        height: 8px;
+        border-width: 2px;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title {
+        min-width: 0;
+        gap: 0;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > strong,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > span,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-destination,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-count,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-toggle,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-now-rail,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-summary,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-operator-board,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-lane-strip,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-route-strip,
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-list {
+        display: none !important;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-compact-target:not([hidden]) {
+        display: block;
+        max-height: 42px;
+        margin-top: 0;
+        overflow: hidden;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-button {
+        height: 40px;
+        min-height: 40px;
+        padding: 5px 6px;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-main strong {
+        font-size: 11px;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-status {
+        overflow: hidden;
+        font-size: 10px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-facts {
+        display: none;
+      }
+      body.activity-dock-visible[data-inkdrop-view="series"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-action {
+        display: none !important;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region {
+        position: static;
+        top: auto;
+        left: auto;
+        right: auto;
+        bottom: auto;
+        width: 100%;
+        max-height: none;
+        margin-top: 3px;
+        padding-top: 3px;
+        border-top: 0;
+        gap: 0;
+        z-index: auto;
+        pointer-events: auto;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-status,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-status,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-status {
+        display: none;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"],
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"],
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] {
+        max-height: 54px;
+        min-height: 0;
+        padding: 6px 7px;
+        overflow: hidden;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-head,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-head,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-head {
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: center;
+        gap: 5px;
+        margin-bottom: 0;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-spinner,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-spinner,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-spinner {
+        width: 8px;
+        min-width: 8px;
+        height: 8px;
+        border-width: 2px;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > strong,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > span,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-destination,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-count,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-toggle,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-now-rail,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-summary,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-operator-board,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-lane-strip,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-route-strip,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-list,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > strong,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > span,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-destination,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-count,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-toggle,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-now-rail,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-summary,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-operator-board,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-lane-strip,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-route-strip,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-list,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > strong,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-title > span,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-destination,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-count,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-toggle,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-now-rail,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-summary,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-operator-board,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-lane-strip,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-route-strip,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-list {
+        display: none !important;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-compact-target:not([hidden]),
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-compact-target:not([hidden]),
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-compact-target:not([hidden]) {
+        display: block;
+        max-height: 42px;
+        margin-top: 0;
+        overflow: hidden;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-button,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-button,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-button {
+        height: 40px;
+        min-height: 40px;
+        padding: 5px 6px;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-main strong,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-main strong,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-main strong {
+        font-size: 11px;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-status,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-status,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-status {
+        overflow: hidden;
+        font-size: 10px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-facts,
+      body[data-inkdrop-view="queue"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-action,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-facts,
+      body[data-inkdrop-view="wanted"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-action,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-compact-target-facts,
+      body[data-inkdrop-view="manual_review"] main > .arr-nav-shell > .activity-region .activity-dock[data-activity-dock-forced="dense-route"] .activity-dock-action {
+        display: none !important;
+      }
+      body.activity-dock-visible[data-inkdrop-view="queue"] .arr-content-shell,
+      body.activity-dock-visible[data-inkdrop-view="wanted"] .arr-content-shell,
+      body.activity-dock-visible[data-inkdrop-view="manual_review"] .arr-content-shell {
+        padding-bottom: 0;
+      }
+      body[data-inkdrop-view="series"] #packReviewBanner:not([hidden]),
+      body[data-inkdrop-view="queue"] #packReviewBanner:not([hidden]),
+      body[data-inkdrop-view="wanted"] #packReviewBanner:not([hidden]),
+      body[data-inkdrop-view="manual_review"] #packReviewBanner:not([hidden]),
+      body[data-inkdrop-view="activity"] #packReviewBanner:not([hidden]) {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 4px;
+        margin: 3px 0 6px;
+        padding: 6px 8px;
+        border-radius: 5px;
+      }
+      body[data-inkdrop-view="series"] #packReviewBanner strong,
+      body[data-inkdrop-view="queue"] #packReviewBanner strong,
+      body[data-inkdrop-view="wanted"] #packReviewBanner strong,
+      body[data-inkdrop-view="manual_review"] #packReviewBanner strong,
+      body[data-inkdrop-view="activity"] #packReviewBanner strong {
+        margin: 0;
+        overflow: hidden;
+        font-size: 12px;
+        line-height: 1.2;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="series"] #packReviewBanner .mini,
+      body[data-inkdrop-view="queue"] #packReviewBanner .mini,
+      body[data-inkdrop-view="wanted"] #packReviewBanner .mini,
+      body[data-inkdrop-view="manual_review"] #packReviewBanner .mini,
+      body[data-inkdrop-view="activity"] #packReviewBanner .mini {
+        min-width: 0;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.2;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="series"] #packReviewBanner .mini:nth-of-type(n+2),
+      body[data-inkdrop-view="queue"] #packReviewBanner .mini:nth-of-type(n+2),
+      body[data-inkdrop-view="wanted"] #packReviewBanner .mini:nth-of-type(n+2),
+      body[data-inkdrop-view="manual_review"] #packReviewBanner .mini:nth-of-type(n+2),
+      body[data-inkdrop-view="activity"] #packReviewBanner .mini:nth-of-type(n+2) {
+        display: none;
+      }
+      body[data-inkdrop-view="series"] #packReviewBanner .actions,
+      body[data-inkdrop-view="queue"] #packReviewBanner .actions,
+      body[data-inkdrop-view="wanted"] #packReviewBanner .actions,
+      body[data-inkdrop-view="manual_review"] #packReviewBanner .actions,
+      body[data-inkdrop-view="activity"] #packReviewBanner .actions {
+        flex-wrap: nowrap;
+        gap: 5px;
+        margin-top: 0;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 1px;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="series"] #packReviewBanner .actions button,
+      body[data-inkdrop-view="queue"] #packReviewBanner .actions button,
+      body[data-inkdrop-view="wanted"] #packReviewBanner .actions button,
+      body[data-inkdrop-view="manual_review"] #packReviewBanner .actions button,
+      body[data-inkdrop-view="activity"] #packReviewBanner .actions button {
+        flex: 0 0 auto;
+        min-height: 23px;
+        padding: 2px 6px;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+    }
+    @media (max-width: 760px) {
+      body[data-series-detail-open="true"] .series-detail-page {
+        gap: 8px;
+      }
+      body[data-series-detail-open="true"] .series-detail-toolbar {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 5px;
+      }
+      body[data-series-detail-open="true"] .series-detail-toolbar-main {
+        gap: 1px;
+      }
+      body[data-series-detail-open="true"] .series-detail-toolbar-main span {
+        display: none;
+      }
+      body[data-series-detail-open="true"] .series-detail-toolbar-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 5px;
+        width: 100%;
+      }
+      body[data-series-detail-open="true"] .series-detail-back,
+      body[data-series-detail-open="true"] .series-detail-remove-primary,
+      body[data-series-detail-open="true"] .series-detail-removed-badge {
+        min-height: 26px;
+        padding: 3px 6px;
+        font-size: 10px;
+      }
+      body[data-series-detail-open="true"] .series-detail-commandbar {
+        flex-wrap: nowrap;
+        gap: 5px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 4px;
+        scrollbar-width: thin;
+      }
+      body[data-series-detail-open="true"] .series-detail-commandbar button {
+        flex: 0 0 auto;
+        min-width: 58px;
+        min-height: 44px;
+        padding: 5px 7px;
+        font-size: 9px;
+        white-space: nowrap;
+      }
+      body[data-series-detail-open="true"] .series-detail-action-icon {
+        font-size: 14px;
+      }
+      body[data-series-detail-open="true"] .series-detail-action-label {
+        max-width: 54px;
+      }
+      body[data-series-detail-open="true"] .series-detail-hero {
+        grid-template-columns: minmax(76px, 92px) minmax(0, 1fr);
+        gap: 8px;
+        align-items: start;
+        padding: 8px;
+      }
+      body[data-series-detail-open="true"] .series-art.detail {
+        width: 92px;
+      }
+      body[data-series-detail-open="true"] .series-art.detail .series-art-fallback strong {
+        font-size: 20px;
+      }
+      body[data-series-detail-open="true"] .series-detail-main {
+        gap: 6px;
+      }
+      body[data-series-detail-open="true"] .series-detail-title {
+        gap: 4px;
+      }
+      body[data-series-detail-open="true"] .series-detail-title h3 {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+        font-size: clamp(18px, 5vw, 22px);
+        line-height: 1.08;
+      }
+      body[data-series-detail-open="true"] .series-detail-meta {
+        gap: 4px;
+      }
+      body[data-series-detail-open="true"] .series-detail-meta span {
+        min-height: 18px;
+        padding: 2px 5px;
+        font-size: 9px;
+      }
+      body[data-series-detail-open="true"] .series-detail-overview {
+        gap: 5px;
+        padding-top: 6px;
+      }
+      body[data-series-detail-open="true"] .series-detail-description {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 4;
+        overflow: hidden;
+        font-size: 11px;
+        line-height: 1.32;
+      }
+      body[data-series-detail-open="true"] .series-detail-facts {
+        gap: 4px;
+      }
+      body[data-series-detail-open="true"] .series-detail-fact {
+        min-height: 18px;
+        padding: 2px 5px;
+        font-size: 9px;
+      }
+      body[data-series-detail-open="true"] .series-detail-path {
+        display: none;
+      }
+      body[data-series-detail-open="true"] .series-focus-next {
+        gap: 2px;
+        padding: 5px 6px;
+      }
+      body[data-series-detail-open="true"] .series-focus-next strong {
+        font-size: 10px;
+      }
+      body[data-series-detail-open="true"] .series-focus-next span {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 1;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.2;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-note {
+        gap: 4px;
+        padding: 6px 7px;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-head {
+        align-items: flex-start;
+        gap: 5px;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-head strong {
+        font-size: 10px;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-head span {
+        font-size: 8px;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-copy,
+      body[data-series-detail-open="true"] .series-reader-visibility-next {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.22;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-copy {
+        -webkit-line-clamp: 2;
+      }
+      body[data-series-detail-open="true"] .series-reader-visibility-next {
+        -webkit-line-clamp: 1;
+      }
+      body[data-series-detail-open="true"] .series-detail-stat-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 5px;
+      }
+      body[data-series-detail-open="true"] .series-detail-stat {
+        gap: 1px;
+        min-height: 0;
+        padding: 5px 6px;
+      }
+      body[data-series-detail-open="true"] .series-detail-stat strong {
+        font-size: 12px;
+      }
+      body[data-series-detail-open="true"] .series-detail-stat span {
+        font-size: 8px;
+        line-height: 1.15;
+      }
+      body[data-series-detail-open="true"] .series-detail-issues-head {
+        gap: 6px;
+        padding: 8px 9px 0;
+      }
+      body[data-series-detail-open="true"] .series-detail-issues-title span {
+        display: none;
+      }
+      body[data-series-detail-open="true"] .arr-content-shell,
+      body[data-series-detail-open="true"] #inkdropSectionPanel,
+      body[data-series-detail-open="true"] .series-detail-page,
+      body[data-series-detail-open="true"] .series-detail-issues,
+      body[data-series-detail-open="true"] .series-detail-issue-groups,
+      body[data-series-detail-open="true"] .series-detail-issue-group,
+      body[data-series-detail-open="true"] .series-detail-issue-table {
+        min-width: 0;
+        max-width: 100%;
+        overflow-x: hidden;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-row.head {
+        display: none;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-row {
+        width: 100%;
+        max-width: 100%;
+        grid-template-columns: minmax(36px, max-content) minmax(0, 1fr);
+        grid-template-areas:
+          "number main"
+          "state state"
+          "detail detail"
+          "actions actions";
+        gap: 5px 8px;
+        align-items: start;
+        min-height: 0;
+        overflow: hidden;
+        padding: 8px 9px;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-number {
+        grid-area: number;
+        min-width: 0;
+        font-size: 12px;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-main {
+        grid-area: main;
+        min-width: 0;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-main strong {
+        font-size: 12px;
+        line-height: 1.2;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-main span {
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-row > .series-detail-issue-state {
+        grid-area: state;
+        justify-self: start;
+        width: auto;
+        max-width: 100%;
+        min-height: 20px;
+        padding: 3px 6px;
+        font-size: 9px;
+        white-space: normal;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-detail {
+        grid-area: detail;
+        min-width: 0;
+        max-width: 100%;
+        font-size: 10px;
+        line-height: 1.25;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-actions {
+        grid-area: actions;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        justify-content: flex-start;
+        width: auto;
+        min-width: 0;
+        overflow: visible;
+        padding-bottom: 0;
+      }
+      body[data-series-detail-open="true"] .series-detail-issue-actions button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: auto;
+        min-width: 0;
+        max-width: 100%;
+        height: 26px;
+        min-height: 26px;
+        padding: 0 8px;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1;
+        white-space: nowrap;
+      }
+      body[data-series-detail-open="true"] .series-detail-issues-actions {
+        width: 100%;
+        justify-content: flex-start;
+      }
+      body[data-series-detail-open="true"] .series-detail-issues-actions button {
+        flex: 1 1 96px;
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="issues"] main > header,
+      body[data-inkdrop-view="issues"] #workflowSnapshot,
+      body[data-inkdrop-view="issues"] #inkdropCore > .core-shell-title,
+      body[data-inkdrop-view="issues"] #inkdropCoreOverview,
+      body[data-inkdrop-view="issues"] .arr-page-masthead,
+      body[data-inkdrop-view="issues"] #packReviewBanner,
+      body[data-inkdrop-view="issues"] #inkdropSectionWorkbench,
+      body[data-inkdrop-view="issues"] #inkdropSectionSummary,
+      body[data-inkdrop-view="issues"] #inkdropSectionNotice,
+      body[data-inkdrop-view="issues"] #inkdropLaneRibbon {
+        display: none !important;
+      }
+      body[data-inkdrop-view="issues"] #inkdropCore,
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel {
+        border-color: transparent;
+        padding: 0;
+        background: transparent;
+        box-shadow: none;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel > .section-commandbar {
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 5px;
+        padding: 0 0 5px;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel .section-eyebrow,
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel .section-heading p {
+        display: none;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel .section-heading h3 {
+        margin: 0;
+        font-size: 17px;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel .section-command-actions {
+        flex-wrap: nowrap;
+        justify-content: flex-end;
+        gap: 4px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionPanel .section-command-actions button {
+        flex: 0 0 auto;
+        min-height: 25px;
+        padding: 2px 8px;
+        font-size: 10px;
+        text-transform: none;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionFilters {
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 4px;
+        margin: 0 0 6px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 2px;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="issues"] #inkdropSectionFilters button {
+        flex: 0 0 auto;
+        min-height: 24px;
+        padding: 2px 7px;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="history"] main > header,
+      body[data-inkdrop-view="history"] #workflowSnapshot,
+      body[data-inkdrop-view="history"] #inkdropCore > .core-shell-title,
+      body[data-inkdrop-view="history"] #inkdropCoreOverview,
+      body[data-inkdrop-view="history"] .arr-page-masthead,
+      body[data-inkdrop-view="history"] #packReviewBanner,
+      body[data-inkdrop-view="history"] #inkdropSectionWorkbench,
+      body[data-inkdrop-view="history"] #inkdropSectionSummary,
+      body[data-inkdrop-view="history"] #inkdropSectionNotice,
+      body[data-inkdrop-view="history"] #inkdropLaneRibbon {
+        display: none !important;
+      }
+      body[data-inkdrop-view="history"] #inkdropCore,
+      body[data-inkdrop-view="history"] #inkdropSectionPanel {
+        border-color: transparent;
+        padding: 0;
+        background: transparent;
+        box-shadow: none;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionPanel > .section-commandbar {
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 5px;
+        padding: 0 0 5px;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionPanel .section-eyebrow,
+      body[data-inkdrop-view="history"] #inkdropSectionPanel .section-heading p {
+        display: none;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionPanel .section-heading h3 {
+        margin: 0;
+        font-size: 17px;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionPanel .section-command-actions {
+        flex-wrap: nowrap;
+        justify-content: flex-end;
+        gap: 4px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionPanel .section-command-actions button {
+        flex: 0 0 auto;
+        min-height: 25px;
+        padding: 2px 8px;
+        font-size: 10px;
+        text-transform: none;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionFilters {
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 4px;
+        margin: 0 0 6px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 2px;
+        scrollbar-width: thin;
+      }
+      body[data-inkdrop-view="history"] #inkdropSectionFilters button {
+        flex: 0 0 auto;
+        min-height: 24px;
+        padding: 2px 7px;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-head {
+        display: none;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-row {
+        width: 100%;
+        max-width: 100%;
+        grid-template-columns: minmax(0, 1fr) minmax(74px, auto);
+        grid-template-areas:
+          "item state"
+          "detail detail"
+          "actions actions";
+        gap: 6px 8px;
+        align-items: start;
+        min-height: 0;
+        overflow: hidden;
+        padding: 8px 36px 8px 10px;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-row > .section-table-item {
+        grid-area: item;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-row > .section-table-state {
+        grid-area: state;
+        justify-self: end;
+        max-width: 112px;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-row > .section-table-detail {
+        grid-area: detail;
+        min-width: 0;
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-row > .section-table-actions {
+        grid-area: actions;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-select {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-title-line {
+        flex-wrap: nowrap;
+        gap: 5px;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-title-line > strong {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        font-size: 12px;
+        line-height: 1.2;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-context,
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-detail-text {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+        font-size: 10px;
+        line-height: 1.25;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-actions.compact-action-rail {
+        display: grid;
+        justify-items: stretch;
+        gap: 5px;
+        overflow: visible;
+        padding-bottom: 0;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-actions.compact-action-rail .section-table-action-group {
+        width: 100%;
+        min-width: 0;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 3px;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-actions.compact-action-rail .section-table-action-group-buttons {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 5px;
+        width: 100%;
+        min-width: 0;
+      }
+      body[data-inkdrop-view="issues"] .section-table-issues .section-table-actions.compact-action-rail button {
+        justify-content: center;
+        width: 100%;
+        max-width: 100%;
+        min-height: 28px;
+        padding: 4px 5px;
+        font-size: 10px;
+      }
+    }
+    
