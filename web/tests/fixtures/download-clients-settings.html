@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>InkDrop Download Clients Fixture</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../static/css/inkdrop.css">
+  <style>
+    :root { color-scheme: dark; --panel: #1d242c; --panel-2: #252d36; --border: #44515d; --text: #e5edf5; --muted: #aebac6; --accent: #35bdf2; --good: #56d68b; --warn: #f0b84b; --bad: #ff6873; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: #151b21; color: var(--text); font-family: Arial, sans-serif; }
+    button, input { border: 1px solid var(--border); background: #27313b; color: var(--text); padding: 7px 10px; }
+    button.primary { background: #087da8; } button.danger { border-color: var(--bad); }
+    main { width: min(1180px, calc(100vw - 24px)); margin: 0 auto; padding: 20px 0 60px; }
+    .settings-group-body { display: grid; gap: 12px; }
+    .settings-card { padding: 12px; border: 1px solid var(--border); background: var(--panel); }
+  </style>
+  <script>
+    (() => {
+      const types = [
+        ["qbittorrent", "qBittorrent", "torrent"], ["transmission", "Transmission", "torrent"],
+        ["deluge", "Deluge", "torrent"], ["utorrent", "uTorrent", "torrent"],
+        ["rtorrent", "rTorrent", "torrent"], ["sabnzbd", "SABnzbd", "usenet"],
+        ["nzbget", "NZBGet", "usenet"], ["slskd", "SLSKD", "soulseek"],
+      ];
+      const common = {base_url: {kind: "url"}, category: {}, download_path: {}, verify_tls: {kind: "boolean", default: true}};
+      const registry = types.map(([client_type, display_name, protocol]) => ({
+        client_id: client_type, client_type, display_name, implemented: true, addable: true, testable: true,
+        supported_protocols: [protocol], fields: {
+          ...common,
+          ...(!["sabnzbd", "slskd"].includes(client_type) ? {username: {}} : {}),
+          ...(["sabnzbd", "slskd"].includes(client_type) ? {api_key: {kind: "secret", write_only: true}} : {password: {kind: "secret", write_only: true}}),
+          ...(client_type === "nzbget" ? {api_key: {kind: "secret", write_only: true}} : {}),
+          ...(["transmission", "deluge", "nzbget", "utorrent", "rtorrent"].includes(client_type) ? {label: {}} : {}),
+        },
+      }));
+      const state = {instances: [], calls: [], secrets: {}, deleteGuard: new Set(), forceConflict: new Set(), run: null, next: 1};
+      const clone = value => JSON.parse(JSON.stringify(value));
+      const error = (detail, status=400) => Object.assign(new Error(detail), {detail, status});
+      function publicInstance(item) {
+        const out = clone(item); out.secret_fields = {};
+        for (const key of Object.keys(state.secrets[item.id] || {})) out.secret_fields[key] = {configured: true};
+        delete out.secrets; delete out.clear_secret_fields; return out;
+      }
+      function instanceId(path) { return decodeURIComponent(path.split("/api/download-clients/")[1]?.split("/")[0] || ""); }
+      window.fixtureState = state;
+      window.InkDropApi = {
+        async request(path, options={}) {
+          const method = String(options.method || "GET").toUpperCase();
+          const body = clone(options.body || {}); state.calls.push({path, method, body, headers: options.headers || {}});
+          if (path === "/api/download-clients" && method === "GET") return {ok: true, registry: {clients: registry, addable: types.map(row => row[0]), testable: types.map(row => row[0])}, instances: state.instances.map(publicInstance)};
+          if (path === "/api/download-clients" && method === "POST") {
+            if (!body.name) throw error("name is required");
+            const item = {...body, id: `dc_fixture_${state.next++}`, enabled: !!body.enabled, priority: Number(body.priority || 100), revision: 1, settings: body.settings || {}, categories: body.categories || {}, download_paths: body.download_paths || {}, path_mappings: body.path_mappings || []};
+            state.secrets[item.id] = Object.fromEntries(Object.entries(body.secrets || {}).filter(([, value]) => value !== "")); state.instances.push(item);
+            return {ok: true, instance: publicInstance(item)};
+          }
+          if (path === "/api/download-clients/test" && method === "POST") return {ok: true, persisted: false, result: {ok: !String(body.base_url || "").includes("fail"), reason: String(body.base_url || "").includes("fail") ? "connectivity" : ""}};
+          if (path === "/api/download-clients/test-all" && method === "POST") {
+            state.run = {run_id: "dctr_fixture", state: "completed", results: state.instances.map(item => item.enabled ? {instance_id: item.id, result: {ok: true}} : {instance_id: item.id, skipped: true, reason: "disabled"})};
+            return {ok: true, accepted: true, run_id: state.run.run_id};
+          }
+          if (path === "/api/download-clients/test-runs/dctr_fixture") return {ok: true, run: clone(state.run)};
+          if (path.endsWith("/test") && method === "POST") {
+            const item = state.instances.find(row => row.id === instanceId(path));
+            return {ok: true, status: {instance_id: item.id, result: item.enabled ? {ok: true} : {ok: true, skipped: true, reason: "disabled"}}};
+          }
+          const id = instanceId(path); const item = state.instances.find(row => row.id === id);
+          if (!item) throw error("download-client instance not found", 404);
+          if (method === "PATCH") {
+            if (state.forceConflict.delete(id)) throw error("download-client instance revision conflict", 409);
+            const revision = Number(String(options.headers?.["If-Match"] || "").replace(/\D/g, ""));
+            if (revision !== item.revision) throw error("download-client instance revision conflict", 409);
+            Object.assign(item, body); item.revision += 1;
+            state.secrets[id] ||= {};
+            for (const [key, value] of Object.entries(body.secrets || {})) if (value !== "") state.secrets[id][key] = value;
+            for (const key of body.clear_secret_fields || []) delete state.secrets[id][key];
+            return {ok: true, instance: publicInstance(item)};
+          }
+          if (method === "DELETE") {
+            if (state.deleteGuard.has(id)) throw error("download-client instance is still referenced by provider mappings or active download tasks", 409);
+            state.instances = state.instances.filter(row => row.id !== id); delete state.secrets[id]; return {ok: true, instance: {...publicInstance(item), deleted_at: Date.now() / 1000}};
+          }
+          throw error(`Unhandled fixture request: ${method} ${path}`, 500);
+        }
+      };
+    })();
+  </script>
+  <script src="../../static/js/inkdrop-download-clients-ui.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Settings</h1>
+    <section class="settings-group-body" id="downloadClientSettings">
+      <details class="settings-card" data-provider-id="qbittorrent"><summary>Legacy qBittorrent fallback</summary></details>
+      <details class="settings-card" data-provider-id="sabnzbd"><summary>Legacy SABnzbd fallback</summary></details>
+      <details class="settings-card" data-provider-id="slskd"><summary>Legacy SLSKD fallback</summary></details>
+    </section>
+  </main>
+  <script>window.InkDropDownloadClients.mount(document.getElementById("downloadClientSettings"));</script>
+</body>
+</html>

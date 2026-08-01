@@ -1,0 +1,1215 @@
+.inkdrop-one-time-key output {
+  display: block;
+  border: 1px solid rgba(247, 201, 111, .45);
+  padding: 12px;
+  background: #10161d;
+  color: var(--warn);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.settings-auth-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* Library adoption and archive conversion were wired up without any styling of
+   their own -- no rule anywhere matched either class. They landed as bare
+   sections in the settings grid: stuck in a single column while every sibling
+   row spans the full width, and with none of the card chrome around them. They
+   are the same kind of thing as backup/restore below, so they get the same
+   look rather than a third one. */
+.library-adoption-panel,
+.archive-conversion-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 14px;
+  background: rgba(15, 21, 28, .45);
+}
+
+.library-adoption-panel > p,
+.archive-conversion-panel > p,
+.library-adoption-status,
+.archive-conversion-status {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* Both panels append their buttons straight into the panel grid, so without
+   this each one stretches to the full row width. */
+.library-adoption-panel > button,
+.archive-conversion-panel > button {
+  justify-self: start;
+}
+
+.library-adoption-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.library-adoption-form > label {
+  display: grid;
+  flex: 1 1 200px;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+}
+
+.library-adoption-form > button {
+  flex: 0 0 auto;
+}
+
+.archive-conversion-options,
+.library-adoption-results,
+.archive-conversion-results {
+  display: grid;
+  gap: 8px;
+}
+
+.archive-conversion-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(230, 162, 62, .4);
+  border-radius: 4px;
+  background: rgba(230, 162, 62, .1);
+  color: #e6a23e;
+}
+
+.settings-backup-restore {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 14px;
+  background: rgba(15, 21, 28, .45);
+}
+
+.settings-backup-restore > p,
+.settings-backup-status {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.settings-backup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.settings-backup-file {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.settings-backup-file input {
+  max-width: min(100%, 320px);
+}
+
+@media (max-width: 600px) {
+  .settings-backup-actions,
+  .settings-backup-file {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .settings-backup-actions > button,
+  .settings-backup-file,
+  .settings-backup-file input {
+    width: 100%;
+    max-width: none;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 600px) {
+  .inkdrop-auth-root {
+    align-items: start;
+    padding: 14px;
+  }
+
+  .inkdrop-auth-card {
+    width: 100%;
+    margin-top: max(24px, 7vh);
+    padding: 20px;
+  }
+
+  .inkdrop-account-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+  }
+
+  .inkdrop-account-head,
+  .inkdrop-account-tabs,
+  .inkdrop-account-dialog [data-account-panel] {
+    padding-inline: 14px;
+  }
+
+  .inkdrop-account-dialog button,
+  .inkdrop-account-dialog .inkdrop-auth-check {
+    min-height: 44px;
+  }
+
+  .inkdrop-api-key-list article {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-data: reduce) {
+  .inkdrop-auth-root::before {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .inkdrop-auth-root::before,
+  .inkdrop-auth-root::after,
+  .inkdrop-auth-card {
+    animation: none;
+    transition: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .inkdrop-auth-card {
+    border-color: #8da0b2;
+    background: #151b22;
+    backdrop-filter: none;
+  }
+}
+
+@media (max-width: 760px) {
+  body[data-inkdrop-view="system"] .system-page,
+  body[data-inkdrop-view="system"] .system-page-grid,
+  body[data-inkdrop-view="system"] .system-section,
+  body[data-inkdrop-view="system"] .system-table {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  body[data-inkdrop-view="system"] .system-page-head {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  body[data-inkdrop-view="system"] .system-page-head .workflow-actions,
+  body[data-inkdrop-view="system"] .system-page-head .workflow-actions button {
+    width: 100%;
+  }
+
+  body[data-inkdrop-view="system"] .system-page-head .workflow-actions button,
+  body[data-inkdrop-view="system"] .system-page-subnav button,
+  body[data-inkdrop-view="system"] .system-copy-button,
+  body[data-inkdrop-view="system"] .inkdrop-release-toggle {
+    min-height: 44px;
+  }
+
+  body[data-inkdrop-view="system"] .system-page-subnav {
+    flex-wrap: nowrap;
+    gap: 6px;
+    max-width: 100%;
+    overflow-x: auto;
+    padding-bottom: 8px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+    overscroll-behavior-inline: contain;
+  }
+
+  body[data-inkdrop-view="system"] .system-page-subnav button {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+    padding-inline: 14px;
+    touch-action: manipulation;
+  }
+
+  body[data-inkdrop-view="system"] .system-section-title {
+    align-items: flex-start;
+  }
+
+  body[data-inkdrop-view="system"] .system-section-title span {
+    max-width: 45%;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
+
+  body[data-inkdrop-view="system"] .system-table-row > span,
+  body[data-inkdrop-view="system"] .system-table-row > strong {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  body[data-inkdrop-view="system"] .system-table-row,
+  body[data-inkdrop-view="system"] .system-table-row[data-system-columns="3"],
+  body[data-inkdrop-view="system"] .system-table-row[data-system-columns="5"] {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+    min-height: 0;
+    padding: 10px 4px;
+  }
+
+  body[data-inkdrop-view="system"] .system-table-row.head {
+    display: none;
+  }
+
+  body[data-inkdrop-view="system"] .inkdrop-release-entry > header,
+  body[data-inkdrop-view="system"] .inkdrop-release-notes-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  body[data-inkdrop-view="system"] .inkdrop-release-toggle {
+    width: 100%;
+  }
+}
+
+@media (max-width: 620px) {
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "item"
+      "state"
+      "detail"
+      "actions";
+    gap: 6px;
+    padding: 8px 36px 8px 9px;
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-select,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-select {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-item,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-item { grid-area: item; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-state,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-state { grid-area: state; justify-self: start; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail { grid-area: detail; width: 100%; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions { grid-area: actions; justify-self: start; }
+}
+
+/* Queue has no bulk mutation, so keep the work table free of empty selection chrome. */
+@media (min-width: 1100px) {
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
+    min-width: 1000px;
+    grid-template-columns: minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row {
+    grid-template-columns: minmax(330px, 1.35fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
+    grid-template-columns: minmax(350px, 1.65fr) minmax(126px, .55fr) minmax(168px, .7fr);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-head,
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
+    grid-template-columns: minmax(360px, 1fr) minmax(168px, .35fr);
+  }
+}
+
+@media (min-width: 621px) and (max-width: 1099px) {
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head {
+    grid-template-columns: minmax(220px, 1.1fr) minmax(120px, .58fr) minmax(190px, .9fr) minmax(64px, auto);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
+    grid-template-columns: minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
+    grid-template-areas:
+      "item state actions"
+      "detail detail actions";
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head {
+    grid-template-columns: minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row {
+    grid-template-columns: minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
+    grid-template-areas:
+      "item item actions"
+      "detail detail actions";
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
+    grid-template-columns: minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
+    grid-template-areas: "item state actions";
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-head,
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
+    grid-template-columns: minmax(220px, 1fr) minmax(64px, auto);
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
+    grid-template-areas: "item actions";
+  }
+}
+
+@media (max-width: 1099px) {
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
+    padding-right: 10px;
+  }
+}
+
+.arr-table-footer-queue.arr-table-footer-compact {
+  min-height: 30px;
+  padding-block: 5px;
+}
+/* An inline-flex box cannot shrink below the width of nowrap content, so a
+   71-character image digest rendered 502px wide inside a 344px column: the
+   digest printed straight over the Detail text and the Copy button landed on
+   top of the digest, squeezed to two letters per line. Grid with a zero-floor
+   first track keeps both inside the column, and the digest wraps -- the same
+   treatment the narrow-viewport rules above already give it. */
+.system-copy-value {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.system-copy-value code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.system-copy-button,
+.inkdrop-about-copy {
+  min-height: 28px;
+  white-space: nowrap;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.system-update-guidance {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.system-update-guidance p { margin: 0; color: var(--muted); }
+.system-update-commands { margin-top: 4px; border: 1px solid var(--border); }
+.system-update-technical { border-top: 1px solid var(--border); }
+.system-update-technical > summary { padding: 12px 14px; color: var(--muted); cursor: pointer; }
+
+.settings-auth-status {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border);
+}
+
+.download-client-operational-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 1px;
+  margin: 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+}
+
+.download-client-operational-fact {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--panel-2);
+}
+
+.download-client-operational-fact small {
+  color: var(--muted);
+}
+
+.download-client-operational-fact strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-client-operational-fact.good strong { color: var(--good); }
+.download-client-operational-fact.warn strong { color: var(--warn); }
+.download-client-operational-fact.bad strong { color: var(--bad); }
+
+/* Instance-scoped download-client settings */
+.download-client-manager {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin-bottom: 8px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.download-client-manager-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.download-client-manager-head h3,
+.download-client-instance-head h3 {
+  margin: 0;
+}
+
+.download-client-manager-head p,
+.download-client-instance-head p,
+.download-client-empty p,
+.download-client-delete-warning p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.download-client-manager-actions,
+.download-client-instance-actions,
+.download-client-dialog-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.download-client-manager-actions button,
+.download-client-instance-actions button,
+.download-client-dialog-footer button,
+.download-client-dialog-close,
+.download-client-add-mapping,
+.download-client-mapping-row > button {
+  min-height: 44px;
+}
+
+.download-client-manager-live {
+  min-height: 20px;
+  color: var(--muted);
+}
+
+.download-client-manager-live[data-tone="good"],
+.download-client-inline-error[data-tone="good"] { color: var(--good); }
+.download-client-manager-live[data-tone="warn"],
+.download-client-inline-error[data-tone="warn"] { color: var(--warn); }
+.download-client-manager-live[data-tone="bad"],
+.download-client-inline-error[data-tone="bad"] { color: var(--bad); }
+
+.download-client-instance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.download-client-instance-card,
+.download-client-empty {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.download-client-empty { grid-column: 1 / -1; }
+
+.download-client-instance-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.download-client-instance-head h3,
+.download-client-instance-head p {
+  overflow-wrap: anywhere;
+}
+
+.download-client-instance-state {
+  flex: none;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.download-client-instance-state.good {
+  border-color: color-mix(in srgb, var(--good) 60%, var(--border));
+  color: var(--good);
+}
+
+.download-client-instance-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.download-client-instance-facts div { min-width: 0; }
+.download-client-instance-facts dt { color: var(--muted); font-size: 11px; }
+.download-client-instance-facts dd {
+  margin: 2px 0 0;
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-client-health.good { color: var(--good); }
+.download-client-health.warn { color: var(--warn); }
+.download-client-health.bad { color: var(--bad); }
+.download-client-instance-note { color: var(--muted); font-size: 12px; }
+
+.download-client-dialog {
+  width: min(980px, calc(100vw - 32px));
+  max-width: 980px;
+  max-height: min(900px, calc(100dvh - 32px));
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.download-client-dialog::backdrop { background: rgba(0, 0, 0, .74); }
+
+.download-client-dialog-shell {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  max-height: min(900px, calc(100dvh - 32px));
+  overflow: hidden;
+}
+
+.download-client-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.download-client-dialog-head h2 { margin: 0; font-size: 20px; }
+.download-client-dialog-copy { margin: 0; padding: 12px 16px 0; color: var(--muted); }
+
+.download-client-chooser,
+.download-client-editor {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 14px 16px 0;
+  overflow: auto;
+}
+
+.download-client-editor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.download-client-editor > .wide { grid-column: 1 / -1; }
+
+.download-client-choice-group,
+.download-client-routing,
+.download-client-mappings {
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+
+.download-client-choice-group legend,
+.download-client-routing legend,
+.download-client-mappings legend { padding: 0 6px; font-weight: 700; }
+
+.download-client-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.download-client-choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 58px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+.download-client-choice:focus-within,
+.download-client-choice:hover { border-color: var(--accent); }
+.download-client-choice input { width: 20px; height: 20px; flex: none; }
+.download-client-choice span { display: grid; gap: 3px; }
+.download-client-choice small { color: var(--muted); }
+
+.download-client-field {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+}
+
+.download-client-field > label:not(.download-client-check) { font-weight: 700; }
+.download-client-field input:not([type="checkbox"]),
+.download-client-field select,
+.download-client-field textarea { width: 100%; min-width: 0; min-height: 40px; }
+.download-client-field input[aria-invalid="true"] { border-color: var(--bad); }
+
+.download-client-field-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.download-client-check {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  font-weight: 700;
+}
+
+.download-client-check input { width: 20px; height: 20px; }
+
+.download-client-routing,
+.download-client-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.download-client-routing > legend,
+.download-client-routing > p { grid-column: 1 / -1; }
+
+.download-client-mapping-rows { display: grid; gap: 8px; margin: 10px 0; }
+.download-client-mapping-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  gap: 8px;
+  align-items: end;
+  min-width: 0;
+}
+
+.download-client-advanced { border: 1px solid var(--border); }
+.download-client-advanced > summary { min-height: 44px; padding: 11px 12px; cursor: pointer; font-weight: 700; }
+.download-client-advanced-grid { padding: 12px; border-top: 1px solid var(--border); }
+
+.download-client-dialog-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  justify-content: flex-end;
+  margin: 0 -16px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.download-client-inline-error,
+.download-client-delete-warning {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--bad) 55%, var(--border));
+  background: color-mix(in srgb, var(--bad) 8%, var(--panel-2));
+  color: var(--bad);
+}
+
+.download-client-delete-warning { margin: 14px 16px; color: var(--text); }
+
+@media (max-width: 760px) {
+  .download-client-manager { padding: 10px; }
+  .download-client-manager-head,
+  .download-client-instance-head { display: grid; grid-template-columns: 1fr; }
+  .download-client-manager-actions,
+  .download-client-instance-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .download-client-manager-actions button,
+  .download-client-instance-actions button { width: 100%; }
+  .download-client-instance-grid,
+  .download-client-choice-grid,
+  .download-client-editor,
+  .download-client-routing,
+  .download-client-advanced-grid { grid-template-columns: minmax(0, 1fr); }
+  .download-client-dialog {
+    width: 100vw;
+    max-width: 100vw;
+    max-height: 100dvh;
+    height: 100dvh;
+    border-width: 0;
+    border-radius: 0;
+  }
+  .download-client-dialog-shell { max-height: 100dvh; height: 100dvh; }
+  .download-client-editor > .wide,
+  .download-client-routing > legend,
+  .download-client-routing > p { grid-column: 1; }
+  .download-client-mapping-row { grid-template-columns: minmax(0, 1fr); }
+  .download-client-mapping-row > button { width: 100%; }
+  .download-client-dialog-footer { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .download-client-dialog-footer button { width: 100%; }
+}
+
+/* Activity completion-truth dashboard */
+.inkdrop-activity-auto-root {
+  margin: 16px 0;
+}
+
+.inkdrop-activity-dashboard {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 4px;
+  overflow: hidden;
+  color: var(--text);
+}
+
+.inkdrop-activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.inkdrop-activity-heading h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.inkdrop-activity-summary {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.inkdrop-activity-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  background: var(--panel-2);
+}
+
+.inkdrop-activity-status.muted {
+  border-left-color: var(--muted);
+}
+
+.inkdrop-activity-status.danger {
+  border-left-color: var(--bad);
+}
+
+.inkdrop-activity-status strong {
+  font-size: 14px;
+}
+
+.inkdrop-activity-status span {
+  color: var(--muted);
+}
+
+.inkdrop-activity-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.inkdrop-activity-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.inkdrop-activity-chip strong {
+  color: var(--warn);
+}
+
+.inkdrop-activity-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.inkdrop-activity-table th,
+.inkdrop-activity-table td {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
+}
+
+.inkdrop-activity-table th {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  background: var(--panel-2);
+}
+
+.inkdrop-activity-table td span {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+}
+
+.inkdrop-activity-row-title strong {
+  color: var(--text);
+}
+
+.inkdrop-stage,
+.inkdrop-completion {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid rgba(214, 165, 54, .55);
+  border-radius: 4px;
+  background: rgba(214, 165, 54, .12);
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.inkdrop-completion {
+  border-color: rgba(70, 190, 116, .5);
+  background: rgba(70, 190, 116, .12);
+  color: var(--good);
+}
+
+.inkdrop-progress {
+  height: 8px;
+  max-width: 220px;
+  margin: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.inkdrop-progress span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.inkdrop-progress-stage {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.inkdrop-progress-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inkdrop-activity-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.inkdrop-activity-expand,
+.inkdrop-activity-retry {
+  border: 1px solid var(--border);
+  background: var(--button-bg);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.inkdrop-activity-expand:focus-visible,
+.inkdrop-activity-retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.inkdrop-activity-detail td {
+  background: var(--bg);
+}
+
+.inkdrop-activity-detail pre {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--muted);
+}
+
+.inkdrop-activity-empty,
+.inkdrop-activity-error {
+  padding: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.inkdrop-activity-error {
+  border-left: 3px solid var(--bad);
+}
+
+@media (max-width: 900px) {
+  .inkdrop-activity-table,
+  .inkdrop-activity-table tbody,
+  .inkdrop-activity-table tr,
+  .inkdrop-activity-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .inkdrop-activity-table thead {
+    display: none;
+  }
+
+  .inkdrop-activity-table tr {
+    border-top: 1px solid var(--border);
+  }
+
+  .inkdrop-activity-table td {
+    border-top: 0;
+    padding: 8px 12px;
+  }
+
+  .inkdrop-activity-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 3px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+
+  .inkdrop-activity-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* The navigation rail exposes Activity as one compact destination. */
+.activity-region,
+.activity-region .activity-dock {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.activity-region .activity-dock {
+  display: block;
+  position: static;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* .activity-status directly above wraps its label rather than clipping it;
+   this sibling pill (same sidebar footer, same role) ellipsized instead.
+   Match the pill it sits next to. */
+.activity-region .activity-sidebar-link {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.activity-region .activity-sidebar-link > span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-region .activity-sidebar-link:hover,
+.activity-region .activity-sidebar-link:focus-visible {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.activity-region .activity-dock-legacy {
+  display: none !important;
+}
+
+.inkdrop-row-action-panel {
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+}
+
+.missing-recovery {
+  display: grid;
+  gap: 14px;
+  margin: 14px 0;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--accent) 8%);
+}
+
+/* An author `display` beats the user agent's [hidden] { display: none } at any
+   specificity, so the rule above kept drawing this panel on Series as an empty
+   1212x32 tinted strip above the table even with the hidden attribute set. */
+.missing-recovery[hidden] {
+  display: none;
+}
+
+.missing-recovery-heading,
+.missing-recovery-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.missing-recovery-copy h3,
+.missing-recovery-copy p {
+  margin: 2px 0 0;
+}
+
+.missing-recovery-state,
+.missing-recovery-category {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--panel-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.missing-recovery-state.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
+.missing-recovery-state.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.missing-recovery-state.active { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.missing-recovery-state.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, var(--border)); }
+
+.missing-recovery-notice,
+.missing-recovery-message {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel-2);
+}
+
+.missing-recovery-notice.warn { border-color: color-mix(in srgb, var(--warn) 42%, var(--border)); }
+.missing-recovery-notice.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); color: var(--bad); }
+.missing-recovery-notice.bad .mini { color: color-mix(in srgb, var(--bad) 70%, var(--muted)); }
+.missing-recovery-message.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); color: var(--bad); }
+
+.missing-recovery-metrics,
+.missing-recovery-progress-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  gap: 8px;
+}
+
+.missing-recovery-metric {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.missing-recovery-metric-label,
+.missing-recovery-metric-detail,
+.missing-recovery-live,
+.missing-recovery-result span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.missing-recovery-metric-value { font-size: 18px; overflow-wrap: anywhere; }
+.missing-recovery-metric.good .missing-recovery-metric-value { color: var(--good); }
+.missing-recovery-metric.bad .missing-recovery-metric-value { color: var(--bad); }
+
+.missing-recovery-categories,
+.missing-recovery-progress,
+.missing-recovery-result {
+  display: grid;
+  gap: 8px;
+}
+
+.missing-recovery-category-list,
+.missing-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.missing-recovery-category strong { color: var(--text); }
+.missing-recovery-live { flex: 1; text-align: right; }
+.missing-recovery-live.bad { color: var(--bad); }
+
+@media (max-width: 760px) {
+  .missing-recovery-heading,
+  .missing-recovery-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .missing-recovery-live { text-align: left; }
+  .missing-recovery-actions { width: 100%; }
+  .missing-recovery-actions button { flex: 1 1 180px; min-height: 44px; }
+}
+
+@media (max-width: 620px) {
+  body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph],
+  body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-more > summary[data-action-force-text="1"][data-action-glyph] {
+    min-width: 64px !important;
+    min-height: 44px !important;
+    height: 44px;
+    padding-inline: 12px !important;
+    font-size: 12px !important;
+  }
+}

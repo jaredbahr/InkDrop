@@ -1,0 +1,9 @@
+services:
+  inkdrop:
+    networks:
+      - inkdrop_external
+
+networks:
+  inkdrop_external:
+    external: true
+    name: ${INKDROP_EXTERNAL_NETWORK:?Set INKDROP_EXTERNAL_NETWORK to an existing Docker network name}

@@ -1,0 +1,637 @@
+name: inkdrop-public-release
+
+on:
+  push:
+    branches:
+      - main
+      - qa
+    paths:
+      - ".github/workflows/inkdrop-public-release.yml"
+      - ".dockerignore"
+      - ".gitignore"
+      - ".env.example"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "README.md"
+      - "inkdrop-logo-mark.png"
+      - "web/static/**"
+      - "web/tests/**"
+      - "docs/inkdrop-source-candidate-catalog-20260702.json"
+      - "docs/inkdrop/docker-first-install.md"
+      - "docs/inkdrop/QA_RELEASE_PROCESS.md"
+      - "docs/inkdrop/releases/**"
+      - "tools/inkdrop_docker_context_manifest.py"
+      - "tools/inkdrop_install_support_summary.py"
+      - "tools/inkdrop_github_release.py"
+      - "tools/inkdrop_public_http_smoke.py"
+      - "tools/inkdrop_qa_candidate_manifest.py"
+      - "tools/inkdrop_public_release_check.py"
+      - "tools/inkdrop_settings_api_surface_audit.py"
+      - "tools/inkdrop_settings_sync_smoke.py"
+      - "tools/inkdrop_state_schema_audit.py"
+      - "tools/inkdrop_web_surface_audit.py"
+      - "inkdrop-autopilot-provider-budget-smoke.py"
+      - "inkdrop*.py"
+      - "inkdrop_*.py"
+      - "kavita*.py"
+      - "kavita_*.py"
+  pull_request:
+    paths:
+      - ".github/workflows/inkdrop-public-release.yml"
+      - ".dockerignore"
+      - ".gitignore"
+      - ".env.example"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "README.md"
+      - "inkdrop-logo-mark.png"
+      - "web/static/**"
+      - "web/tests/**"
+      - "docs/inkdrop-source-candidate-catalog-20260702.json"
+      - "docs/inkdrop/docker-first-install.md"
+      - "docs/inkdrop/QA_RELEASE_PROCESS.md"
+      - "docs/inkdrop/releases/**"
+      - "tools/inkdrop_docker_context_manifest.py"
+      - "tools/inkdrop_install_support_summary.py"
+      - "tools/inkdrop_github_release.py"
+      - "tools/inkdrop_public_http_smoke.py"
+      - "tools/inkdrop_qa_candidate_manifest.py"
+      - "tools/inkdrop_public_release_check.py"
+      - "tools/inkdrop_settings_api_surface_audit.py"
+      - "tools/inkdrop_settings_sync_smoke.py"
+      - "tools/inkdrop_state_schema_audit.py"
+      - "tools/inkdrop_web_surface_audit.py"
+      - "inkdrop*.py"
+      - "inkdrop_*.py"
+      - "kavita*.py"
+      - "kavita_*.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inkdrop-public-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  public_release:
+    name: Public release smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        timeout-minutes: 5
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Run static public-release checks
+        timeout-minutes: 15
+        run: |
+          export INKDROP_CONFIG_DIR="$RUNNER_TEMP/inkdrop/config"
+          export INKDROP_STATE_DIR="$RUNNER_TEMP/inkdrop/state"
+          export INKDROP_LOCK_DIR="$RUNNER_TEMP/inkdrop/state/locks"
+          export INKDROP_LOG_DIR="$RUNNER_TEMP/inkdrop/state/logs"
+          export INKDROP_CACHE_DIR="$RUNNER_TEMP/inkdrop/state/cache"
+          export INKDROP_BACKUP_DIR="$RUNNER_TEMP/inkdrop/state/backups"
+          export INKDROP_STAGING_DIR="$RUNNER_TEMP/inkdrop/staging"
+          export INKDROP_MANUAL_INBOX_DIR="$RUNNER_TEMP/inkdrop/manual-inbox"
+          export INKDROP_QUARANTINE_DIR="$RUNNER_TEMP/inkdrop/state/quarantine"
+          mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
+          python -B tools/inkdrop_public_http_smoke.py --json > inkdrop-public-http-smoke.json
+          python -B tools/inkdrop_public_release_check.py --strict-host-dependencies
+
+      - name: Run Automatic Search provider-budget smoke
+        timeout-minutes: 2
+        env:
+          INKDROP_CONFIG_DIR: ${{ runner.temp }}/inkdrop/config
+          INKDROP_STATE_DIR: ${{ runner.temp }}/inkdrop/state
+          INKDROP_LOCK_DIR: ${{ runner.temp }}/inkdrop/state/locks
+          INKDROP_LOG_DIR: ${{ runner.temp }}/inkdrop/state/logs
+          INKDROP_CACHE_DIR: ${{ runner.temp }}/inkdrop/state/cache
+          INKDROP_BACKUP_DIR: ${{ runner.temp }}/inkdrop/state/backups
+          INKDROP_STAGING_DIR: ${{ runner.temp }}/inkdrop/staging
+          INKDROP_MANUAL_INBOX_DIR: ${{ runner.temp }}/inkdrop/manual-inbox
+          INKDROP_QUARANTINE_DIR: ${{ runner.temp }}/inkdrop/state/quarantine
+        run: |
+          mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
+          python -B inkdrop-autopilot-provider-budget-smoke.py
+
+      - name: Validate operational JavaScript syntax
+        timeout-minutes: 2
+        run: find web/static/js -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Summarize Docker context manifest
+        timeout-minutes: 2
+        run: |
+          python -B tools/inkdrop_docker_context_manifest.py --summary | tee docker-context-manifest-summary.txt
+          python -B tools/inkdrop_docker_context_manifest.py --json > docker-context-manifest.json
+          {
+            echo "## Docker context manifest"
+            echo
+            echo '```text'
+            cat docker-context-manifest-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate Docker Compose config
+        timeout-minutes: 2
+        run: docker compose config --quiet
+
+      - name: Build Docker image
+        timeout-minutes: 30
+        run: docker compose build inkdrop
+
+      - name: Run strict container preflight
+        timeout-minutes: 5
+        run: |
+          docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+          docker compose run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only
+
+      - name: Verify container install support summary
+        timeout-minutes: 5
+        run: |
+          docker compose run --rm inkdrop python -B tools/inkdrop_install_support_summary.py --create --json | tee inkdrop-install-support-summary.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("inkdrop-install-support-summary.json").read_text(encoding="utf-8"))
+          assert payload["install_support_schema_version"] == 1, payload
+          assert payload["preflight_schema_version"] == 1, payload
+          assert payload["release_check_schema_version"] == 1, payload
+          assert payload["preflight"]["ok"] is True, payload
+          assert "effective_config" not in payload["preflight"], payload
+          PY
+
+      - name: Verify release-ready JSON gate
+        timeout-minutes: 35
+        run: |
+          export INKDROP_CONFIG_DIR="$RUNNER_TEMP/inkdrop/config"
+          export INKDROP_STATE_DIR="$RUNNER_TEMP/inkdrop/state"
+          export INKDROP_LOCK_DIR="$RUNNER_TEMP/inkdrop/state/locks"
+          export INKDROP_LOG_DIR="$RUNNER_TEMP/inkdrop/state/logs"
+          export INKDROP_CACHE_DIR="$RUNNER_TEMP/inkdrop/state/cache"
+          export INKDROP_BACKUP_DIR="$RUNNER_TEMP/inkdrop/state/backups"
+          export INKDROP_STAGING_DIR="$RUNNER_TEMP/inkdrop/staging"
+          export INKDROP_MANUAL_INBOX_DIR="$RUNNER_TEMP/inkdrop/manual-inbox"
+          export INKDROP_QUARANTINE_DIR="$RUNNER_TEMP/inkdrop/state/quarantine"
+          mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
+          python -B tools/inkdrop_public_release_check.py --docker --require-docker --skip-docker-build --json | tee inkdrop-release-check.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("inkdrop-release-check.json").read_text(encoding="utf-8"))
+          assert payload["release_check_schema_version"] == 1, payload
+          assert payload["ok"] is True, payload
+          assert payload["release_ready"] is True, payload
+          assert payload["docker_available"] is True, payload
+          assert payload["docker_requested"] is True, payload
+          assert payload["docker_required"] is True, payload
+          assert payload["docker_build_skipped"] is True, payload
+          assert payload["docker_gate_status"] == "passed", payload
+          build = next(item for item in payload["results"] if item["name"] == "docker_compose_build")
+          assert build["skipped"] is True, payload
+          PY
+
+      - name: Upload public-release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkdrop-public-release-evidence
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            docker-context-manifest-summary.txt
+            docker-context-manifest.json
+            inkdrop-install-support-summary.json
+            inkdrop-public-http-smoke.json
+            inkdrop-release-check.json
+
+  # Runs the WHOLE tracked smoke suite, not the single test public_release
+  # runs -- a green check used to mean one smoke passed, which let a real
+  # regression ship. This job GATES qa_image: the suite's very first advisory
+  # run proved why -- build 633 published and deployed carrying a known-red
+  # regression (same-stat archive swap, PASS12-CORE-P1-01) because nothing
+  # depended on the suite's verdict. Known-flaky or environment-bound tests
+  # belong on the runner's documented skip list, which is the pressure valve
+  # that keeps one flake from stalling every deploy; a red suite otherwise
+  # means the build must not ship.
+  full_smoke_suite:
+    name: Full smoke suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        timeout-minutes: 5
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Run full smoke suite
+        timeout-minutes: 80
+        env:
+          INKDROP_CONFIG_DIR: ${{ runner.temp }}/inkdrop/config
+          INKDROP_STATE_DIR: ${{ runner.temp }}/inkdrop/state
+          INKDROP_LOCK_DIR: ${{ runner.temp }}/inkdrop/state/locks
+          INKDROP_LOG_DIR: ${{ runner.temp }}/inkdrop/state/logs
+          INKDROP_CACHE_DIR: ${{ runner.temp }}/inkdrop/state/cache
+          INKDROP_BACKUP_DIR: ${{ runner.temp }}/inkdrop/state/backups
+          INKDROP_STAGING_DIR: ${{ runner.temp }}/inkdrop/staging
+          INKDROP_MANUAL_INBOX_DIR: ${{ runner.temp }}/inkdrop/manual-inbox
+          INKDROP_QUARANTINE_DIR: ${{ runner.temp }}/inkdrop/state/quarantine
+        run: |
+          mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
+          python -B tools/inkdrop_run_smoke_suite.py
+
+  qa_image:
+    name: Publish QA image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/qa'
+    needs: [public_release, full_smoke_suite]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      short_sha: ${{ steps.build_meta.outputs.short_sha }}
+      version: ${{ steps.release.outputs.version }}
+      release_tag: ${{ steps.release.outputs.tag }}
+      previous_state_schema_version: ${{ steps.release.outputs.previous_state_schema_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate checked-in release metadata
+        id: release
+        run: python -B tools/inkdrop_github_release.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepare build metadata
+        id: build_meta
+        run: |
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish immutable QA image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/inkdrop-qa:sha-${{ steps.build_meta.outputs.short_sha }}
+            ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa-${{ steps.build_meta.outputs.short_sha }}
+            ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa
+          build-args: |
+            INKDROP_VERSION=${{ steps.release.outputs.version }}
+            INKDROP_COMMIT_SHA=${{ github.sha }}
+            INKDROP_BUILD_DATE=${{ steps.build_meta.outputs.created }}
+            INKDROP_RELEASE_CHANNEL=qa
+            INKDROP_QA_BUILD_NUMBER=${{ github.run_number }}
+
+      - name: Generate immutable QA candidate manifest
+        run: |
+          state_schema_version="$(python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          tree = ast.parse(Path("inkdrop_state.py").read_text(encoding="utf-8"))
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION" for target in node.targets):
+                  print(ast.literal_eval(node.value))
+                  break
+          else:
+              raise SystemExit("SCHEMA_VERSION not found")
+          PY
+          )"
+          python -B tools/inkdrop_qa_candidate_manifest.py \
+            --branch "${GITHUB_REF_NAME}" \
+            --commit-sha "${GITHUB_SHA}" \
+            --version "${{ steps.release.outputs.version }}" \
+            --release-channel "qa" \
+            --build-date "${{ steps.build_meta.outputs.created }}" \
+            --image-tag "ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa-${{ steps.build_meta.outputs.short_sha }}" \
+            --image-digest "${{ steps.build.outputs.digest }}" \
+            --workflow-run-id "${{ github.run_id }}" \
+            --qa-build-number "${{ github.run_number }}" \
+            --state-schema-version "$state_schema_version" \
+            --output qa-candidate.json
+
+      - name: Upload immutable QA candidate manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkdrop-qa-candidate-${{ steps.build_meta.outputs.short_sha }}
+          retention-days: 30
+          if-no-files-found: error
+          path: qa-candidate.json
+
+      - name: Summarize QA image
+        run: |
+          {
+            echo "## QA image"
+            echo
+            echo "- Immutable tag: \`ghcr.io/${{ github.repository_owner }}/inkdrop-qa:sha-${{ steps.build_meta.outputs.short_sha }}\`"
+            echo "- Image: \`ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa-${{ steps.build_meta.outputs.short_sha }}\`"
+            echo "- Moving QA tag: \`ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- QA Build: \`${{ github.run_number }}\`"
+            echo "- Created: \`${{ steps.build_meta.outputs.created }}\`"
+            echo "- Candidate manifest artifact: \`inkdrop-qa-candidate-${{ steps.build_meta.outputs.short_sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  validate_qa_image:
+    name: Validate immutable QA image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/qa'
+    needs: [public_release, qa_image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR for digest validation
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download exact QA candidate manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: inkdrop-qa-candidate-${{ needs.qa_image.outputs.short_sha }}
+
+      - name: Validate candidate manifest identity
+        env:
+          EXPECTED_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+          EXPECTED_SHORT_SHA: ${{ needs.qa_image.outputs.short_sha }}
+          EXPECTED_VERSION: ${{ needs.qa_image.outputs.version }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path("qa-candidate.json").read_text(encoding="utf-8"))
+          expected_tag = f"ghcr.io/{os.environ['GITHUB_REPOSITORY_OWNER']}/inkdrop-qa:qa-{os.environ['EXPECTED_SHORT_SHA']}"
+          expected = {
+              "branch": "qa",
+              "full_commit_sha": os.environ["GITHUB_SHA"],
+              "version": os.environ["EXPECTED_VERSION"],
+              "release_channel": "qa",
+              "image_tag": expected_tag,
+              "image_digest": os.environ["EXPECTED_DIGEST"],
+          }
+          mismatches = {
+              key: {"expected": value, "actual": payload.get(key)}
+              for key, value in expected.items()
+              if payload.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(f"QA candidate identity mismatch: {mismatches}")
+          PY
+
+      - name: Pull and inspect exact image digest
+        env:
+          IMAGE_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+          EXPECTED_VERSION: ${{ needs.qa_image.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa@${IMAGE_DIGEST}"
+          docker pull "$image"
+          docker image inspect "$image" > qa-image-inspect.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          labels = json.loads(Path("qa-image-inspect.json").read_text(encoding="utf-8"))[0]["Config"]["Labels"]
+          expected = {
+              "org.opencontainers.image.revision": os.environ["GITHUB_SHA"],
+              "org.opencontainers.image.version": os.environ["EXPECTED_VERSION"],
+              "io.inkdrop.release.channel": "qa",
+          }
+          mismatches = {
+              key: {"expected": value, "actual": labels.get(key)}
+              for key, value in expected.items()
+              if labels.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(f"QA image label mismatch: {mismatches}")
+          PY
+
+      - name: Run strict preflight from exact image
+        env:
+          IMAGE_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa@${IMAGE_DIGEST}"
+          docker run --rm --entrypoint python \
+            -e INKDROP_CONFIG_DIR=/tmp/inkdrop/config \
+            -e INKDROP_STATE_DIR=/tmp/inkdrop/state \
+            -e INKDROP_LOCK_DIR=/tmp/inkdrop/state/locks \
+            -e INKDROP_LOG_DIR=/tmp/inkdrop/state/logs \
+            -e INKDROP_CACHE_DIR=/tmp/inkdrop/state/cache \
+            -e INKDROP_BACKUP_DIR=/tmp/inkdrop/state/backups \
+            -e INKDROP_STAGING_DIR=/tmp/inkdrop/staging \
+            -e INKDROP_MANUAL_INBOX_DIR=/tmp/inkdrop/manual-inbox \
+            -e INKDROP_QUARANTINE_DIR=/tmp/inkdrop/state/quarantine \
+            "$image" -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+          docker run --rm --entrypoint python \
+            -e INKDROP_CONFIG_DIR=/tmp/inkdrop/config \
+            -e INKDROP_STATE_DIR=/tmp/inkdrop/state \
+            -e INKDROP_LOCK_DIR=/tmp/inkdrop/state/locks \
+            -e INKDROP_LOG_DIR=/tmp/inkdrop/state/logs \
+            -e INKDROP_CACHE_DIR=/tmp/inkdrop/state/cache \
+            -e INKDROP_BACKUP_DIR=/tmp/inkdrop/state/backups \
+            -e INKDROP_STAGING_DIR=/tmp/inkdrop/staging \
+            -e INKDROP_MANUAL_INBOX_DIR=/tmp/inkdrop/manual-inbox \
+            -e INKDROP_QUARANTINE_DIR=/tmp/inkdrop/state/quarantine \
+            "$image" -B inkdrop_container_healthcheck.py --preflight-only --json
+
+      - name: Prove container health and public HTTP
+        env:
+          IMAGE_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa@${IMAGE_DIGEST}"
+          container="inkdrop-qa-validate-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker logs "$container" > qa-container.log 2>&1 || true
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name "$container" -p 127.0.0.1::8796 \
+            -e INKDROP_CONFIG_DIR=/tmp/inkdrop/config \
+            -e INKDROP_STATE_DIR=/tmp/inkdrop/state \
+            -e INKDROP_LOCK_DIR=/tmp/inkdrop/state/locks \
+            -e INKDROP_LOG_DIR=/tmp/inkdrop/state/logs \
+            -e INKDROP_CACHE_DIR=/tmp/inkdrop/state/cache \
+            -e INKDROP_BACKUP_DIR=/tmp/inkdrop/state/backups \
+            -e INKDROP_STAGING_DIR=/tmp/inkdrop/staging \
+            -e INKDROP_MANUAL_INBOX_DIR=/tmp/inkdrop/manual-inbox \
+            -e INKDROP_QUARANTINE_DIR=/tmp/inkdrop/state/quarantine \
+            "$image"
+          port="$(docker port "$container" 8796/tcp | sed -E 's/.*:([0-9]+)$/\1/')"
+          for attempt in $(seq 1 60); do
+            status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container")"
+            if [ "$status" = healthy ] && curl --fail --silent --show-error "http://127.0.0.1:${port}/status.json" > qa-status.json; then
+              break
+            fi
+            if [ "$status" = unhealthy ] || [ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 2
+          done
+          test -s qa-status.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("qa-status.json").read_text(encoding="utf-8"))
+          required = {"status", "detail", "source_health", "system_health", "inkdrop_state"}
+          missing = sorted(required.difference(payload))
+          if missing or not str(payload.get("status") or "").strip():
+              raise SystemExit(f"unexpected public status payload: {payload}")
+          PY
+
+      - name: Create verified QA image summary
+        env:
+          EXPECTED_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+          EXPECTED_VERSION: ${{ needs.qa_image.outputs.version }}
+          EXPECTED_TAG: ${{ needs.qa_image.outputs.release_tag }}
+          PREVIOUS_STATE_SCHEMA_VERSION: ${{ needs.qa_image.outputs.previous_state_schema_version }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          candidate_bytes = Path("qa-candidate.json").read_bytes()
+          candidate = json.loads(candidate_bytes)
+          digest = os.environ["EXPECTED_DIGEST"]
+          payload = {
+              "schema": "inkdrop.qa_image_validation.v1",
+              "passed": True,
+              "commit": os.environ["GITHUB_SHA"],
+              "version": os.environ["EXPECTED_VERSION"],
+              "release_tag": os.environ["EXPECTED_TAG"],
+              "image_digest": digest,
+              "image_ref": f"ghcr.io/{os.environ['GITHUB_REPOSITORY_OWNER']}/inkdrop-qa@{digest}",
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "candidate_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
+              "validated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "previous_state_schema_version": int(os.environ["PREVIOUS_STATE_SCHEMA_VERSION"]),
+              "target_state_schema_version": int(candidate["state_schema_version"]),
+              "checks": ["candidate_identity", "oci_labels", "strict_preflight", "container_health", "public_http"],
+          }
+          Path("qa-image-validation.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload immutable-image validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkdrop-qa-image-validation-${{ needs.qa_image.outputs.short_sha }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            qa-candidate.json
+            qa-image-inspect.json
+            qa-status.json
+            qa-container.log
+            qa-image-validation.json
+
+  github_release:
+    name: Publish GitHub prerelease
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/qa'
+    needs: [qa_image, validate_qa_image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download exact QA candidate evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: inkdrop-qa-candidate-${{ needs.qa_image.outputs.short_sha }}
+          path: release-evidence/candidate
+
+      - name: Download exact QA image validation evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: inkdrop-qa-image-validation-${{ needs.qa_image.outputs.short_sha }}
+          path: release-evidence/validation
+
+      - name: Generate and validate update metadata
+        run: |
+          python -B tools/inkdrop_github_release.py \
+            --candidate release-evidence/candidate/qa-candidate.json \
+            --validation release-evidence/validation/qa-image-validation.json \
+            --image-repository "ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa" \
+            --contract docs/inkdrop/releases/current.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --generate-update-manifest-output release-evidence/inkdrop-update-manifest.json
+          python -B tools/inkdrop_github_release.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --candidate release-evidence/candidate/qa-candidate.json \
+            --validation release-evidence/validation/qa-image-validation.json \
+            --image-repository "ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa" \
+            --update-manifest release-evidence/inkdrop-update-manifest.json
+
+      - name: Create or update exact GitHub prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -B tools/inkdrop_github_release.py \
+            --publish \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --candidate release-evidence/candidate/qa-candidate.json \
+            --validation release-evidence/validation/qa-image-validation.json \
+            --image-repository "ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa" \
+            --update-manifest release-evidence/inkdrop-update-manifest.json
