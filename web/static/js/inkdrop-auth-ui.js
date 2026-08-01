@@ -113,18 +113,20 @@
   }
 
   function renderBootstrap() {
-    const form = authCard("Create the first administrator", "Set up the account that will manage this InkDrop instance.", `<form class="inkdrop-auth-form">${field("Username", "text", "username", "username")}${field("Password", "password", "password", "new-password")}${field("Confirm password", "password", "confirm", "new-password")}<p class="inkdrop-auth-secondary" data-password-policy></p><div class="inkdrop-auth-message" data-auth-message role="status"></div><button type="submit">Create administrator</button></form>`);
+    const form = authCard("Create the first administrator", "Set up the account that will manage this InkDrop instance.", `<form class="inkdrop-auth-form">${field("Setup code", "text", "credential", "one-time-code")}<p class="inkdrop-auth-secondary">Find the setup code in <code>bootstrap-token.txt</code> inside your InkDrop config folder.</p>${field("Username", "text", "username", "username")}${field("Password", "password", "password", "new-password")}${field("Confirm password", "password", "confirm", "new-password")}<p class="inkdrop-auth-secondary" data-password-policy></p><div class="inkdrop-auth-message" data-auth-message role="status"></div><button type="submit">Create administrator</button></form>`);
     applyPasswordPolicy(form);
     form.addEventListener("submit", async event => {
       event.preventDefault();
       const submit = form.querySelector("button[type=submit]");
+      const credential = form.elements.credential.value.trim();
       const username = form.elements.username.value.trim();
       const password = form.elements.password.value;
+      if (!credential) return message(form, "Enter the setup code from bootstrap-token.txt in your InkDrop config folder.", "bad");
       if (password !== form.elements.confirm.value) return message(form, "Passwords do not match.", "bad");
       submit.disabled = true;
       message(form, "Creating administrator…");
       try {
-        await request("/api/auth/bootstrap", {method: "POST", body: {username, password, role: "admin"}});
+        await request("/api/auth/bootstrap", {method: "POST", body: {credential, username, password, role: "admin"}});
         await login(username, password);
       } catch (error) {
         message(form, error.message, "bad");
