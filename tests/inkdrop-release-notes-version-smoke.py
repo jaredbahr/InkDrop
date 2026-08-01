@@ -32,16 +32,8 @@ metadata = inkdrop_version.build_metadata({
 assert metadata["version"] == injected_version, metadata
 assert metadata["display_version"] == injected_version, metadata
 
-# The in-app About catalog was cleared to a single current entry ahead of the
-# public beta launch (see docs/inkdrop/releases/*.md for the full alpha-by-
-# alpha history, which stays on disk and on GitHub -- it just no longer gets
-# mirrored into the in-app widget one entry per build). This test used to
-# assert every individual alpha entry's exact phrasing against its standalone
-# release-notes file; that comprehensive a check made sense while the catalog
-# carried the full history, and doesn't fit a single-entry catalog. What's
-# still meaningful: the one remaining entry must be the real current version,
-# must actually match its own standalone release-notes content, and the
-# rollup mechanism the old multi-entry catalog needed is gone, not just empty.
+# The in-app About catalog carries one entry: the current release. Full
+# history lives in docs/inkdrop/releases/ and on GitHub.
 detailed_releases_match = re.search(r"var DETAILED_RELEASES = Object\.freeze\(\[(.*?)\]\);", catalog, re.DOTALL)
 assert detailed_releases_match, "DETAILED_RELEASES array was not found"
 detailed_releases_body = detailed_releases_match.group(1)

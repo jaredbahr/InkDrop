@@ -443,8 +443,8 @@
     },
     {
       "path": "tests/inkdrop-release-notes-version-smoke.py",
-      "sha256": "cee0c55e7c63e777f90bd1a3b910d32b1eb6317cbdedd95dc6fb07f18338e564",
-      "size_bytes": 3579
+      "sha256": "413556193092daaac08a73c03c3d909c54170b0be1f90c913e055c058950f7e7",
+      "size_bytes": 2935
     },
     {
       "path": "tests/inkdrop-runtime-source-settings-smoke.py",
@@ -528,8 +528,8 @@
     },
     {
       "path": "tests/inkdrop-standalone-entrypoints-smoke.py",
-      "sha256": "a6cf269a1a9829818a7f6a38db8b3b29c7ca2983d86b8eb8fe075b84e3e0d7cd",
-      "size_bytes": 8686
+      "sha256": "5d165c96707bb661cb0dfb16a7e5aeebb614785f0d4debc7aa3733d046ee626b",
+      "size_bytes": 8689
     },
     {
       "path": "scripts/inkdrop-state-path-contract-sync-regression-alert.sh",
@@ -583,8 +583,8 @@
     },
     {
       "path": "inkdrop_auth.py",
-      "sha256": "58008217affba0518257d85c7680a717447675f9bbacc1b7314716e487bbda3e",
-      "size_bytes": 70733
+      "sha256": "00f80afeb7de47704297e244e186ded8842bc589a052d819d75133d3b9280d55",
+      "size_bytes": 69766
     },
     {
       "path": "inkdrop_auth_cli.py",
@@ -878,8 +878,8 @@
     },
     {
       "path": "inkdrop_slskd_staging_sweep.py",
-      "sha256": "c611b086f291dbba324222ab6b2023bf254938c102d9dd6bcdcbdb81c3fc96e1",
-      "size_bytes": 19660
+      "sha256": "dcbbd8a04c118526fdba1ffb0933c4b78d6ce5b96b1acf243b2f1a1f1aa9b0c8",
+      "size_bytes": 19416
     },
     {
       "path": "inkdrop_source_catalog.py",
@@ -993,8 +993,8 @@
     },
     {
       "path": "inkdrop_web.py",
-      "sha256": "4f4d639e2182b5f71c67b1cc629e7f8ce434c4c917505a4a2f49fad8dfd4e027",
-      "size_bytes": 2964135
+      "sha256": "4e0a293aadd4bb2affd2fb6325f63a9eea78f15bc3047a4978558b223b84afd6",
+      "size_bytes": 2964051
     },
     {
       "path": "inkdrop_web_state_views.py",
@@ -1259,5 +1259,5 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "total_size_bytes": 16342146
+  "total_size_bytes": 16340210
 }

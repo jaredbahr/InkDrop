@@ -51,11 +51,8 @@ def extract_issue_number(filename):
     return None
 
 # Resolved through inkdrop_runtime_config rather than written out, so no
-# operator's home directory or NAS mount is baked into the source. These used to
-# be literal defaults; that made the file unshippable -- the public release
-# gates correctly refuse to export a private path -- and it silently tied the
-# sweep to one host. The env vars still win where set, which is how this
-# deployment configures every one of them, so resolution here is unchanged.
+# host-specific home directory or NAS mount is baked into the source. The
+# environment variables still take precedence wherever they are set.
 SLSKD_ROOT = os.environ.get("INKDROP_SLSKD_DOWNLOAD_ROOT") or str(
     inkdrop_runtime_config.staging_dir() / "slskd"
 )

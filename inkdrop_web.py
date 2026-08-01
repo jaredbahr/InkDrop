@@ -1560,12 +1560,11 @@ HTML = r"""<!doctype html>
     let activeInkdropSectionPayload = null;
     let activeInkdropPrimarySection = "series";
     let activeInkdropViewSection = "series";
-    // Calendar (inkdrop_release_calendar.py) shipped, then Jared pulled it for
-    // this release: no provider gives forward-looking release dates, so the
-    // page is just a backward-looking list right now, not worth shipping yet.
-    // Module, route, and CSS all stay in place -- this is the one switch that
-    // controls whether a user can reach the page (nav button also carries a
-    // matching `hidden` attribute below; flip both back together to restore).
+    // Calendar is off: no metadata provider supplies forward-looking release
+    // dates, so the page can only show a backward-looking list. The module
+    // (inkdrop_release_calendar.py), route, and CSS stay in place -- this is
+    // the one switch controlling whether a user can reach the page. The nav
+    // button carries a matching `hidden` attribute below; flip both together.
     const INKDROP_CALENDAR_ENABLED = false;
     // Import Lists has no backend behind it -- the settings page's own empty
     // state already admitted "this will eventually allow..." there is no way

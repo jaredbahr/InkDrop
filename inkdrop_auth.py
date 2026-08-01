@@ -958,24 +958,6 @@ def public_status(db_path, environ=None):
     return status
 
 
-# InkDrop's first run used to require a setup code written to
-# bootstrap-token.txt in the config directory, so that reaching the port was
-# not by itself enough to claim the install -- you also had to be able to read
-# a file inside it. Jared retired that requirement on 2026-08-01 for these
-# self-hosted, isolated-network deployments, accepting the same model Sonarr
-# and most self-hosted apps use: whoever reaches first-run setup first creates
-# the administrator.
-#
-# The residual risk is real and is documented in the README rather than
-# hidden: between the container starting and the account being created,
-# anyone who can reach the port can claim the install, so the port should not
-# be exposed publicly until setup is finished. What still holds the line is
-# the begin-immediate transaction in bootstrap_admin below -- once an
-# administrator exists the route is closed for good, and two simultaneous
-# attempts cannot both succeed.
-
-
-
 def bootstrap_admin(db_path, username, password, *, remote_addr=None, user_agent=None):
     """Create the first administrator. The first caller to finish wins.
 

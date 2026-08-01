@@ -127,7 +127,7 @@ def main() -> int:
     require(worker_text, 'LOG="${INKDROP_IMPORT_READY_LOG:-$LOG_DIR/inkdrop-import-ready-worker.log}"', "import-ready worker configurable log path")
     private_home = "/home/" + "curlz620"
     if f"{private_home}/bin/" in worker_text or f"{private_home}/arr-docker/" in worker_text:
-        fail("import-ready worker should not require Jared-specific host paths")
+        fail("import-ready worker should not require operator-specific host paths")
 
     web_text = WEB_IMPL.read_text(encoding="utf-8")
     require(web_text, 'script_path("inkdrop_completed_import.py"', "web neutral import command")
