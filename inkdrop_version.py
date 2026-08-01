@@ -232,8 +232,13 @@ def normalize_update_timestamp(value):
 
 
 def _update_semver(value):
+    # Leading zeros are allowed in the numeric parts, which strict semver
+    # forbids. InkDrop's release counter lives in the patch position and is
+    # zero-padded on purpose -- 0.1.01-beta, 0.1.02-beta -- so rejecting "01"
+    # would rule out every release the project actually cuts. Build metadata
+    # is still refused, since the update manifest has nowhere to put it.
     raw = str(value or "").strip()
-    if not re.fullmatch(r"(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2}(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", raw):
+    if not re.fullmatch(r"\d+(?:\.\d+){2}(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", raw):
         raise ValueError("version must be a semantic version without build metadata")
     return raw
 

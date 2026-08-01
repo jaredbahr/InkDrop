@@ -28,8 +28,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "95f57d858a36188bf92d4932dc4f0c984a706b071e90cbc32810c82ad2af133d",
-      "size_bytes": 6219
+      "sha256": "54bb2b2024a17af5abf3c6ce8793c08b0f2577db4a085d9ad86ac966db1ddad0",
+      "size_bytes": 5712
     },
     {
       "path": "deploy/compose.network.example.yml",
@@ -68,8 +68,8 @@
     },
     {
       "path": "docs/inkdrop/releases/current.json",
-      "sha256": "54de21b65198d538d637ea49258072febe674d028c1d1012ffd3a296f98781a5",
-      "size_bytes": 261
+      "sha256": "3974969593338a3a4dd4e6e8b44a1bc89be075bcd751d3798d646b6d02afe27f",
+      "size_bytes": 257
     },
     {
       "path": "docs/inkdrop/releases/v0.1.0-alpha.22.md",
@@ -182,9 +182,9 @@
       "size_bytes": 1118
     },
     {
-      "path": "docs/inkdrop/releases/v0.1.0-beta.2.md",
-      "sha256": "2529018295ad61803f72124235cff12e4d5f22142d0e8b6a6c7d438d99c56873",
-      "size_bytes": 1617
+      "path": "docs/inkdrop/releases/v0.1.01-beta.md",
+      "sha256": "bdbcfaddeb2adb583b72ac44ff91ddb7285ab1e40ebf954f6f0d49c1e346f0f5",
+      "size_bytes": 1627
     },
     {
       "path": "tests/inkdrop-acquisition-funnel-evidence-smoke.py",
@@ -988,8 +988,8 @@
     },
     {
       "path": "inkdrop_version.py",
-      "sha256": "d7e7477baa96ebfc9ae35556ccf41c23b96594b4238b8ecc685d0e2079ddeb3c",
-      "size_bytes": 34691
+      "sha256": "cdf6b2cb3619a839d664826844a2e2b0b58fa3f8688098bfa51b51d6f7e82cc0",
+      "size_bytes": 35052
     },
     {
       "path": "inkdrop_web.py",
@@ -1233,8 +1233,8 @@
     },
     {
       "path": "web/static/js/inkdrop-version-about.js",
-      "sha256": "aa3edbae07e30fed042f6d4a2851e2bc55910450cae826ab6a267a83bd0f829f",
-      "size_bytes": 15290
+      "sha256": "ade6d6b8a9918f6b3b4c59e427402cce12625e996e0a8a3c6ee07f885aa910a1",
+      "size_bytes": 16277
     },
     {
       "path": "web/tests/download-clients-settings-browser-smoke.js",
@@ -1259,5 +1259,5 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "total_size_bytes": 16341299
+  "total_size_bytes": 16342146
 }

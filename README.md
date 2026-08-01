@@ -86,15 +86,6 @@ http://your-host:8796
 
 The first-run setup will ask you to create a login, select your library folders, and connect the download sources you use.
 
-The first person to open InkDrop creates the administrator account, and the
-setup screen closes for good once that account exists. There is no setup code
-to copy. That does mean anyone who can reach port 8796 before you finish could
-create the account instead of you, so keep the port on your own network until
-setup is done. Do not forward it through your router or expose it to the
-internet first.
-
-Settings include a short explanation of what they control. If something is still unclear, open an issue.
-
 ## Getting started
 
 1. Open **Series** and add something you collect.

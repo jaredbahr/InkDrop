@@ -49,8 +49,8 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.0-beta.2",
-      slug: "v0-1-0-beta-2",
+      version: "v0.1.01-beta",
+      slug: "v0-1-01-beta",
       released_at: "2026-08-01",
       title: "First-run setup works",
       summary: "Creating the administrator on a fresh install returned “Forbidden” with no way past it: the server wanted a setup code the setup screen had no field to send. Whoever opens InkDrop first now creates the account directly.",
@@ -103,23 +103,46 @@
     beta: { label: "Beta", stage: "Public beta" }
   });
 
+  // Two shapes. Current releases put the counter in the patch position and
+  // end at the stage: 0.1.01-beta, 0.1.02-beta. Earlier ones trailed the
+  // counter after the stage: 0.1.0-alpha.98, 0.1.0-beta.2. The older form is
+  // still parsed so historical entries and deep links keep rendering.
   function closedAlphaParts(value) {
-    var match = /^v?(\d+)\.(\d+)\.(\d+)-(alpha|beta)\.(\d+)$/i.exec(text(value));
-    if (!match) return null;
+    var raw = text(value);
+    var trailing = /^v?(\d+)\.(\d+)\.(\d+)-(alpha|beta)\.(\d+)$/i.exec(raw);
+    if (trailing) {
+      return {
+        major: Number(trailing[1]),
+        minor: Number(trailing[2]),
+        patch: Number(trailing[3]),
+        prerelease: trailing[4].toLowerCase(),
+        update: Number(trailing[5]),
+        counterInPatch: false,
+        patchText: trailing[3]
+      };
+    }
+    var inPatch = /^v?(\d+)\.(\d+)\.(\d+)-(alpha|beta)$/i.exec(raw);
+    if (!inPatch) return null;
     return {
-      major: Number(match[1]),
-      minor: Number(match[2]),
-      patch: Number(match[3]),
-      prerelease: match[4].toLowerCase(),
-      update: Number(match[5])
+      major: Number(inPatch[1]),
+      minor: Number(inPatch[2]),
+      patch: Number(inPatch[3]),
+      prerelease: inPatch[4].toLowerCase(),
+      update: Number(inPatch[3]),
+      counterInPatch: true,
+      // Kept as written so 0.1.01-beta does not render as 0.1.1-beta.
+      patchText: inPatch[3]
     };
   }
 
   function productVersionLabel(value) {
     var parts = closedAlphaParts(value && typeof value === "object" ? displayVersion(value) : value);
     if (!parts) return text(value && typeof value === "object" ? displayVersion(value) : value, "Development build");
-    var patch = parts.patch ? "." + parts.patch : "";
     var stage = PRERELEASE_STAGES[parts.prerelease] || PRERELEASE_STAGES.alpha;
+    if (parts.counterInPatch) {
+      return parts.major + "." + parts.minor + "." + parts.patchText + " " + stage.label;
+    }
+    var patch = parts.patch ? "." + parts.patchText : "";
     return parts.major + "." + parts.minor + patch + " " + stage.label + " · Update " + parts.update;
   }
 
