@@ -123,8 +123,8 @@ def docker_context_paths(manifest):
         {
             ".dockerignore",
             ".env.example",
-            "compose.release-gate.network-none.yml",
-            "compose.network.example.yml",
+            "deploy/compose.release-gate.network-none.yml",
+            "deploy/compose.network.example.yml",
             "docker-compose.yml",
             "tools/inkdrop_public_release_check.py",
         }

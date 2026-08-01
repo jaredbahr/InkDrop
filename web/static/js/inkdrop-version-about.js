@@ -49,18 +49,18 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.0-beta.1",
-      slug: "v0-1-0-beta-1",
-      released_at: "2026-07-31",
-      title: "Opening a series page no longer risks a minute-long hang",
-      summary: "A series page with no cached description could take over a minute to open, or fail outright, on 338 of 342 series — a database write that ran on the request itself. It now loads immediately and finishes that write in the background. Five more real fixes landed alongside it.",
+      version: "v0.1.0-beta.2",
+      slug: "v0-1-0-beta-2",
+      released_at: "2026-08-01",
+      title: "First-run setup works",
+      summary: "Creating the administrator on a fresh install returned “Forbidden” with no way past it: the server wanted a setup code the setup screen had no field to send. Whoever opens InkDrop first now creates the account directly.",
       highlights: [
-        "A series with no cached description ran its refresh inline and could wait out a 60-second lock before failing; it now serves the description immediately and finishes the write in the background.",
-        "Leaving System or Settings and going anywhere else could leave that page's row list stuck invisible even though its data loaded fine. Every page now shows its rows regardless of where you came from.",
-        "The cold summary rebuild that runs after a stretch of inactivity is about 21% faster end to end.",
-        "Downloads that never actually started transferring could sit forever unretried; a separate 24-hour timeout, adjustable in Settings, now releases them.",
-        "A Manual Search run that lost its worker mid-search would retry automatically, but the retry was guaranteed to fail instantly. It now gets a genuine second attempt.",
-        "Starting a Recover Missing pass could fail silently under database contention, and Pausing one could silently do nothing. Both now report what actually happened."
+        "Creating the first administrator no longer needs a setup code. The screen closes for good once the account exists, and two people hitting it at once cannot both succeed.",
+        "Keep the port on your own network until setup is done, since anyone who reaches it first can claim the install.",
+        "The install instructions mounted libraries and downloads where InkDrop does not read them, so a new install showed an empty library. Corrected to /data/comics, /data/manga and /downloads.",
+        "A test now derives those paths from the image itself, so the instructions and the image cannot drift apart again.",
+        "The image source label pointed at a repository nobody outside the project can open; it now points at the public one.",
+        "Repository layout: tests in tests/, cron and maintenance scripts in scripts/, optional compose overrides in deploy/."
       ]
     }),
   ]);

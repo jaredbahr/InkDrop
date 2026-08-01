@@ -63,7 +63,6 @@ def main():
             code, _, payload = http_json(anonymous, "POST", base + "/api/auth/bootstrap", {
                 "username": "admin",
                 "password": "a correct horse battery staple",
-                "credential": inkdrop_auth.current_bootstrap_credential(db),
             })
             require(code == 200 and payload["ok"], "admin bootstrap failed")
             code, _, _ = http_json(anonymous, "GET", base + "/api/download-clients")

@@ -1,16 +1,18 @@
 # The scheduler runs inside this one service by default, so this is the
 # whole install -- no separate worker container needed.
 #
-# The paths below are InkDrop's own defaults, so nothing extra needs to be
-# set: /state holds the database, logs, cache, and backups; /staging is
-# where downloads land before they are checked and imported.
+# Four mounts, matching the paths the image actually uses:
+#   /config          database, logs, cache, backups, quarantine, manual inbox
+#   /downloads       where downloads land before they are checked and imported
+#   /data/comics     your comic library
+#   /data/manga      your manga library
 #
-# This is the beta channel, pinned to one signed, verified digest --
-# not the bare ghcr.io/jaredbahr/inkdrop name, which is reserved for a
-# future stable release.
+# Mounting a library somewhere else without also changing Comic root or
+# Manga root under Settings -> Media Management leaves it invisible to
+# InkDrop, so it is worth keeping these as they are.
 services:
   inkdrop:
-    image: ghcr.io/jaredbahr/inkdrop-beta@sha256:ca29ff1d454343f14b9b800886942bea4a1a71b10089a1e43aae1d8d43a082b1
+    image: ghcr.io/jaredbahr/inkdrop:latest
     container_name: inkdrop
     environment:
       # Off by default so a fresh install never grabs anything before you've
@@ -22,11 +24,9 @@ services:
       - "8796:8796"
     volumes:
       - ./config:/config
-      - ./state:/state
-      - ./staging:/staging
-      - ./manual-inbox:/manual-inbox
-      - /path/to/your/Comics:/library/comics
-      - /path/to/your/Manga:/library/manga
+      - ./downloads:/downloads
+      - /path/to/your/Comics:/data/comics
+      - /path/to/your/Manga:/data/manga
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"]

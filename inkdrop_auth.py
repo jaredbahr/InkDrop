@@ -958,132 +958,31 @@ def public_status(db_path, environ=None):
     return status
 
 
-BOOTSTRAP_CREDENTIAL_FILENAME = "bootstrap-token.txt"
-BOOTSTRAP_CREDENTIAL_TTL_SECONDS = 24 * 60 * 60
+# InkDrop's first run used to require a setup code written to
+# bootstrap-token.txt in the config directory, so that reaching the port was
+# not by itself enough to claim the install -- you also had to be able to read
+# a file inside it. Jared retired that requirement on 2026-08-01 for these
+# self-hosted, isolated-network deployments, accepting the same model Sonarr
+# and most self-hosted apps use: whoever reaches first-run setup first creates
+# the administrator.
+#
+# The residual risk is real and is documented in the README rather than
+# hidden: between the container starting and the account being created,
+# anyone who can reach the port can claim the install, so the port should not
+# be exposed publicly until setup is finished. What still holds the line is
+# the begin-immediate transaction in bootstrap_admin below -- once an
+# administrator exists the route is closed for good, and two simultaneous
+# attempts cannot both succeed.
 
 
-def bootstrap_credential_path(db_path, environ=None):
-    """Where the first-run credential is written for the operator to read.
 
-    The config directory is the one place the install documentation always
-    mounts, so the owner can read this from the host without exec'ing into
-    a container.
+def bootstrap_admin(db_path, username, password, *, remote_addr=None, user_agent=None):
+    """Create the first administrator. The first caller to finish wins.
+
+    begin immediate is what makes that safe: it takes the write lock before
+    the existence check, so two simultaneous requests serialize and the
+    second one sees the administrator the first one wrote and is refused.
     """
-    env = os.environ if environ is None else environ
-    config_dir = str(env.get("INKDROP_CONFIG_DIR") or "").strip()
-    if config_dir:
-        return Path(config_dir).expanduser() / BOOTSTRAP_CREDENTIAL_FILENAME
-    return Path(db_path).expanduser().parent / BOOTSTRAP_CREDENTIAL_FILENAME
-
-
-def _write_bootstrap_credential_file(path, token):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(
-            token
-            + "\n\nThis is InkDrop's first-run setup code. Enter it once to create the\n"
-            "administrator account. It expires, it works only once, and this file\n"
-            "is removed as soon as it is used.\n"
-        )
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
-
-
-def ensure_bootstrap_credential(db_path, environ=None, now=None):
-    """Make sure an unclaimed installation has exactly one live setup code.
-
-    Without this, anyone who could reach the port before the owner finished
-    setup could claim the installation, because creating the first
-    administrator required nothing at all. Reaching the port is no longer
-    enough: you also have to read a file that only someone with access to
-    the install's own config directory can read.
-    """
-    now = float(now or time.time())
-    path = bootstrap_credential_path(db_path, environ)
-    with _connect(db_path, operation="auth_bootstrap_credential") as con:
-        ensure_auth_schema(con)
-        if con.execute("select 1 from auth_users limit 1").fetchone():
-            return {"ok": True, "required": False, "reason": "administrator_exists"}
-        live = con.execute(
-            "select token_hash from auth_bootstrap_credentials"
-            " where consumed_at is null and expires_at > ? limit 1",
-            (now,),
-        ).fetchone()
-        if live and path.exists():
-            return {"ok": True, "required": True, "created": False, "path": str(path)}
-        # Either there is no live code, or its file is gone and the plaintext
-        # is unrecoverable by design. Replace it rather than stranding setup.
-        con.execute("delete from auth_bootstrap_credentials where consumed_at is null")
-        token = secrets.token_urlsafe(32)
-        con.execute(
-            "insert into auth_bootstrap_credentials(token_hash, created_at, expires_at) values(?,?,?)",
-            (_digest(token), now, now + BOOTSTRAP_CREDENTIAL_TTL_SECONDS),
-        )
-        _write_bootstrap_credential_file(path, token)
-    return {"ok": True, "required": True, "created": True, "path": str(path)}
-
-
-def current_bootstrap_credential(db_path, environ=None):
-    """Return the live setup code for an unclaimed install, minting if needed.
-
-    For callers that already hold the install's own filesystem -- a first-run
-    CLI, an operator script -- reading the code they are entitled to read is
-    the supported path. It is deliberately the same file a person would open,
-    so there is one mechanism rather than a separate back door.
-    """
-    state = ensure_bootstrap_credential(db_path, environ)
-    if not state.get("required"):
-        return None
-    path = Path(state.get("path") or bootstrap_credential_path(db_path, environ))
-    try:
-        return path.read_text(encoding="utf-8").split("\n", 1)[0].strip() or None
-    except OSError:
-        return None
-
-
-def _consume_bootstrap_credential(con, token, now):
-    """Verify and spend the setup code inside the caller's transaction.
-
-    Verification and spending have to happen in the same transaction that
-    creates the administrator, or two racing requests could both pass the
-    check before either wrote anything.
-    """
-    supplied = str(token or "").strip()
-    if not supplied:
-        raise AuthError(
-            "bootstrap_credential_required",
-            "Enter the setup code from bootstrap-token.txt in your InkDrop config folder.",
-            status=403,
-        )
-    row = con.execute(
-        "select token_hash, expires_at, consumed_at from auth_bootstrap_credentials where token_hash=?",
-        (_digest(supplied),),
-    ).fetchone()
-    if not row or row["consumed_at"] is not None:
-        raise AuthError(
-            "bootstrap_credential_invalid",
-            "That setup code is not valid. Check bootstrap-token.txt in your InkDrop config folder.",
-            status=403,
-        )
-    if float(row["expires_at"] or 0) <= now:
-        raise AuthError(
-            "bootstrap_credential_expired",
-            "That setup code has expired. Restart InkDrop to generate a new one.",
-            status=403,
-        )
-    con.execute(
-        "update auth_bootstrap_credentials set consumed_at=? where token_hash=? and consumed_at is null",
-        (now, row["token_hash"]),
-    )
-    if con.total_changes <= 0:
-        raise AuthError("bootstrap_credential_invalid", "That setup code was already used.", status=403)
-
-
-def bootstrap_admin(db_path, username, password, *, remote_addr=None, user_agent=None, credential=None):
     username = str(username or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,128}", username):
         raise AuthError("invalid_username", "username must be 3-128 safe characters")
@@ -1092,7 +991,6 @@ def bootstrap_admin(db_path, username, password, *, remote_addr=None, user_agent
     with _connect(db_path, operation="auth_bootstrap") as con:
         ensure_auth_schema(con)
         con.execute("begin immediate")
-        _consume_bootstrap_credential(con, credential, now)
         if con.execute("select 1 from auth_users limit 1").fetchone():
             _audit(con, "bootstrap", "denied", username=username, remote_addr=remote_addr, user_agent=user_agent)
             con.commit()
@@ -1103,12 +1001,6 @@ def bootstrap_admin(db_path, username, password, *, remote_addr=None, user_agent
             (user_id, username, hashed, "admin", 1, now, now, now, _json_text({"source": "bootstrap"})),
         )
         _audit(con, "bootstrap", "success", actor_type="user", actor_id=user_id, username=username, remote_addr=remote_addr, user_agent=user_agent)
-    # The code is spent; leaving the file behind would only invite someone to
-    # try it. Failure to remove it is not worth failing a completed setup.
-    try:
-        bootstrap_credential_path(db_path).unlink(missing_ok=True)
-    except OSError:
-        pass
     return {"ok": True, "user": {"id": user_id, "username": username, "role": "admin", "enabled": True}}
 
 

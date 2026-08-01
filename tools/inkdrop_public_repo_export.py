@@ -32,8 +32,8 @@ PUBLIC_REPO_EXTRA_PATHS = (
     ".env.example",
     ".github/workflows/inkdrop-public-release.yml",
     ".gitignore",
-    "compose.release-gate.network-none.yml",
-    "compose.network.example.yml",
+    "deploy/compose.release-gate.network-none.yml",
+    "deploy/compose.network.example.yml",
     "docker-compose.yml",
     "docs/inkdrop/arr-stack-deployment-plan.md",
     "docs/inkdrop/docker-first-install.md",
@@ -197,10 +197,18 @@ def public_dockerfile_bytes(root: Path = ROOT):
     source paths must point at scripts/ once the cron scripts move there.
     The COPY destination stays the flat ./ it always was, so the running
     image (and everything inside it that invokes these by their in-container
-    path) is completely unaffected -- only where the build reads them from."""
+    path) is completely unaffected -- only where the build reads them from.
+
+    org.opencontainers.image.source is also repointed: that label is what
+    tells anyone inspecting the image where its source lives, so on a public
+    image it has to name the repository they can actually open."""
     text = (root / "Dockerfile").read_text(encoding="utf-8")
     for name in RELOCATABLE_SCRIPTS_DIR_FILES:
         text = text.replace(f"    {name} \\\n", f"    scripts/{name} \\\n")
+    text = text.replace(
+        'org.opencontainers.image.source="https://github.com/jaredbahr/inkdrop-dev"',
+        'org.opencontainers.image.source="https://github.com/jaredbahr/InkDrop"',
+    )
     return text.encode("utf-8")
 
 

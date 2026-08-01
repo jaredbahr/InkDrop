@@ -8,7 +8,7 @@ ARG INKDROP_QA_BUILD_NUMBER=0
 
 LABEL org.opencontainers.image.title="InkDrop" \
     org.opencontainers.image.description="InkDrop comics and manga acquisition automation" \
-    org.opencontainers.image.source="https://github.com/jaredbahr/inkdrop-dev" \
+    org.opencontainers.image.source="https://github.com/jaredbahr/InkDrop" \
     org.opencontainers.image.version="${INKDROP_VERSION}" \
     org.opencontainers.image.revision="${INKDROP_COMMIT_SHA}" \
     org.opencontainers.image.created="${INKDROP_BUILD_DATE}" \

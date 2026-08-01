@@ -80,11 +80,11 @@ That layout is intentionally independent from `arr-docker`, `docker-arrs`, or
 any other existing media stack. Attach InkDrop to an existing Docker network or
 set adapter URLs only when you want it to talk to those services.
 If InkDrop should stay as its own Compose project but also reach services on an
-existing Docker network, use the optional `compose.network.example.yml`
+existing Docker network, use the optional `deploy/compose.network.example.yml`
 override after setting `INKDROP_EXTERNAL_NETWORK` to an existing network name:
 
 ```bash
-docker compose -f docker-compose.yml -f compose.network.example.yml up -d --build
+docker compose -f docker-compose.yml -f deploy/compose.network.example.yml up -d --build
 ```
 
 This attaches only the `inkdrop` web container to that network. The repository
@@ -730,7 +730,7 @@ If adding InkDrop directly to an existing Arr Compose file, do it deliberately:
 
 - keep InkDrop's state/config/staging/manual-inbox/library volumes separate
   from existing application config folders
-- prefer `compose.network.example.yml` when all you need is same-network access
+- prefer `deploy/compose.network.example.yml` when all you need is same-network access
   from a separate InkDrop Compose project
 - use service DNS names such as `http://prowlarr:9696`,
   `http://sabnzbd:8080`, `http://qbittorrent:8080`, `http://kavita:5000`, or

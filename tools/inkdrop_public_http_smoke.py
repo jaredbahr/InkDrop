@@ -137,35 +137,13 @@ def post_json(port, path, payload, *, timeout=3.0, headers=None):
         raise RuntimeError(f"{path} returned non-JSON body: {response_body[:500]}") from exc
 
 
-def read_setup_code(config_dir, *, timeout=10.0):
-    """Read the first-run setup code the way an operator does: from the file.
-
-    The server writes it just after it starts listening, so this can win the
-    race against startup on a slow runner.
-    """
-    path = Path(config_dir) / "bootstrap-token.txt"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            first_line = path.read_text(encoding="utf-8").splitlines()[0].strip()
-        except (OSError, IndexError):
-            first_line = ""
-        if first_line:
-            return first_line
-        time.sleep(0.1)
-    raise RuntimeError(f"the server never wrote a setup code to {path}")
-
-
-def login_cookie(port, config_dir):
+def login_cookie(port, config_dir=None):
+    # config_dir is no longer read: first-run setup takes no setup code.
     password = f"Smoke-{secrets.token_urlsafe(18)}"
     post_json(
         port,
         "/api/auth/bootstrap",
-        {
-            "username": "smoke-admin",
-            "password": password,
-            "credential": read_setup_code(config_dir),
-        },
+        {"username": "smoke-admin", "password": password},
         timeout=5.0,
     )
     _payload, response_headers = post_json(

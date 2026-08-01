@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -395,10 +396,10 @@ def assert_exported_readme_is_approved(root, result):
     require("all rights reserved" in shipped.lower(), "exported README should carry the resolved license")
     require("a license has not been selected" not in shipped.lower(), "exported README license placeholder should be resolved")
     require(
-        "ghcr.io/jaredbahr/inkdrop-beta@sha256:ca29ff1d454343f14b9b800886942bea4a1a71b10089a1e43aae1d8d43a082b1" in shipped,
-        "exported README should carry the real, promoted inkdrop-beta digest",
+        "ghcr.io/jaredbahr/inkdrop:latest" in shipped,
+        "exported README should carry the public inkdrop:latest reference",
     )
-    require("ghcr.io/jaredbahr/inkdrop:latest" not in shipped, "exported README must not reference the reserved stable image name")
+    require("ghcr.io/jaredbahr/inkdrop-beta" not in shipped, "exported README should point new installs at the current channel, not the frozen legacy one")
     require("REPLACE_WITH_YOUR_APPROVED_DIGEST" not in shipped, "exported README should not still carry the unresolved digest placeholder")
     # Once the source file is actually resolved (as it is right now, ready to
     # publish), the placeholder list must be empty -- see
@@ -406,6 +407,52 @@ def assert_exported_readme_is_approved(root, result):
     # detection mechanism itself, independent of this file's current content.
     placeholders = result.get("readme_placeholders")
     require(isinstance(placeholders, list) and not placeholders, f"README should have no unresolved placeholders left: {placeholders}")
+
+
+def dockerfile_env_defaults(root):
+    """The image's own ENV block, which is what actually applies at runtime.
+
+    Read from the Dockerfile rather than from the Python modules: the code
+    carries fallbacks like /library/comics that the ENV block overrides, so
+    the module-level values describe what happens outside a container, not
+    inside one.
+    """
+    text = (Path(root) / "Dockerfile").read_text(encoding="utf-8")
+    block = re.search(r"^ENV\s+(.*?)(?=^\w|\Z)", text, re.MULTILINE | re.DOTALL)
+    require(bool(block), "Dockerfile has no ENV block to derive runtime paths from")
+    values = dict(re.findall(r"(INKDROP_[A-Z_]+)=(\S+)", block.group(1)))
+    require(values, "Dockerfile ENV block exposed no INKDROP_* values")
+    return values
+
+
+def assert_compose_mounts_match_dockerfile_defaults(root):
+    """Every runtime path the image writes to must land inside a mount.
+
+    The published compose file once mounted /state, /staging and
+    /library/comics while the image actually used /config/state,
+    /downloads/staging and /data/comics. Nothing failed loudly: the
+    container started, the database persisted under the mounted /config,
+    and the library simply looked empty because the comics were mounted
+    somewhere the app never reads. Deriving this from the Dockerfile means
+    the two cannot drift apart again without failing here first.
+    """
+    env = dockerfile_env_defaults(root)
+    shipped = (Path(root) / "docker-compose.yml").read_text(encoding="utf-8")
+    mounts = re.findall(r"^\s*-\s+\S+:(/[^\s:]+)", shipped, re.MULTILINE)
+    require(mounts, "exported compose declares no volume mounts")
+
+    def is_covered(target):
+        return any(target == m or target.startswith(m.rstrip("/") + "/") for m in mounts)
+
+    for key in ("INKDROP_STATE_DIR", "INKDROP_STAGING_DIR", "INKDROP_COMIC_ROOT", "INKDROP_MANGA_ROOT"):
+        path = env.get(key)
+        require(bool(path), f"Dockerfile ENV is missing {key}")
+        require(
+            is_covered(path),
+            f"{key}={path} is not inside any mount in the exported compose "
+            f"(mounts: {sorted(set(mounts))}) -- data written there would not persist, "
+            f"or a library mounted elsewhere would be invisible to InkDrop",
+        )
 
 
 def assert_exported_compose_is_approved(root, result):
@@ -418,13 +465,12 @@ def assert_exported_compose_is_approved(root, result):
     require(shipped == approved, "exported docker-compose.yml drifted from the approved beta source")
     require("inkdrop-worker" not in shipped, "exported beta compose should not carry the second service")
     require("build:" not in shipped, "exported beta compose should pull a prebuilt image, not build from source")
-    require("/library/comics" in shipped and "/library/manga" in shipped, "exported beta compose should mount InkDrop's real default library paths")
-    require("/state" in shipped, "exported beta compose must mount /state or the database will not persist across recreates")
+    assert_compose_mounts_match_dockerfile_defaults(root)
     require(
-        "ghcr.io/jaredbahr/inkdrop-beta@sha256:ca29ff1d454343f14b9b800886942bea4a1a71b10089a1e43aae1d8d43a082b1" in shipped,
-        "exported compose should carry the real, promoted inkdrop-beta digest",
+        "ghcr.io/jaredbahr/inkdrop:latest" in shipped,
+        "exported compose should carry the public inkdrop:latest reference",
     )
-    require("ghcr.io/jaredbahr/inkdrop:latest" not in shipped, "exported compose must not reference the reserved stable image name")
+    require("ghcr.io/jaredbahr/inkdrop-beta" not in shipped, "exported compose should point new installs at the current channel, not the frozen legacy one")
     require("REPLACE_WITH_YOUR_APPROVED_DIGEST" not in shipped, "exported compose should not still carry the unresolved digest placeholder")
     placeholders = result.get("compose_placeholders")
     require(isinstance(placeholders, list) and not placeholders, f"compose file should have no unresolved placeholders left: {placeholders}")

@@ -58898,15 +58898,14 @@ class Handler(BaseHTTPRequestHandler):
             if not inkdrop_auth_is_public_path(path, method, status):
                 if status.get("built_in_auth", {}).get("bootstrap_required"):
                     detail = (
-                        "InkDrop has no administrator yet. Finish first-run setup "
-                        "with the code in bootstrap-token.txt before using the API."
+                        "InkDrop has no administrator yet. Open InkDrop in a browser "
+                        "and finish first-run setup before using the API."
                     )
                 else:
                     # mode=="external" never populates auth_users, so
                     # bootstrap_required is permanently false here -- the
                     # lockout is an unready trusted-proxy list, not an
-                    # unclaimed install, and bootstrap-token.txt does not
-                    # exist to fix it.
+                    # unclaimed install, so first-run setup is not the fix.
                     detail = (
                         "InkDrop cannot authenticate any caller right now (mode is external but no usable "
                         "trusted proxy is configured). Fix INKDROP_EXTERNAL_AUTH_TRUSTED_PROXIES in your "
@@ -59847,12 +59846,6 @@ class Handler(BaseHTTPRequestHandler):
                     role=data.get("role") or "admin",
                     remote_addr=self.client_address[0] if self.client_address else None,
                     user_agent=self.headers.get("User-Agent"),
-                    credential=(
-                        data.get("credential")
-                        or data.get("bootstrap_token")
-                        or data.get("setup_code")
-                        or self.headers.get("X-InkDrop-Bootstrap-Token")
-                    ),
                 )
                 clear_inkdrop_auth_status_cache()
                 result["auth"] = inkdrop_state.auth_status(INKDROP_STATE_DB)
@@ -60215,17 +60208,6 @@ def _web_background_bootstrap():
         launch_pending_manga_companion_jobs(limit=2)
     except Exception as exc:
         print(f"Warning: failed to resume manga companion setup: {exc}", flush=True)
-    try:
-        credential = inkdrop_auth.ensure_bootstrap_credential(INKDROP_STATE_DB)
-        if credential.get("required"):
-            # The path, never the code itself: this line goes to container logs.
-            print(
-                f"InkDrop setup code written to {credential.get('path')} -- "
-                "open it to create the first administrator.",
-                flush=True,
-            )
-    except Exception as exc:
-        print(f"Warning: could not prepare the first-run setup code: {exc}", flush=True)
     threading.Thread(target=manual_review_reconciler_loop, daemon=True).start()
     threading.Thread(target=auto_pack_import_loop, daemon=True).start()
     threading.Thread(target=series_queue_runner_loop, daemon=True).start()

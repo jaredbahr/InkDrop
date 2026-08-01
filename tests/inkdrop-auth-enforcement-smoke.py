@@ -86,7 +86,7 @@ def main():
             "installed version must remain available to ordinary signed-in users",
         )
 
-        user = inkdrop_state.bootstrap_auth_user(db_path, "admin", "correct horse battery staple", credential=inkdrop_auth.current_bootstrap_credential(db_path))
+        user = inkdrop_state.bootstrap_auth_user(db_path, "admin", "correct horse battery staple")
         require(user["ok"], "bootstrap should create the first user")
         status, _ = inkdrop_web.inkdrop_auth_required_status(
             db_path,

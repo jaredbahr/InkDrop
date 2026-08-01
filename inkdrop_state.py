@@ -33516,7 +33516,7 @@ def auth_status(db_path, environ=None):
     return inkdrop_auth.public_status(db_path, environ=environ)
 
 
-def bootstrap_auth_user(db_path, username, password, *, role="admin", remote_addr=None, user_agent=None, credential=None):
+def bootstrap_auth_user(db_path, username, password, *, role="admin", remote_addr=None, user_agent=None):
     if str(role or "admin").lower() != "admin":
         raise ValueError("InkDrop supports one administrator role")
     return inkdrop_auth.bootstrap_admin(
@@ -33525,7 +33525,6 @@ def bootstrap_auth_user(db_path, username, password, *, role="admin", remote_add
         password,
         remote_addr=remote_addr,
         user_agent=user_agent,
-        credential=credential,
     )
 
 

@@ -812,7 +812,7 @@ def assert_public_release_docs_contract():
     readme = (root / "README.md").read_text(encoding="utf-8")
     install_doc = (root / "docs" / "inkdrop" / "docker-first-install.md").read_text(encoding="utf-8")
     arr_stack_doc = (root / "docs" / "inkdrop" / "arr-stack-deployment-plan.md").read_text(encoding="utf-8")
-    network_override = (root / "compose.network.example.yml").read_text(encoding="utf-8")
+    network_override = (root / "deploy/compose.network.example.yml").read_text(encoding="utf-8")
     evidence_helper = (root / "tools" / "inkdrop_release_evidence_bundle.py").read_text(encoding="utf-8")
     compose_plan_helper = (root / "tools" / "inkdrop_compose_deployment_plan.py").read_text(encoding="utf-8")
     require("INKDROP_EXTERNAL_NETWORK" in network_override, "network override should require an explicit external network name")
@@ -821,7 +821,7 @@ def assert_public_release_docs_contract():
     for private_hint in ("arr-docker", "192.168.", "private-user", "/mnt/private-media"):
         require(private_hint not in network_override, f"network override should not contain private hint {private_hint}")
     require("split_host_release_ready" in evidence_helper, "release evidence helper should emit split-host readiness")
-    require('"compose.network.example.yml"' in evidence_helper, "release evidence helper should include the optional network override")
+    require('"deploy/compose.network.example.yml"' in evidence_helper, "release evidence helper should include the optional network override")
     require("--output" in compose_plan_helper and "write_overlay_if_requested" in compose_plan_helper, "compose deployment helper should support explicit overlay output")
     require("Output file already exists; pass --force" in compose_plan_helper, "compose deployment helper should refuse accidental overwrite")
     require("Refusing to write overlay because service" in compose_plan_helper, "compose deployment helper should refuse duplicate service overlay")
@@ -941,7 +941,7 @@ def assert_public_release_docs_contract():
         "python -B tools/inkdrop_compose_deployment_plan.py",
         "--output inkdrop.override.yaml",
         "docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml config",
-        "docker compose -f docker-compose.yml -f compose.network.example.yml up -d --build",
+        "docker compose -f docker-compose.yml -f deploy/compose.network.example.yml up -d --build",
         "python -B tools/inkdrop_public_release_check.py --docker --require-docker",
         "python -B tools/inkdrop_public_release_check.py --docker-only --require-docker",
         "python -B tools/inkdrop_public_release_check.py --docker --require-docker --skip-docker-build",

@@ -41,7 +41,7 @@ Kavita is optional, but InkDrop can request a library scan after importing new f
 ```yaml
 services:
   inkdrop:
-    image: ghcr.io/jaredbahr/inkdrop-beta@sha256:ca29ff1d454343f14b9b800886942bea4a1a71b10089a1e43aae1d8d43a082b1
+    image: ghcr.io/jaredbahr/inkdrop:latest
     container_name: inkdrop
     environment:
       # Off by default so a fresh install never grabs anything before you've
@@ -53,11 +53,9 @@ services:
       - "8796:8796"
     volumes:
       - ./config:/config
-      - ./state:/state
-      - ./staging:/staging
-      - ./manual-inbox:/manual-inbox
-      - /path/to/your/Comics:/library/comics
-      - /path/to/your/Manga:/library/manga
+      - ./downloads:/downloads
+      - /path/to/your/Comics:/data/comics
+      - /path/to/your/Manga:/data/manga
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"]
@@ -66,6 +64,13 @@ services:
       retries: 3
       start_period: 30s
 ```
+
+Point the two library lines at your own folders and leave the container-side
+paths alone. InkDrop reads comics from `/data/comics` and manga from
+`/data/manga`, keeps its database, logs, and backups under `/config`, and
+downloads into `/downloads` before checking and importing them. If you would
+rather mount a library somewhere else, change Comic root or Manga root under
+**Settings -> Media Management** to match, otherwise InkDrop will not see it.
 
 Start the container:
 
@@ -80,6 +85,13 @@ http://your-host:8796
 ```
 
 The first-run setup will ask you to create a login, select your library folders, and connect the download sources you use.
+
+The first person to open InkDrop creates the administrator account, and the
+setup screen closes for good once that account exists. There is no setup code
+to copy. That does mean anyone who can reach port 8796 before you finish could
+create the account instead of you, so keep the port on your own network until
+setup is done. Do not forward it through your router or expose it to the
+internet first.
 
 Settings include a short explanation of what they control. If something is still unclear, open an issue.
 

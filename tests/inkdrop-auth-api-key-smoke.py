@@ -25,7 +25,7 @@ def main():
         require(status["built_in_auth"]["bootstrap_required"] is True, "fresh DB should require auth bootstrap")
         require(status["api_keys"]["configured"] is False, "fresh DB should have no API keys")
 
-        user = inkdrop_state.bootstrap_auth_user(db_path, "admin", "correct horse battery staple", credential=inkdrop_auth.current_bootstrap_credential(db_path))
+        user = inkdrop_state.bootstrap_auth_user(db_path, "admin", "correct horse battery staple")
         require(user["ok"], "bootstrap user should be created")
         require("password_hash" not in json.dumps(user), "bootstrap response must not expose password hash")
 

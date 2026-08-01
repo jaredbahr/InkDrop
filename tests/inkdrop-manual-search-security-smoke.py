@@ -74,7 +74,6 @@ def handler_override_contract(db):
         db,
         "http-admin",
         "correct horse battery staple",
-        credential=inkdrop_auth.current_bootstrap_credential(db),
     )
     acquisition_key = inkdrop_state.create_api_key(db, "Manual Search acquisition", scopes=["acquisition"])["api_key"]["key"]
     admin_key = inkdrop_state.create_api_key(db, "Manual Search admin", scopes=["admin"])["api_key"]["key"]
