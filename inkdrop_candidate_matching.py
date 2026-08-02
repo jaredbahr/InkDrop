@@ -1152,7 +1152,22 @@ def candidate_compatibility(candidate, wanted_item=None):
         and not evidence.get("coverage_start")
         and not evidence.get("coverage_end")
     )
-    if evidence.get("conflicts") or (evidence.get("ambiguous") and not hierarchical_chapter_identity):
+    # A print-run marker ("v1 #19") alongside the exact wanted issue number is
+    # not two conflicting unit claims, it's one -- the volume digit names
+    # which real-world numbered run the issue belongs to.
+    hierarchical_issue_identity = bool(
+        target.get("unit_type") in ISSUE_UNITS
+        and evidence.get("issue_number")
+        and evidence.get("issue_number") == target.get("issue_number")
+        and set(evidence.get("present_unit_fields") or ()) <= {"volume_number", "book_number", "issue_number"}
+        and not evidence.get("conflicts")
+        and not evidence.get("chapter_number")
+        and not evidence.get("coverage_start")
+        and not evidence.get("coverage_end")
+    )
+    if evidence.get("conflicts") or (
+        evidence.get("ambiguous") and not hierarchical_chapter_identity and not hierarchical_issue_identity
+    ):
         blocked.append("ambiguous_unit_identity")
 
     edition = evidence.get("edition_marker") or ""
@@ -1193,14 +1208,20 @@ def candidate_compatibility(candidate, wanted_item=None):
             blocked.append("coverage_not_unit_number")
         elif collected_singleton_alias_volume_match:
             positive.append("collected_singleton_alias_volume")
-        elif evidence.get("volume_number") or evidence.get("book_number") or evidence.get("chapter_number"):
+        elif evidence.get("chapter_number"):
             blocked.append("wrong_unit_type")
         elif evidence.get("issue_number") and wanted and evidence.get("issue_number") != wanted:
             blocked.append("wrong_issue_number")
         elif evidence.get("issue_number") and evidence.get("issue_number") == wanted:
+            # A volume/book marker alongside the matching issue number
+            # identifies which numbered run the issue belongs to; it is not
+            # a competing unit type the way it is when no issue number is
+            # present at all (a bare collected volume/book, handled below).
             positive.append("exact_issue_number")
             if singleton_exact_match:
                 positive.append("singleton_exact_title")
+        elif evidence.get("volume_number") or evidence.get("book_number"):
+            blocked.append("wrong_unit_type")
         elif wanted and manifest_exact_member:
             positive.append("exact_pack_manifest_member")
         elif wanted and singleton_exact_match:

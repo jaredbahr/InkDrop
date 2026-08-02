@@ -8511,11 +8511,27 @@ HTML = r"""<!doctype html>
       renderInkdropSystemPage({loading: true});
       scrollInkdropShellTop(true);
       const errors = [];
+      // Every sibling data-loading path (Settings, History) bounds its fetch with
+      // getJsonWithTimeout, so a hung backend call surfaces as a labeled error row
+      // instead of leaving the page frozen. This helper used a bare fetch() with no
+      // AbortController, so a stalled endpoint (write-lock contention, a slow query)
+      // left the System page stuck on "Loading..." forever with no feedback --
+      // reported as "System is not opening."
       const fetchJson = async (url, options={}) => {
-        const res = await fetch(url, {cache: options.cache || "no-store"});
-        const data = await res.json();
-        if (!res.ok || data.ok === false) throw new Error(data.error || data.view?.error || `HTTP ${res.status}`);
-        return data;
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timeoutMs = Math.max(1000, Number(options.timeoutMs || 12000));
+        const timeout = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+        try {
+          const res = await fetch(url, {cache: options.cache || "no-store", ...(controller ? {signal: controller.signal} : {})});
+          const data = await res.json();
+          if (!res.ok || data.ok === false) throw new Error(data.error || data.view?.error || `HTTP ${res.status}`);
+          return data;
+        } catch (err) {
+          if (err?.name === "AbortError") throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+          throw err;
+        } finally {
+          if (timeout) window.clearTimeout(timeout);
+        }
       };
       const statusPromise = fetchJson("/status.json").catch(err => {
         errors.push(`status: ${err?.message || err}`);
@@ -46348,9 +46364,9 @@ def runtime_provider_settings():
             "username": "",
             "password": "",
             "comics_category": "comics",
-            "ebooks_category": "readarr",
+            "ebooks_category": "ebooks",
             "comics_save_path": "/downloads/comics",
-            "ebooks_save_path": "/downloads/readarr",
+            "ebooks_save_path": "/downloads/ebooks",
             "torrent_cleanup_policy": "external_retention",
             "secret_fields": ["password"],
             "editable_fields": ["username", "password", "comics_category", "comics_save_path"],
@@ -51953,7 +51969,7 @@ def sab_comic_failures(limit=30):
         name = str(slot.get("name") or slot.get("filename") or "")
         category = str(slot.get("category") or "").lower()
         text = f"{name} {category}".lower()
-        is_related = category in SAB_COMIC_CATEGORIES or any(word in text for word in ("comic", "manga", "kapowarr", "mylar", "berserk", "one piece"))
+        is_related = category in SAB_COMIC_CATEGORIES or any(word in text for word in ("comic", "manga", "kapowarr", "mylar"))
         if not is_related:
             continue
         status_text = " ".join(str(slot.get(key) or "") for key in ("status", "fail_message", "fail_msg", "script_log", "action_line")).lower()

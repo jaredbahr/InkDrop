@@ -212,10 +212,10 @@ def materialize_instance_settings(db_path, instance_id, media_type="comics", *, 
         runtime.update({
             "comics_category": _text(categories.get("comics") or category or "comics"),
             "manga_category": _text(categories.get("manga") or category or "manga"),
-            "ebooks_category": _text(categories.get("ebooks") or category or "readarr"),
+            "ebooks_category": _text(categories.get("ebooks") or category or "ebooks"),
             "comics_save_path": _text(paths.get("comics") or download_path or "/downloads/comics"),
             "manga_save_path": _text(paths.get("manga") or download_path or "/downloads/manga"),
-            "ebooks_save_path": _text(paths.get("ebooks") or download_path or "/downloads/readarr"),
+            "ebooks_save_path": _text(paths.get("ebooks") or download_path or "/downloads/ebooks"),
         })
     if client_type == "sabnzbd":
         runtime["comics_category"] = category or "comics"

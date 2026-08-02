@@ -451,7 +451,7 @@ def fake_http_get(request):
                 ],
                 "headers": {"Content-Type": "application/json"},
             }
-        if params.get("indexerIds") in (["15"], "15"):
+        if params.get("indexerIds") in (["902"], "902"):
             return {
                 "json": [
                     {
@@ -1512,6 +1512,29 @@ def main():
         )
         inkdrop_state.update_provider_config(
             db_path,
+            "prowlarr_torrentleech_comics",
+            {
+                "base_url": "http://prowlarr.local",
+                "secret_ref": "prowlarr_api_key",
+                "settings": {
+                    "implementation_status": "implemented",
+                    "source_mode": "auto",
+                    "auto_download_allowed": True,
+                    "requires_manual_confirm": False,
+                    "policy": {
+                        "rights_gate": "user_owned_collection_required",
+                        "direct_url_policy": "download_client_handoff_after_strict_candidate_verdict",
+                        "scope_policy": "western_comic_pack",
+                        "categories": ["7030"],
+                        "minimum_seeders": 1,
+                        "indexer_ids": ["901"],
+                        "requires_manual_confirm": False,
+                    },
+                },
+            },
+        )
+        inkdrop_state.update_provider_config(
+            db_path,
             "prowlarr_dognzb_comics",
             {
                 "base_url": "http://prowlarr.local",
@@ -1526,7 +1549,7 @@ def main():
                         "direct_url_policy": "download_client_handoff_after_strict_candidate_verdict",
                         "categories": ["7030"],
                         "minimum_seeders": 0,
-                        "indexer_ids": ["15"],
+                        "indexer_ids": ["902"],
                         "download_client_by_protocol": {"usenet": "sabnzbd"},
                         "requires_manual_confirm": False,
                     },
@@ -2739,9 +2762,9 @@ def main():
         assert_equal(tl_comics["job_status"], "ready", "TorrentLeech Comics Prowlarr job is ready when enabled")
         assert_true(tl_comics["emits_download_task"], "TorrentLeech Comics can emit downloader tasks after strict verdicts")
         assert_equal(tl_comics["registry_row"]["registry_state"], "ready", "TorrentLeech Comics registry state")
-        assert_equal(tl_comics["registry_row"]["policy"]["indexer_ids"], ["47"], "TorrentLeech Comics targets the comics clone")
+        assert_equal(tl_comics["registry_row"]["policy"]["indexer_ids"], ["901"], "TorrentLeech Comics targets the comics clone")
         tl_request = tl_comics["fetch_plan"]["requests"][0]
-        assert_equal(tl_request["params"]["indexerIds"], "47", "TorrentLeech Comics request targets the configured indexer id")
+        assert_equal(tl_request["params"]["indexerIds"], "901", "TorrentLeech Comics request targets the configured indexer id")
         assert_equal(
             tl_request["headers"]["X-Api-Key"],
             "<secret_ref:prowlarr_api_key>",
@@ -2753,7 +2776,7 @@ def main():
         assert_true(manga_tl["emits_download_task"], "TorrentLeech Comics manga pack lane can emit downloader tasks after strict verdicts")
         assert_equal(
             manga_tl["fetch_plan"]["requests"][0]["params"]["indexerIds"],
-            "47",
+            "901",
             "TorrentLeech Comics manga pack lane keeps the configured comics clone",
         )
         urasawa_wanted = {
@@ -2813,7 +2836,7 @@ def main():
         assert_equal(dognzb_comics["job_status"], "ready", "DOGnzb Comics Prowlarr job is ready when enabled")
         assert_true(dognzb_comics["emits_download_task"], "DOGnzb Comics can emit downloader tasks after strict verdicts")
         assert_equal(dognzb_comics["registry_row"]["registry_state"], "ready", "DOGnzb Comics registry state")
-        assert_equal(dognzb_comics["registry_row"]["policy"]["indexer_ids"], ["15"], "DOGnzb Comics targets the configured Newznab indexer")
+        assert_equal(dognzb_comics["registry_row"]["policy"]["indexer_ids"], ["902"], "DOGnzb Comics targets the configured Newznab indexer")
         assert_equal(
             dognzb_comics["registry_row"]["policy"]["download_client_by_protocol"],
             {"usenet": "sabnzbd"},
@@ -2825,7 +2848,7 @@ def main():
             "DOGnzb Comics keeps sidecar host allowlist provider-scoped",
         )
         dognzb_request = dognzb_comics["fetch_plan"]["requests"][0]
-        assert_equal(dognzb_request["params"]["indexerIds"], "15", "DOGnzb Comics request targets configured indexer id")
+        assert_equal(dognzb_request["params"]["indexerIds"], "902", "DOGnzb Comics request targets configured indexer id")
         assert_equal(dognzb_request["params"]["categories"], ["7030"], "DOGnzb Comics request uses comic category")
         assert_equal(
             dognzb_request["headers"]["X-Api-Key"],
@@ -2837,7 +2860,7 @@ def main():
         assert_true(manga_dognzb["emits_download_task"], "DOGnzb Comics manga pack lane can emit downloader tasks after strict verdicts")
         assert_equal(
             manga_dognzb["fetch_plan"]["requests"][0]["params"]["indexerIds"],
-            "15",
+            "902",
             "DOGnzb Comics manga pack lane keeps the configured Newznab indexer",
         )
 
@@ -3417,7 +3440,7 @@ def main():
 
         def fake_manhattan_dognzb(request):
             assert_equal(request["url"], "http://prowlarr.local/api/v1/search", "Manhattan DOGnzb job uses native Prowlarr endpoint")
-            assert_equal(request.get("params", {}).get("indexerIds"), "15", "Manhattan DOGnzb job targets DOGnzb")
+            assert_equal(request.get("params", {}).get("indexerIds"), "902", "Manhattan DOGnzb job targets DOGnzb")
             return {
                 "json": [
                     {

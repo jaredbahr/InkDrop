@@ -52,21 +52,9 @@ OWNERSHIP_MAX_AGE_SECONDS = float(os.environ.get("INKDROP_SAB_OWNERSHIP_MAX_AGE_
 # rows; this set survives solely so the status report can show how many rows the
 # retired heuristic would have claimed without durable evidence.
 LEGACY_TITLE_HINTS = {
-    "berserk",
-    "black.science",
-    "black science",
     "chew",
-    "die!die!die",
-    "fire.punch",
-    "fire punch",
-    "invincible",
-    "lazarus",
-    "monstress",
-    "one.piece",
-    "one piece",
     "prophet",
     "saga",
-    "vagabond",
 }
 OWNERSHIP_ID_KEYS = (
     "external_id",

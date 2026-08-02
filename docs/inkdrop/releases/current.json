@@ -1,9 +1,9 @@
 {
   "schema": "inkdrop.github_release.v1",
-  "version": "0.1.02",
-  "tag": "v0.1.02",
-  "name": "InkDrop 0.1.02",
-  "notes_path": "docs/inkdrop/releases/v0.1.02.md",
+  "version": "0.1.03",
+  "tag": "v0.1.03",
+  "name": "InkDrop 0.1.03",
+  "notes_path": "docs/inkdrop/releases/v0.1.03.md",
   "previous_state_schema_version": 18,
   "prerelease": true
 }

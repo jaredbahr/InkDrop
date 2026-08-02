@@ -2026,7 +2026,7 @@ def sab_items():
             category = str(slot.get("cat") or slot.get("category") or "")
             name = slot.get("name") or slot.get("filename") or slot.get("nzb_name")
             text = norm(sab_slot_text(slot))
-            if category not in COMIC_CLIENT_CATEGORIES and not any(word in text for word in ("comic", "manga", "berserk", "one piece")):
+            if category not in COMIC_CLIENT_CATEGORIES and not any(word in text for word in ("comic", "manga")):
                 continue
             status = str(slot.get("status") or "").lower()
             if "complete" in status and "fail" not in status and "error" not in status:

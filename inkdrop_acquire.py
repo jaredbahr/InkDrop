@@ -706,9 +706,9 @@ def load_qbit_settings():
         "pass": password,
         "api_key": api_key,
         "comics_category": str(settings.get("comics_category") or "comics").strip() or "comics",
-        "ebooks_category": str(settings.get("ebooks_category") or "readarr").strip() or "readarr",
+        "ebooks_category": str(settings.get("ebooks_category") or "ebooks").strip() or "ebooks",
         "comics_save_path": str(settings.get("comics_save_path") or "/downloads/comics").strip() or "/downloads/comics",
-        "ebooks_save_path": str(settings.get("ebooks_save_path") or "/downloads/readarr").strip() or "/downloads/readarr",
+        "ebooks_save_path": str(settings.get("ebooks_save_path") or "/downloads/ebooks").strip() or "/downloads/ebooks",
         "source": config.get("source") or "fallback",
     }
 

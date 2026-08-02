@@ -403,8 +403,8 @@ def main():
     assert_equal(nyaa_settings["rights_gate"], "user_owned_collection_required", "Prowlarr Nyaa ownership gate")
     assert_true("indexer_ids" in nyaa_settings["editable_fields"], "Prowlarr Nyaa target indexers are editable")
     assert_true("categoryless_fallback_indexer_ids" in nyaa_settings["editable_fields"], "Prowlarr Nyaa categoryless fallback indexers are editable")
-    assert_equal(nyaa_settings["policy"]["indexer_ids"], ["6", "46"], "Prowlarr Nyaa targets generic and literature indexers")
-    assert_equal(nyaa_settings["policy"]["categoryless_fallback_indexer_ids"], ["46"], "Prowlarr Nyaa categoryless fallback targets Literature indexer only")
+    assert_equal(nyaa_settings["policy"]["indexer_ids"], [], "Prowlarr Nyaa ships with no indexer IDs preselected; the user maps their own Prowlarr indexer")
+    assert_equal(nyaa_settings["policy"]["categoryless_fallback_indexer_ids"], [], "Prowlarr Nyaa categoryless fallback ships empty until the user maps an indexer")
     assert_equal(nyaa_settings["policy"]["allowed_languages"], ["en"], "Prowlarr Nyaa language policy")
     assert_equal(nyaa_settings["policy"]["scope_policy"], "manga_metadata_or_manga_publisher", "Prowlarr Nyaa manga scope policy")
     assert_true("health_provider_ids" in nyaa_settings["editable_fields"], "Prowlarr Nyaa health providers are editable")
@@ -420,7 +420,7 @@ def main():
     assert_false(tokyo_settings["requires_manual_confirm"], "Prowlarr Tokyo Toshokan manga strict gates replace manual confirm")
     assert_equal(tokyo_settings["rights_gate"], "user_owned_collection_required", "Prowlarr Tokyo Toshokan manga ownership gate")
     assert_true("indexer_ids" in tokyo_settings["editable_fields"], "Prowlarr Tokyo Toshokan manga indexer IDs are editable")
-    assert_equal(tokyo_settings["policy"]["indexer_ids"], ["45"], "Prowlarr Tokyo Toshokan manga targets live Kavita manga indexer")
+    assert_equal(tokyo_settings["policy"]["indexer_ids"], [], "Prowlarr Tokyo Toshokan manga ships with no indexer IDs preselected; the user maps their own Prowlarr indexer")
     assert_equal(tokyo_settings["policy"]["allowed_languages"], ["en"], "Prowlarr Tokyo Toshokan manga language policy")
     assert_equal(tokyo_settings["policy"]["scope_policy"], "manga_metadata_or_manga_publisher", "Prowlarr Tokyo Toshokan manga manga scope policy")
 
@@ -433,7 +433,7 @@ def main():
     assert_false(tl_settings["requires_manual_confirm"], "Prowlarr TorrentLeech comics strict gates replace manual confirm")
     assert_true("indexer_ids" in tl_settings["editable_fields"], "Prowlarr TorrentLeech comics indexer IDs are editable")
     assert_true("weekly_pack_query_limit" in tl_settings["editable_fields"], "Prowlarr TorrentLeech comics weekly pack cap is editable")
-    assert_equal(tl_settings["policy"]["indexer_ids"], ["47"], "Prowlarr TorrentLeech comics targets live InkDrop comics clone")
+    assert_equal(tl_settings["policy"]["indexer_ids"], [], "Prowlarr TorrentLeech comics ships with no indexer IDs preselected; the user maps their own Prowlarr indexer")
     assert_equal(tl_settings["policy"]["scope_policy"], "western_comic_pack", "Prowlarr TorrentLeech comics scope policy")
     assert_equal(tl_settings["policy"]["weekly_pack_query_limit"], 8, "Prowlarr TorrentLeech comics can ask dated weekly-pack queries")
     assert_equal(tl_settings["policy"]["pack_detail_max_fetches"], 20, "Prowlarr TorrentLeech comics detail cap supports weekly pack NFO scanning")
@@ -449,7 +449,7 @@ def main():
     assert_true("indexer_ids" in dog_settings["editable_fields"], "Prowlarr DOGnzb comics indexer IDs are editable")
     assert_true("download_client_by_protocol" in dog_settings["editable_fields"], "Prowlarr DOGnzb comics client mapping is editable")
     assert_true("weekly_pack_query_limit" in dog_settings["editable_fields"], "Prowlarr DOGnzb comics weekly pack cap is editable")
-    assert_equal(dog_settings["policy"]["indexer_ids"], ["15"], "Prowlarr DOGnzb comics targets live DOGnzb Newznab indexer")
+    assert_equal(dog_settings["policy"]["indexer_ids"], [], "Prowlarr DOGnzb comics ships with no indexer IDs preselected; the user maps their own Prowlarr indexer")
     assert_equal(dog_settings["policy"]["scope_policy"], "western_comic_pack", "Prowlarr DOGnzb comics scope policy")
     assert_equal(dog_settings["policy"]["download_client_by_protocol"], {"usenet": "sabnzbd"}, "Prowlarr DOGnzb comics uses SABnzbd for Usenet")
     assert_equal(dog_settings["policy"]["weekly_pack_query_limit"], 8, "Prowlarr DOGnzb comics can ask dated weekly-pack queries")
@@ -733,7 +733,7 @@ def main():
         assert_equal(registry_rows["prowlarr_torrentleech_comics"]["registry_state"], "ready", "enabled TorrentLeech comics registry state")
         assert_true(registry_rows["prowlarr_torrentleech_comics"]["auto_download_allowed"], "enabled TorrentLeech comics can auto-handoff after strict verdicts")
         assert_false(registry_rows["prowlarr_torrentleech_comics"]["requires_manual_review"], "enabled TorrentLeech comics does not require manual review")
-        assert_equal(registry_rows["prowlarr_torrentleech_comics"]["policy"]["indexer_ids"], ["47"], "TorrentLeech comics registry targets InkDrop comics clone")
+        assert_equal(registry_rows["prowlarr_torrentleech_comics"]["policy"]["indexer_ids"], [], "TorrentLeech comics registry has no indexer ID until the user maps one")
         inkdrop_state.update_provider_config(
             db_path,
             "prowlarr_dognzb_comics",
@@ -745,7 +745,7 @@ def main():
         assert_equal(registry_rows["prowlarr_dognzb_comics"]["registry_state"], "ready", "enabled DOGnzb comics registry state")
         assert_true(registry_rows["prowlarr_dognzb_comics"]["auto_download_allowed"], "enabled DOGnzb comics can auto-handoff after strict verdicts")
         assert_false(registry_rows["prowlarr_dognzb_comics"]["requires_manual_review"], "enabled DOGnzb comics does not require manual review")
-        assert_equal(registry_rows["prowlarr_dognzb_comics"]["policy"]["indexer_ids"], ["15"], "DOGnzb comics registry targets DOGnzb Newznab indexer")
+        assert_equal(registry_rows["prowlarr_dognzb_comics"]["policy"]["indexer_ids"], [], "DOGnzb comics registry has no indexer ID until the user maps one")
         assert_equal(registry_rows["prowlarr_dognzb_comics"]["policy"]["download_client_by_protocol"], {"usenet": "sabnzbd"}, "DOGnzb comics registry uses SABnzbd for Usenet")
         assert_equal(registry_rows["prowlarr_dognzb_comics"]["policy"]["pack_detail_allowed_hosts"], ["dognzb.cr"], "DOGnzb comics registry keeps sidecar host provider-scoped")
         inkdrop_state.update_provider_config(

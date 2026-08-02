@@ -13727,7 +13727,8 @@
       body[data-inkdrop-view="wanted"] main > .arr-content-shell,
       body[data-inkdrop-view="activity"] main > .arr-content-shell,
       body[data-inkdrop-view="manual_review"] main > .arr-content-shell,
-      body[data-inkdrop-view="settings"] main > .arr-content-shell {
+      body[data-inkdrop-view="settings"] main > .arr-content-shell,
+      body[data-inkdrop-view="system"] main > .arr-content-shell {
         grid-row: 1 / span 2;
         padding-top: 8px;
       }

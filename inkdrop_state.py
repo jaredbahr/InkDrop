@@ -32463,6 +32463,63 @@ def upsert_app_setting(con, setting, now):
     return True
 
 
+# These Prowlarr child-indexer catalog templates briefly shipped with a real,
+# instance-specific indexer_ids default (captured from a live Prowlarr during
+# catalog authoring) instead of an empty one. Any install that seeded a
+# template before the catalog fix still carries that stale value in
+# provider_configs, and merge_provider_settings() always lets a stored value
+# win over the (now-fixed) catalog default, so the bad value never self-heals
+# on its own. Scrub it explicitly wherever the row is still catalog-owned.
+LEAKED_PROWLARR_CATALOG_INDEXER_ID_FIELDS = {
+    "prowlarr_nyaa": ("indexer_ids", "categoryless_fallback_indexer_ids"),
+    "prowlarr_tokyo_toshokan_manga": ("indexer_ids",),
+    "prowlarr_torrentleech_comics": ("indexer_ids",),
+    "prowlarr_kat_comics": ("indexer_ids",),
+    "prowlarr_pirate_bay_comics": ("indexer_ids",),
+    "prowlarr_torrentdownload_comics": ("indexer_ids",),
+    "prowlarr_dognzb_comics": ("indexer_ids",),
+}
+
+
+def scrub_leaked_prowlarr_catalog_indexer_ids(con):
+    """Clear stale instance-specific indexer IDs from untouched catalog templates.
+
+    Only rows still owned by source_catalog are touched; a row's source flips
+    to 'user' the moment update_provider_config() saves any user edit, so this
+    can never overwrite a real user-entered indexer mapping.
+    """
+    scrubbed = 0
+    for provider_id, fields in LEAKED_PROWLARR_CATALOG_INDEXER_ID_FIELDS.items():
+        row = con.execute(
+            "select settings_json from provider_configs where id = ? and source = 'source_catalog'",
+            (provider_id,),
+        ).fetchone()
+        if not row:
+            continue
+        settings = json_loads(row["settings_json"] or "{}", {})
+        if not isinstance(settings, dict):
+            continue
+        changed = False
+        for field in fields:
+            if settings.get(field):
+                settings[field] = []
+                changed = True
+        policy = settings.get("policy") if isinstance(settings.get("policy"), dict) else None
+        if policy:
+            for field in fields:
+                if policy.get(field):
+                    policy[field] = []
+                    changed = True
+        if not changed:
+            continue
+        con.execute(
+            "update provider_configs set settings_json = ? where id = ? and source = 'source_catalog'",
+            (json_dumps(settings), provider_id),
+        )
+        scrubbed += 1
+    return scrubbed
+
+
 def sync_settings(db_path, providers=None, settings=None):
     db_path = Path(db_path)
     now = time.time()
@@ -32476,13 +32533,18 @@ def sync_settings(db_path, providers=None, settings=None):
         for setting in settings or []:
             if upsert_app_setting(con, setting, now):
                 setting_count += 1
+        scrubbed_indexer_ids = scrub_leaked_prowlarr_catalog_indexer_ids(con)
         update_sync_meta(con, now, "settings")
         con.commit()
     clear_settings_caches()
     return {
         "ok": True,
         "db_path": str(db_path),
-        "synced": {"providers": provider_count, "settings": setting_count},
+        "synced": {
+            "providers": provider_count,
+            "settings": setting_count,
+            "scrubbed_prowlarr_catalog_indexer_ids": scrubbed_indexer_ids,
+        },
         "synced_at": now,
         "synced_at_iso": utc_stamp(now),
     }

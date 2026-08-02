@@ -2934,9 +2934,9 @@ def load_qbit_settings():
         "user": user,
         "pass": password,
         "comics_category": str(settings.get("comics_category") or "comics").strip() or "comics",
-        "ebooks_category": str(settings.get("ebooks_category") or "readarr").strip() or "readarr",
+        "ebooks_category": str(settings.get("ebooks_category") or "ebooks").strip() or "ebooks",
         "comics_save_path": str(settings.get("comics_save_path") or "/downloads/comics").strip() or "/downloads/comics",
-        "ebooks_save_path": str(settings.get("ebooks_save_path") or "/downloads/readarr").strip() or "/downloads/readarr",
+        "ebooks_save_path": str(settings.get("ebooks_save_path") or "/downloads/ebooks").strip() or "/downloads/ebooks",
         "source": config.get("source") or "fallback",
     }
 
@@ -7259,10 +7259,10 @@ def load_qbit_incomplete_paths(kind):
         if kind == "comics":
             category_keys.update({normalize("comics")})
         else:
-            category_keys.update({normalize("readarr")})
+            category_keys.update({normalize("ebooks")})
         save_paths = {
             str(path or "").strip().lower().rstrip("/")
-            for path in (target_save_path, "/downloads/comics" if kind == "comics" else "/downloads/readarr")
+            for path in (target_save_path, "/downloads/comics" if kind == "comics" else "/downloads/ebooks")
             if str(path or "").strip()
         }
         session = requests.Session()

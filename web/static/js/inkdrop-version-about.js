@@ -49,17 +49,15 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.02",
-      slug: "v0-1-02",
-      released_at: "2026-08-01",
-      title: "Searches that found nothing now work",
-      summary: "Several separate faults could each stop a series from ever getting a search result. If something has sat in Wanted with no explanation, this build is worth trying.",
+      version: "v0.1.03",
+      slug: "v0-1-03",
+      released_at: "2026-08-02",
+      title: "Search tries the right title, and the System page stops hanging",
+      summary: "Search now tries the title people actually share files under instead of burning its budget on one nobody uses, and a real print-run marker on the exact issue you wanted no longer gets rejected. The System page also stops hanging if a request stalls.",
       highlights: [
-        "Searches run properly again, and reuse a recent result instead of asking twice for the same thing.",
-        "Volumes and chapters match correctly, and ordinary comic filenames are no longer rejected.",
-        "A failed archive read could be remembered as having no metadata for two weeks, and the wrong issue imported afterwards.",
-        "A CBR import could crash after copying the file and mark a good file as bad.",
-        "qBittorrent supports API keys. MangaDex mature content is ranked, not hidden."
+        "Searches for licensed creator-credit titles (like \"Naoki Urasawa's Monster\") now try the title people actually share files under, instead of spending the whole budget on one nobody uses.",
+        "A volume/print-run marker like \"v1 #19\" no longer gets treated as a mismatch when it's exactly the issue you wanted — that was silently blocking real grabs.",
+        "The System page no longer hangs on a silent \"Loading...\" if a request stalls; you'll see what failed instead."
       ]
     })
   ]);
