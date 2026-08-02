@@ -110,7 +110,6 @@ services:
       INKDROP_SUWAYOMI_API_BASE_URL: ${INKDROP_SUWAYOMI_API_BASE_URL:-}
       INKDROP_KAVITA_URL: ${INKDROP_KAVITA_URL:-}
       INKDROP_KOMGA_URL: ${INKDROP_KOMGA_URL:-}
-      INKDROP_KAPOWARR_URL: ${INKDROP_KAPOWARR_URL:-}
       INKDROP_SAB_PATH_MAPPINGS: ${INKDROP_SAB_PATH_MAPPINGS:-}
       INKDROP_UNC_PATH_MAPPINGS: ${INKDROP_UNC_PATH_MAPPINGS:-}
     ports:
@@ -183,7 +182,7 @@ and backups.
 - Do not mount another application's SQLite database unless you are explicitly
   using a migration/visibility adapter and understand that it is read-only
   compatibility state, not InkDrop's source of truth.
-- Do not make qBittorrent, SABnzbd, SLSKD, Prowlarr, Kavita, Komga, Kapowarr,
+- Do not make qBittorrent, SABnzbd, SLSKD, Prowlarr, Kavita, Komga,
   Suwayomi, or ComicVine required for a clean start.
 - Do not commit `.env`, real hostnames, LAN IPs, API keys, passwords, media
   paths, generated evidence bundles, or mounted runtime folders.

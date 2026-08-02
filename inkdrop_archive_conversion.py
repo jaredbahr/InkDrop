@@ -391,7 +391,25 @@ def build_cbz(source, dest_tmp, workdir):
     if not pages:
         raise ConversionRefused("no_readable_pages")
 
-    pages.sort(key=lambda item: natural_sort_key(item.relative_to(workdir).as_posix()))
+    manifest = _write_page_archive(pages, dest_tmp, workdir, comicinfo_file)
+
+    return {
+        "pages": manifest,
+        "comicinfo_preserved": comicinfo_file is not None,
+        "dropped_members": sorted(dropped),
+        "source_format": container,
+        "dest_format": "cbz",
+        **extract_meta,
+    }
+
+
+def _write_page_archive(pages, dest_tmp, base_dir, comicinfo_file):
+    """Write `pages` into a CBZ at `dest_tmp` and return the page manifest.
+
+    Shared by both conversion entry points so page ordering, zero-padded stored
+    names and the hash manifest can never drift between them.
+    """
+    pages.sort(key=lambda item: natural_sort_key(item.relative_to(base_dir).as_posix()))
     width = max(4, len(str(len(pages))))
 
     manifest = []
@@ -405,22 +423,14 @@ def build_cbz(source, dest_tmp, workdir):
             manifest.append(
                 {
                     "stored_name": stored,
-                    "source_name": page.relative_to(workdir).as_posix(),
+                    "source_name": page.relative_to(base_dir).as_posix(),
                     "sha256": _sha256(page),
                     "bytes": page.stat().st_size,
                 }
             )
         if comicinfo_file is not None:
             archive.writestr("ComicInfo.xml", comicinfo_file.read_bytes())
-
-    return {
-        "pages": manifest,
-        "comicinfo_preserved": comicinfo_file is not None,
-        "dropped_members": sorted(dropped),
-        "source_format": container,
-        "dest_format": "cbz",
-        **extract_meta,
-    }
+    return manifest
 
 
 def validate_cbz(path, build_meta):
@@ -458,6 +468,173 @@ def validate_cbz(path, build_meta):
         "page_count": len(expected),
         "comicinfo_preserved": build_meta["comicinfo_preserved"],
         "bytes": path.stat().st_size,
+    }
+
+
+MIN_PAGE_DIRECTORY_IMAGES = 3
+
+
+def inspect_page_directory(source):
+    """Describe a folder of loose page images without converting anything.
+
+    Some Soulseek uploaders share a comic as the raw scans -- one folder per
+    issue, page-by-page .jpg, no archive anywhere. Real example, seen live:
+    ``Love & Rockets v1 (1-50)/Love and rockets v1 001/`` with 280 images.
+    Nothing in InkDrop could read that; the page-pack builder only takes HTTP
+    URLs from reader sources, and the archive converter only takes archives.
+    """
+    source = Path(source)
+    if not source.is_dir():
+        raise ConversionRefused("source_not_a_directory")
+
+    pages = []
+    nested_archives = []
+    subdirectories = []
+    comicinfo_file = None
+    dropped = []
+    for entry in sorted(source.iterdir()):
+        if entry.is_symlink():
+            dropped.append(entry.name)
+            continue
+        if entry.is_dir():
+            subdirectories.append(entry.name)
+            continue
+        if not entry.is_file():
+            dropped.append(entry.name)
+            continue
+        kind = _member_kind(entry.name)
+        if kind == "image":
+            pages.append(entry)
+        elif kind == "comicinfo":
+            comicinfo_file = entry
+        elif kind == "nested_archive":
+            nested_archives.append(entry.name)
+        else:
+            dropped.append(entry.name)
+
+    return {
+        "source": str(source),
+        "pages": pages,
+        "image_count": len(pages),
+        "nested_archives": sorted(nested_archives),
+        # A page folder is one issue. Descending would silently fuse a whole
+        # run -- the live example sits inside a folder holding 50 sibling
+        # issues -- so subdirectories are reported and refused, never walked.
+        "subdirectories": sorted(subdirectories),
+        "has_comicinfo": comicinfo_file is not None,
+        "comicinfo_file": comicinfo_file,
+        "dropped_members": sorted(dropped),
+    }
+
+
+def convert_page_directory(
+    source,
+    *,
+    dest=None,
+    root=None,
+    originals_dir=None,
+    keep_original=True,
+    dry_run=False,
+):
+    """Package one folder of loose page images as a validated CBZ.
+
+    Deliberately says nothing about *which* series or issue the folder holds.
+    Identity stays with the callers that already do it -- the same search that
+    surfaced the real Love and Rockets scans also returned a music folder for
+    the band of the same name, so a converter that guessed would be a new way
+    to import the wrong thing.
+    """
+    source = Path(source)
+    root = Path(root) if root else source.parent
+    result = {"source": str(source), "converted": False, "dry_run": bool(dry_run)}
+    if not source.is_dir():
+        return {**result, "reason": "source_not_a_directory"}
+
+    try:
+        inspection = inspect_page_directory(source)
+    except ConversionRefused as exc:
+        return {**result, "reason": exc.reason, "detail": exc.detail}
+    result["inspection"] = {
+        key: value
+        for key, value in inspection.items()
+        if key not in {"pages", "comicinfo_file"}
+    }
+
+    if inspection["nested_archives"]:
+        return {**result, "reason": "nested_archive_member", "detail": inspection["nested_archives"]}
+    if inspection["subdirectories"]:
+        return {**result, "reason": "page_directory_has_subdirectories", "detail": inspection["subdirectories"]}
+    if not inspection["image_count"]:
+        return {**result, "reason": "no_image_members"}
+    if inspection["image_count"] < MIN_PAGE_DIRECTORY_IMAGES:
+        # A stray cover or a thumbnail folder is not an issue.
+        return {
+            **result,
+            "reason": "too_few_pages",
+            "detail": {"found": inspection["image_count"], "minimum": MIN_PAGE_DIRECTORY_IMAGES},
+        }
+
+    dest = Path(dest) if dest else source.with_suffix(".cbz")
+    result["dest"] = str(dest)
+    if dest.exists():
+        return {**result, "reason": "destination_exists"}
+
+    originals_target = None
+    if keep_original:
+        originals_target = _originals_destination(source, root, originals_dir or default_originals_dir())
+        result["original_moved_to"] = str(originals_target)
+        if originals_target.exists():
+            return {**result, "reason": "original_pages_slot_taken"}
+
+    if dry_run:
+        return {**result, "reason": "convertible", "ok": True}
+
+    started = time.time()
+    tmp_dest = dest.with_suffix(dest.suffix + ".tmp")
+    for page in inspection["pages"]:
+        if page.stat().st_size <= 0:
+            return {**result, "reason": "source_page_empty", "detail": page.name}
+    try:
+        manifest = _write_page_archive(
+            list(inspection["pages"]), tmp_dest, source, inspection["comicinfo_file"]
+        )
+    except OSError as exc:
+        tmp_dest.unlink(missing_ok=True)
+        return {**result, "reason": "conversion_failed", "detail": f"{type(exc).__name__}: {exc}"}
+
+    build_meta = {
+        "pages": manifest,
+        "comicinfo_preserved": inspection["has_comicinfo"],
+        "dropped_members": inspection["dropped_members"],
+        "source_format": "page_directory",
+        "dest_format": "cbz",
+    }
+    validation = validate_cbz(tmp_dest, build_meta)
+    result["validation"] = validation
+    if not validation["ok"]:
+        tmp_dest.unlink(missing_ok=True)
+        return {**result, "reason": validation["reason"], "detail": validation.get("detail")}
+    if len(manifest) != inspection["image_count"]:
+        tmp_dest.unlink(missing_ok=True)
+        return {
+            **result,
+            "reason": "partial_page_capture",
+            "detail": {"listed": inspection["image_count"], "written": len(manifest)},
+        }
+
+    if keep_original:
+        originals_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(originals_target))
+    else:
+        shutil.rmtree(source)
+    tmp_dest.replace(dest)
+
+    return {
+        **result,
+        "converted": True,
+        "ok": True,
+        "build": build_meta,
+        "elapsed_seconds": round(time.time() - started, 3),
     }
 
 
@@ -747,7 +924,37 @@ def main(argv=None):
     parser.add_argument("--originals-dir", default=None, help="Where retired originals go. Defaults to the quarantine directory.")
     parser.add_argument("--include-mislabeled-cbz", action="store_true", help="Also rewrite .cbz files whose bytes are actually RAR.")
     parser.add_argument("--json", action="store_true", help="Print the full result document instead of a summary.")
+    parser.add_argument(
+        "--pages",
+        action="append",
+        dest="page_directories",
+        help="Package a folder of loose page images (page-by-page .jpg scans) as one CBZ. Repeatable. "
+        "The folder is treated as a single issue, so it must not contain subfolders.",
+    )
     args = parser.parse_args(argv)
+
+    if args.page_directories:
+        results = [
+            convert_page_directory(
+                Path(directory),
+                originals_dir=args.originals_dir,
+                keep_original=not args.discard_originals,
+                dry_run=not args.apply,
+            )
+            for directory in args.page_directories
+        ]
+        ok = all(item.get("ok") for item in results)
+        if args.json:
+            print(json.dumps({"schema": ARCHIVE_CONVERSION_SCHEMA, "results": results}, indent=2, sort_keys=True, default=str))
+            return 0 if ok else 1
+        for item in results:
+            if item.get("converted"):
+                print(f"converted {item['source']} -> {item['dest']} ({len(item['build']['pages'])} pages)")
+            elif item.get("ok"):
+                print(f"would convert {item['source']} -> {item['dest']} ({item['inspection']['image_count']} pages)")
+            else:
+                print(f"  {item.get('reason')}: {item['source']} {item.get('detail', '')}".rstrip())
+        return 0 if ok else 1
 
     summary = convert_library(
         [Path(root) for root in args.roots] if args.roots else None,

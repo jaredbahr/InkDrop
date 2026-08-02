@@ -45,7 +45,6 @@ FAILED_HANDOFF_RETRY_STATUSES = {
     "provider_unavailable",
     "provider_wait",
 }
-KAPOWARR_ISSUE_DATE_CACHE = {}
 VOLUME_TITLE_RE = re.compile(r"(?i)^\s*(?:vol(?:ume)?|v)\.?\s*(\d+(?:\.\d+)?)\s*$")
 VOLUME_QUERY_RE = re.compile(r"(?i)(?:^|\b)(?:vol(?:ume)?|v)\.?\s*(\d+(?:\.\d+)?)(?:\b|$)")
 CHAPTER_QUERY_RE = re.compile(r"(?i)(?:^|\b)(?:chapter|chap|ch|c)\.?\s*\d")
@@ -95,26 +94,6 @@ def _json_loads(value):
         except ValueError:
             return {}
     return {}
-
-
-def _kapowarr_issue_date(kapowarr_issue_id):
-    issue_id = str(kapowarr_issue_id or "").strip()
-    if not issue_id:
-        return ""
-    if issue_id in KAPOWARR_ISSUE_DATE_CACHE:
-        return KAPOWARR_ISSUE_DATE_CACHE[issue_id]
-    db_path = Path(getattr(inkdrop_state, "DEFAULT_KAPOWARR_DB", ""))
-    if not db_path.exists():
-        KAPOWARR_ISSUE_DATE_CACHE[issue_id] = ""
-        return ""
-    try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as con:
-            row = con.execute("select date from issues where id=? limit 1", (issue_id,)).fetchone()
-            value = str(row[0] or "").strip() if row else ""
-    except Exception:
-        value = ""
-    KAPOWARR_ISSUE_DATE_CACHE[issue_id] = value
-    return value
 
 
 def _clean_number(value):
@@ -357,7 +336,6 @@ def wanted_item_from_queue(queue, db_path=None, *, con=None, singleton_context=N
         or queue.get("release_date")
         or raw.get("release_date")
         or raw.get("date")
-        or _kapowarr_issue_date(kapowarr_issue_id)
     )
     # Durable queue projection fields outrank raw_json.  In particular, a
     # caller may not inject MangaDex provenance into a ComicVine issue.

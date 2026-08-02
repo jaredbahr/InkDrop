@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 import time
+import traceback
 from pathlib import Path
 
 
@@ -61,6 +62,24 @@ def open_connection(
     return con
 
 
+def _calling_site():
+    """Name the code that held the connection, for the slow path only.
+
+    Every state write shares operation="inkdrop_state_write", so the log line alone
+    can never say who. Walking the stack is not free, so this is only called when a
+    warning is already being emitted.
+    """
+    try:
+        here = Path(__file__).name
+        for frame in reversed(traceback.extract_stack()[:-2]):
+            name = Path(frame.filename).name
+            if name not in {here, "contextlib.py"}:
+                return f"{name}:{frame.lineno}:{frame.name}"
+    except Exception:
+        pass
+    return "unknown"
+
+
 @contextlib.contextmanager
 def connection(
     db_path,
@@ -83,6 +102,7 @@ def connection(
         operation=operation,
     )
     started = time.monotonic()
+    changes_at_start = 0 if readonly else con.total_changes
     try:
         yield con
     except Exception as exc:
@@ -99,12 +119,22 @@ def connection(
     else:
         if not readonly:
             elapsed = time.monotonic() - started
-            if con.in_transaction and elapsed >= LONG_WRITE_SECONDS:
+            # in_transaction alone misses the holders that matter. A caller that
+            # commits inside its own block -- inkdrop_state.py does so in 119
+            # places, including the 43-stage import sync that commits per stage --
+            # leaves in_transaction False here no matter how long it held the
+            # writer. That blind spot is why a 2026-07-31 audit concluded the write
+            # lock was under "diffuse contention from many writers" when it was one
+            # holder keeping it for 109s at a stretch. total_changes moving proves
+            # this connection wrote, committed internally or not.
+            wrote = con.total_changes != changes_at_start
+            if (con.in_transaction or wrote) and elapsed >= LONG_WRITE_SECONDS:
                 LOG.warning(
-                    "long sqlite write transaction operation=%s db=%s elapsed_seconds=%.3f",
+                    "long sqlite write transaction operation=%s db=%s elapsed_seconds=%.3f caller=%s",
                     operation,
                     _label(db_path),
                     elapsed,
+                    _calling_site(),
                 )
             con.commit()
     finally:

@@ -20,10 +20,10 @@ from pathlib import Path
 import inkdrop_service_inventory as inventory
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "inkdrop" / "service-inventory.md"
 SMOKES_DOC = ROOT / "docs" / "inkdrop" / "smokes.md"
-IMPORT_READY_WORKER = ROOT / "inkdrop-import-ready-worker.sh"
+IMPORT_READY_WORKER = ROOT / "scripts/inkdrop-import-ready-worker.sh"
 WEB_IMPL = ROOT / "inkdrop_web.py"
 RECONCILE_IMPL = ROOT / "inkdrop_reconcile_imports.py"
 PACK_IMPORT_IMPL = ROOT / "inkdrop_pack_import.py"

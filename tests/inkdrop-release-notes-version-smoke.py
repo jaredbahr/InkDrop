@@ -6,7 +6,7 @@ from pathlib import Path
 import inkdrop_version
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 catalog = (ROOT / "web/static/js/inkdrop-version-about.js").read_text(encoding="utf-8")
 workflow = (ROOT / ".github/workflows/inkdrop-public-release.yml").read_text(encoding="utf-8")
 release_contract = json.loads((ROOT / "docs/inkdrop/releases/current.json").read_text(encoding="utf-8"))

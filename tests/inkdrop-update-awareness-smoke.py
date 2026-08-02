@@ -16,7 +16,7 @@ import inkdrop_version as updates
 from tools import inkdrop_github_release as release_tool
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 NOW = 1784422800
 COMMIT = "a" * 40
 CURRENT_DIGEST = "sha256:" + "b" * 64

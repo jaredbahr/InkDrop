@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+import copy
 import datetime
 import hashlib
 import hmac
@@ -56,7 +57,6 @@ STATE_SOURCE_FILES = (
 )
 DOWNLOAD_RECONCILIATION_DB_NAME = "imported-files.sqlite3"
 DEFAULT_KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
-DEFAULT_KAPOWARR_DB = inkdrop_runtime_config.kapowarr_db_path()
 SQLITE_CONNECT_TIMEOUT_SECONDS = 90
 SQLITE_BUSY_TIMEOUT_MS = 60000
 DIRECT_IMPORT_VERIFICATION_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -1175,6 +1175,24 @@ def init_schema_uncached(con):
             archive_member_manifest_hash text,
             derived_at real not null
         );
+        create table if not exists archive_comicinfo_cache (
+            archive_path text primary key,
+            size integer not null,
+            mtime real not null,
+            ctime real,
+            reader_key text,
+            comicinfo_json text,
+            read_at real not null
+        );
+        create table if not exists archive_member_semantics_cache (
+            archive_path text primary key,
+            size integer not null,
+            mtime real not null,
+            ctime real,
+            reader_key text,
+            semantics_json text,
+            derived_at real not null
+        );
         create unique index if not exists idx_media_files_normalized_path on media_files(normalized_path);
         create index if not exists idx_media_files_series_issue on media_files(series_id, issue_id, active, last_seen_at desc);
         create index if not exists idx_media_files_import_result on media_files(import_result_id);
@@ -1284,6 +1302,14 @@ def init_schema_uncached(con):
             on queue_items(issue_id, updated_at desc, id desc);
 
         drop trigger if exists trg_history_bucket_insert;
+        create trigger if not exists trg_provider_health_revision
+        after insert on history_events
+        when new.entity_type='provider' and new.event_type='provider_health'
+        begin
+            insert into schema_meta(key, value) values('provider_health_revision','1')
+            on conflict(key) do update set
+                value = cast(cast(coalesce(schema_meta.value,'0') as integer) + 1 as text);
+        end;
         create trigger if not exists trg_history_bucket_insert
         after insert on history_events
         begin
@@ -1330,6 +1356,7 @@ def init_schema_uncached(con):
             "insert into schema_meta(key,value) values('history_bucket_v2_complete','1') "
             "on conflict(key) do update set value='1'"
         )
+    upgrade_mangadex_default_content_ratings(con)
     inkdrop_auth.ensure_auth_schema(con)
     inkdrop_manual_search_core.ensure_schema(con)
     inkdrop_download_client_config.ensure_schema(con)
@@ -1875,10 +1902,6 @@ def metadata_identity(row):
         ("issue_metadataId", issue_provider),
         ("issueId", issue_provider),
         ("id", issue_provider),
-        ("kapowarrId", "kapowarr"),
-        ("kapowarr_id", "kapowarr"),
-        ("kapowarrIssueId", "kapowarr"),
-        ("kapowarr_issue_id", "kapowarr"),
         ("comicvine_issue_id", "comicvine"),
         ("mangadex_chapter_id", "mangadex"),
     ):
@@ -11099,11 +11122,16 @@ def direct_import_destination_unit_gate(con, queue, dest_path, raw, *, already_s
                 "source_path": source_path or None,
             }
     identity_evidence_path = dest_path if already_satisfied_destination else (source_path or dest_path)
+    # classify_import_filename_safety() re-reads the archive's ComicInfo unless it
+    # is handed one. This is the reconciliation hot path -- 288 reads, 199s, 48.7%
+    # of an import sync, all inside the write transaction -- so hand it the cached
+    # read. Same values, one stat instead of a `7z l` fork.
     gate = completed_import.classify_import_filename_safety(
         Path(identity_evidence_path),
         target=target,
         kind="comics",
         trusted_issue=trusted_issue,
+        comicinfo=cached_archive_comicinfo(con, identity_evidence_path),
     )
     gate = gate if isinstance(gate, dict) else {}
     if gate.get("ok") or gate.get("reason") == "duplicate_copy_suffix":
@@ -15613,7 +15641,7 @@ def reconciliation_wrong_unit_page_pack_evidence(con, record, queue):
     row = reconciliation_wrong_unit_page_pack_row(con, record, queue)
     if not row:
         return {}
-    evidence = wrong_unit_page_pack_import_row(row)
+    evidence = wrong_unit_page_pack_import_row(row, con=con)
     return evidence if isinstance(evidence, dict) else {}
 
 
@@ -25319,6 +25347,194 @@ def cached_strict_archive_validation(con, candidate):
     return archive_check if isinstance(archive_check, dict) else {"ok": False, "reason": "invalid_result"}
 
 
+ARCHIVE_COMICINFO_CACHE_MAX_AGE_SECONDS = int(
+    os.environ.get("INKDROP_ARCHIVE_COMICINFO_CACHE_MAX_AGE_SECONDS") or (14 * 24 * 3600)
+)
+# Bump when read_comicinfo() changes what it extracts, so stored rows written
+# under the old recipe are misses rather than wrong answers. v2 retires every row
+# written by v1: that build could not tell a failed read from a confirmed absence,
+# so any stored "no ComicInfo" from it is unsafe to trust and cheap to re-derive.
+ARCHIVE_COMICINFO_CACHE_READER_KEY = "comicinfo-v2"
+ARCHIVE_COMICINFO_CACHE_MAX_JSON_BYTES = 256 * 1024
+
+
+def cached_archive_comicinfo(con, path):
+    """read_comicinfo() behind the same (size, mtime, ctime) cache as archives.
+
+    Measured on production 2026-08-01: read_comicinfo cost 199s of a 408s import
+    sync -- 48.7% -- and all of it ran inside the SQLite write transaction, which
+    is most of why the write lock was held 66% of the wall clock. Nearly all of
+    that is archive_entry_names(), which has no cache of its own and, for a .cbr,
+    forks `7z l -slt` per call (712ms average).
+
+    An in-process memo cannot fix this: the import child is a fresh process every
+    pass, so it can only ever catch the within-pass repeats (56 of 277 calls). The
+    reconciliation passes re-examine every already-verified row on every cycle, so
+    the same unchanged files are re-read forever. Persisting the result is what
+    makes the steady state free.
+
+    Cache key discipline is deliberately identical to
+    cached_strict_archive_validation(): size AND mtime AND ctime, because every
+    restore-shaped write (rsync -a, cp -p, restic/Backrest, which runs nightly
+    here) preserves mtime, and os.utime() can forge it -- ctime is the field no
+    syscall can set. A row that cannot be read or stored must never change the
+    answer; worst case is paying the real read again next cycle.
+    """
+    import inkdrop_completed_import as completed_import
+
+    try:
+        candidate = Path(path)
+        stat = candidate.stat()
+    except (OSError, TypeError, ValueError):
+        return {}
+    size = stat.st_size
+    mtime = stat.st_mtime
+    ctime = stat.st_ctime
+    now = time.time()
+    key = str(candidate)
+    try:
+        row = con.execute(
+            "select size, mtime, ctime, reader_key, comicinfo_json, read_at "
+            "from archive_comicinfo_cache where archive_path=?",
+            (key,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if (
+        row is not None
+        and row["ctime"] is not None
+        and row["reader_key"] == ARCHIVE_COMICINFO_CACHE_READER_KEY
+        and row["size"] == size
+        and row["mtime"] == mtime
+        and row["ctime"] == ctime
+        and (now - (row["read_at"] or 0)) < ARCHIVE_COMICINFO_CACHE_MAX_AGE_SECONDS
+    ):
+        cached = json_loads(row["comicinfo_json"] or "{}", {})
+        if isinstance(cached, dict):
+            return cached
+    info, readable = completed_import.read_comicinfo_status(candidate)
+    info = info if isinstance(info, dict) else {}
+    if not readable:
+        # A read that failed is not evidence that the archive has no ComicInfo,
+        # and this cache holds its answer for 14 days. Storing the failure turned
+        # one momentary 7z error or locked file into a durable "confirmed no
+        # metadata", after which a classifier reading only the filename could
+        # take a file whose ComicInfo says issue 7 and accept it as issue 1.
+        # Return what we have for this call and remember nothing.
+        return info
+    payload = json_dumps(info)
+    # An oversized ComicInfo is still returned to the caller; it just is not
+    # stored, so one pathological archive cannot bloat the state database.
+    if len(payload.encode("utf-8", "replace")) <= ARCHIVE_COMICINFO_CACHE_MAX_JSON_BYTES:
+        try:
+            con.execute(
+                """
+                insert into archive_comicinfo_cache (
+                    archive_path, size, mtime, ctime, reader_key, comicinfo_json, read_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?)
+                on conflict(archive_path) do update set
+                    size=excluded.size,
+                    mtime=excluded.mtime,
+                    ctime=excluded.ctime,
+                    reader_key=excluded.reader_key,
+                    comicinfo_json=excluded.comicinfo_json,
+                    read_at=excluded.read_at
+                """,
+                (key, size, mtime, ctime, ARCHIVE_COMICINFO_CACHE_READER_KEY, payload, now),
+            )
+        except sqlite3.Error:
+            pass
+    return info
+
+
+ARCHIVE_MEMBER_SEMANTICS_CACHE_MAX_AGE_SECONDS = int(
+    os.environ.get("INKDROP_ARCHIVE_SEMANTICS_CACHE_MAX_AGE_SECONDS") or (14 * 24 * 3600)
+)
+# Bump when archive_member_semantics() changes how it derives semantic_unit or its
+# marker coverage, so rows written under the old recipe are misses.
+ARCHIVE_MEMBER_SEMANTICS_CACHE_READER_KEY = "semantics-v1"
+ARCHIVE_MEMBER_SEMANTICS_CACHE_MAX_JSON_BYTES = 512 * 1024
+
+
+def cached_archive_member_semantics(con, path, *, fresh=False):
+    """archive_member_semantics() persisted across passes.
+
+    It already has an in-process LRU, which is why 162 of 306 calls in a measured
+    sync cost nothing. The other 144 are distinct files and cost 199.63s -- 72% of
+    a 277s import sync after the ComicInfo cache landed -- because the import child
+    is a fresh process every pass, so the LRU starts empty every time and the same
+    unchanged files are re-decompressed and re-decoded (PIL) forever.
+
+    fresh=True still means what it says: the caller has evidence the file changed
+    (cleanup_wrong_unit_page_pack_import_proofs passes it on a central-directory
+    signature mismatch) and must not be served any remembered answer.
+
+    Key discipline matches the other archive caches -- size AND mtime AND ctime.
+    Note this is deliberately stronger than the in-process LRU's own key, which is
+    (path, mtime_ns, size) and would ride an mtime-preserving in-place rewrite.
+    """
+    if fresh:
+        return inkdrop_artifact_acceptance.archive_member_semantics(path, fresh=True)
+    try:
+        candidate = Path(path)
+        stat = candidate.stat()
+    except (OSError, TypeError, ValueError):
+        return inkdrop_artifact_acceptance.archive_member_semantics(path)
+    size = stat.st_size
+    mtime = stat.st_mtime
+    ctime = stat.st_ctime
+    now = time.time()
+    key = str(candidate)
+    try:
+        row = con.execute(
+            "select size, mtime, ctime, reader_key, semantics_json, derived_at "
+            "from archive_member_semantics_cache where archive_path=?",
+            (key,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if (
+        row is not None
+        and row["ctime"] is not None
+        and row["reader_key"] == ARCHIVE_MEMBER_SEMANTICS_CACHE_READER_KEY
+        and row["size"] == size
+        and row["mtime"] == mtime
+        and row["ctime"] == ctime
+        and (now - (row["derived_at"] or 0)) < ARCHIVE_MEMBER_SEMANTICS_CACHE_MAX_AGE_SECONDS
+    ):
+        cached = json_loads(row["semantics_json"] or "{}", {})
+        if isinstance(cached, dict) and cached.get("checked"):
+            return cached
+    semantics = inkdrop_artifact_acceptance.archive_member_semantics(path)
+    semantics = semantics if isinstance(semantics, dict) else {}
+    # Only a completed read is worth remembering. An unchecked result means the
+    # path was not a readable .cbz at all, and that is cheap to re-derive.
+    if semantics.get("checked"):
+        payload = json_dumps(semantics)
+        if len(payload.encode("utf-8", "replace")) <= ARCHIVE_MEMBER_SEMANTICS_CACHE_MAX_JSON_BYTES:
+            try:
+                con.execute(
+                    """
+                    insert into archive_member_semantics_cache (
+                        archive_path, size, mtime, ctime, reader_key, semantics_json, derived_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    on conflict(archive_path) do update set
+                        size=excluded.size,
+                        mtime=excluded.mtime,
+                        ctime=excluded.ctime,
+                        reader_key=excluded.reader_key,
+                        semantics_json=excluded.semantics_json,
+                        derived_at=excluded.derived_at
+                    """,
+                    (key, size, mtime, ctime, ARCHIVE_MEMBER_SEMANTICS_CACHE_READER_KEY, payload, now),
+                )
+            except sqlite3.Error:
+                pass
+    return semantics
+
+
 QUEUE_ARTIFACT_IDENTITY_CACHE_MAX_AGE_SECONDS = int(
     os.environ.get("INKDROP_ARTIFACT_IDENTITY_CACHE_MAX_AGE_SECONDS") or (14 * 24 * 3600)
 )
@@ -28544,7 +28760,7 @@ def wrong_unit_page_pack_source_evidence(row, raw_dicts=None):
     }
 
 
-def wrong_unit_page_pack_import_row(row, *, fresh_archive_semantics=False):
+def wrong_unit_page_pack_import_row(row, *, fresh_archive_semantics=False, con=None):
     if not row:
         return {}
     if import_result_is_bad_or_retracted(row):
@@ -28562,9 +28778,13 @@ def wrong_unit_page_pack_import_row(row, *, fresh_archive_semantics=False):
         if not candidate_key or candidate_key in seen_candidate_paths:
             continue
         seen_candidate_paths.add(candidate_key)
-        semantics = inkdrop_artifact_acceptance.archive_member_semantics(
-            candidate_path,
-            fresh=fresh_archive_semantics,
+        semantics = (
+            cached_archive_member_semantics(con, candidate_path, fresh=fresh_archive_semantics)
+            if con is not None
+            else inkdrop_artifact_acceptance.archive_member_semantics(
+                candidate_path,
+                fresh=fresh_archive_semantics,
+            )
         )
         if semantics.get("semantic_unit") == "chapter":
             return {
@@ -28590,7 +28810,7 @@ def wrong_unit_page_pack_import_row(row, *, fresh_archive_semantics=False):
     return wrong_unit_page_pack_source_evidence(row, raw_dicts)
 
 
-def wrong_unit_page_pack_task_or_attempt_matches(record, import_row):
+def wrong_unit_page_pack_task_or_attempt_matches(record, import_row, *, con=None):
     if not record:
         return False
     import_attempt_id = str(row_value(import_row, "source_attempt_id") or "").strip()
@@ -28598,7 +28818,11 @@ def wrong_unit_page_pack_task_or_attempt_matches(record, import_row):
     if import_attempt_id and record_attempt_id == import_attempt_id:
         return True
     semantic_path = str(row_value(import_row, "dest_path") or row_value(import_row, "source_path") or "").strip()
-    semantic_evidence = inkdrop_artifact_acceptance.archive_member_semantics(semantic_path)
+    semantic_evidence = (
+        cached_archive_member_semantics(con, semantic_path)
+        if con is not None
+        else inkdrop_artifact_acceptance.archive_member_semantics(semantic_path)
+    )
     source_values = [
         row_value(record, "source"),
         row_value(record, "provider_id"),
@@ -28821,7 +29045,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
         # size) cache key, so only a forced re-read can see the new members.
         # Everywhere else the cache key is sufficient and fresh=True would
         # just re-decompress unchanged archives.
-        evidence = wrong_unit_page_pack_import_row(row, fresh_archive_semantics=signature_mismatch)
+        evidence = wrong_unit_page_pack_import_row(row, fresh_archive_semantics=signature_mismatch, con=con)
         if not evidence:
             raw = json_loads(row["import_raw_json"] or "{}", {})
             raw = raw if isinstance(raw, dict) else {}
@@ -28917,7 +29141,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             (row["queue_id"],),
         ).fetchall() if row["queue_id"] else []
         for task in task_rows:
-            if not wrong_unit_page_pack_task_or_attempt_matches(task, row):
+            if not wrong_unit_page_pack_task_or_attempt_matches(task, row, con=con):
                 continue
             task_raw = json_loads(task["raw_json"] or "{}", {})
             task_raw = task_raw if isinstance(task_raw, dict) else {}
@@ -28968,7 +29192,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             (row["queue_id"],),
         ).fetchall() if row["queue_id"] else []
         for attempt in attempt_rows:
-            if not wrong_unit_page_pack_task_or_attempt_matches(attempt, row):
+            if not wrong_unit_page_pack_task_or_attempt_matches(attempt, row, con=con):
                 continue
             attempt_raw = json_loads(attempt["raw_json"] or "{}", {})
             attempt_raw = attempt_raw if isinstance(attempt_raw, dict) else {}
@@ -30456,33 +30680,8 @@ def backfill_provider_contract_fields(con):
     }
 
 
-def load_kapowarr_volume_path_rows(kapowarr_db=DEFAULT_KAPOWARR_DB):
-    path = Path(kapowarr_db)
-    if not path.exists():
-        return []
-    conn = sqlite3.connect(path, timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        return [
-            dict(row)
-            for row in conn.execute(
-                """
-                select id, title, comicvine_id, folder
-                from volumes
-                where folder is not null
-                  and folder != ''
-                """
-            )
-        ]
-    finally:
-        conn.close()
-
-
-def backfill_series_path_contracts(con, now=None, kapowarr_db=DEFAULT_KAPOWARR_DB):
+def backfill_series_path_contracts(con, now=None):
     now = float(now or time.time())
-    volumes = load_kapowarr_volume_path_rows(kapowarr_db)
-    by_kapowarr = {str(row.get("id")): row for row in volumes if row.get("id") not in (None, "")}
-    by_comicvine = {str(row.get("comicvine_id")): row for row in volumes if row.get("comicvine_id") not in (None, "")}
     rows = con.execute(
         """
         select id, title, publisher, metadata_provider, metadata_id, kapowarr_id,
@@ -30506,55 +30705,32 @@ def backfill_series_path_contracts(con, now=None, kapowarr_db=DEFAULT_KAPOWARR_D
         row_source = str(row["source"] or "").strip().lower()
         if row_source == "kapowarr" or str(row["metadata_provider"] or "").strip().lower() == "kapowarr":
             continue
-        volume = None
-        if not repair_media_root and row["kapowarr_id"] not in (None, ""):
-            volume = by_kapowarr.get(str(row["kapowarr_id"]))
-        if not repair_media_root and not volume and str(row["metadata_provider"] or "").lower() == "comicvine" and row["metadata_id"] not in (None, ""):
-            volume = by_comicvine.get(str(row["metadata_id"]))
-        if volume:
-            contract = series_path_contract(
-                {
-                    "folder": volume.get("folder"),
-                    "title": volume.get("title") or row["title"],
-                },
-                provider="kapowarr",
-                kapowarr_id=volume.get("id"),
-                source="kapowarr",
-            )
-            contract_source = {
-                "source": "kapowarr",
-                "contract_source": "kapowarr_adapter",
-                "reason": "series_backfill_from_adapter",
-                "adapter": "kapowarr",
-                "adapter_volume_id": volume.get("id"),
+        contract = native_series_path_contract(
+            row,
+            media_type=media_type,
+            con=con,
+            prefer_existing_root=not repair_media_root,
+        )
+        if not contract:
+            continue
+        previous_contract = None
+        if repair_media_root:
+            previous_contract = {
+                "library_root": row["library_root"],
+                "library_path": row["library_path"],
+                "library_path_template": row["library_path_template"],
+                "library_path_source": row["library_path_source"],
+                "library_adapter_path": row["library_adapter_path"],
+                "media_type": row["media_type"],
             }
-        else:
-            contract = native_series_path_contract(
-                row,
-                media_type=media_type,
-                con=con,
-                prefer_existing_root=not repair_media_root,
-            )
-            if not contract:
-                continue
-            previous_contract = None
-            if repair_media_root:
-                previous_contract = {
-                    "library_root": row["library_root"],
-                    "library_path": row["library_path"],
-                    "library_path_template": row["library_path_template"],
-                    "library_path_source": row["library_path_source"],
-                    "library_adapter_path": row["library_adapter_path"],
-                    "media_type": row["media_type"],
-                }
-            contract_source = {
-                "source": "inkdrop",
-                "contract_source": "native_root_template",
-                "reason": "media_root_mismatch_repaired" if repair_media_root else "missing_kapowarr_path_contract",
-                "media_type_decision": media_decision,
-            }
-            if previous_contract:
-                contract_source["previous_path_contract"] = previous_contract
+        contract_source = {
+            "source": "inkdrop",
+            "contract_source": "native_root_template",
+            "reason": "media_root_mismatch_repaired" if repair_media_root else "missing_path_contract",
+            "media_type_decision": media_decision,
+        }
+        if previous_contract:
+            contract_source["previous_path_contract"] = previous_contract
         if not contract.get("library_path") and not contract.get("library_adapter_path"):
             continue
         current = {
@@ -30694,6 +30870,62 @@ def sync_state(state_dir, db_path=None, *, retire_absent_json=False):
 
     return with_db_lock_retry(_sync, attempts=4, initial_delay=1.0)
 
+
+
+MANGADEX_SUPERSEDED_DEFAULT_CONTENT_RATINGS = ["safe", "suggestive"]
+MANGADEX_UPGRADED_DEFAULT_CONTENT_RATINGS = ["safe", "suggestive", "erotica"]
+
+
+def upgrade_mangadex_default_content_ratings(con):
+    """One-shot: carry the corrected MangaDex rating default onto existing installs.
+
+    The old default excluded ``erotica``, which is stricter than MangaDex's own API
+    default and hid acclaimed titles outright -- Berserk is rated erotica, so it
+    returned no results at all. Changing the fallback was not enough: first-run
+    seeding persists the value into provider_configs, so every existing install
+    keeps the old list forever and stays broken. Verified on production, where the
+    corrected build still searched with ["safe", "suggestive"].
+
+    Only a value that is *exactly* the superseded default is touched, because that
+    is indistinguishable from never having chosen. The schema_meta guard makes this
+    run once per database, so an operator who deliberately narrows the list back
+    afterwards keeps their choice.
+    """
+    try:
+        done = con.execute(
+            "select value from schema_meta where key='mangadex_content_ratings_erotica_default'"
+        ).fetchone()
+    except sqlite3.Error:
+        return
+    if done and str(done["value"] if not isinstance(done, tuple) else done[0]) == "1":
+        return
+    try:
+        row = con.execute(
+            "select settings_json from provider_configs where id='mangadex'"
+        ).fetchone()
+    except sqlite3.Error:
+        return
+    if row is not None:
+        raw = row["settings_json"] if not isinstance(row, tuple) else row[0]
+        settings = json_loads(raw or "{}", {})
+        if isinstance(settings, dict):
+            current = settings.get("content_ratings")
+            if isinstance(current, list) and [str(v) for v in current] == MANGADEX_SUPERSEDED_DEFAULT_CONTENT_RATINGS:
+                settings["content_ratings"] = list(MANGADEX_UPGRADED_DEFAULT_CONTENT_RATINGS)
+                try:
+                    con.execute(
+                        "update provider_configs set settings_json=? where id='mangadex'",
+                        (json_dumps(settings),),
+                    )
+                except sqlite3.Error:
+                    return
+    try:
+        con.execute(
+            "insert into schema_meta(key,value) values('mangadex_content_ratings_erotica_default','1') "
+            "on conflict(key) do update set value='1'"
+        )
+    except sqlite3.Error:
+        pass
 
 def update_sync_meta(con, now, scope="full", source_mtime=None):
     # Every write that matters to the summaries stamps its sync here -- adding
@@ -32594,7 +32826,6 @@ def first_run_setup_status(db_path=None, environ=None):
         "suwayomi": _first_run_adapter_status(env, "suwayomi", ("INKDROP_SUWAYOMI_API_BASE_URL",)),
         "kavita": _first_run_adapter_status(env, "kavita", ("INKDROP_KAVITA_URL",)),
         "komga": _first_run_adapter_status(env, "komga", ("INKDROP_KOMGA_URL",)),
-        "kapowarr": _first_run_adapter_status(env, "kapowarr", ("INKDROP_KAPOWARR_URL",)),
     }
     for adapter_id, adapter in adapters.items():
         resolved = effective_by_id.get(adapter_id)
@@ -32891,7 +33122,6 @@ def first_run_setup_status(db_path=None, environ=None):
             "optional": True,
             "configured": [name for name in ("kavita", "komga") if adapters[name].get("configured")],
             "available": ["kavita", "komga"],
-            "legacy_adapter": {"id": "kapowarr", "configured": adapters["kapowarr"].get("configured")},
         },
         "metadata_providers": {
             "local_metadata_mode": local_mode_selected,
@@ -40274,7 +40504,70 @@ def provider_health_is_problem(health):
     return True
 
 
+# Six providers exist, but the map below is a grouped self-join over history_events
+# (1.5M rows). refresh_queue_provider_status_columns rebuilds it to refresh a SINGLE
+# queue row, and record_source_attempt calls that once per attempt: measured live on
+# 2026-08-01 at 1209 rebuilds and 30.9s of one sync_download_reconciliation pass --
+# all of it inside the SQLite write lock.
+#
+# The newest provider_health timestamp is the map's whole input, and reading it is an
+# index seek (~0.005ms vs ~26ms to rebuild). Key the cache on it: two connections that
+# can see the same newest event derive the same map, and a connection's own uncommitted
+# insert moves its marker but not another connection's, so this stays correct across
+# processes without an invalidation hook. Adding count(*) would make the marker exact
+# against a same-timestamp insert, but it costs 10ms -- as much as the rebuild -- and a
+# briefly stale derived status column re-settles on the next health event.
+PROVIDER_HEALTH_MAP_CACHE = {}
+PROVIDER_HEALTH_MAP_CACHE_LIMIT = 4
+
+
+def bump_provider_health_revision(con):
+    """Advance the provider-health revision by hand.
+
+    Normally unnecessary: a trigger on history_events advances it for every
+    provider_health row, whoever writes it. Relying on writers to remember was
+    the first version of this and it was wrong -- a caller inserting the row
+    directly got a stale map, which is the same class of bug the revision exists
+    to fix. Kept for callers that synthesise health without an event row.
+    """
+    try:
+        con.execute(
+            "insert into schema_meta(key, value) values('provider_health_revision', '1') "
+            "on conflict(key) do update set "
+            "value = cast(cast(coalesce(schema_meta.value,'0') as integer) + 1 as text)"
+        )
+    except sqlite3.Error:
+        pass
+
+
+def provider_health_map_marker(con):
+    """A revision counter, not a timestamp.
+
+    max(created_at) looked free and correct and was neither. A batch that marks
+    several providers healthy stamps them all with the same created_at, so the
+    second and later rows could not invalidate a cache the first one had just
+    populated: their health never reached the map, and a queue row waiting on
+    that provider stayed in provider_wait indefinitely. A monotonic revision
+    cannot collide that way. Reading it is a single indexed schema_meta row.
+    """
+    try:
+        row = con.execute(
+            "select value from schema_meta where key='provider_health_revision'"
+        ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        # No revision recorded yet is itself a stable state to cache against.
+        return "0"
+    return str(row[0] if not isinstance(row, sqlite3.Row) else row["value"])
+
+
 def latest_provider_health_map(con):
+    marker = provider_health_map_marker(con)
+    if marker is not None:
+        cached = PROVIDER_HEALTH_MAP_CACHE.get(marker)
+        if cached is not None:
+            return copy.deepcopy(cached)
     rows = con.execute(
         """
         select h.entity_id, h.message, h.created_at, h.raw_json
@@ -40306,6 +40599,10 @@ def latest_provider_health_map(con):
             }
         )
         out[provider_id] = health
+    if marker is not None:
+        if len(PROVIDER_HEALTH_MAP_CACHE) >= PROVIDER_HEALTH_MAP_CACHE_LIMIT:
+            PROVIDER_HEALTH_MAP_CACHE.clear()
+        PROVIDER_HEALTH_MAP_CACHE[marker] = copy.deepcopy(out)
     return out
 
 
@@ -62206,687 +62503,6 @@ def series_watch_readiness_view(db_path, limit=80, readiness_filter=None, summar
     }
 
 
-KAPOWARR_SHUTDOWN_CODE_CHECKS = (
-    {
-        "id": "completed_import_kapowarr_adapter",
-        "label": "Completed Import Adapter",
-        "file": "inkdrop_completed_import.py",
-        "tokens": ("KAPOWARR_DB", "KAPOWARR_API", "KAPOWARR_COMIC_ROOT"),
-        "guard_token": "completed_import_kapowarr_adapter_enabled",
-        "guard_setting": "automation.kapowarr_completed_import_fallback",
-        "severity": "blocker",
-        "detail": "Completed-import and verification code still has Kapowarr DB/API paths.",
-        "next_action": "Keep completed-import Kapowarr DB/API fallback disabled for normal InkDrop operation.",
-    },
-    {
-        "id": "missing_acquire_kapowarr_fallback",
-        "label": "Missing Acquire Fallback",
-        "file": "inkdrop_missing_acquire.py",
-        "tokens": ("KAPOWARR_DB", "kapowarr_missing_fallback_enabled", "kapowarr_folder_for_volume"),
-        "guard_token": "kapowarr_missing_db_fallback_enabled",
-        "guard_setting": "automation.kapowarr_missing_fallback",
-        "severity": "blocker",
-        "detail": "Missing-acquire can still read Kapowarr folders or fallback missing rows.",
-        "next_action": "Keep missing acquisition queue-mode native and remove/disable Kapowarr folder fallback paths.",
-    },
-    {
-        "id": "series_autopilot_kapowarr_paths",
-        "label": "Series Autopilot Path Checks",
-        "file": "inkdrop_series_autopilot.py",
-        "tokens": ("KAPOWARR_DB", "kapowarr_folder_prefixes_by_volume_id", "item_path_matches_kapowarr_folder"),
-        "guard_token": "kapowarr_path_fallback_enabled",
-        "guard_setting": "automation.kapowarr_path_fallback",
-        "severity": "blocker",
-        "detail": "Series Autopilot still has Kapowarr folder-prefix verification paths.",
-        "next_action": "Keep legacy Kapowarr folder-prefix verification disabled for normal InkDrop operation.",
-    },
-    {
-        "id": "web_kapowarr_sync",
-        "label": "Web Kapowarr Sync",
-        "file": "inkdrop_web.py",
-        "tokens": ("/api/kapowarr/sync", "sync_kapowarr_series", "Kapowarr"),
-        "guard_token": "kapowarr_legacy_sync_enabled",
-        "guard_setting": "kapowarr.allow_legacy_sync",
-        "severity": "blocker",
-        "detail": "The web app still exposes/uses Kapowarr sync plumbing.",
-        "next_action": "Make Kapowarr sync explicitly legacy/manual-only or remove it after native add-series/import flows are proven.",
-    },
-    {
-        "id": "state_kapowarr_path_backfill",
-        "label": "State Path Backfill",
-        "file": "inkdrop_state.py",
-        "tokens": ("DEFAULT_KAPOWARR_DB", "load_kapowarr_volume_path_rows", "backfill_series_path_contracts"),
-        "severity": "watch",
-        "detail": "InkDrop state still has a Kapowarr DB reader for path backfill/migration support.",
-        "next_action": "Keep as migration-only until path contracts are fully InkDrop-owned, then remove the DB reader.",
-    },
-)
-
-KAPOWARR_SHUTDOWN_COMPOSE_CHECKS = (
-    {
-        "id": "live_arr_core_compose_kapowarr_profile",
-        "label": "Live Arr Core Kapowarr Profile",
-        "file": os.environ.get("INKDROP_ARR_CORE_COMPOSE") or "compose.yaml",
-        "service": "kapowarr",
-        "required_profile": "kapowarr-adapter",
-        "detail": "A configured Arr core compose file can start Kapowarr during a normal stack refresh.",
-        "next_action": "Keep any legacy Kapowarr service behind the kapowarr-adapter profile with restart set to no.",
-    },
-    {
-        "id": "legacy_arr_docker_compose_kapowarr_profile",
-        "label": "Legacy Arr Docker Kapowarr Profile",
-        "file": os.environ.get("INKDROP_LEGACY_ARR_DOCKER_COMPOSE") or "legacy-compose.yaml",
-        "service": "kapowarr",
-        "required_profile": "kapowarr-adapter",
-        "detail": "A configured legacy compose file can start Kapowarr during a broad stack refresh.",
-        "next_action": "Keep the legacy Kapowarr service behind the kapowarr-adapter profile with restart set to no.",
-    },
-    {
-        "id": "arr_core_compose_kapowarr_profile",
-        "label": "Arr Core Kapowarr Profile",
-        "file": "arr-core-compose.bazarr.yaml",
-        "service": "kapowarr",
-        "required_profile": "kapowarr-adapter",
-        "detail": "The active Arr core compose template can start Kapowarr during a normal stack refresh.",
-        "next_action": "Keep the Kapowarr service behind the kapowarr-adapter profile with restart set to no.",
-    },
-    {
-        "id": "scratch_repair_compose_kapowarr_profile",
-        "label": "Scratch Repair Kapowarr Profile",
-        "file": os.environ.get("INKDROP_SCRATCH_REPAIR_COMPOSE") or "",
-        "service": "kapowarr",
-        "required_profile": "kapowarr-adapter",
-        "detail": "An optional scratch-repair compose file can be checked when INKDROP_SCRATCH_REPAIR_COMPOSE is configured.",
-        "next_action": "Set INKDROP_SCRATCH_REPAIR_COMPOSE only when auditing a local recovery compose file.",
-    },
-    {
-        "id": "download_flow_compose_kapowarr_profile",
-        "label": "Download Flow Kapowarr Profile",
-        "file": os.environ.get("INKDROP_DOWNLOAD_FLOW_COMPOSE") or "",
-        "service": "kapowarr",
-        "required_profile": "kapowarr-adapter",
-        "detail": "An optional legacy download-flow compose file can be checked when INKDROP_DOWNLOAD_FLOW_COMPOSE is configured.",
-        "next_action": "Set INKDROP_DOWNLOAD_FLOW_COMPOSE only when auditing a local legacy compose file.",
-    },
-)
-
-
-def kapowarr_shutdown_code_dependency_rows(repo_root=None):
-    root = Path(repo_root) if repo_root else Path(__file__).resolve().parent
-    rows = []
-    for check in KAPOWARR_SHUTDOWN_CODE_CHECKS:
-        rel = str(check.get("file") or "")
-        path = root / rel
-        present_tokens = []
-        file_exists = path.exists()
-        text = ""
-        if file_exists:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
-        for token in check.get("tokens") or ():
-            if text and str(token) in text:
-                present_tokens.append(str(token))
-        guard_token = str(check.get("guard_token") or "")
-        guard_token_present = bool(guard_token and text and guard_token in text)
-        active = bool(present_tokens)
-        severity = str(check.get("severity") or "watch").strip().lower()
-        if severity not in {"blocker", "watch"}:
-            severity = "watch"
-        state = "gap" if active and severity == "blocker" else ("watch" if active else "ready")
-        rows.append({
-            "id": check.get("id"),
-            "label": check.get("label"),
-            "category": "code_dependency",
-            "state": state,
-            "severity": severity,
-            "blocking": bool(active and severity == "blocker"),
-            "ready": not active,
-            "file": rel,
-            "file_exists": bool(file_exists),
-            "tokens_present": present_tokens,
-            "token_count": len(present_tokens),
-            "guard_token": guard_token or None,
-            "guard_token_present": guard_token_present,
-            "guard_setting": check.get("guard_setting"),
-            "detail": check.get("detail") if active else f"{check.get('label')} no longer exposes known Kapowarr tokens.",
-            "next_action": check.get("next_action") if active else "No action needed for this codepath.",
-            "needs_user": False,
-            "actionability": "engineering",
-        })
-    return rows
-
-
-def compose_service_block(text, service):
-    if not text or not service:
-        return ""
-    header_re = re.compile(rf"^  {re.escape(str(service))}:\s*(?:#.*)?$", re.MULTILINE)
-    match = header_re.search(text)
-    if not match:
-        return ""
-    block_lines = []
-    for index, line in enumerate(text[match.start():].splitlines()):
-        if index and re.match(r"^  [A-Za-z0-9_.-]+:\s*(?:#.*)?$", line):
-            break
-        block_lines.append(line)
-    return "\n".join(block_lines)
-
-
-def compose_service_has_profile(block, profile):
-    if not block or not profile:
-        return False
-    profile = str(profile)
-    inline = re.search(r"^\s+profiles:\s*\[([^\]]*)\]", block, re.MULTILINE)
-    if inline and profile in inline.group(1):
-        return True
-    if not re.search(r"^\s+profiles:\s*$", block, re.MULTILINE):
-        return False
-    return bool(re.search(rf"^\s+-\s*['\"]?{re.escape(profile)}['\"]?\s*$", block, re.MULTILINE))
-
-
-def compose_service_restart_policy(block):
-    if not block:
-        return ""
-    match = re.search(r"^\s+restart:\s*([^#\r\n]+)", block, re.MULTILINE)
-    if not match:
-        return ""
-    return match.group(1).strip().strip("'\"").lower()
-
-
-def kapowarr_shutdown_compose_rows(repo_root=None):
-    root = Path(repo_root) if repo_root else Path(__file__).resolve().parent
-    rows = []
-    for check in KAPOWARR_SHUTDOWN_COMPOSE_CHECKS:
-        rel = str(check.get("file") or "")
-        path = root / rel if rel else None
-        file_exists = bool(path and path.exists())
-        text = ""
-        if file_exists:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
-        service = str(check.get("service") or "kapowarr")
-        block = compose_service_block(text, service) if text else ""
-        service_present = bool(block)
-        required_profile = str(check.get("required_profile") or "")
-        profile_present = compose_service_has_profile(block, required_profile) if service_present else False
-        restart_policy = compose_service_restart_policy(block)
-        restart_safe = restart_policy in {"", "no", "none", "false"}
-        blocking = bool(service_present and (not profile_present or not restart_safe))
-        if not rel:
-            detail = f"{check.get('label') or check.get('id') or 'Compose check'} is not configured."
-            next_action = check.get("next_action") or "No action needed for this optional compose check."
-            state = "ready"
-        elif not file_exists:
-            detail = f"{rel} is not present in this repo root."
-            next_action = "No action needed for this compose copy."
-            state = "ready"
-        elif not service_present:
-            detail = f"{rel} does not define a Kapowarr service."
-            next_action = "No action needed for this compose copy."
-            state = "ready"
-        elif blocking:
-            missing = []
-            if not profile_present:
-                missing.append(f"profile {required_profile}")
-            if not restart_safe:
-                missing.append('restart "no"')
-            detail = f"Kapowarr service is present in {rel} without {', '.join(missing)}."
-            next_action = check.get("next_action")
-            state = "gap"
-        else:
-            detail = f"Kapowarr service in {rel} is opt-in only via {required_profile} and will not restart by default."
-            next_action = "No action needed for this compose copy."
-            state = "ready"
-        rows.append({
-            "id": check.get("id"),
-            "label": check.get("label"),
-            "category": "deployment_compose",
-            "state": state,
-            "severity": "blocker",
-            "blocking": blocking,
-            "ready": not blocking,
-            "file": rel,
-            "file_exists": bool(file_exists),
-            "service": service,
-            "service_present": service_present,
-            "required_profile": required_profile,
-            "profile_present": profile_present,
-            "restart_policy": restart_policy or "default",
-            "restart_safe": restart_safe,
-            "detail": detail,
-            "next_action": next_action,
-            "needs_user": False,
-            "actionability": "engineering" if blocking else "diagnostic",
-        })
-    return rows
-
-
-def kapowarr_runtime_container_probe():
-    docker = shutil.which("docker")
-    if not docker:
-        return {
-            "docker_available": False,
-            "container_present": False,
-            "state": "not_checked",
-            "reason": "docker_unavailable",
-        }
-    cmd = [
-        docker,
-        "inspect",
-        "kapowarr",
-        "--format",
-        "{{.State.Status}}\t{{.HostConfig.RestartPolicy.Name}}\t{{.Config.Image}}\t{{.Name}}",
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=4,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "docker_available": True,
-            "container_present": False,
-            "state": "unknown",
-            "reason": "docker_timeout",
-        }
-    except OSError as exc:
-        return {
-            "docker_available": False,
-            "container_present": False,
-            "state": "unknown",
-            "reason": "docker_probe_failed",
-            "error": str(exc),
-        }
-    stdout = str(result.stdout or "").strip()
-    stderr = str(result.stderr or "").strip()
-    if result.returncode != 0:
-        lowered = (stdout + "\n" + stderr).lower()
-        if "no such object" in lowered or "no such container" in lowered:
-            return {
-                "docker_available": True,
-                "container_present": False,
-                "state": "absent",
-                "reason": "container_absent",
-            }
-        return {
-            "docker_available": True,
-            "container_present": False,
-            "state": "unknown",
-            "reason": "docker_probe_error",
-            "error": stderr or stdout,
-        }
-    parts = stdout.split("\t")
-    state = (parts[0] if len(parts) > 0 else "").strip().lower() or "unknown"
-    restart_policy = (parts[1] if len(parts) > 1 else "").strip().lower() or "default"
-    image = (parts[2] if len(parts) > 2 else "").strip()
-    name = (parts[3] if len(parts) > 3 else "").strip().lstrip("/") or "kapowarr"
-    return {
-        "docker_available": True,
-        "container_present": True,
-        "state": state,
-        "running": state == "running",
-        "restart_policy": restart_policy,
-        "image": image,
-        "name": name,
-    }
-
-
-def kapowarr_shutdown_runtime_rows(container_probe=None):
-    if callable(container_probe):
-        payload = container_probe()
-    else:
-        payload = kapowarr_runtime_container_probe()
-    payload = payload if isinstance(payload, dict) else {}
-    docker_available = bool(payload.get("docker_available"))
-    present = bool(payload.get("container_present"))
-    state_value = str(payload.get("state") or "unknown").strip().lower()
-    running = bool(payload.get("running") or state_value == "running")
-    restart_policy = str(payload.get("restart_policy") or "").strip().lower() or "default"
-    if not docker_available and state_value in {"not_checked", "unknown"}:
-        state = "ready"
-        detail = "Docker is not available in this environment, so no live Kapowarr container state was checked."
-        next_action = "Run the live readiness check on the server to verify Kapowarr container state."
-        actionability = "diagnostic"
-    elif not present:
-        state = "ready"
-        detail = "No live Kapowarr container exists."
-        next_action = "No container cleanup needed."
-        actionability = "diagnostic"
-    elif running:
-        state = "gap"
-        detail = "A live Kapowarr container is running even though InkDrop no longer treats it as a normal dependency."
-        next_action = "Stop and remove the Kapowarr container; recreate it only with the kapowarr-adapter profile for legacy adapter debugging."
-        actionability = "engineering"
-    else:
-        state = "watch"
-        detail = f"A stopped Kapowarr container still exists with state={state_value}."
-        next_action = "Remove the stopped Kapowarr container so it cannot be started directly outside the adapter profile."
-        actionability = "engineering"
-    return [
-        {
-            "id": "kapowarr_runtime_container",
-            "label": "Live Kapowarr Container",
-            "category": "runtime_container",
-            "state": state,
-            "severity": "watch",
-            "blocking": False,
-            "ready": state == "ready",
-            "docker_available": docker_available,
-            "container_present": present,
-            "container_running": running,
-            "container_state": state_value,
-            "restart_policy": restart_policy,
-            "image": payload.get("image"),
-            "container_name": payload.get("name") or "kapowarr",
-            "reason": payload.get("reason"),
-            "detail": detail,
-            "next_action": next_action,
-            "needs_user": False,
-            "actionability": actionability,
-        }
-    ]
-
-
-def _kapowarr_shutdown_provider_rows(con):
-    if con is None or not table_exists(con, "provider_configs"):
-        return []
-    rows = []
-    for row in con.execute(
-        """
-        select id, provider_type, display_name, enabled, ownership, automation_role, source
-        from provider_configs
-        where lower(coalesce(id,'')) like '%kapowarr%'
-           or lower(coalesce(display_name,'')) like '%kapowarr%'
-           or lower(coalesce(source,'')) like '%kapowarr%'
-           or lower(coalesce(ownership,'')) like '%kapowarr%'
-        order by enabled desc, id
-        """
-    ):
-        enabled = bool(int(row["enabled"] or 0))
-        rows.append({
-            "id": row["id"],
-            "label": row["display_name"] or row["id"],
-            "category": "provider_config",
-            "state": "gap" if enabled else "ready",
-            "severity": "blocker",
-            "blocking": bool(enabled),
-            "ready": not enabled,
-            "provider_type": row["provider_type"],
-            "enabled": enabled,
-            "ownership": row["ownership"],
-            "automation_role": row["automation_role"],
-            "source": row["source"],
-            "detail": "Kapowarr provider/config entry is still enabled." if enabled else "Kapowarr provider/config entry is disabled.",
-            "next_action": "Disable or remove this provider config before shutdown." if enabled else "No action needed for this provider config.",
-            "needs_user": False,
-            "actionability": "engineering" if enabled else "diagnostic",
-        })
-    return rows
-
-
-def kapowarr_shutdown_readiness_view(db_path, limit=80, summary_mode=None, row_mode=None, focus=None, repo_root=None, container_probe=None):
-    path = Path(db_path)
-    if not path.exists():
-        return {"ok": False, "reason": "state_db_missing", "view": "kapowarr_shutdown_readiness", "db_path": str(path)}
-    fetch_limit = max(1, min(int(limit or 80), 500))
-    focus_entities = normalize_focus_entities(focus)
-    normalized_row_mode = normalize_state_view_row_mode(row_mode)
-    summary_mode_key = str(summary_mode or "full").strip().lower().replace("-", "_")
-    compact_mode = summary_mode_key in {"compact", "minimal"}
-    code_rows = kapowarr_shutdown_code_dependency_rows(repo_root=repo_root)
-    compose_rows = kapowarr_shutdown_compose_rows(repo_root=repo_root)
-    runtime_rows = kapowarr_shutdown_runtime_rows(container_probe=container_probe)
-    with connect_read(path) as con:
-        removed_sql = series_removed_sql("s")
-        unparked_kapowarr_series_count = int(con.execute(
-            f"""
-            select count(*)
-            from series s
-            where s.id like 'kapowarr:%'
-              and not {removed_sql}
-            """
-        ).fetchone()[0])
-        parked_kapowarr_series_count = int(con.execute(
-            f"""
-            select count(*)
-            from series s
-            where s.id like 'kapowarr:%'
-              and {removed_sql}
-            """
-        ).fetchone()[0])
-        truth_dependency_count = int(con.execute(
-            f"""
-            select count(*)
-            from series s
-            where not {removed_sql}
-              and (
-                lower(coalesce(s.source,'')) = 'kapowarr'
-                or lower(coalesce(s.metadata_provider,'')) = 'kapowarr'
-                or s.id like 'kapowarr:%'
-              )
-            """
-        ).fetchone()[0])
-        # These policies were retired in Build 165. Preserve legacy rows for
-        # rollback/audit, but never project or execute their stored values.
-        kapowarr_missing_fallback = False
-        kapowarr_path_fallback = False
-        kapowarr_completed_import_fallback = False
-        kapowarr_allow_legacy_sync = False
-        if table_exists(con, "provider_configs"):
-            row = con.execute(
-                "select enabled, settings_json from provider_configs where id = 'kapowarr' limit 1"
-            ).fetchone()
-            if row:
-                settings = json_loads(row["settings_json"] or "{}", {})
-                settings = settings if isinstance(settings, dict) else {}
-                kapowarr_allow_legacy_sync = boolish(row["enabled"], False) and boolish(settings.get("allow_legacy_sync"), False)
-        provider_rows = _kapowarr_shutdown_provider_rows(con)
-    guard_setting_enabled = {
-        "kapowarr.allow_legacy_sync": bool(kapowarr_allow_legacy_sync),
-        "automation.kapowarr_missing_fallback": bool(kapowarr_missing_fallback),
-        "automation.kapowarr_path_fallback": bool(kapowarr_path_fallback),
-        "automation.kapowarr_completed_import_fallback": bool(kapowarr_completed_import_fallback),
-    }
-    for row in code_rows:
-        setting_key = str(row.get("guard_setting") or "")
-        if not setting_key:
-            continue
-        enabled = bool(guard_setting_enabled.get(setting_key, False))
-        if row.get("guard_token_present") and not enabled:
-            retired = inkdrop_settings_registry.is_retired_setting(setting_key)
-            row.update({
-                "state": "ready",
-                "blocking": False,
-                "ready": True,
-                "detail": ("Legacy Kapowarr code is retained for rollback but its policy is retired and permanently disabled." if retired else f"Legacy Kapowarr code is present but guarded off by {setting_key}."),
-                "next_action": ("No operator action is available or required." if retired else f"Keep {setting_key} off during normal InkDrop operation."),
-                "actionability": "diagnostic",
-                "guard_setting_enabled": False,
-                "retired": bool(retired),
-            })
-        else:
-            row["guard_setting_enabled"] = enabled
-    series_rows = []
-    if unparked_kapowarr_series_count:
-        series_rows.append({
-            "id": "unparked_kapowarr_series",
-            "label": "Unparked Kapowarr Series",
-            "category": "series_state",
-            "state": "gap",
-            "severity": "blocker",
-            "blocking": True,
-            "ready": False,
-            "metric": unparked_kapowarr_series_count,
-            "detail": f"{unparked_kapowarr_series_count} kapowarr:* Series rows are still active.",
-            "next_action": "Merge or retire the remaining imported legacy records before shutdown.",
-            "needs_user": False,
-            "actionability": "engineering",
-        })
-    else:
-        series_rows.append({
-            "id": "unparked_kapowarr_series",
-            "label": "Unparked Kapowarr Series",
-            "category": "series_state",
-            "state": "ready",
-            "severity": "blocker",
-            "blocking": False,
-            "ready": True,
-            "metric": 0,
-            "detail": f"0 active kapowarr:* Series rows; {parked_kapowarr_series_count} parked adapter rows are retained as history.",
-            "next_action": "No imported legacy records need duplicate cleanup.",
-            "needs_user": False,
-            "actionability": "diagnostic",
-        })
-    if truth_dependency_count:
-        series_rows.append({
-            "id": "kapowarr_truth_series",
-            "label": "Kapowarr Truth Series",
-            "category": "series_state",
-            "state": "gap",
-            "severity": "blocker",
-            "blocking": True,
-            "ready": False,
-            "metric": truth_dependency_count,
-            "detail": f"{truth_dependency_count} active Series rows still identify Kapowarr as source/metadata authority.",
-            "next_action": "Backfill native metadata/issues/wanted/queue rows for these Series.",
-            "needs_user": False,
-            "actionability": "engineering",
-        })
-    else:
-        series_rows.append({
-            "id": "kapowarr_truth_series",
-            "label": "Kapowarr Truth Series",
-            "category": "series_state",
-            "state": "ready",
-            "severity": "blocker",
-            "blocking": False,
-            "ready": True,
-            "metric": 0,
-            "detail": "No active Series rows treat Kapowarr as source/metadata authority.",
-            "next_action": "Keep future add-series paths native.",
-            "needs_user": False,
-            "actionability": "diagnostic",
-        })
-    fallback_row = {
-        "id": "kapowarr_missing_fallback",
-        "label": "Retired Kapowarr Missing Fallback",
-        "category": "setting",
-        "state": "gap" if kapowarr_missing_fallback else "ready",
-        "severity": "blocker",
-        "blocking": bool(kapowarr_missing_fallback),
-        "ready": not bool(kapowarr_missing_fallback),
-        "enabled": bool(kapowarr_missing_fallback),
-        "detail": "This fallback is retired and permanently disabled.",
-        "next_action": "No operator action is available or required.",
-        "needs_user": False,
-        "actionability": "diagnostic",
-        "retired": True,
-    }
-    path_fallback_row = {
-        "id": "kapowarr_path_fallback",
-        "label": "Retired Kapowarr Path Fallback",
-        "category": "setting",
-        "state": "gap" if kapowarr_path_fallback else "ready",
-        "severity": "blocker",
-        "blocking": bool(kapowarr_path_fallback),
-        "ready": not bool(kapowarr_path_fallback),
-        "enabled": bool(kapowarr_path_fallback),
-        "detail": "This fallback is retired and permanently disabled.",
-        "next_action": "No operator action is available or required.",
-        "needs_user": False,
-        "actionability": "diagnostic",
-        "retired": True,
-    }
-    completed_import_fallback_row = {
-        "id": "kapowarr_completed_import_fallback",
-        "label": "Retired Kapowarr Completed Import Fallback",
-        "category": "setting",
-        "state": "gap" if kapowarr_completed_import_fallback else "ready",
-        "severity": "blocker",
-        "blocking": bool(kapowarr_completed_import_fallback),
-        "ready": not bool(kapowarr_completed_import_fallback),
-        "enabled": bool(kapowarr_completed_import_fallback),
-        "detail": "This fallback is retired and permanently disabled.",
-        "next_action": "No operator action is available or required.",
-        "needs_user": False,
-        "actionability": "diagnostic",
-        "retired": True,
-    }
-    rows = series_rows + [fallback_row, path_fallback_row, completed_import_fallback_row] + provider_rows + runtime_rows + compose_rows + code_rows
-    if focus_entities:
-        rows = focus_rows(rows, focus_entities)
-    blocker_count = sum(1 for row in rows if row.get("blocking"))
-    watch_count = sum(1 for row in rows if row.get("state") == "watch")
-    ready_count = sum(1 for row in rows if row.get("state") == "ready")
-    hard_code_dependency_count = sum(1 for row in code_rows if row.get("blocking"))
-    compose_blocker_count = sum(1 for row in compose_rows if row.get("blocking"))
-    runtime_container_present_count = sum(1 for row in runtime_rows if row.get("container_present"))
-    runtime_container_running_count = sum(1 for row in runtime_rows if row.get("container_running"))
-    safe_to_stop = blocker_count == 0
-    if not safe_to_stop:
-        recommendation = "keep_running"
-        next_action = "Keep Kapowarr running; replace the blocking dependency rows first."
-    elif runtime_container_running_count:
-        recommendation = "stop_container"
-        next_action = "Kapowarr is no longer required; stop and remove the live container so it stays adapter-only."
-    elif runtime_container_present_count:
-        recommendation = "remove_stopped_container"
-        next_action = "Remove the stopped Kapowarr container so it cannot be started directly outside the adapter profile."
-    else:
-        recommendation = "safe_to_stop"
-        next_action = "Kapowarr is not needed and no live container cleanup is required."
-    summary = {
-        "ok": True,
-        "db_path": str(path),
-        "summary_mode": "compact" if compact_mode else "full",
-        "safe_to_stop_kapowarr": bool(safe_to_stop),
-        "kapowarr_container_recommendation": recommendation,
-        "state": "ready" if safe_to_stop else "blocked",
-        "next_action": next_action,
-        "blocking_count": blocker_count,
-        "watch_count": watch_count,
-        "ready_count": ready_count,
-        "check_count": len(rows),
-        "unparked_kapowarr_series": unparked_kapowarr_series_count,
-        "parked_kapowarr_series": parked_kapowarr_series_count,
-        "kapowarr_truth_series": truth_dependency_count,
-        "kapowarr_missing_fallback_enabled": bool(kapowarr_missing_fallback),
-        "kapowarr_path_fallback_enabled": bool(kapowarr_path_fallback),
-        "kapowarr_completed_import_fallback_enabled": bool(kapowarr_completed_import_fallback),
-        "kapowarr_provider_config_count": len(provider_rows),
-        "kapowarr_provider_enabled_count": sum(1 for row in provider_rows if row.get("enabled")),
-        "kapowarr_runtime_container_present_count": runtime_container_present_count,
-        "kapowarr_runtime_container_running_count": runtime_container_running_count,
-        "kapowarr_runtime_check_count": len(runtime_rows),
-        "kapowarr_compose_blocker_count": compose_blocker_count,
-        "kapowarr_compose_check_count": len(compose_rows),
-        "hard_code_dependency_count": hard_code_dependency_count,
-        "code_dependency_count": len(code_rows),
-    }
-    return {
-        "ok": True,
-        "view": "kapowarr_shutdown_readiness",
-        "summary": summary,
-        "row_mode": normalized_row_mode,
-        "count": len(rows[:fetch_limit]),
-        "loaded_count": len(rows[:fetch_limit]),
-        "total_count": len(rows),
-        "limit": fetch_limit,
-        "rows": rows[:fetch_limit],
-        "db_path": str(path),
-        "focus": focus_entities,
-        "focused": bool(focus_entities),
-        "safe_to_stop_kapowarr": bool(safe_to_stop),
-        "kapowarr_container_recommendation": recommendation,
-    }
-
-
 READINESS_REPAIR_FILTERS = {
     "all": "All Plans",
     "safe": "Safe Plans",
@@ -66948,14 +66564,6 @@ def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None
     perf_started_at = time.perf_counter()
     key = str(view or "").strip().lower()
     key = STATE_VIEW_ALIAS_MAP.get(key, key)
-    if key in {"kapowarr_shutdown_readiness", "kapowarr-shutdown-readiness", "kapowarr_shutdown", "kapowarr-shutdown", "kapowarr_exit_gate", "kapowarr-exit-gate"}:
-        return kapowarr_shutdown_readiness_view(
-            db_path,
-            limit=limit,
-            summary_mode=summary_mode,
-            row_mode=row_mode,
-            focus=focus,
-        )
     if key in {"kapowarr_adapter_drain_plan", "kapowarr-adapter-drain-plan", "kapowarr_adapter_drain", "kapowarr-adapter-drain", "adapter_shadow_drain_plan", "adapter-shadow-drain-plan"}:
         return kapowarr_adapter_drain_plan_view(
             db_path,

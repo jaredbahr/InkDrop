@@ -11,7 +11,7 @@ from pathlib import Path
 import inkdrop_state
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "web" / "tests" / "fixtures" / "history-taxonomy-v2.json"
 
 

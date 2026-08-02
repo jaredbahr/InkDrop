@@ -61,7 +61,8 @@ REQUIRED_WEB_HELPER_SNIPPETS = {
     "update_inkdrop_provider_settings": (
         "def update_inkdrop_provider_settings(payload):",
         "inkdrop_state.update_provider_config(INKDROP_STATE_DB, provider_id, patch)",
-        "claim_inkdrop_provider_settings(payload)",
+        "runtime_provider_by_id(provider_id)",
+        "inkdrop_state.sync_settings(INKDROP_STATE_DB, providers=[runtime_provider], settings=[])",
     ),
     "add_inkdrop_provider_from_template": (
         "def add_inkdrop_provider_from_template(payload):",

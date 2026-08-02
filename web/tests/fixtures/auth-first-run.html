@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en" class="inkdrop-auth-pending">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>InkDrop authentication fixture</title>
+  <link rel="stylesheet" href="../../static/css/inkdrop.css">
+  <script>
+    window.__authFixture = {
+      bootstrapped: new URLSearchParams(location.search).has("configured"),
+      setupRequired: new URLSearchParams(location.search).has("setup-required"),
+      authenticated: false,
+      username: "qaadmin",
+      password: "fixture configured password",
+      failedLogins: 0,
+      external: new URLSearchParams(location.search).has("external"),
+      keys: []
+    };
+
+    window.fetch = async function (path, options = {}) {
+      const fixture = window.__authFixture;
+      const body = options.body ? JSON.parse(options.body) : {};
+      const json = (status, payload, headers = {}) => new Response(JSON.stringify(payload), {
+        status,
+        headers: Object.assign({"Content-Type": "application/json"}, headers)
+      });
+      if (path === "/api/auth/status") {
+        const externalOnly = fixture.external;
+        const setupRequired = !externalOnly && (fixture.setupRequired || !fixture.bootstrapped);
+        return json(200, {ok: true, auth: {
+          mode: externalOnly ? "external" : "built_in",
+          required: true,
+          setup_required: setupRequired,
+          bootstrap_required: !externalOnly && !fixture.bootstrapped,
+          built_in_auth: {enabled: !externalOnly, configured: fixture.bootstrapped, bootstrap_required: !externalOnly && !fixture.bootstrapped},
+          external_auth: {enabled: externalOnly, ready: externalOnly, next_action: "Sign in through the configured identity proxy."},
+          api_keys: {enabled: true, configured: fixture.keys.some(key => key.enabled)}
+        }});
+      }
+      if (path === "/api/auth/bootstrap") {
+        fixture.bootstrapped = true;
+        fixture.username = body.username;
+        fixture.password = body.password;
+        return json(201, {ok: true});
+      }
+      if (path === "/api/auth/login") {
+        if (fixture.failedLogins >= 3) return json(429, {ok: false, message: "Too many sign-in attempts", retry_after: 30}, {"Retry-After": "30"});
+        if (body.username !== fixture.username || body.password !== fixture.password) {
+          fixture.failedLogins += 1;
+          return json(401, {ok: false, message: "Username or password is incorrect"});
+        }
+        fixture.authenticated = true;
+        fixture.failedLogins = 0;
+        return json(200, {ok: true});
+      }
+      if (path === "/api/auth/session") {
+        if (!fixture.authenticated) return json(401, {ok: false, message: "Session expired"});
+        return json(200, {ok: true, authenticated: true, principal: {method: "session", session: {expires_at: Math.floor(Date.now() / 1000) + 86400}, user: {username: fixture.username, role: "admin"}}});
+      }
+      if (path === "/api/auth/logout") {
+        fixture.authenticated = false;
+        return json(200, {ok: true});
+      }
+      if (path === "/api/auth/password") {
+        if (body.current_password !== fixture.password) return json(400, {ok: false, message: "Current password is incorrect"});
+        fixture.password = body.new_password;
+        return json(200, {ok: true});
+      }
+      if (path === "/api/auth/api-keys" && (!options.method || options.method === "GET")) {
+        return json(200, {ok: true, api_keys: fixture.keys.map(({raw, ...key}) => key)});
+      }
+      if (path === "/api/auth/api-keys" && options.method === "POST") {
+        const id = String(fixture.keys.length + 1);
+        const raw = `inkdrop_fixture_${id}_one_time_secret`;
+        const expiresAt = body.expires_in_seconds ? Math.floor(Date.now() / 1000) + Number(body.expires_in_seconds) : null;
+        const key = {id, name: body.name, description: body.description, scopes: body.scopes, enabled: true, expired: false, expires_at: expiresAt, fingerprint: `1234567890abcdef${id}`, preview: `inkdrop…${id}`, raw};
+        fixture.keys.push(key);
+        return json(201, {ok: true, api_key: Object.assign({}, key, {key: raw})});
+      }
+      const revoke = String(path).match(/^\/api\/auth\/api-keys\/(.+)\/revoke$/);
+      if (revoke) {
+        const key = fixture.keys.find(item => item.id === decodeURIComponent(revoke[1]));
+        if (key) key.enabled = false;
+        return json(200, {ok: true});
+      }
+      return json(404, {ok: false, message: "Fixture endpoint not found"});
+    };
+  </script>
+  <script src="../../static/js/inkdrop-api.js" defer></script>
+  <script src="../../static/js/inkdrop-auth-ui.js" defer></script>
+</head>
+<body>
+  <div id="inkdropAuthRoot" class="inkdrop-auth-root" aria-live="polite"></div>
+  <main id="inkdropAppShell" hidden>
+    <nav class="arr-nav" aria-label="InkDrop sections"><button type="button">Series</button></nav>
+    <section><h1>InkDrop authenticated application</h1><p>The application shell is visible only after session validation.</p></section>
+  </main>
+</body>
+</html>

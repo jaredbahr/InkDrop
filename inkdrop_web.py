@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import importlib.util
 import inkdrop_acquire_adapter
+import inkdrop_qbittorrent_auth
 import inkdrop_library_frontends
 import inkdrop_runtime_config
 import inkdrop_settings_registry
@@ -93,7 +94,6 @@ def env_bool(name, default=False):
 
 HOST = inkdrop_runtime_config.web_host()
 PORT = inkdrop_runtime_config.web_port(strict=False)
-KAPOWARR_URL = env_value("INKDROP_KAPOWARR_URL", "")
 WEB_RUNTIME_STARTED_AT = time.time()
 MANUAL_SEARCH_THREADS = {}
 MANUAL_SEARCH_THREADS_LOCK = threading.Lock()
@@ -183,7 +183,6 @@ MANUAL_REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
 FRESH_SWEEP_LOG = LOG_DIR / "fresh-release-sweep.log"
 HOT_SWEEP_LOG = LOG_DIR / "hot-release-sweep.log"
 MISSING_ACQUIRE_LOG = LOG_DIR / "missing-acquire-cron.log"
-KAPOWARR_SYNC_LOG = LOG_DIR / "kapowarr-sync.log"
 RSS_DISCOVERY_LOG = LOG_DIR / "rss-discovery.log"
 RSS_DISCOVERY_STATUS_FILE = STATE_DIR / "rss-discovery-status.json"
 COMICSCODES_DISCOVERY_LOG = LOG_DIR / "comicscodes-discovery.log"
@@ -560,7 +559,6 @@ MANGA_PUBLISHER_HINTS = {
 MANGA_TITLE_HINTS = {"berserk", "chainsaw man", "one piece", "onepiece", "fire punch", "firepunch", "vagabond"}
 MANUAL_INBOX_EXTS = {".cbz", ".cbr", ".pdf", ".epub"}
 COMIC_SERIES_FILE = STATE_DIR / "comic-series-watches.json"
-KAPOWARR_DB = inkdrop_runtime_config.kapowarr_db_path()
 KAVITA_API = env_value("INKDROP_KAVITA_URL", "")
 KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
 KOMGA_API = env_value("INKDROP_KOMGA_URL", "")
@@ -639,6 +637,23 @@ MANGADEX_COVER_URL = "https://uploads.mangadex.org/covers"
 SAB_COMIC_CATEGORIES = {"comics", "manga", "mylar", "kapowarr"}
 COMICVINE_USER_AGENT = env_value("INKDROP_COMICVINE_USER_AGENT", "InkDrop/0.1 (+metadata lookup)")
 MANGADEX_USER_AGENT = "InkDrop/0.1 (+metadata lookup)"
+# MangaDex's own API default is safe + suggestive + erotica; it excludes only
+# pornographic. InkDrop defaulted to safe + suggestive, which is stricter than
+# upstream and silently so: the rating filter is applied in the request, so an
+# excluded title is not down-ranked or flagged, it simply does not exist as far as
+# the user can tell. Berserk is rated erotica on MangaDex, so searching for it
+# returned nothing at all -- reported by a tester on 2026-08-01, and it is 8,959
+# titles wide, not one book.
+#
+# Mature content is still handled, just at the right layer: mangadex_search_result
+# scores erotica and pornographic at -35, so it ranks below an equally-matching
+# safe title instead of vanishing. That penalty was dead code for erotica while
+# the request filter removed those rows first. Pornographic stays excluded by
+# default, and the whole list remains user-configurable.
+MANGADEX_DEFAULT_CONTENT_RATINGS = ("safe", "suggestive", "erotica")
+# Smaller than the narrowest relevance tier gap in mangadex_result_score (12).
+MANGADEX_MATURE_RATING_PENALTY = 8
+
 COMICVINE_ENGLISH_PUBLISHER_HINTS = {
     "abrams",
     "archie",
@@ -1190,7 +1205,6 @@ HTML = r"""<!doctype html>
       </summary>
       <p class="advanced-ops-note">Advanced operator tools for recovery and targeted diagnostics. These are not normal Settings; day-to-day work should stay in Series, Wanted, Queue, Activity, Manual Review, and provider Settings.</p>
       <div class="advanced-ops">
-        <button id="kapowarrSyncBtn">Sync Metadata Adapter</button>
         <button class="primary" id="processReadyBtn">Process All Ready</button>
         <button id="freshSweepBtn">Fast Fresh Sweep</button>
         <button id="rssDiscoveryBtn">GetComics RSS Sweep</button>
@@ -6713,7 +6727,6 @@ HTML = r"""<!doctype html>
         "/api/missing/process": payload?.series ? `Processing ${payload.series}` : "Processing queue",
         "/api/missing/recheck": payload?.series ? `Rechecking ${payload.series}` : "Rechecking sources",
         "/api/missing/fresh": "Running fresh sweep",
-        "/api/kapowarr/sync": "Syncing metadata adapter",
         "/api/rss/discover": "Running RSS sweep",
         "/api/comicscodes/discover": "Running ComicsCodes sweep",
         "/api/slskd-source-probe/run": "Probing SLSKD",
@@ -6814,7 +6827,6 @@ HTML = r"""<!doctype html>
       if (path.startsWith("/api/watch/")) return "advancedOps";
       if (path === "/api/search" || path === "/api/source-probe" || path === "/api/grab") return "advancedOps";
       if (path === "/api/manga-unit/set") return route({section: "series", filter: "all", label: "Series · All"});
-      if (path === "/api/kapowarr/sync") return route({section: "series", filter: "adapter", label: "Series · Adapter"});
       if (path === "/api/rss/discover" || path === "/api/comicscodes/discover") return route({section: "queue", filter: "provider_wait", label: "Queue · Waiting"});
       return null;
     }
@@ -15888,10 +15900,10 @@ HTML = r"""<!doctype html>
     function appendSeriesDetailTruthFacts(parent, row={}) {
       if (!parent) return;
       const adapterBacked = row.ownership === "adapter";
-      appendSeriesDetailFact(parent, "Tracked by", adapterBacked ? "Kapowarr adapter" : "InkDrop", {
+      appendSeriesDetailFact(parent, "Tracked by", adapterBacked ? "Legacy adapter" : "InkDrop", {
         tone: adapterBacked ? "warn" : "good",
         title: adapterBacked
-          ? "This series' metadata still comes through the legacy Kapowarr adapter rather than InkDrop's own ComicVine/MangaDex tracking."
+          ? "This series' metadata still comes from a retired legacy adapter record rather than InkDrop's own ComicVine/MangaDex tracking."
           : "InkDrop's own state and managed-folder evidence drive automation for this series directly.",
       });
       const libraryPath = row.library_path || row.path_contract?.library_path || row.library_adapter_path || "";
@@ -23121,7 +23133,6 @@ HTML = r"""<!doctype html>
         public_free_book_sites: ["automation", "Download Sources", "Direct downloads, RSS/ComicsCodes, and automatic search order"],
         rss: ["automation", "Sources", "Configured sources for Automatic Search"],
         comicscodes: ["automation", "Sources", "Configured sources for Automatic Search"],
-        kapowarr: ["automation", "Sources", "Optional compatibility source"],
       };
       if (providerGroups[id]) return providerGroups[id];
       if (/(_sources|_trackers|reader_sites|search_engines|ddl_blogs|book_sites)$/.test(id)) {
@@ -30030,23 +30041,6 @@ HTML = r"""<!doctype html>
       }
     }
 
-    async function syncKapowarr() {
-      $("output").textContent = "Syncing metadata adapter links...";
-      $("kapowarrSyncBtn").disabled = true;
-      try {
-        const data = await api("/api/kapowarr/sync", {});
-        $("output").textContent = JSON.stringify(data.result, null, 2);
-        toast("Metadata adapter sync complete.");
-        loadComicSeries();
-        refreshStatus();
-      } catch (err) {
-        $("output").textContent = err?.message || String(err);
-        toast(err.message, false);
-      } finally {
-        $("kapowarrSyncBtn").disabled = false;
-      }
-    }
-
     async function processReady(fresh=false) {
       const btn = fresh ? $("freshSweepBtn") : $("processReadyBtn");
       btn.disabled = true;
@@ -33562,7 +33556,6 @@ HTML = r"""<!doctype html>
     window.addEventListener("resize", applyActivityDockCollapsedState);
     window.addEventListener("hashchange", handleInkdropRouteNavigation);
     window.addEventListener("popstate", handleInkdropRouteNavigation);
-    bindClick("kapowarrSyncBtn", syncKapowarr);
     bindClick("processReadyBtn", () => processReady(false));
     bindClick("freshSweepBtn", () => processReady(true));
     bindClick("rssDiscoveryBtn", rssDiscovery);
@@ -35671,14 +35664,7 @@ def load_comicvine_key():
         key = str(settings.get("api_key") or "").strip()
         if key:
             return key
-    if not KAPOWARR_DB.exists():
-        raise RuntimeError("ComicVine metadata needs an API key. Add one in InkDrop Settings > Metadata Source to search or add ComicVine series.")
-    con = sqlite3.connect(KAPOWARR_DB)
-    row = con.execute("select value from config where key='comicvine_api_key'").fetchone()
-    con.close()
-    if not row or not row[0]:
-        raise RuntimeError("ComicVine metadata needs an API key. Add one in InkDrop Settings > Metadata Source to search or add ComicVine series.")
-    return row[0]
+    raise RuntimeError("ComicVine metadata needs an API key. Add one in InkDrop Settings > Metadata Source to search or add ComicVine series.")
 
 
 def comicvine_provider_runtime_status():
@@ -35691,15 +35677,6 @@ def comicvine_provider_runtime_status():
     settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
     if str(settings.get("api_key") or "").strip():
         return "configured"
-    if KAPOWARR_DB.exists():
-        try:
-            con = sqlite3.connect(KAPOWARR_DB)
-            row = con.execute("select value from config where key='comicvine_api_key'").fetchone()
-            con.close()
-            if row and str(row[0] or "").strip():
-                return "configured"
-        except (OSError, sqlite3.Error):
-            pass
     return "configuration_needed"
 
 
@@ -35716,7 +35693,7 @@ def load_comicvine_settings():
         "source_order": normalize_comicvine_source_order(
             settings.get("source_order") or ["local", "prowlarr", "rss", "slskd"]
         ),
-        "source": config.get("source") or ("inkdrop_state" if config else "kapowarr_fallback"),
+        "source": config.get("source") or ("inkdrop_state" if config else "default"),
     }
 
 
@@ -35810,148 +35787,6 @@ def comicvine_result_score(query, item, quality_settings=None):
         "note": ", ".join(notes[:3]),
         "warning": warning,
     }
-
-
-def load_kapowarr_api_key():
-    if not KAPOWARR_DB.exists():
-        raise RuntimeError("Kapowarr DB not found; cannot read API key")
-    con = sqlite3.connect(KAPOWARR_DB)
-    row = con.execute("select value from config where key='api_key'").fetchone()
-    con.close()
-    if not row or not row[0]:
-        raise RuntimeError("Kapowarr API key is missing")
-    return row[0]
-
-
-class KapowarrBusyError(RuntimeError):
-    pass
-
-
-def kapowarr_api(method, path, params=None, json_body=None, timeout=90):
-    params = dict(params or {})
-    params["api_key"] = load_kapowarr_api_key()
-    url = KAPOWARR_URL.rstrip("/") + "/" + path.lstrip("/")
-    try:
-        response = requests.request(method, url, params=params, json=json_body, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-    except requests.exceptions.Timeout as exc:
-        raise KapowarrBusyError(
-            f"Kapowarr did not respond within {timeout} seconds. It is probably busy with existing series tasks."
-        ) from exc
-    except requests.exceptions.ConnectionError as exc:
-        raise KapowarrBusyError("Kapowarr is not accepting connections right now.") from exc
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        raise RuntimeError(f"Kapowarr API request failed (HTTP {status}).") from exc
-    except ValueError as exc:
-        raise RuntimeError("Kapowarr returned a response InkDrop could not read.") from exc
-    if payload.get("error"):
-        error = str(payload.get("error") or "")
-        if error == "CVRateLimitReached":
-            raise RuntimeError(
-                "ComicVine is temporarily unavailable through Kapowarr. No series was added or changed."
-            )
-        if error == "InvalidComicVineApiKey":
-            raise RuntimeError("ComicVine metadata needs a valid API key. Add or update it in InkDrop Settings > Metadata Source.")
-        if error == "VolumeAlreadyAdded":
-            result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
-            return result
-        raise RuntimeError(f"Kapowarr API error: {error}")
-    return payload.get("result")
-
-
-def kapowarr_volume_from_db_by_cv(comicvine_id):
-    comicvine_id = int(comicvine_id or 0)
-    if not comicvine_id:
-        return None
-    con = kapowarr_connect()
-    try:
-        row = con.execute(
-            """
-            select id, comicvine_id, title, alt_title, year, publisher, volume_number,
-                   description, site_url, monitored, monitor_new_issues, root_folder,
-                   folder, custom_folder, last_cv_fetch, special_version, special_version_locked
-            from volumes
-            where comicvine_id = ?
-            limit 1
-            """,
-            (comicvine_id,),
-        ).fetchone()
-    finally:
-        con.close()
-    if not row:
-        return None
-    volume = dict(row)
-    volume["id"] = int(volume["id"])
-    volume["comicvine_id"] = int(volume["comicvine_id"])
-    volume["monitored"] = bool(volume.get("monitored"))
-    volume["monitor_new_issues"] = bool(volume.get("monitor_new_issues"))
-    return volume
-
-
-def kapowarr_existing_volume_by_cv(comicvine_id):
-    return kapowarr_volume_from_db_by_cv(comicvine_id)
-
-
-def wait_for_kapowarr_volume_by_cv(comicvine_id, seconds=45):
-    deadline = time.time() + max(0, seconds)
-    while time.time() <= deadline:
-        volume = kapowarr_volume_from_db_by_cv(comicvine_id)
-        if volume:
-            return volume
-        time.sleep(2)
-    return None
-
-
-def kapowarr_add_volume(volume, auto_search=False):
-    cv_id = int(volume.get("comicvineId") or volume.get("comicvine_id") or 0)
-    if not cv_id:
-        raise ValueError("ComicVine volume id is required")
-    existing = kapowarr_existing_volume_by_cv(cv_id)
-    if existing:
-        volume_id = int(existing["id"])
-        if not existing.get("monitored") or not existing.get("monitor_new_issues"):
-            try:
-                kapowarr_api(
-                    "PUT",
-                    f"/volumes/{volume_id}",
-                    json_body={
-                        "monitored": True,
-                        "monitor_new_issues": True,
-                        "monitoring_scheme": "all",
-                    },
-                    timeout=30,
-                )
-                existing = kapowarr_existing_volume_by_cv(cv_id) or existing
-            except KapowarrBusyError:
-                existing["monitor_update_pending"] = True
-        return {**existing, "id": volume_id, "already_present": True}
-    try:
-        result = kapowarr_api(
-            "POST",
-            "/volumes",
-            json_body={
-                "comicvine_id": cv_id,
-                "root_folder_id": 1,
-                "monitor": True,
-                "monitoring_scheme": "all",
-                "monitor_new_issues": True,
-                "volume_folder": "",
-                "special_version": "auto",
-                "auto_search": bool(auto_search),
-            },
-            timeout=75,
-        )
-    except KapowarrBusyError as exc:
-        existing = wait_for_kapowarr_volume_by_cv(cv_id, seconds=45)
-        if existing:
-            return {**existing, "already_present": True, "add_response_timed_out": True}
-        raise RuntimeError(
-            "The metadata adapter is busy and did not confirm the add. Try again shortly; if it finishes in the background, Sync Metadata Adapter will pick it up."
-        ) from exc
-    result["already_present"] = False
-    return result
 
 
 def comicvine_get(path, params, timeout=30, attempts=2):
@@ -36058,7 +35893,7 @@ def load_mangadex_settings():
         "base_url": str(config.get("base_url") or MANGADEX_API).rstrip("/"),
         "user_agent": str(settings.get("user_agent") or MANGADEX_USER_AGENT).strip() or MANGADEX_USER_AGENT,
         "translated_languages": setting_list_values(settings.get("translated_languages") or settings.get("allowed_languages"), ["en"]),
-        "content_ratings": setting_list_values(settings.get("content_ratings"), ["safe", "suggestive"]),
+        "content_ratings": setting_list_values(settings.get("content_ratings"), MANGADEX_DEFAULT_CONTENT_RATINGS),
         "source_order": normalize_mangadex_source_order(
             settings.get("source_order") or ["mangadex", "slskd", "prowlarr", "rss"]
         ),
@@ -36197,7 +36032,14 @@ def mangadex_result_score(query, title, attributes, preferred_languages=None):
     if attributes.get("status") in {"ongoing", "completed"}:
         score += 4
     if attributes.get("contentRating") in {"erotica", "pornographic"}:
-        score -= 35
+        # Rank mature content below an equally relevant safe title, not below a
+        # less relevant one. The relevance tiers here are 12 points apart at the
+        # narrowest (exact title 100, title-contains-query 88), so a 35 point
+        # penalty spanned two whole tiers: searching "Berserk" put the actual
+        # Berserk fourth, behind "Berserk Gaiden" and two unrelated titles that
+        # merely contain the word. Keep this smaller than the narrowest tier gap
+        # so it breaks ties inside a tier and never reorders across them.
+        score -= MANGADEX_MATURE_RATING_PENALTY
     return {
         "score": int(score),
         "note": ", ".join(notes[:3]),
@@ -37028,130 +36870,7 @@ def comicvine_fetch_issues(comicvine_id, limit=100, timeout=30, attempts=2):
     return issues
 
 
-def kapowarr_connect():
-    if not KAPOWARR_DB.exists():
-        raise RuntimeError("Kapowarr DB not found")
-    con = sqlite3.connect(KAPOWARR_DB)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def kapowarr_monitored_volumes():
-    con = kapowarr_connect()
-    try:
-        rows = con.execute(
-            """
-            select id, comicvine_id, title, year, publisher, volume_number,
-                   monitored, monitor_new_issues, folder, site_url
-            from volumes
-            where monitored = 1
-              and comicvine_id is not null
-              and title is not null
-            order by lower(title), year
-            """
-        ).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        con.close()
-
-
-def kapowarr_volume_monitor_states(volume_ids):
-    ids = sorted({int(value) for value in (volume_ids or []) if str(value or "").isdigit()})
-    if not ids:
-        return {}
-    con = kapowarr_connect()
-    try:
-        placeholders = ",".join("?" for _ in ids)
-        rows = con.execute(
-            f"""
-            select id, comicvine_id, title, monitored, monitor_new_issues
-            from volumes
-            where id in ({placeholders})
-            """,
-            ids,
-        ).fetchall()
-        out = {}
-        for row in rows:
-            item = dict(row)
-            item["monitored"] = bool(item.get("monitored"))
-            item["monitor_new_issues"] = bool(item.get("monitor_new_issues"))
-            out[int(item["id"])] = item
-        return out
-    finally:
-        con.close()
-
-
-def kapowarr_fetch_issues(volume_id):
-    con = kapowarr_connect()
-    try:
-        rows = con.execute(
-            """
-            select id, comicvine_id, issue_number, calculated_issue_number,
-                   title, date, monitored
-            from issues
-            where volume_id = ?
-            order by calculated_issue_number asc, issue_number asc
-            """,
-            (int(volume_id),),
-        ).fetchall()
-    finally:
-        con.close()
-    issues = []
-    for row in rows:
-        issue_id = str(row["comicvine_id"] or f"kapowarr-{row['id']}")
-        issues.append(
-            {
-                "id": issue_id,
-                "kapowarrIssueId": row["id"],
-                "issueNumber": str(row["issue_number"] or "").strip(),
-                "title": row["title"] or "",
-                "date": row["date"],
-                "monitored": bool(row["monitored"]),
-                "siteUrl": None,
-            }
-        )
-    return issues
-
-
-def kapowarr_missing_issues(volume_id):
-    con = kapowarr_connect()
-    try:
-        rows = con.execute(
-            """
-            select i.id, i.comicvine_id, i.issue_number, i.calculated_issue_number,
-                   i.title, i.date, i.monitored
-            from issues i
-            join volumes v on v.id = i.volume_id
-            left join issues_files f on f.issue_id = i.id
-            where i.volume_id = ?
-              and v.monitored = 1
-              and i.monitored = 1
-              and f.issue_id is null
-            order by i.calculated_issue_number asc, i.issue_number asc
-            """,
-            (int(volume_id),),
-        ).fetchall()
-    finally:
-        con.close()
-    issues = []
-    for row in rows:
-        issues.append(
-            {
-                "id": str(row["comicvine_id"] or f"kapowarr-{row['id']}"),
-                "kapowarrIssueId": row["id"],
-                "issueNumber": str(row["issue_number"] or "").strip(),
-                "title": row["title"] or "",
-                "date": row["date"],
-                "monitored": bool(row["monitored"]),
-                "siteUrl": None,
-            }
-        )
-    return issues
-
-
 def fetch_watch_issues(watch):
-    if watch.get("source") == "kapowarr" and watch.get("kapowarrId"):
-        return kapowarr_fetch_issues(watch["kapowarrId"])
     return comicvine_fetch_issues(watch["comicvineId"])
 
 
@@ -37191,83 +36910,6 @@ def mark_watch_inkdrop_owned(watch, state_row=None, adapter="kapowarr", now=None
         if state_row.get("monitor_new") not in (None, ""):
             watch["monitorNew"] = bool(state_row.get("monitor_new"))
     watch["ownershipUpdatedAt"] = now
-    return watch
-
-
-ADAPTER_BACKFILL_TRUE_VALUES = {"1", "true", "yes", "on", "allow", "allowed", "backfill", "queue"}
-ADAPTER_BACKFILL_KEYS = (
-    "allowBackfill",
-    "allow_backfill",
-    "queueBackfill",
-    "queue_backfill",
-    "backfill",
-    "monitorAndBackfill",
-    "monitor_and_backfill",
-)
-
-
-def adapter_backfill_policy_supplied(payload=None):
-    payload = payload if isinstance(payload, dict) else {}
-    if inkdrop_bool_value(payload.get("metadataOnly"), False) or inkdrop_bool_value(payload.get("metadata_only"), False):
-        return True
-    return any(key in payload for key in ADAPTER_BACKFILL_KEYS)
-
-
-def adapter_backfill_requested(payload=None, default=False):
-    payload = payload if isinstance(payload, dict) else {}
-    if inkdrop_bool_value(payload.get("metadataOnly"), False) or inkdrop_bool_value(payload.get("metadata_only"), False):
-        return False
-    for key in ADAPTER_BACKFILL_KEYS:
-        if key not in payload:
-            continue
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value.strip().lower() in ADAPTER_BACKFILL_TRUE_VALUES
-        return bool(value)
-    return bool(default)
-
-
-def kapowarr_adapter_backfill_default_enabled():
-    try:
-        config = inkdrop_state.provider_config(INKDROP_STATE_DB, "kapowarr") or {}
-    except Exception:
-        config = {}
-    settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
-    return inkdrop_bool_value(settings.get("allow_adapter_backfill"), False)
-
-
-def kapowarr_provider_settings():
-    try:
-        config = inkdrop_state.provider_config(INKDROP_STATE_DB, "kapowarr") or {}
-    except Exception:
-        config = {}
-    settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
-    return config, settings
-
-
-def kapowarr_legacy_sync_enabled(payload=None):
-    config, settings = kapowarr_provider_settings()
-    enabled = bool(config.get("enabled", False))
-    allow_legacy_sync = inkdrop_bool_value(settings.get("allow_legacy_sync"), False)
-    return bool(enabled and allow_legacy_sync)
-
-
-def annotate_adapter_backfill_policy(watch, *, allow_backfill=False, reason="kapowarr_sync", now=None, missing_count=0):
-    watch = watch if isinstance(watch, dict) else {}
-    now = now or time.time()
-    allow_backfill = bool(allow_backfill)
-    watch["adapterBackfillPolicy"] = "explicit_backfill" if allow_backfill else "metadata_only"
-    watch["adapterBackfillAllowed"] = allow_backfill
-    watch["adapterBackfillReason"] = reason
-    watch["adapterBackfillMissingCount"] = int(missing_count or 0)
-    watch["adapterBackfillUpdatedAt"] = now
-    watch["adapterBackfillUpdatedAtIso"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-    if allow_backfill:
-        watch.pop("adapterBackfillSuppressedAt", None)
-        watch.pop("adapterBackfillSuppressedAtIso", None)
-    elif missing_count:
-        watch["adapterBackfillSuppressedAt"] = now
-        watch["adapterBackfillSuppressedAtIso"] = watch["adapterBackfillUpdatedAtIso"]
     return watch
 
 
@@ -37452,14 +37094,11 @@ def refresh_missing_issues(watch, now=None):
     visible_in_kavita = kavita_visible_numbers(watch.get("name"))
     completed_numbers = completed_manga | completed_collections
     kavita_visible_suppressed = 0
-    if watch.get("source") == "kapowarr" and watch.get("kapowarrId"):
-        candidate_issues = kapowarr_missing_issues(watch["kapowarrId"])
-    else:
-        candidate_issues = [
-            dict(issue)
-            for issue in (watch.get("knownIssues") or {}).values()
-            if isinstance(issue, dict) and issue.get("monitored", True)
-        ]
+    candidate_issues = [
+        dict(issue)
+        for issue in (watch.get("knownIssues") or {}).values()
+        if isinstance(issue, dict) and issue.get("monitored", True)
+    ]
     for issue in candidate_issues:
         prior = previous.get(issue["id"], {})
         issue["searchQuery"] = issue_search_query(watch, issue)
@@ -37741,12 +37380,6 @@ def add_comic_series(payload):
     if watch.get("kapowarrId") not in (None, ""):
         watch["metadataAdapterStatus"] = "registered"
         watch["lastAdapterError"] = None
-    elif kapowarr_adapter_registration_enabled():
-        watch["metadataAdapter"] = "kapowarr"
-        watch["kapowarrRole"] = "metadata_adapter"
-        watch["metadataAdapterStatus"] = "pending"
-        watch["metadataAdapterQueuedAt"] = time.time()
-        watch["lastAdapterError"] = None
     else:
         watch["metadataAdapter"] = "kapowarr"
         watch["kapowarrRole"] = "optional_metadata_adapter"
@@ -37871,7 +37504,7 @@ def add_comic_series(payload):
                 "id": watch.get("kapowarrId"),
                 "alreadyPresent": False,
                 "title": result.get("name"),
-                "adapterEnabled": kapowarr_adapter_registration_enabled(),
+                "adapterEnabled": False,
                 "adapterPending": False,
                 "adapterJob": None,
             },
@@ -37901,12 +37534,10 @@ def add_comic_series(payload):
     )
     autopilot = autopilot_public_status()
     backfill = {"status": "handled_by_series_autopilot", "actions": [], "review": []}
-    adapter_enabled = kapowarr_adapter_registration_enabled()
-    adapter_pending = adapter_enabled and watch.get("kapowarrId") in (None, "")
+    adapter_enabled = False
+    adapter_pending = False
     adapter_job = None
-    if adapter_pending:
-        adapter_job = launch_kapowarr_adapter_registration(volume, cv_id, auto_grab=auto_grab)
-    elif not adapter_enabled and watch.get("kapowarrId") in (None, ""):
+    if watch.get("kapowarrId") in (None, ""):
         sync_summary["status"] = "adapter_disabled"
     else:
         sync_summary["status"] = "adapter_already_registered"
@@ -38464,496 +38095,6 @@ def run_post_provider_manga_companion_maintenance(reconcile_limit=1, refresh_lim
     }
 
 
-def launch_kapowarr_adapter_registration(volume, cv_id, auto_grab=True):
-    job_id = f"kapowarr-adapter-{cv_id}-{int(time.time())}"
-    worker = threading.Thread(
-        target=kapowarr_adapter_registration_worker,
-        args=(dict(volume or {}), int(cv_id), bool(auto_grab), job_id),
-        daemon=True,
-    )
-    worker.start()
-    return {"id": job_id, "status": "started"}
-
-
-def kapowarr_adapter_registration_worker(volume, cv_id, auto_grab, job_id):
-    started = time.time()
-    kapowarr_volume = None
-    adapter_error = None
-    try:
-        kapowarr_volume = kapowarr_add_volume(volume, auto_search=False)
-    except Exception as exc:
-        adapter_error = f"{type(exc).__name__}: {exc}"
-    now = time.time()
-    data = load_comic_series()
-    watch = None
-    for item in data.get("watches", []):
-        if int(item.get("comicvineId") or 0) == int(cv_id):
-            watch = item
-            break
-    if watch is not None:
-        if kapowarr_volume:
-            watch["kapowarrId"] = kapowarr_volume.get("id")
-            watch["metadataAdapter"] = "kapowarr"
-            watch["kapowarrRole"] = "metadata_adapter"
-            watch["metadataAdapterStatus"] = "registered"
-            watch["metadataAdapterUpdatedAt"] = now
-            watch["lastAdapterError"] = None
-        else:
-            watch["metadataAdapter"] = "kapowarr"
-            watch["kapowarrRole"] = "metadata_adapter"
-            watch["metadataAdapterStatus"] = "failed"
-            watch["metadataAdapterUpdatedAt"] = now
-            watch["lastAdapterError"] = adapter_error or "Optional metadata adapter registration did not return a record"
-        save_comic_series(data)
-    try:
-        record_inkdrop_series_add(
-            volume,
-            auto_grab=auto_grab,
-            status="adapter_registered" if kapowarr_volume else "adapter_failed",
-            source="comicvine",
-            watch=watch or {},
-            kapowarr_volume=kapowarr_volume or {},
-            error=adapter_error,
-        )
-    except Exception as exc:
-        adapter_error = adapter_error or f"state_record_failed: {type(exc).__name__}: {exc}"
-    watch_log(
-        "kapowarr_adapter_registration",
-        {
-            "jobId": job_id,
-            "comicvineId": cv_id,
-            "name": volume.get("name") or volume.get("title"),
-            "kapowarrId": (kapowarr_volume or {}).get("id"),
-            "status": "registered" if kapowarr_volume else "failed",
-            "error": adapter_error,
-            "durationSeconds": round(now - started, 3),
-        },
-    )
-
-
-def watch_was_explicitly_user_added(watch):
-    watch = watch if isinstance(watch, dict) else {}
-    created_by = str(watch.get("createdBy") or watch.get("created_by") or "").strip().lower()
-    return bool(
-        watch.get("inkdropUserAdded")
-        or watch.get("userAdded")
-        or created_by in {"inkdrop_add_series", "inkdrop_ui", "user"}
-        or watch.get("autoGrabUserSet")
-    )
-
-
-def watch_uses_kapowarr_adapter(watch):
-    watch = watch if isinstance(watch, dict) else {}
-    adapter = str(watch.get("metadataAdapter") or watch.get("metadata_adapter") or "").strip().lower()
-    adapter_role = str(watch.get("metadataAdapterRole") or watch.get("kapowarrRole") or "").strip().lower()
-    return bool(
-        watch.get("kapowarrId") not in (None, "")
-        and (
-            adapter == "kapowarr"
-            or "metadata_adapter" in adapter_role
-            or "adapter" in adapter_role
-        )
-    )
-
-
-def reconcile_unmonitored_kapowarr_adapters(payload=None):
-    payload = payload or {}
-    if payload.get("reconcileUnmonitored") is False or payload.get("reconcile_unmonitored") is False:
-        return {"skipped": True, "reason": "disabled_by_request"}
-    dry_run = inkdrop_gate_bool(payload, "dryRun")
-    watch_id = str(payload.get("watchId") or payload.get("id") or "").strip()
-    only_cv_id = int(payload.get("comicvineId") or payload.get("comicvine_id") or 0)
-    only_kapowarr_id = int(payload.get("kapowarrId") or payload.get("kapowarr_id") or 0)
-    data = load_comic_series()
-    watches = [watch for watch in data.get("watches", []) if isinstance(watch, dict)]
-    volume_ids = [watch.get("kapowarrId") for watch in watches if watch.get("kapowarrId") not in (None, "")]
-    monitor_states = kapowarr_volume_monitor_states(volume_ids)
-    now = time.time()
-    summary = {
-        "scanned": 0,
-        "parked": 0,
-        "wouldPark": 0,
-        "queueRetired": 0,
-        "stateParked": 0,
-        "dryRun": dry_run,
-        "samples": [],
-        "errors": [],
-    }
-    changed = False
-    state_parks = []
-    message = "Legacy metadata record is unmonitored; InkDrop automation parked this adapter-seeded series"
-    for watch in watches:
-        if watch_id and str(watch.get("id") or "") != watch_id:
-            continue
-        if only_cv_id and int(watch.get("comicvineId") or 0) != only_cv_id:
-            continue
-        if only_kapowarr_id and int(watch.get("kapowarrId") or 0) != only_kapowarr_id:
-            continue
-        kapowarr_id = int(watch.get("kapowarrId") or 0)
-        if not kapowarr_id:
-            continue
-        summary["scanned"] += 1
-        volume_state = monitor_states.get(kapowarr_id)
-        if not volume_state or volume_state.get("monitored"):
-            continue
-        if not watch_uses_kapowarr_adapter(watch) or watch_was_explicitly_user_added(watch):
-            continue
-        if (
-            watch.get("adapterAutomationParked")
-            and not watch.get("enabled", True)
-            and str(watch.get("metadataAdapterStatus") or "").lower() == "unmonitored"
-        ):
-            continue
-        sample = {
-            "id": watch.get("id"),
-            "series": watch.get("name"),
-            "comicvineId": watch.get("comicvineId"),
-            "kapowarrId": kapowarr_id,
-            "kapowarrTitle": volume_state.get("title"),
-        }
-        if dry_run:
-            summary["wouldPark"] += 1
-            summary["samples"].append(sample)
-            continue
-        previous = {
-            "enabled": watch.get("enabled", True),
-            "autoGrab": watch.get("autoGrab", True),
-            "monitorNew": watch.get("monitorNew", True),
-            "missingIssueCount": watch.get("missingIssueCount"),
-            "missingIssueTotal": watch.get("missingIssueTotal"),
-        }
-        watch["enabled"] = False
-        watch["autoGrab"] = False
-        watch["monitorNew"] = False
-        watch["missingIssues"] = []
-        watch["missingIssueCount"] = 0
-        watch["missingIssueTotal"] = 0
-        watch["newIssues"] = []
-        watch["metadataAdapterStatus"] = "unmonitored"
-        watch["adapterAutomationParked"] = True
-        watch["adapterAutomationParkedReason"] = "kapowarr_unmonitored"
-        watch["adapterAutomationParkedAt"] = now
-        watch["adapterAutomationParkedAtIso"] = series_queue_now_iso(now)
-        watch["adapterAutomationPrevious"] = previous
-        changed = True
-        identity = f"comicvine:{watch.get('comicvineId')}" if watch.get("comicvineId") else f"kapowarr:{kapowarr_id}"
-        queue_retire = retire_series_autopilot_queue_identity(
-            identity,
-            reason="kapowarr_unmonitored_adapter",
-            retired_state="adapter_unmonitored",
-            event_message=message,
-        )
-        summary["queueRetired"] += int(queue_retire.get("retired") or 0)
-        state_parks.append(
-            {
-                "series_id": identity,
-                "watch": watch,
-                "volume_state": volume_state,
-                "queue_retire": queue_retire,
-            }
-        )
-        summary["parked"] += 1
-        sample["queueRetired"] = int(queue_retire.get("retired") or 0)
-        summary["samples"].append(sample)
-    if changed:
-        save_comic_series(data)
-    if state_parks:
-        for item in state_parks:
-            try:
-                state_result = inkdrop_state.park_series_automation(
-                    INKDROP_STATE_DB,
-                    item["series_id"],
-                    reason="kapowarr_unmonitored_adapter",
-                    message=message,
-                    source="kapowarr_adapter_reconcile",
-                    raw={
-                        "watch_id": item["watch"].get("id"),
-                        "kapowarr_id": item["watch"].get("kapowarrId"),
-                        "comicvine_id": item["watch"].get("comicvineId"),
-                        "kapowarr_title": item["volume_state"].get("title"),
-                        "kapowarr_monitored": item["volume_state"].get("monitored"),
-                        "kapowarr_monitor_new_issues": item["volume_state"].get("monitor_new_issues"),
-                        "queue_retire": item["queue_retire"],
-                    },
-                )
-                if state_result.get("ok"):
-                    summary["stateParked"] += 1
-                else:
-                    summary["errors"].append(state_result)
-            except Exception as exc:
-                summary["errors"].append({"series": item["series_id"], "error": f"{type(exc).__name__}: {exc}"})
-        try:
-            summary["standaloneState"] = inkdrop_state_summary_public()
-        except Exception as exc:
-            summary["errors"].append({"standaloneState": f"{type(exc).__name__}: {exc}"})
-    if changed or summary["parked"] or summary["wouldPark"]:
-        watch_log("kapowarr_unmonitored_adapter_reconcile", summary)
-    return summary
-
-
-def sync_kapowarr_series(payload=None):
-    payload = payload or {}
-    if not kapowarr_legacy_sync_enabled(payload):
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "kapowarr_legacy_sync_disabled",
-            "message": "Kapowarr legacy sync is disabled; InkDrop native series/wanted state remains the ownership path.",
-            "next_action": "Enable the Kapowarr provider and allow_legacy_sync only for a deliberate migration/debug pass.",
-            "metadata_adapter": "kapowarr",
-            "provider_setting": "kapowarr.allow_legacy_sync",
-        }
-    dry_run = inkdrop_gate_bool(payload, "dryRun")
-    only_cv_id = int(payload.get("comicvineId") or payload.get("comicvine_id") or 0)
-    only_kapowarr_id = int(payload.get("kapowarrId") or payload.get("kapowarr_id") or 0)
-    filtered = bool(only_cv_id or only_kapowarr_id)
-    scan_issues = filtered or (
-        inkdrop_bool_value(payload.get("scanIssues"), False)
-        or inkdrop_bool_value(payload.get("forceFull"), False)
-        or inkdrop_bool_value(payload.get("full"), False)
-    )
-    create_from_adapter = filtered or inkdrop_gate_bool(payload, "createFromAdapter")
-    backfill_policy_supplied = adapter_backfill_policy_supplied(payload)
-    adapter_backfill_default = kapowarr_adapter_backfill_default_enabled()
-    allow_backfill = adapter_backfill_requested(payload, default=adapter_backfill_default)
-    backfill_gate = "explicit_backfill" if allow_backfill and backfill_policy_supplied else ("provider_default_backfill" if allow_backfill else "metadata_only")
-    adapter_reconcile = reconcile_unmonitored_kapowarr_adapters(payload)
-    data = load_comic_series()
-    by_cv = {int(w.get("comicvineId") or 0): w for w in data.get("watches", []) if w.get("comicvineId")}
-    summary = {
-        "created": 0,
-        "updated": 0,
-        "newIssues": 0,
-        "missingIssues": 0,
-        "volumes": 0,
-        "nativeOwned": 0,
-        "adapterOwned": 0,
-        "migratedToNative": 0,
-        "dryRun": dry_run,
-        "scanIssues": scan_issues,
-        "createFromAdapter": create_from_adapter,
-        "allowBackfill": allow_backfill,
-        "backfillGate": backfill_gate,
-        "backfillPolicySource": "request" if backfill_policy_supplied else "kapowarr_provider_setting",
-        "backfillDefault": adapter_backfill_default,
-        "backfillSuppressed": 0,
-        "backfillSuppressedWatches": 0,
-        "adapterReconcile": adapter_reconcile,
-        "errors": [],
-    }
-    now = time.time()
-    touched_watches = []
-    queue_watches = []
-
-    if not filtered and not scan_issues:
-        for volume in kapowarr_monitored_volumes():
-            summary["volumes"] += 1
-            try:
-                cv_id = int(volume.get("comicvine_id") or 0)
-                if not cv_id:
-                    continue
-                existing = by_cv.get(cv_id)
-                native_owned = bool(cv_id)
-                summary["nativeOwned" if native_owned else "adapterOwned"] += 1
-                if existing is None:
-                    continue
-                changed = False
-                if existing.get("kapowarrId") != volume["id"]:
-                    existing["kapowarrId"] = volume["id"]
-                    changed = True
-                previous_source = str(existing.get("source") or "").strip().lower()
-                if previous_source == "kapowarr" or existing.get("owner") != "inkdrop" or existing.get("ownership") != "native":
-                    mark_watch_inkdrop_owned(existing, state_row=None, adapter="kapowarr", now=now)
-                    changed = True
-                    if previous_source == "kapowarr":
-                        summary["migratedToNative"] += 1
-                for key, value in (
-                    ("name", safe_query(volume.get("title"))),
-                    ("year", volume.get("year")),
-                    ("publisher", volume.get("publisher")),
-                    ("siteUrl", volume.get("site_url")),
-                ):
-                    if value not in (None, "") and not existing.get(key):
-                        existing[key] = value
-                        changed = True
-                summary["updated"] += 1
-                if changed:
-                    existing["lastAdapterSync"] = now
-                    touched_watches.append(existing)
-            except Exception as exc:
-                summary["errors"].append({"volume": volume.get("title"), "error": str(exc)})
-        if not dry_run:
-            if touched_watches:
-                save_comic_series(data)
-            summary["queueTargets"] = 0
-            summary["queue"] = {
-                "created": 0,
-                "resurrected": 0,
-                "updated": 0,
-                "migratedIdentity": 0,
-                "normalizedNativeIdentity": 0,
-                "watches": 0,
-                "missingIssues": 0,
-                "reason": "kapowarr_sync",
-            }
-            summary["standaloneState"] = inkdrop_state_summary_public()
-            watch_log("kapowarr_series_sync", summary)
-        return summary
-
-    for volume in kapowarr_monitored_volumes():
-        if only_cv_id and int(volume.get("comicvine_id") or 0) != only_cv_id:
-            continue
-        if only_kapowarr_id and int(volume.get("id") or 0) != only_kapowarr_id:
-            continue
-        summary["volumes"] += 1
-        try:
-            cv_id = int(volume.get("comicvine_id") or 0)
-            if not cv_id:
-                continue
-            state_row = inkdrop_native_series_row(cv_id) if filtered else None
-            native_owned = bool(cv_id)
-            issues = kapowarr_fetch_issues(volume["id"]) if scan_issues else []
-            existing = by_cv.get(cv_id)
-            if existing is None:
-                if not create_from_adapter:
-                    summary["nativeOwned" if native_owned else "adapterOwned"] += 1
-                    continue
-                known = {}
-                for issue in issues:
-                    issue["searchQuery"] = f"{volume.get('title') or ''} {issue.get('issueNumber') or ''}".strip()
-                    issue["firstSeen"] = now
-                    known[issue["id"]] = issue
-                watch = {
-                    "id": uuid.uuid4().hex[:12],
-                    "comicvineId": cv_id,
-                    "kapowarrId": volume["id"],
-                    "name": safe_query(volume.get("title")),
-                    "year": volume.get("year"),
-                    "publisher": volume.get("publisher"),
-                    "issueCount": len(known),
-                    "siteUrl": volume.get("site_url"),
-                    "image": None,
-                    "source": "kapowarr",
-                    "enabled": True,
-                    "autoGrab": True,
-                    "created": now,
-                    "lastScan": now,
-                    "lastError": None,
-                    "knownIssues": known,
-                    "newIssues": [],
-                    "missingIssues": [],
-                    "missingIssueCount": 0,
-                    "missingIssueTotal": 0,
-                }
-                if native_owned:
-                    mark_watch_inkdrop_owned(watch, state_row=state_row, adapter="kapowarr", now=now)
-                missing_count = refresh_missing_issues(watch, now)
-                annotate_adapter_backfill_policy(
-                    watch,
-                    allow_backfill=allow_backfill,
-                    reason="kapowarr_sync_create",
-                    now=now,
-                    missing_count=missing_count,
-                )
-                if not allow_backfill and missing_count:
-                    summary["backfillSuppressed"] += missing_count
-                    summary["backfillSuppressedWatches"] += 1
-                if not dry_run:
-                    data["watches"].append(watch)
-                    by_cv[cv_id] = watch
-                    touched_watches.append(watch)
-                    if allow_backfill:
-                        queue_watches.append(watch)
-                summary["created"] += 1
-                summary["missingIssues"] += missing_count
-                summary["nativeOwned" if native_owned else "adapterOwned"] += 1
-                continue
-
-            existing["kapowarrId"] = volume["id"]
-            previous_source = str(existing.get("source") or "").strip().lower()
-            if native_owned:
-                mark_watch_inkdrop_owned(existing, state_row=state_row, adapter="kapowarr", now=now)
-                if previous_source == "kapowarr":
-                    summary["migratedToNative"] += 1
-            else:
-                existing["source"] = "kapowarr"
-                existing.setdefault("metadataAdapter", None)
-            existing["name"] = existing.get("name") or safe_query(volume.get("title"))
-            existing["year"] = existing.get("year") or volume.get("year")
-            existing["publisher"] = existing.get("publisher") or volume.get("publisher")
-            existing["siteUrl"] = existing.get("siteUrl") or volume.get("site_url")
-            if "autoGrab" not in existing:
-                existing["autoGrab"] = True
-            existing.setdefault("knownIssues", {})
-            existing.setdefault("newIssues", [])
-            added = 0
-            if scan_issues:
-                for issue in issues:
-                    issue_id = issue["id"]
-                    if issue_id in existing["knownIssues"]:
-                        continue
-                    issue["searchQuery"] = issue_search_query(existing, issue)
-                    issue["firstSeen"] = now
-                    issue["status"] = "new"
-                    if not dry_run:
-                        existing["knownIssues"][issue_id] = issue
-                        existing["newIssues"].insert(0, issue)
-                    added += 1
-                known_count = len(existing.get("knownIssues", {})) + (added if dry_run else 0)
-                existing["issueCount"] = max(int(existing.get("issueCount") or 0), known_count)
-                missing_count = refresh_missing_issues(existing, now)
-            else:
-                missing_count = int(existing.get("missingIssueCount") or 0)
-            annotate_adapter_backfill_policy(
-                existing,
-                allow_backfill=allow_backfill,
-                reason="kapowarr_sync",
-                now=now,
-                missing_count=missing_count,
-            )
-            summary["missingIssues"] += missing_count
-            existing["lastScan"] = now
-            existing["lastError"] = None
-            summary["updated"] += 1
-            summary["newIssues"] += added
-            summary["nativeOwned" if native_owned else "adapterOwned"] += 1
-            touched_watches.append(existing)
-            if scan_issues and not allow_backfill and missing_count:
-                summary["backfillSuppressed"] += missing_count
-                summary["backfillSuppressedWatches"] += 1
-            if scan_issues and (added or missing_count or previous_source == "kapowarr"):
-                if allow_backfill:
-                    queue_watches.append(existing)
-        except Exception as exc:
-            summary["errors"].append({"volume": volume.get("title"), "error": str(exc)})
-
-    if not dry_run:
-        for watch in data.get("watches", []):
-            if watch.get("newIssues"):
-                watch["newIssues"] = watch["newIssues"][:80]
-            if watch.get("missingIssues"):
-                watch["missingIssues"] = watch["missingIssues"][:120]
-        save_comic_series(data)
-        enqueue_targets = queue_watches
-        summary["queueTargets"] = len(enqueue_targets)
-        if enqueue_targets:
-            summary["queue"] = enqueue_comic_series_watches(enqueue_targets, reason="kapowarr_sync")
-        else:
-            summary["queue"] = {
-                "created": 0,
-                "resurrected": 0,
-                "updated": 0,
-                "migratedIdentity": 0,
-                "normalizedNativeIdentity": 0,
-                "watches": 0,
-                "missingIssues": 0,
-                "reason": "kapowarr_sync" if allow_backfill else "kapowarr_sync_metadata_only",
-            }
-        summary["standaloneState"] = inkdrop_state_summary_public()
-        watch_log("kapowarr_series_sync", summary)
-    return summary
-
-
 def update_comic_series(payload):
     watch_id = str(payload.get("id") or "")
     data = load_comic_series()
@@ -39216,13 +38357,7 @@ def scan_comic_series(payload):
         and (not only_cv_id or int(watch.get("comicvineId") or 0) == only_cv_id)
         and (not only_kapowarr_id or int(watch.get("kapowarrId") or 0) == only_kapowarr_id)
     ]
-    # Legacy Kapowarr-backed watches remain available for an explicit single-series
-    # refresh, but must not make the broad scheduler bypass ComicVine readiness.
-    adapter_can_scan = filtered and any(
-        watch.get("source") == "kapowarr" and watch.get("kapowarrId")
-        for watch in eligible_watches
-    )
-    if provider_status != "configured" and not adapter_can_scan:
+    if provider_status != "configured":
         summary.update(
             {
                 "status": provider_status,
@@ -42250,7 +41385,6 @@ def inkdrop_log_health_items(log_dir=None, explicit_paths=None, limit=SYSTEM_HEA
             FRESH_SWEEP_LOG,
             HOT_SWEEP_LOG,
             MISSING_ACQUIRE_LOG,
-            KAPOWARR_SYNC_LOG,
             RSS_DISCOVERY_LOG,
             COMICSCODES_DISCOVERY_LOG,
             SLSKD_SOURCE_PROBE_LOG,
@@ -43308,21 +42442,17 @@ def qbittorrent_api_health(timeout=4.0):
         acquire = load_acquire_module()
         qbit = acquire.load_qbit_settings()
         session = requests.Session()
-        login = session.post(
-            qbit["host"].rstrip("/") + "/api/v2/auth/login",
-            data={"username": qbit["user"], "password": qbit["pass"]},
-            timeout=timeout,
-        )
-        elapsed_ms = round((time.time() - started) * 1000)
-        if login.status_code in {401, 403} or "fail" in str(login.text or "").strip().lower():
+        try:
+            inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=timeout)
+        except inkdrop_qbittorrent_auth.QbitAuthError as exc:
             return {
                 "state": "watch",
                 "label": "auth failed",
-                "detail": "qBittorrent rejected the configured username/password.",
+                "detail": exc.reason,
+                "auth_failure": exc.kind,
                 "base_url": qbit["host"],
-                "latency_ms": elapsed_ms,
+                "latency_ms": round((time.time() - started) * 1000),
             }
-        login.raise_for_status()
         version_response = session.get(qbit["host"].rstrip("/") + "/api/v2/app/version", timeout=timeout)
         elapsed_ms = round((time.time() - started) * 1000)
         version_response.raise_for_status()
@@ -43415,14 +42545,10 @@ def qbittorrent_transfer_snapshots(timeout=4.0):
         qbit = acquire.load_qbit_settings()
         session = requests.Session()
         base = str(qbit.get("host") or "").rstrip("/")
-        login = session.post(
-            base + "/api/v2/auth/login",
-            data={"username": qbit.get("user"), "password": qbit.get("pass")},
-            timeout=timeout,
-        )
-        if login.status_code in {401, 403} or "fail" in str(login.text or "").strip().lower():
-            return {"ok": False, "client": "qbittorrent", "available": False, "error": "qBittorrent auth failed"}
-        login.raise_for_status()
+        try:
+            inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=timeout)
+        except inkdrop_qbittorrent_auth.QbitAuthError as exc:
+            return {"ok": False, "client": "qbittorrent", "available": False, "error": exc.reason, "auth_failure": exc.kind}
         response = session.get(base + "/api/v2/torrents/info", timeout=timeout)
         response.raise_for_status()
         torrents = response.json()
@@ -46897,19 +46023,6 @@ def runtime_provider_settings():
             sab_host = None
 
     runtime_paths = inkdrop_runtime_paths()
-    kapowarr_register_new_series = False
-    kapowarr_allow_adapter_backfill = False
-    kapowarr_allow_legacy_sync = False
-    try:
-        existing_kapowarr = inkdrop_state.provider_config(INKDROP_STATE_DB, "kapowarr") or {}
-        existing_kapowarr_settings = existing_kapowarr.get("settings") if isinstance(existing_kapowarr.get("settings"), dict) else {}
-        kapowarr_register_new_series = inkdrop_bool_value(existing_kapowarr_settings.get("register_new_series"), False)
-        kapowarr_allow_adapter_backfill = inkdrop_bool_value(existing_kapowarr_settings.get("allow_adapter_backfill"), False)
-        kapowarr_allow_legacy_sync = inkdrop_bool_value(existing_kapowarr_settings.get("allow_legacy_sync"), False)
-    except Exception:
-        kapowarr_register_new_series = False
-        kapowarr_allow_adapter_backfill = False
-        kapowarr_allow_legacy_sync = False
 
     provider(
         "comicvine",
@@ -46917,7 +46030,7 @@ def runtime_provider_settings():
         "ComicVine",
         enabled=True,
         base_url=COMICVINE_API,
-        secret_ref="InkDrop provider setting: api_key; fallback Kapowarr DB config: comicvine_api_key",
+        secret_ref="InkDrop provider setting: api_key",
         settings_payload={
             "adapter": "native_search",
             "user_agent": COMICVINE_USER_AGENT,
@@ -46942,7 +46055,7 @@ def runtime_provider_settings():
             "requires_manual_confirm": False,
             "translated_languages": ["en"],
             "allowed_languages": ["en"],
-            "content_ratings": ["safe", "suggestive"],
+            "content_ratings": list(MANGADEX_DEFAULT_CONTENT_RATINGS),
             "health_provider_ids": ["mangadex", "mangadex_api"],
             "user_agent": MANGADEX_USER_AGENT,
             "data_saver": False,
@@ -46954,7 +46067,7 @@ def runtime_provider_settings():
             "allowed_image_extensions": [".jpg", ".jpeg", ".png", ".webp"],
             "policy": {
                 "allowed_languages": ["en"],
-                "content_ratings": ["safe", "suggestive"],
+                "content_ratings": list(MANGADEX_DEFAULT_CONTENT_RATINGS),
                 "health_provider_ids": ["mangadex", "mangadex_api"],
                 "fetch_at_home_pages": True,
                 "mangadex_page_quality": "data",
@@ -46986,23 +46099,6 @@ def runtime_provider_settings():
                 "allowed_image_extensions",
                 "source_order",
             ],
-        },
-    )
-    provider(
-        "kapowarr",
-        "metadata_adapter",
-        "Kapowarr",
-        enabled=bool(KAPOWARR_DB.exists() and kapowarr_register_new_series),
-        base_url=KAPOWARR_URL,
-        secret_ref="Kapowarr DB config: api_key",
-        settings_payload={
-            "role": "temporary_adapter",
-            "db_path": str(KAPOWARR_DB),
-            "adapter_available": KAPOWARR_DB.exists(),
-            "register_new_series": kapowarr_register_new_series,
-            "allow_adapter_backfill": kapowarr_allow_adapter_backfill,
-            "allow_legacy_sync": kapowarr_allow_legacy_sync,
-            "editable_fields": ["register_new_series", "allow_adapter_backfill", "allow_legacy_sync"],
         },
     )
     provider(
@@ -47762,7 +46858,7 @@ def runtime_provider_settings():
                 "scope": "setup",
                 "label": "External Adapters Optional",
                 "value": True,
-                "description": "Treat Prowlarr, download clients, SLSKD, Suwayomi, Kavita, Komga, and Kapowarr as optional adapters rather than startup requirements.",
+                "description": "Treat Prowlarr, download clients, SLSKD, Suwayomi, Kavita, and Komga as optional adapters rather than startup requirements.",
                 "source": "runtime",
             },
             {
@@ -48103,14 +47199,6 @@ PROVIDER_SETTINGS_META = {
         "applied_by": ["Prowlarr acquire worker", "SLSKD source probe", "Manual intake", "Pack importer"],
         "ownership": "native",
     },
-    "kapowarr": {
-        "settings_group": "adapters",
-        "automation_role": "Temporary metadata adapter",
-        "description": "Compatibility bridge while InkDrop owns series/wanted state.",
-        "next_action": "Keep disabled for new-series ownership unless adapter fallback is needed.",
-        "applied_by": ["Legacy metadata adapter", "Legacy fallback only"],
-        "ownership": "adapter",
-    },
 }
 
 
@@ -48358,11 +47446,6 @@ PROVIDER_FIELD_HELP = {
         "manga_companion_folder_convergence": "Kavita and Komga group by physical folder, not by matching metadata across folders -- a companion tracking chapters ahead of a volume release will otherwise show as a second, incomplete series tile. On by default; turn off only if you deliberately want companion chapters kept separate.",
         "import_conflict_policy": "skip_existing avoids replacing files until replacement/upgrade quality profiles exist.",
         "minimum_free_space_gb": "Managed imports will refuse the planned path if the comic or manga root would fall below this floor.",
-    },
-    "kapowarr": {
-        "register_new_series": "When off, InkDrop keeps new-series ownership native and treats Kapowarr as adapter-only.",
-        "allow_adapter_backfill": "When off, bulk Kapowarr syncs update metadata only. Turn on only if you want Kapowarr-adopted missing rows to queue automatically.",
-        "allow_legacy_sync": "When off, the old Kapowarr sync endpoint is a no-op so InkDrop does not rely on the adapter during normal operation.",
     },
     "komga": {
         "username": "Komga account used for API checks. Leave blank until Komga is running and reachable.",
@@ -48632,7 +47715,6 @@ def settings_provider_group_public(provider):
         "quality_language_rules": "language",
         "rss": "automation",
         "comicscodes": "automation",
-        "kapowarr": "automation",
     }
     if provider_id in provider_groups:
         return provider_groups[provider_id]
@@ -49136,6 +48218,11 @@ def augment_settings_provider_health(snapshot, live_health=False):
         if not isinstance(provider, dict):
             providers.append(provider)
             continue
+        if str(provider.get("id") or "").strip().lower() == "kapowarr":
+            # Kapowarr is retired. A provider_configs row can still exist from
+            # before retirement; keep the stored row for rollback/audit but
+            # never surface it on the Settings page.
+            continue
         item = dict(provider)
         provider_key = inkdrop_state.provider_activity_key(provider.get("id"))
         provider_row = provider_rows.get(provider_key) or {}
@@ -49281,14 +48368,17 @@ def provider_settings_patch_from_payload(payload):
     return provider_id, patch
 
 
-def runtime_provider_template_for_claim(provider_id):
-    provider_id = str(provider_id or "").strip()
-    runtime_provider = None
+def runtime_provider_by_id(provider_id):
+    provider_id = str(provider_id or "").strip().lower()
     runtime = runtime_provider_settings()
     for provider in runtime.get("providers") or []:
-        if str(provider.get("id") or "").strip().lower() == provider_id.lower():
-            runtime_provider = provider
-            break
+        if str(provider.get("id") or "").strip().lower() == provider_id:
+            return provider
+    return None
+
+
+def runtime_provider_template_for_claim(provider_id):
+    runtime_provider = runtime_provider_by_id(provider_id)
     runtime_settings = (
         runtime_provider.get("settings")
         if isinstance(runtime_provider, dict) and isinstance(runtime_provider.get("settings"), dict)
@@ -49317,7 +48407,15 @@ def update_inkdrop_provider_settings(payload):
     except ValueError as exc:
         if "provider config not found" not in str(exc).lower():
             raise
-        return claim_inkdrop_provider_settings(payload)
+        # The settings UI shows every runtime provider (native or template) even
+        # before its row has ever been synced into provider_configs. Saving one
+        # of those should just seed the row from its runtime defaults and apply
+        # the edit, not require it to be a user-addable "claim" template.
+        runtime_provider = runtime_provider_by_id(provider_id)
+        if not runtime_provider:
+            raise
+        inkdrop_state.sync_settings(INKDROP_STATE_DB, providers=[runtime_provider], settings=[])
+        return inkdrop_state.update_provider_config(INKDROP_STATE_DB, provider_id, patch)
 
 
 def add_inkdrop_provider_from_template(payload):
@@ -50061,15 +49159,6 @@ def update_inkdrop_app_setting(payload):
             raise
         inkdrop_state.sync_settings(INKDROP_STATE_DB, providers=[], settings=[seed])
         return inkdrop_state.update_app_setting(INKDROP_STATE_DB, key, value)
-
-
-def kapowarr_adapter_registration_enabled():
-    try:
-        config = inkdrop_state.provider_config(INKDROP_STATE_DB, "kapowarr") or {}
-    except Exception:
-        config = {}
-    settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
-    return bool(config.get("enabled", KAPOWARR_DB.exists())) and bool(settings.get("register_new_series", False))
 
 
 def record_inkdrop_series_add(volume, **kwargs):
@@ -53722,12 +52811,7 @@ def qbit_pack_state(record, title):
         qbit = acquire.load_qbit_settings()
         session = requests.Session()
         base = str(qbit.get("host") or "").rstrip("/")
-        login = session.post(
-            base + "/api/v2/auth/login",
-            data={"username": qbit.get("user"), "password": qbit.get("pass")},
-            timeout=3,
-        )
-        login.raise_for_status()
+        inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=3)
         torrents = session.get(base + "/api/v2/torrents/info", timeout=5).json()
     except Exception as exc:
         message = re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", str(exc))
@@ -55485,9 +54569,6 @@ def script_status():
         "queue_mode": inkdrop_bool_setting("automation.queue_mode", True),
         "automatic_search_enabled": SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED,
         "automatic_search_interval_seconds": SERIES_QUEUE_RUNNER_AUTOPILOT_MIN_SECONDS,
-        "kapowarr_missing_fallback": False,
-        "kapowarr_path_fallback": False,
-        "kapowarr_completed_import_fallback": False,
         "source_order": configured_series_autopilot_source_order(),
     }
     manual_comics_inbox = runtime_paths["manual_comics_inbox"]
@@ -55517,7 +54598,6 @@ def script_status():
         HOT_SWEEP_LOG,
         FRESH_SWEEP_LOG,
         MISSING_ACQUIRE_LOG,
-        KAPOWARR_SYNC_LOG,
         RSS_DISCOVERY_LOG,
         RSS_DISCOVERY_STATUS_FILE,
         COMICSCODES_DISCOVERY_LOG,
@@ -55531,7 +54611,6 @@ def script_status():
     age = None if not log_mtime else round((time.time() - log_mtime) / 60, 1)
     hot_sweep_age = age_minutes(HOT_SWEEP_LOG)
     fresh_sweep_age = age_minutes(FRESH_SWEEP_LOG)
-    kapowarr_sync_age = age_minutes(KAPOWARR_SYNC_LOG)
     missing_worker_age = age_minutes(MISSING_ACQUIRE_LOG)
     autopilot_age = age_minutes(SERIES_AUTOPILOT_STATUS_FILE)
     autopilot_status = autopilot_public_status()
@@ -56118,7 +55197,6 @@ def script_status():
         "actionable_sab_failure_count": actionable_sab_failure_count,
         "hot_sweep_minutes": hot_sweep_age,
         "fresh_sweep_minutes": fresh_sweep_age,
-        "kapowarr_sync_minutes": kapowarr_sync_age,
         "missing_worker_minutes": missing_worker_age,
         "rss_discovery_minutes": rss_discovery_age,
         "rss_candidates_found": int(rss_status.get("candidates_found") or 0) if isinstance(rss_status, dict) else 0,
@@ -57676,9 +56754,6 @@ def light_script_status():
         "queue_mode": inkdrop_bool_setting("automation.queue_mode", True),
         "automatic_search_enabled": SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED,
         "automatic_search_interval_seconds": SERIES_QUEUE_RUNNER_AUTOPILOT_MIN_SECONDS,
-        "kapowarr_missing_fallback": False,
-        "kapowarr_path_fallback": False,
-        "kapowarr_completed_import_fallback": False,
         "source_order": configured_series_autopilot_source_order(),
     }
     active_downloads = int(reconcile_status.get("active_downloads") or 0) if isinstance(reconcile_status, dict) else 0
@@ -59989,8 +59064,6 @@ class Handler(BaseHTTPRequestHandler):
                         bool(data.get("monitored", True)),
                     )
                 )
-            elif path == "/api/kapowarr/sync":
-                self.send_json({"ok": True, "result": sync_kapowarr_series(data)})
             elif path == "/api/missing/process":
                 series = safe_query(data.get("series")) if data.get("series") else None
                 self.send_json({"ok": True, "result": run_missing_acquire(fresh=False, series=series)})

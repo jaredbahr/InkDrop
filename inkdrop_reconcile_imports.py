@@ -19,6 +19,7 @@ from pathlib import Path
 import requests
 
 import inkdrop_runtime_config
+import inkdrop_qbittorrent_auth
 import inkdrop_download_client_routing
 
 
@@ -1371,8 +1372,12 @@ def qbit_settings():
             host = str(cfg.get("host") or "").strip().rstrip("/")
             user = str(cfg.get("user") or "").strip()
             password = str(cfg.get("pass") or "").strip()
-            if host and user and password:
-                return {"host": host, "user": user, "pass": password}
+            api_key = str(cfg.get("api_key") or "").strip()
+            # An API key is a complete credential on its own; requiring a
+            # username here made key-only setups fall through to the
+            # qbit_manage fallback and then silently reconcile nothing.
+            if host and (api_key or (user and password)):
+                return {"host": host, "user": user, "pass": password, "api_key": api_key}
     except Exception:
         pass
     try:
@@ -1388,16 +1393,18 @@ def qbit_settings():
             "host": host,
             "user": str(os.environ.get("INKDROP_QBITTORRENT_USERNAME") or cfg["user"]),
             "pass": str(os.environ.get("INKDROP_QBITTORRENT_PASSWORD") or cfg["pass"]),
+            "api_key": str(os.environ.get("INKDROP_QBITTORRENT_API_KEY") or "").strip(),
         }
     except Exception:
         host = str(os.environ.get("INKDROP_QBITTORRENT_URL") or "").strip().rstrip("/")
         user = str(os.environ.get("INKDROP_QBITTORRENT_USERNAME") or "").strip()
         password = str(os.environ.get("INKDROP_QBITTORRENT_PASSWORD") or "").strip()
-        if not host or not user or not password:
+        api_key = str(os.environ.get("INKDROP_QBITTORRENT_API_KEY") or "").strip()
+        if not host or not (api_key or (user and password)):
             return None
         if not host.startswith(("http://", "https://")):
             host = "http://" + host
-        return {"host": host, "user": user, "pass": password}
+        return {"host": host, "user": user, "pass": password, "api_key": api_key}
 
 
 def longest_prefix_host_root(mappings, normalized):
@@ -1836,12 +1843,7 @@ def qbit_items():
         return []
     try:
         session = requests.Session()
-        login = session.post(
-            cfg["host"] + "/api/v2/auth/login",
-            data={"username": cfg["user"], "password": cfg["pass"]},
-            timeout=15,
-        )
-        login.raise_for_status()
+        inkdrop_qbittorrent_auth.authenticate_settings(session, cfg, timeout=15)
         torrents = session.get(cfg["host"] + "/api/v2/torrents/info", timeout=20).json()
         out = []
         for torrent in torrents:

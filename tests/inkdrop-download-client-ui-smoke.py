@@ -4,7 +4,7 @@
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 WEB = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8")
 JS = (ROOT / "web/static/js/inkdrop-download-clients-ui.js").read_text(encoding="utf-8")
 CSS = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")

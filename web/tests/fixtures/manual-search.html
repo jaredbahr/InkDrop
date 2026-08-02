@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>InkDrop Manual Search Fixture</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../static/css/inkdrop.css">
+  <style>
+    body { margin: 0; background: #111820; color: #dce7f0; font-family: Arial, sans-serif; }
+    .fixture-page { min-height: 100vh; padding: 24px; }
+    .fixture-page button { padding: 10px 14px; }
+  </style>
+</head>
+<body>
+  <main class="fixture-page">
+    <h1>Wanted</h1>
+    <p>Manual Search fixture for a canonical issue.</p>
+    <button id="openFixture" type="button">Manual Search</button>
+  </main>
+  <script>
+    (() => {
+      const params = new URLSearchParams(location.search);
+      const mode = params.get("mode") || "results";
+      const calls = [];
+      let grabCount = 0;
+      const attempts = [
+        {
+          provider_id: "prowlarr",
+          provider_display_name: "Prowlarr",
+          child_source_name: "DOGnzb",
+          state: mode === "timeout" ? "timed_out" : mode === "credentials" ? "provider_failure" : "complete",
+          error_code: mode === "credentials" ? "provider_failure" : null,
+          diagnostics: mode === "credentials" ? {
+            provider_rows: [{ provider_id: "prowlarr", result_status: "provider_wait", failure_code: "provider_credentials_unavailable" }]
+          } : {}
+        },
+        ...(mode === "credentials" ? [{
+          provider_id: "direct",
+          provider_display_name: "Direct",
+          state: "provider_failure",
+          error_code: "provider_failure",
+          diagnostics: { provider_rows: [{ provider_id: "comicscodes", result_status: "provider_wait", failure_code: "provider_http_error" }] }
+        }] : []),
+        { provider_id: "slskd", provider_display_name: "SLSKD", state: "complete" },
+        { provider_id: "suwayomi", provider_display_name: "Suwayomi", child_source_name: "Weeb Central", state: "complete" },
+        { provider_id: "getcomics", provider_display_name: "RSS", child_source_name: "GetComics", state: "complete" }
+      ];
+      const result = (overrides) => ({
+        candidate_id: `candidate-${Math.random().toString(16).slice(2)}`,
+        original_title: "The Example #12 (2026) Digital",
+        provider_id: "prowlarr",
+        provider_display_name: "Prowlarr",
+        child_source_name: "DOGnzb",
+        protocol: "usenet",
+        interpreted_work: "The Example",
+        interpreted_edition: "Digital",
+        interpreted_unit_number: "12",
+        interpreted_publisher: "Example Press",
+        interpreted_year: 2026,
+        language: "English",
+        format: "CBZ",
+        size_bytes: 73400320,
+        age_seconds: 7200,
+        seeders: null,
+        pack_candidate: false,
+        match_score: 98,
+        accepted: true,
+        acquisition_capability: "automatic",
+        query_evidence: { query: "The Example 12" },
+        source_health_snapshot: { status: "healthy" },
+        decision: { decision: "safe_match", positive_evidence: ["exact issue match", "title alias matched"], negative_evidence: [], explanation: "Core matched the work and unit identity." },
+        ...overrides
+      });
+      const results = ["zero", "timeout", "credentials"].includes(mode) ? [] : [
+        result({ candidate_id: "safe-usenet" }),
+        result({ candidate_id: "safe-torrent", provider_id: "prowlarr-torrent-with-an-adversarially-long-identifier", child_source_name: "TorrentLeech with a deliberately long indexer display name", protocol: "torrent", seeders: 42, original_title: "The Example 012 2026 Digital-Group with an exceptionally long release title that must remain inside the result panel", match_score: 96 }),
+        result({ candidate_id: "safe-slskd", provider_id: "slskd", provider_display_name: "SLSKD", child_source_name: "", protocol: "soulseek", remote_availability: "Available", original_title: "The Example 012.cbz", match_score: 94 }),
+        result({ candidate_id: "safe-suwayomi", provider_id: "suwayomi", provider_display_name: "Suwayomi", child_source_name: "Weeb Central", protocol: "direct", format: "Pages", original_title: "The Example - Chapter 12", match_score: 92 }),
+        result({ candidate_id: "assisted-getcomics", provider_id: "getcomics", provider_display_name: "RSS", child_source_name: "GetComics", protocol: "direct", original_title: "The Example Vol. 2", accepted: false, assisted_only: true, acquisition_capability: "assisted", match_score: 78, decision: { decision: "assisted", positive_evidence: ["work title matched"], negative_evidence: ["automatic retrieval unavailable"], explanation: "Open the source page and place the file in Manual Inbox." } }),
+        result({ candidate_id: "safe-direct", provider_id: "direct", provider_display_name: "RSS / Direct", child_source_name: "Configured feed", protocol: "direct", original_title: "The Example 12.cbz", match_score: 91 }),
+        result({ candidate_id: "safe-pack", provider_id: "prowlarr-torrent", child_source_name: "TorrentLeech", protocol: "torrent", original_title: "The Example 001-020 Complete", pack_candidate: true, pack_type: "Issue range", likely_wanted_coverage: 8, size_bytes: 45097156608, seeders: 17, match_score: 88, decision: { decision: "safe_match", positive_evidence: ["pack covers wanted unit"], negative_evidence: ["pack size warning"], explanation: "Core permits an explicit grab after confirmation." } }),
+        result({ candidate_id: "collected-rejected", provider_id: "prowlarr", original_title: "The Example Omnibus", interpreted_edition: "Collected edition", accepted: false, match_score: 45, force_grab: { eligible: true, reason: "Explicit admin override is available.", rejection_codes: ["collected edition does not replace individual issues"] }, decision: { decision: "rejected", positive_evidence: ["work title matched"], negative_evidence: ["collected edition does not replace individual issues"], explanation: "Core rejected this edition for the requested unit." } }),
+        result({ candidate_id: "already-active", original_title: "The Example #12 - Existing Job", accepted: false, already_downloading: true, match_score: 90, decision: { decision: "already_downloading", positive_evidence: ["duplicate client job"], negative_evidence: [], explanation: "The download client already has this candidate." } })
+      ];
+      window.fixtureState = { calls, get grabCount() { return grabCount; } };
+      window.InkDropApi = {
+        async request(path, options = {}) {
+          calls.push({ path, method: options.method || "GET", body: options.body || null });
+          if (mode === "session" && path.includes("/grab")) throw { status: 401, code: "session_expired", detail: "Session expired" };
+          if (path === "/api/manual-search/runs" && options.method === "POST") return { ok: true, run_id: "fixture-run", state: "queued", providers: attempts, source_profile: { display_name: "Comics / English" }, context: {} };
+          if (path === "/api/manual-search/runs/fixture-run") return { ok: true, run: { id: "fixture-run", state: mode === "timeout" ? "timed_out" : mode === "credentials" ? "partial" : "complete" }, candidate_counts: { accepted: results.filter((item) => item.accepted).length, rejected: results.filter((item) => !item.accepted).length }, provider_attempts: attempts };
+          if (path.startsWith("/api/manual-search/runs/fixture-run/results")) {
+            const includeRejected = new URL(path, location.origin).searchParams.get("include_rejected") === "1";
+            const visibleResults = includeRejected ? results : results.filter((item) => item.accepted);
+            return { ok: true, run_id: "fixture-run", results: visibleResults, total: visibleResults.length, limit: 500, offset: 0 };
+          }
+          if (path.endsWith("/diagnostics")) return { ok: true, run_id: "fixture-run", provider_attempts: attempts, queries: [{ provider_id: "prowlarr", query: "The Example 12" }] };
+          if (path.endsWith("/cancel")) return { ok: true, state: "cancelled" };
+          if (path.includes("/grab")) { grabCount += 1; await new Promise((resolve) => setTimeout(resolve, 80)); return { ok: true, queue_id: "queue-fixture" }; }
+          throw { status: 404, code: "fixture_route_missing", detail: path };
+        }
+      };
+    })();
+  </script>
+  <script src="../../static/js/inkdrop-manual-search.js"></script>
+  <script>
+    const context = { series_id: "series-fixture", issue_id: "issue-fixture", series_title: "The Example", issue_number: "12", issue_title: "A Safe Search", source_profile_summary: "Comics / English" };
+    document.getElementById("openFixture").addEventListener("click", () => window.InkDropManualSearch.open(context));
+    window.InkDropManualSearch.open(context);
+  </script>
+</body>
+</html>

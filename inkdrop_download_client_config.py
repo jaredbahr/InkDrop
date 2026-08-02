@@ -30,7 +30,11 @@ TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "canceled", "removed
 
 
 DEFAULT_TYPE_SCHEMAS = {
-    "qbittorrent": {"implemented": True, "protocols": ["torrent"], "required_fields": ["base_url", "username"], "secret_fields": ["password"], "required_secret_fields": ["password"]},
+    # qBittorrent 5.2.0 added API keys, which authenticate without a Web UI
+    # user at all. Requiring username+password here blocked those users from
+    # saving a client before any network call happened, so the requirement is
+    # "one of password or api_key" with username paired to password below.
+    "qbittorrent": {"implemented": True, "protocols": ["torrent"], "required_fields": ["base_url"], "secret_fields": ["password", "api_key"], "required_secret_fields_any": ["password", "api_key"]},
     "sabnzbd": {"implemented": True, "protocols": ["usenet"], "required_fields": ["base_url"], "secret_fields": ["api_key"], "required_secret_fields": ["api_key"]},
     "slskd": {"implemented": True, "protocols": ["soulseek"], "required_fields": ["base_url"], "secret_fields": ["api_key"], "required_secret_fields": ["api_key"]},
     "transmission": {"implemented": True, "protocols": ["torrent"], "required_fields": ["base_url"], "secret_fields": ["password"], "required_secret_fields": []},
@@ -350,6 +354,12 @@ def _validate_ready(candidate, configured_secrets):
     any_fields = list(schema.get("required_secret_fields_any") or [])
     if any_fields and not any(configured_secrets.get(field) for field in any_fields):
         raise ValueError(f"one of {', '.join(any_fields)} is required when the client is enabled")
+    if candidate["client_type"] == "qbittorrent":
+        # An API key stands alone. A password does not: qBittorrent's login
+        # endpoint takes both fields, so a password with no username can only
+        # ever produce a confusing "Fails." from the far end.
+        if configured_secrets.get("password") and not candidate.get("username"):
+            raise ValueError("qBittorrent needs a username with the password, or an API key instead")
     if candidate["client_type"] == "transmission":
         has_username = bool(candidate.get("username"))
         has_password = bool(configured_secrets.get("password"))

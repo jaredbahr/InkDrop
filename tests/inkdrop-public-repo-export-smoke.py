@@ -36,7 +36,6 @@ REQUIRED_EXPORT_FILES = {
     "tests/inkdrop-download-client-instance-store-smoke.py",
     "tests/inkdrop-download-client-instance-api-smoke.py",
     "tests/inkdrop-download-client-secret-store-smoke.py",
-    "tests/inkdrop-kapowarr-fallback-retirement-smoke.py",
     "tests/inkdrop-reconcile-lock-observability-smoke.py",
     "tests/inkdrop-autopilot-fairness-smoke.py",
     "tests/inkdrop-automatic-search-recall-smoke.py",
@@ -50,21 +49,6 @@ REQUIRED_EXPORT_FILES = {
     "tests/inkdrop-closed-alpha-packet-smoke.py",
     "tests/inkdrop-update-awareness-smoke.py",
     "docs/inkdrop/releases/current.json",
-    "docs/inkdrop/releases/v0.1.0-alpha.22.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.23.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.24.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.25.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.26.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.27.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.28.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.29.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.30.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.31.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.32.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.33.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.34.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.35.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.36.md",
     "tests/inkdrop-direct-source-certification-smoke.py",
     "tests/inkdrop-source-worker-jobs-smoke.py",
     "inkdrop_manual_search.py",
@@ -155,7 +139,6 @@ EXPORT_SELF_CHECK_COMPILE_FILES = (
     "tests/inkdrop-download-client-instance-store-smoke.py",
     "tests/inkdrop-download-client-instance-api-smoke.py",
     "tests/inkdrop-download-client-secret-store-smoke.py",
-    "tests/inkdrop-kapowarr-fallback-retirement-smoke.py",
     "inkdrop_manual_search.py",
     "tests/inkdrop-manual-search-readiness-smoke.py",
     "tests/inkdrop_download_client_ownership_smoke.py",
@@ -181,6 +164,25 @@ def exported_paths(root):
 def current_notes_path(root):
     payload = json.loads((Path(root) / "docs/inkdrop/releases/current.json").read_text(encoding="utf-8"))
     return str(payload.get("notes_path") or "")
+
+
+def assert_only_current_release_note_exported(root, paths):
+    """The export ships one release note: the release the public repo is on.
+
+    Every earlier note describes an internal build, and the alpha ones are headed
+    "Private Alpha Update N". Twenty-two of them were published because they were
+    listed in the export allowlist AND required by this smoke, so nothing on
+    either side objected. This asserts the exclusion instead of just not asking
+    for the inclusion.
+    """
+    contract = json.loads((Path(root) / "docs/inkdrop/releases/current.json").read_text(encoding="utf-8"))
+    expected = str(contract.get("notes_path") or "").strip()
+    notes = {p for p in paths if p.startswith("docs/inkdrop/releases/") and p.endswith(".md")}
+    require(notes == {expected}, f"export must ship only {expected!r}; found {sorted(notes)}")
+    for path in notes:
+        text = (Path(root) / path).read_text(encoding="utf-8", errors="replace").lower()
+        for marker in ("private alpha", "closed alpha", "internal build"):
+            require(marker not in text, f"exported release note {path} contains internal-stage text: {marker!r}")
 
 
 def assert_current_release_contract_is_closed(root, paths):
@@ -528,6 +530,7 @@ def main():
         copied_forbidden = (FORBIDDEN_EXPORT_FILES - {"PUBLIC_REPO_MANIFEST.json"}) & paths
         require(not copied_forbidden, f"forbidden files exported: {sorted(copied_forbidden)}")
         assert_current_release_contract_is_closed(tmp, paths)
+        assert_only_current_release_note_exported(tmp, paths)
         for path in paths:
             parts = set(Path(path).parts)
             require(not (parts & FORBIDDEN_PARTS), f"forbidden path part exported: {path}")

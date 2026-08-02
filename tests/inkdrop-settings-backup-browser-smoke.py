@@ -42,7 +42,7 @@ def main():
             env["INKDROP_SETTINGS_BROWSER_URL"] = f"http://127.0.0.1:{server.server_address[1]}/"
             completed = subprocess.run(
                 ["node", "web/tests/settings-backup-restore-browser-smoke.js"],
-                cwd=Path(__file__).resolve().parent,
+                cwd=Path(__file__).resolve().parents[1],
                 env=env,
                 text=True,
                 capture_output=True,

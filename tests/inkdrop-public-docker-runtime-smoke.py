@@ -127,7 +127,7 @@ def assert_runtime_state_only_uses_state_as_config():
 
 
 def assert_packaging_files():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     for name in ("README.md", "Dockerfile", "docker-compose.yml", ".env.example", ".dockerignore", ".gitignore", "requirements.txt", "inkdrop-logo-mark.png", "inkdrop_container_healthcheck.py", "inkdrop_container_start.py", "inkdrop_preflight.py", "inkdrop-public-release-safety-audit.py"):
         path = root / name
         require(path.exists(), f"missing {name}")
@@ -325,7 +325,7 @@ def assert_packaging_files():
 
 
 def assert_compose_yaml_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
     require(isinstance(compose, dict), "compose should parse as a YAML mapping")
     services = compose.get("services")
@@ -393,7 +393,7 @@ def _compose_interpolate(value, env):
 
 
 def assert_compose_env_interpolation_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
     env_example = _env_example_values(root)
     resolved_default = _compose_interpolate(compose, env_example)
@@ -403,7 +403,6 @@ def assert_compose_env_interpolation_contract():
     require(inkdrop_default["environment"]["INKDROP_HOST_PORT"] == "8796", "default compose interpolation should pass INKDROP_HOST_PORT=8796")
     require(inkdrop_default["environment"]["INKDROP_CONTAINER_WEB_BASE_URL"] == "http://inkdrop:8796", "default worker callback should use the internal container port")
     require(inkdrop_default["environment"]["INKDROP_WEB_BASE_URL"] == "", "default compose interpolation should keep INKDROP_WEB_BASE_URL blank")
-    require(inkdrop_default["environment"]["INKDROP_KAPOWARR_DB"] == "", "default compose interpolation should keep Kapowarr DB blank")
     require(inkdrop_default["environment"]["INKDROP_KAVITA_DB"] == "", "default compose interpolation should keep Kavita DB blank")
     require(inkdrop_default["environment"]["INKDROP_SAB_PATH_MAPPINGS"] == "", "default compose interpolation should keep SAB path mappings blank")
     with tempfile.TemporaryDirectory(prefix="inkdrop-compose-default-preflight-") as tmp:
@@ -424,8 +423,6 @@ def assert_compose_env_interpolation_contract():
         compose_preflight = inkdrop_preflight.run_preflight(preflight_env, create=True)
         require(compose_preflight["web"]["callback_base_url"] == "http://inkdrop:8796", "default Compose worker callback should use service DNS")
         require(compose_preflight["web"]["callback_base_source"] == "INKDROP_CONTAINER_WEB_BASE_URL", "default Compose worker callback should report the container source")
-        require(compose_preflight["configured_adapters"]["kapowarr"]["configured"] is False, "default Compose env should not configure Kapowarr adapter")
-        require(compose_preflight["configured_adapters"]["kapowarr"]["existing_path_missing_keys"] == [], "default Compose env should not report missing Kapowarr DB path")
         require(compose_preflight["configured_adapters"]["kavita"]["configured"] is False, "default Compose env should not configure Kavita adapter")
         require(compose_preflight["configured_adapters"]["kavita"]["existing_path_missing_keys"] == [], "default Compose env should not report missing Kavita DB path")
     custom_env = dict(env_example)
@@ -453,7 +450,7 @@ def assert_compose_env_interpolation_contract():
 
 
 def assert_public_release_workflow_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     path = root / ".github" / "workflows" / "inkdrop-public-release.yml"
     require(path.exists(), "public-release GitHub Actions workflow should exist")
     workflow_text = path.read_text(encoding="utf-8")
@@ -525,7 +522,7 @@ def assert_public_release_workflow_contract():
 
 
 def assert_public_release_runner_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     runner = (root / "tools" / "inkdrop_public_release_check.py").read_text(encoding="utf-8")
     evidence_helper = (root / "tools" / "inkdrop_release_evidence_bundle.py").read_text(encoding="utf-8")
     require("tools/inkdrop_state_schema_audit.py" in runner, "release runner should include the static state schema audit")
@@ -587,7 +584,7 @@ def assert_public_release_runner_contract():
 
 
 def assert_public_release_runner_json_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
     env["INKDROP_RELEASE_CHECK_SELFTEST_SKIP_RUNTIME_SMOKE"] = "1"
     contract_probe = r'''
@@ -732,7 +729,7 @@ raise SystemExit(release_check.main(["--json"]))
 def assert_public_release_runner_docker_unavailable_json_contract():
     if shutil.which("docker") is not None:
         return
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
     env["INKDROP_RELEASE_CHECK_SELFTEST_SKIP_RUNTIME_SMOKE"] = "1"
     result = subprocess.run(
@@ -778,7 +775,7 @@ def assert_public_release_runner_docker_unavailable_json_contract():
 def assert_public_release_runner_docker_only_unavailable_json_contract():
     if shutil.which("docker") is not None:
         return
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [sys.executable, "-B", "tools/inkdrop_public_release_check.py", "--docker-only", "--json"],
         cwd=root,
@@ -808,7 +805,7 @@ def assert_public_release_runner_docker_only_unavailable_json_contract():
 
 
 def assert_public_release_docs_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     install_doc = (root / "docs" / "inkdrop" / "docker-first-install.md").read_text(encoding="utf-8")
     arr_stack_doc = (root / "docs" / "inkdrop" / "arr-stack-deployment-plan.md").read_text(encoding="utf-8")
@@ -996,7 +993,7 @@ def assert_public_release_docs_contract():
 
 
 def assert_web_surface_audit_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     audit_path = root / "tools" / "inkdrop_web_surface_audit.py"
     require(audit_path.exists(), "web surface audit tool should exist")
     text = audit_path.read_text(encoding="utf-8")
@@ -1021,7 +1018,7 @@ def assert_web_surface_audit_contract():
 
 
 def assert_install_support_summary_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     tool_path = root / "tools" / "inkdrop_install_support_summary.py"
     require(tool_path.exists(), "install support summary tool should exist")
     text = tool_path.read_text(encoding="utf-8")
@@ -1142,7 +1139,7 @@ def assert_install_support_summary_contract():
 
 
 def assert_settings_api_surface_audit_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     audit_path = root / "tools" / "inkdrop_settings_api_surface_audit.py"
     require(audit_path.exists(), "settings API surface audit tool should exist")
     text = audit_path.read_text(encoding="utf-8")
@@ -1169,7 +1166,7 @@ def assert_settings_api_surface_audit_contract():
 
 
 def assert_state_schema_audit_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     audit_path = root / "tools" / "inkdrop_state_schema_audit.py"
     require(audit_path.exists(), "state schema audit tool should exist")
     text = audit_path.read_text(encoding="utf-8")
@@ -1231,7 +1228,7 @@ def assert_state_schema_audit_contract():
 
 
 def assert_preflight_config_key_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
     compose_env = set((compose.get("services") or {}).get("inkdrop", {}).get("environment") or {})
     env_example = {
@@ -1259,7 +1256,7 @@ def assert_preflight_config_key_contract():
 
 
 def assert_public_operator_knobs_are_visible():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
     compose_env = set((compose.get("services") or {}).get("inkdrop", {}).get("environment") or {})
     env_example = {
@@ -1308,7 +1305,7 @@ def assert_public_operator_knobs_are_visible():
 
 
 def assert_manual_source_callback_derivation_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     text = (root / "inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8")
     require("def _inkdrop_web_endpoint" in text, "manual-source worker should derive callback endpoints from a shared helper")
     require("inkdrop_runtime_config.worker_web_base_url()" in text, "manual-source callback fallback should use the shared container-aware resolver")
@@ -1450,7 +1447,7 @@ def assert_image_defaults_live_under_documented_mounts():
     backups, and quarantine once defaulted to an unmounted /state, so
     recreating the documented container destroyed a tester's everything."""
     documented_mounts = ("/config", "/data/comics", "/data/manga", "/downloads")
-    dockerfile = (Path(__file__).parent / "Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
     import re as _re
 
     for name, value in _re.findall(r"(INKDROP_[A-Z_]+)=(/[^\s\\]+)", dockerfile):
@@ -1464,7 +1461,7 @@ def assert_image_defaults_live_under_documented_mounts():
 
 
 def assert_docker_python_allowlist_import_closure():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     patterns = _dockerignore_patterns(root)
     included_paths = [
         path
@@ -1497,7 +1494,7 @@ def assert_docker_python_allowlist_import_closure():
 
 
 def assert_docker_context_manifest_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     attributes = (root / ".gitattributes").read_text(encoding="utf-8")
     require(
         "web/static/css/inkdrop.css text eol=lf" in attributes,
@@ -1578,7 +1575,7 @@ def assert_docker_context_manifest_contract():
 
 
 def assert_docker_core_worker_scripts_included():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     patterns = _dockerignore_patterns(root)
     required_scripts = (
         "inkdrop_acquire.py",
@@ -1606,7 +1603,7 @@ def assert_docker_core_worker_scripts_included():
 
 
 def assert_runtime_source_catalog_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     catalog_path = root / "docs" / "inkdrop-source-candidate-catalog-20260702.json"
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     require(isinstance(catalog.get("catalog_version"), int), "source catalog should have an integer catalog_version")
@@ -1649,7 +1646,7 @@ def assert_runtime_source_catalog_contract():
 
 
 def assert_docker_runtime_python_files_compile():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     patterns = _dockerignore_patterns(root)
     runtime_files = [
         path
@@ -1669,7 +1666,7 @@ def assert_docker_runtime_python_files_compile():
 
 
 def assert_runtime_third_party_imports_are_declared():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     patterns = _dockerignore_patterns(root)
     runtime_files = [
         path
@@ -1720,7 +1717,7 @@ def assert_runtime_third_party_imports_are_declared():
 
 
 def assert_dockerignore_allowlist_shape():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     patterns = _dockerignore_patterns(root)
     for relative in (
         Path("Dockerfile"),
@@ -1791,7 +1788,6 @@ def assert_preflight_contract():
         require(created["path_mappings"]["INKDROP_SAB_PATH_MAPPINGS"]["configured"] is False, "blank SAB path mappings are accepted")
         require("warning_summary" in created, "preflight reports a structured warning summary")
         require(created["warning_summary"]["optional_adapters_unconfigured"] == ["comicvine", "prowlarr", "qbittorrent", "sabnzbd", "slskd", "suwayomi"], "clean preflight has stable optional-adapter warnings")
-        require("kapowarr" not in created["warning_summary"]["optional_adapters_unconfigured"], "Kapowarr should not be a clean-install warning")
         require("kavita" not in created["warning_summary"]["optional_adapters_unconfigured"], "Kavita should not be a clean-install warning")
         require(isinstance(created["warning_summary"]["runtime_tools_missing"], list), "preflight summarizes missing runtime tools")
         require(isinstance(created["warning_summary"]["python_dependencies_missing"], list), "preflight summarizes missing Python dependencies")
@@ -1799,16 +1795,14 @@ def assert_preflight_contract():
         require(created["configured_adapters"]["comicvine"]["configured_by"] == "", "blank ComicVine reports no configuration source")
         require(created["configured_adapters"]["comicvine"]["missing_required_keys"] == ["INKDROP_COMICVINE_API_KEY"], "blank ComicVine reports missing API key")
         require(created["configured_adapters"]["comicvine"]["reason"] == "missing required settings", "blank ComicVine reports a clear reason")
-        require(created["configured_adapters"]["kapowarr"]["configured"] is False, "missing default Kapowarr DB is reported as unconfigured")
-        require(created["configured_adapters"]["kapowarr"]["existing_path_missing_keys"] == [], "blank Kapowarr DB env has no missing explicit path")
         require(created["configured_adapters"]["kavita"]["configured"] is False, "missing default Kavita DB is reported as unconfigured")
         require(created["configured_adapters"]["komga"]["configured"] is False, "blank Komga URL is reported as unconfigured")
         require(created["configured_adapters"]["slskd"]["configured"] is False, "blank SLSKD API URL is reported as unconfigured")
         require(created["configured_adapters"]["suwayomi"]["configured"] is False, "blank Suwayomi API URL is reported as unconfigured")
         require("required_keys" in created["configured_adapters"]["prowlarr"], "preflight reports adapter required keys")
-        require("existing_path_keys" in created["configured_adapters"]["kapowarr"], "preflight reports adapter path keys")
-        require("existing_path_exists_keys" in created["configured_adapters"]["kapowarr"], "preflight reports adapter existing path evidence")
-        require("reason" in created["configured_adapters"]["kapowarr"], "preflight reports adapter readiness reason")
+        require("existing_path_keys" in created["configured_adapters"]["kavita"], "preflight reports adapter path keys")
+        require("existing_path_exists_keys" in created["configured_adapters"]["kavita"], "preflight reports adapter existing path evidence")
+        require("reason" in created["configured_adapters"]["kavita"], "preflight reports adapter readiness reason")
         require("archive_tools" in created, "preflight reports archive tool availability")
         require("seven_zip" in created["archive_tools"], "preflight reports 7z availability")
         require("unrar" in created["archive_tools"], "preflight reports unrar fallback availability")
@@ -1979,14 +1973,14 @@ def assert_preflight_contract():
         require(any("not a Windows drive path" in error for error in invalid_windows_mapping["errors"]), "Windows mapping target error should be clear")
 
         existing_path_env = dict(env)
-        existing_path_env["INKDROP_KAPOWARR_DB"] = str(root / "config" / "kapowarr.db")
-        Path(existing_path_env["INKDROP_KAPOWARR_DB"]).parent.mkdir(parents=True, exist_ok=True)
-        Path(existing_path_env["INKDROP_KAPOWARR_DB"]).write_text("", encoding="utf-8")
+        existing_path_env["INKDROP_KAVITA_DB"] = str(root / "config" / "kavita.db")
+        Path(existing_path_env["INKDROP_KAVITA_DB"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(existing_path_env["INKDROP_KAVITA_DB"]).write_text("", encoding="utf-8")
         path_configured = inkdrop_preflight.run_preflight(existing_path_env, create=True)
-        require(path_configured["configured_adapters"]["kapowarr"]["configured"] is True, "existing Kapowarr DB path can configure adapter")
-        require(path_configured["configured_adapters"]["kapowarr"]["configured_by"] == "existing_path", "existing Kapowarr DB reports path-based configuration")
-        require(path_configured["configured_adapters"]["kapowarr"]["existing_path_exists_keys"] == ["INKDROP_KAPOWARR_DB"], "existing Kapowarr DB reports matching path key")
-        require(path_configured["configured_adapters"]["kapowarr"]["reason"] == "adapter path exists", "existing Kapowarr DB reports a clear reason")
+        require(path_configured["configured_adapters"]["kavita"]["configured"] is True, "existing Kavita DB path can configure adapter")
+        require(path_configured["configured_adapters"]["kavita"]["configured_by"] == "existing_path", "existing Kavita DB reports path-based configuration")
+        require(path_configured["configured_adapters"]["kavita"]["existing_path_exists_keys"] == ["INKDROP_KAVITA_DB"], "existing Kavita DB reports matching path key")
+        require(path_configured["configured_adapters"]["kavita"]["reason"] == "adapter path exists", "existing Kavita DB reports a clear reason")
 
         invalid_port_env = dict(env)
         invalid_port_env["INKDROP_PORT"] = "not-a-port"
@@ -2018,7 +2012,7 @@ def assert_preflight_contract():
 
 
 def assert_preflight_cli_json_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
 
     def base_env(tmp_root):
         env = dict(os.environ)
@@ -2323,7 +2317,7 @@ def assert_runtime_optional_root_failures_do_not_crash_web_startup():
 
 
 def assert_web_uses_runtime_config():
-    text = (Path(__file__).resolve().parent / "inkdrop_web.py").read_text(encoding="utf-8")
+    text = (Path(__file__).resolve().parents[1] / "inkdrop_web.py").read_text(encoding="utf-8")
     require("import inkdrop_runtime_config" in text, "web runtime imports inkdrop_runtime_config")
     require("HOST = inkdrop_runtime_config.web_host()" in text, "web host is runtime-config-backed")
     require("PORT = inkdrop_runtime_config.web_port(strict=False)" in text, "web import should not crash on invalid port config")
@@ -2332,7 +2326,6 @@ def assert_web_uses_runtime_config():
     require("LOG_DIR = inkdrop_runtime_config.log_dir()" in text, "web log dir is runtime-config-backed")
     require("inkdrop_runtime_config.ensure_runtime_roots()" in text, "web startup creates runtime roots")
     require('SLSKD_API_BASE_URL = env_value("INKDROP_SLSKD_API_BASE_URL", "")' in text, "web should not invent a default SLSKD API endpoint")
-    require('KAPOWARR_URL = env_value("INKDROP_KAPOWARR_URL", "")' in text, "web should not invent a default Kapowarr API endpoint")
     require('KAVITA_API = env_value("INKDROP_KAVITA_URL", "")' in text, "web should not invent a default Kavita API endpoint")
     require('KOMGA_API = env_value("INKDROP_KOMGA_URL", "")' in text, "web should not invent a default Komga API endpoint")
     require('base_url=KAVITA_API' in text, "runtime Kavita provider template should use configured URL")
@@ -2346,7 +2339,7 @@ def assert_web_uses_runtime_config():
 
 
 def assert_optional_adapter_defaults_are_explicit():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     completed_import = (root / "inkdrop_completed_import.py").read_text(encoding="utf-8")
     slskd_probe = (root / "inkdrop_slskd_source_probe.py").read_text(encoding="utf-8")
     manual_autoresolve = (root / "inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8")
@@ -2356,7 +2349,6 @@ def assert_optional_adapter_defaults_are_explicit():
     reconcile = (root / "inkdrop_reconcile_imports.py").read_text(encoding="utf-8")
     require('KAVITA_API = os.environ.get("INKDROP_KAVITA_URL") or ""' in completed_import, "Kavita importer URL should be blank unless configured")
     require('KOMGA_API = os.environ.get("INKDROP_KOMGA_URL") or ""' in completed_import, "Komga importer URL should be blank unless configured")
-    require('KAPOWARR_API = os.environ.get("INKDROP_KAPOWARR_URL") or ""' in completed_import, "Kapowarr importer URL should be blank unless configured")
     require('"qBittorrent URL is not configured' in completed_import, "completed import qBittorrent checks should report missing URL clearly")
     require('DEFAULT_SLSKD_BASE_URL = os.environ.get("INKDROP_SLSKD_API_BASE_URL") or ""' in slskd_probe, "SLSKD probe URL should be blank unless configured")
     require('SLSKD_BASE_URL = os.environ.get("INKDROP_SLSKD_API_BASE_URL") or ""' in manual_autoresolve, "SLSKD autoresolver URL should be blank unless configured")
@@ -2385,7 +2377,7 @@ def assert_optional_adapter_defaults_are_explicit():
 
 
 def assert_protocol_order_contract():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     acquire = (root / "inkdrop_acquire.py").read_text(encoding="utf-8")
     missing_acquire = (root / "inkdrop_missing_acquire.py").read_text(encoding="utf-8")
     for label, text in (
@@ -2398,7 +2390,7 @@ def assert_protocol_order_contract():
 
 
 def assert_release_safety_audit():
-    path = Path(__file__).resolve().parent / "inkdrop-public-release-safety-audit.py"
+    path = Path(__file__).resolve().parents[1] / "inkdrop-public-release-safety-audit.py"
     text = path.read_text(encoding="utf-8")
     require("scan_github_workflows" in text, "release safety audit scans GitHub workflow files")
     require("scan_public_image_context_private_text_files" in text, "release safety audit scans text files included in Docker context")

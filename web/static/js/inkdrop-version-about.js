@@ -49,20 +49,19 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.01-beta",
-      slug: "v0-1-01-beta",
+      version: "v0.1.02",
+      slug: "v0-1-02",
       released_at: "2026-08-01",
-      title: "First-run setup works",
-      summary: "Creating the administrator on a fresh install returned “Forbidden” with no way past it: the server wanted a setup code the setup screen had no field to send. Whoever opens InkDrop first now creates the account directly.",
+      title: "Searches that found nothing now work",
+      summary: "Several separate faults could each stop a series from ever getting a search result. If something has sat in Wanted with no explanation, this build is worth trying.",
       highlights: [
-        "Creating the first administrator no longer needs a setup code. The screen closes for good once the account exists, and two people hitting it at once cannot both succeed.",
-        "Keep the port on your own network until setup is done, since anyone who reaches it first can claim the install.",
-        "The install instructions mounted libraries and downloads where InkDrop does not read them, so a new install showed an empty library. Corrected to /data/comics, /data/manga and /downloads.",
-        "A test now derives those paths from the image itself, so the instructions and the image cannot drift apart again.",
-        "The image source label pointed at a repository nobody outside the project can open; it now points at the public one.",
-        "Repository layout: tests in tests/, cron and maintenance scripts in scripts/, optional compose overrides in deploy/."
+        "Searches run properly again, and reuse a recent result instead of asking twice for the same thing.",
+        "Volumes and chapters match correctly, and ordinary comic filenames are no longer rejected.",
+        "A failed archive read could be remembered as having no metadata for two weeks, and the wrong issue imported afterwards.",
+        "A CBR import could crash after copying the file and mark a good file as bad.",
+        "qBittorrent supports API keys. MangaDex mature content is ranked, not hidden."
       ]
-    }),
+    })
   ]);
 
   var PUBLIC_RELEASES = Object.freeze(DETAILED_RELEASES.slice(0, DETAILED_RELEASE_LIMIT));
@@ -103,10 +102,11 @@
     beta: { label: "Beta", stage: "Public beta" }
   });
 
-  // Two shapes. Current releases put the counter in the patch position and
-  // end at the stage: 0.1.01-beta, 0.1.02-beta. Earlier ones trailed the
-  // counter after the stage: 0.1.0-alpha.98, 0.1.0-beta.2. The older form is
-  // still parsed so historical entries and deep links keep rendering.
+  // Three shapes, newest first. Current releases are the bare number: 0.1.02.
+  // Before that the counter sat in the patch slot with a stage suffix
+  // (0.1.01-beta), and before that it trailed the stage (0.1.0-alpha.98).
+  // Both older forms are still parsed so historical entries and deep links
+  // keep rendering.
   function closedAlphaParts(value) {
     var raw = text(value);
     var trailing = /^v?(\d+)\.(\d+)\.(\d+)-(alpha|beta)\.(\d+)$/i.exec(raw);
@@ -122,22 +122,43 @@
       };
     }
     var inPatch = /^v?(\d+)\.(\d+)\.(\d+)-(alpha|beta)$/i.exec(raw);
-    if (!inPatch) return null;
+    if (inPatch) {
+      return {
+        major: Number(inPatch[1]),
+        minor: Number(inPatch[2]),
+        patch: Number(inPatch[3]),
+        prerelease: inPatch[4].toLowerCase(),
+        update: Number(inPatch[3]),
+        counterInPatch: true,
+        // Kept as written so 0.1.01-beta does not render as 0.1.1-beta.
+        patchText: inPatch[3]
+      };
+    }
+    // Releases from 0.1.02 on carry no stage suffix at all: the version is just
+    // the number. Parsed explicitly rather than left to fall through, because
+    // the unparsed path renders the string but reports no stage, which would
+    // put the raw channel ("qa") on the About page where a label belongs.
+    var plain = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw);
+    if (!plain) return null;
     return {
-      major: Number(inPatch[1]),
-      minor: Number(inPatch[2]),
-      patch: Number(inPatch[3]),
-      prerelease: inPatch[4].toLowerCase(),
-      update: Number(inPatch[3]),
+      major: Number(plain[1]),
+      minor: Number(plain[2]),
+      patch: Number(plain[3]),
+      prerelease: null,
+      update: Number(plain[3]),
       counterInPatch: true,
-      // Kept as written so 0.1.01-beta does not render as 0.1.1-beta.
-      patchText: inPatch[3]
+      // Kept as written so 0.1.02 does not render as 0.1.2.
+      patchText: plain[3]
     };
   }
 
   function productVersionLabel(value) {
     var parts = closedAlphaParts(value && typeof value === "object" ? displayVersion(value) : value);
     if (!parts) return text(value && typeof value === "object" ? displayVersion(value) : value, "Development build");
+    // No suffix means no stage word: the version stands on its own.
+    if (!parts.prerelease) {
+      return parts.major + "." + parts.minor + "." + parts.patchText;
+    }
     var stage = PRERELEASE_STAGES[parts.prerelease] || PRERELEASE_STAGES.alpha;
     if (parts.counterInPatch) {
       return parts.major + "." + parts.minor + "." + parts.patchText + " " + stage.label;
@@ -149,7 +170,8 @@
   function releaseStageLabel(metadata) {
     metadata = metadata && typeof metadata === "object" ? metadata : {};
     var parts = closedAlphaParts(displayVersion(metadata));
-    if (parts) return (PRERELEASE_STAGES[parts.prerelease] || PRERELEASE_STAGES.alpha).stage;
+    if (parts && parts.prerelease) return (PRERELEASE_STAGES[parts.prerelease] || PRERELEASE_STAGES.alpha).stage;
+    if (parts) return "Release";
     return text(metadata.release_channel || metadata.channel, "Development");
   }
 

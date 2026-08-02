@@ -49,6 +49,7 @@
 !/inkdrop_container_start.py
 !/inkdrop_direct_downloader.py
 !/inkdrop_download_clients.py
+!/inkdrop_qbittorrent_auth.py
 !/inkdrop_download_client_config.py
 !/inkdrop_download_client_api.py
 !/inkdrop_download_client_routing.py

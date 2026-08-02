@@ -112,6 +112,10 @@ jobs:
           python -B tools/inkdrop_public_http_smoke.py --json > inkdrop-public-http-smoke.json
           python -B tools/inkdrop_public_release_check.py --strict-host-dependencies
 
+      - name: Verify the staged public export actually runs
+        timeout-minutes: 10
+        run: python -B tests/inkdrop-public-export-runnable-smoke.py
+
       - name: Run Automatic Search provider-budget smoke
         timeout-minutes: 2
         env:
@@ -126,7 +130,7 @@ jobs:
           INKDROP_QUARANTINE_DIR: ${{ runner.temp }}/inkdrop/state/quarantine
         run: |
           mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
-          python -B inkdrop-autopilot-provider-budget-smoke.py
+          python -B tests/inkdrop-autopilot-provider-budget-smoke.py
 
       - name: Validate operational JavaScript syntax
         timeout-minutes: 2

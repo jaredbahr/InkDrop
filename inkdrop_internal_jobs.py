@@ -42,8 +42,6 @@ def run_autopilot_web_job(path: str, payload: dict | None = None) -> dict:
             state["sync_scheduled"] = bool(sync_job.get("started"))
             state["sync_job"] = sync_job
         return {"ok": bool(sync_job.get("ok", True)), "state": state, "sync_job": sync_job}
-    if path == "/api/kapowarr/sync":
-        return {"ok": True, "result": inkdrop_web.sync_kapowarr_series(data)}
     raise ValueError(f"unsupported internal autopilot route: {path}")
 
 

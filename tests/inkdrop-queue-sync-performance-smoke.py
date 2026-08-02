@@ -225,7 +225,7 @@ def main():
         check(jobs["deep-state-integrity-audit"].command[-1] == "100", "deep integrity audit batch is not bounded")
         check(jobs["deep-state-integrity-audit"].timeout_seconds <= 300, "deep integrity audit can monopolize a worker slot")
         check(not jobs["deep-state-integrity-audit"].critical, "deep integrity audit outranks acquisition work")
-        maintenance_source = Path(__file__).with_name("inkdrop_state_maintenance.py").read_text(encoding="utf-8")
+        maintenance_source = (Path(__file__).resolve().parents[1] / "inkdrop_state_maintenance.py").read_text(encoding="utf-8")
         check('"full"' in maintenance_source, "manual full reconciliation capability was removed")
 
         integrity_names = (

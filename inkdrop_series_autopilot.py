@@ -88,7 +88,6 @@ PACK_REVIEW_STATE_FILE = STATE_DIR / "pack-review-state.json"
 PACK_BAD_ARCHIVE_HISTORY_FILE = STATE_DIR / "pack-bad-archive-history.json"
 IMPORTED_DB = STATE_DIR / "imported-files.sqlite3"
 KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
-KAPOWARR_DB = inkdrop_runtime_config.kapowarr_db_path()
 COMIC_ROOT = Path(os.environ.get("INKDROP_COMIC_ROOT") or "/library/comics")
 MANGA_ROOT = Path(os.environ.get("INKDROP_MANGA_ROOT") or "/library/manga")
 KAVITA_COMIC_ROOT = os.environ.get("INKDROP_KAVITA_COMIC_ROOT") or "/data/comics"
@@ -3794,24 +3793,8 @@ def sync_watched_state(
                 timeout_seconds=sync_timeout_seconds,
                 error=f"{type(exc).__name__}: {exc}",
             )
-    if sync_metadata_adapter:
-        if sync_result is None:
-            sync_result = {}
-        try:
-            sync_result["metadata_adapter"] = post_json(
-                "/api/kapowarr/sync",
-                {"scanIssues": False},
-                timeout=sync_metadata_adapter_timeout_seconds,
-            ).get("result")
-        except Exception as exc:
-            sync_result["metadata_adapter_error"] = f"{type(exc).__name__}: {exc}"
-            sync_result["metadata_adapter_timeout_seconds"] = sync_metadata_adapter_timeout_seconds
-            log(
-                "sync_failed",
-                sync_kind="metadata_adapter",
-                timeout_seconds=sync_metadata_adapter_timeout_seconds,
-                error=f"{type(exc).__name__}: {exc}",
-            )
+    # sync_metadata_adapter is accepted but ignored -- Kapowarr is retired
+    # software with no live endpoint to sync against.
     return sync_result
 
 
@@ -7408,41 +7391,6 @@ def path_under_prefix(path, prefix):
     return bool(path and prefix and (path == prefix or path.startswith(prefix + "/")))
 
 
-def kapowarr_path_fallback_enabled():
-    # Retired in Build 165. Legacy rows remain only for rollback/audit.
-    return False
-
-
-def kapowarr_folder_prefixes_by_volume_id(enabled=None):
-    if enabled is None:
-        enabled = kapowarr_path_fallback_enabled()
-    if not enabled:
-        return {}
-    if not KAPOWARR_DB.exists():
-        return {}
-    con = sqlite3.connect(KAPOWARR_DB)
-    try:
-        rows = con.execute("select id, folder from volumes where folder is not null").fetchall()
-    finally:
-        con.close()
-    prefixes = {}
-    for volume_id, folder in rows:
-        folder = normalize_kavita_path(folder)
-        if not folder:
-            continue
-        values = {folder}
-        if folder.startswith("/comics"):
-            rel = folder[len("/comics"):].lstrip("/")
-            values.add(f"{KAVITA_COMIC_ROOT}{folder[len('/comics'):]}")
-            values.add(str(COMIC_ROOT / rel) if rel else str(COMIC_ROOT))
-        elif folder.startswith("/manga"):
-            rel = folder[len("/manga"):].lstrip("/")
-            values.add(f"{KAVITA_MANGA_ROOT}{folder[len('/manga'):]}")
-            values.add(str(MANGA_ROOT / rel) if rel else str(MANGA_ROOT))
-        prefixes[int(volume_id)] = {normalize_kavita_path(value) for value in values if value}
-    return prefixes
-
-
 def item_volume_id(item):
     value = item.get("kapowarr_id") or item.get("volume_id")
     try:
@@ -7483,34 +7431,13 @@ def item_uses_kapowarr_as_truth(item):
     return series_source == "kapowarr" or metadata_provider == "kapowarr"
 
 
-def queue_has_kapowarr_truth_items(queue):
-    items = queue.get("items") if isinstance(queue, dict) else {}
-    if not isinstance(items, dict):
-        return False
-    return any(item_uses_kapowarr_as_truth(item) for item in items.values() if isinstance(item, dict))
-
-
 def item_path_matches_kapowarr_folder(item, path, folder_prefixes=None):
-    if not item_uses_kapowarr_as_truth(item):
-        return True
-    volume_id = item_volume_id(item)
-    if not volume_id:
-        return True
-    prefixes = (folder_prefixes or {}).get(volume_id)
-    if not prefixes:
-        return True
-    candidates = {normalize_kavita_path(path)}
-    kavita_path = kavita_path_for_host_path(path)
-    if kavita_path:
-        candidates.add(normalize_kavita_path(kavita_path))
-    host_path = host_path_for_kavita_path(path)
-    if host_path:
-        candidates.add(normalize_kavita_path(host_path))
-    return any(
-        path_under_prefix(candidate, prefix)
-        for candidate in candidates
-        for prefix in prefixes
-    )
+    # Kapowarr is retired software; there is no live Kapowarr volume/folder
+    # data to compare against, so this check always passes now. Kept as a
+    # no-op function rather than deleted -- it has several call sites that
+    # still gate on its result, and none of them need touching now that the
+    # answer is unconditionally "yes, treat this as matched."
+    return True
 
 
 def kavita_visible_issue_index(queue):
@@ -7543,9 +7470,9 @@ def kavita_visible_issue_index(queue):
         ).fetchall()
     finally:
         con.close()
-    folder_prefixes = kapowarr_folder_prefixes_by_volume_id(
-        enabled=kapowarr_path_fallback_enabled() and queue_has_kapowarr_truth_items(queue)
-    )
+    # Kapowarr is retired; no live volume/folder data to key candidate
+    # matching against.
+    folder_prefixes = {}
     index = {}
     for row in rows:
         row_series = row["series"] or ""
@@ -8034,14 +7961,9 @@ def annotate_states(queue, max_seconds=None, reason=None, row_keys=None):
         kavita_visible = timed_phase("kavita_visible_issue_index", lambda: kavita_visible_issue_index(queue))
         if budget_exhausted("kavita_visible_issue_index"):
             return annotate_summary
-    folder_prefixes = timed_phase(
-        "kapowarr_folder_prefixes",
-        lambda: kapowarr_folder_prefixes_by_volume_id(
-            enabled=kapowarr_path_fallback_enabled() and queue_has_kapowarr_truth_items(queue)
-        ),
-    )
-    if budget_exhausted("kapowarr_folder_prefixes"):
-        return annotate_summary
+    # Kapowarr is retired; no live volume/folder data to key candidate
+    # matching against.
+    folder_prefixes = {}
     waiting_records = timed_phase("read_waiting_records", read_waiting_records)
     if budget_exhausted("read_waiting_records"):
         return annotate_summary

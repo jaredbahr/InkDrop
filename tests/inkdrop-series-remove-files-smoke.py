@@ -10,7 +10,7 @@ from pathlib import Path
 import inkdrop_state
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 WEB_PATH = ROOT / "inkdrop_web.py"
 
 

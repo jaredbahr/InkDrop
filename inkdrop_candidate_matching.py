@@ -1215,8 +1215,23 @@ def candidate_compatibility(candidate, wanted_item=None):
             review.append("missing_required_unit_number")
     elif target_unit in CHAPTER_UNITS:
         wanted = target.get("chapter_number")
+        target_volume = target.get("volume_number")
         if (evidence.get("coverage_start") or evidence.get("coverage_end")) and not manifest_exact_member:
             blocked.append("coverage_not_unit_number")
+        elif (
+            target_volume
+            and not evidence.get("chapter_number")
+            and not evidence.get("issue_number")
+            and target_volume in (evidence.get("volume_number"), evidence.get("book_number"))
+        ):
+            # The wanted chapter's own metadata (target_context, populated
+            # from the series' real source -- ComicVine/MangaDex volume
+            # grouping, never a filename guess) says it belongs to this
+            # exact volume, and the candidate's parsed evidence is that same
+            # volume with no conflicting chapter/issue identity. A volume
+            # release that collects the wanted chapter satisfies it; it is
+            # not a different unit type.
+            positive.append("exact_volume_containing_wanted_chapter")
         elif (evidence.get("volume_number") or evidence.get("book_number") or evidence.get("issue_number")) and not evidence.get("chapter_number"):
             blocked.append("wrong_unit_type")
         elif evidence.get("chapter_number") and wanted and evidence.get("chapter_number") != wanted:

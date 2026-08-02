@@ -17,7 +17,7 @@ import inkdrop_runtime_config
 from tools import inkdrop_install_support_summary
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def require(condition, message):

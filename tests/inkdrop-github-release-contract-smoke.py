@@ -13,7 +13,7 @@ from pathlib import Path
 from tools import inkdrop_github_release as release_tool
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def require(condition, message):

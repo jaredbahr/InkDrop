@@ -30,6 +30,21 @@ GUTENDEX_BOOKS_URL = "https://gutendex.com/books"
 INTERNET_ARCHIVE_SEARCH_URL = "https://archive.org/services/search/v1/scrape"
 INTERNET_ARCHIVE_METADATA_BASE = "https://archive.org/metadata"
 MANGADEX_API_BASE = "https://api.mangadex.org"
+# MangaDex's own API default is safe + suggestive + erotica; it excludes only
+# pornographic. InkDrop defaulted to safe + suggestive, which is stricter than
+# upstream and silently so: the rating filter is applied in the request, so an
+# excluded title is not down-ranked or flagged, it simply does not exist as far as
+# the user can tell. Berserk is rated erotica on MangaDex, so searching for it
+# returned nothing at all -- reported by a tester on 2026-08-01, and it is 8,959
+# titles wide, not one book.
+#
+# Mature content is still handled, just at the right layer: mangadex_search_result
+# scores erotica and pornographic at -35, so it ranks below an equally-matching
+# safe title instead of vanishing. That penalty was dead code for erotica while
+# the request filter removed those rows first. Pornographic stays excluded by
+# default, and the whole list remains user-configurable.
+MANGADEX_DEFAULT_CONTENT_RATINGS = ("safe", "suggestive", "erotica")
+
 SUWAYOMI_API_BASE = str(os.environ.get("INKDROP_SUWAYOMI_API_BASE_URL") or "").strip().rstrip("/")
 GETCOMICS_FEED_URL = "https://getcomics.org/feed/"
 GETCOMICS_DISCOVERY_HOSTS = ("getcomics.org", "www.getcomics.org")
@@ -1413,7 +1428,7 @@ def _mangadex_languages(row, wanted_item=None):
 
 
 def _mangadex_content_ratings(row):
-    return _policy_list(row, "content_ratings", ["safe", "suggestive"])
+    return _policy_list(row, "content_ratings", MANGADEX_DEFAULT_CONTENT_RATINGS)
 
 
 def _mangadex_allowed_hosts(row):

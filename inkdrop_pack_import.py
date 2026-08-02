@@ -59,7 +59,6 @@ PACK_BAD_ARCHIVE_HISTORY_FILE = STATE_DIR / "pack-bad-archive-history.json"
 PACK_LOG = LOG_DIR / "pack-import.log"
 PENDING_PACKS_LOG = STATE_DIR / "pending-pack-imports.jsonl"
 COMPLETED_IMPORT_PATH = script_path("inkdrop_completed_import.py", env_var="INKDROP_COMPLETED_IMPORT_SCRIPT")
-KAPOWARR_DB = inkdrop_runtime_config.kapowarr_db_path()
 
 COMIC_ROOT = Path(os.environ.get("INKDROP_COMIC_ROOT") or "/library/comics")
 PACK_SOURCES = [
@@ -697,81 +696,11 @@ def normalize_manga_number(value):
     return f"{int(whole):03d}.{frac}"
 
 
-def completed_numbers_for_table(table, truth_model, volume_id):
-    if not COMPLETION_DB.exists():
-        return set()
-    conn = sqlite3.connect(COMPLETION_DB)
-    try:
-        row = conn.execute(
-            "select name from sqlite_master where type='table' and name=?",
-            (table,),
-        ).fetchone()
-        if not row:
-            return set()
-        unit_filter = "and unit_type in ('volume','pack')" if table == "manga_coverage" else ""
-        rows = conn.execute(
-            f"""
-            select normalized_number
-            from {table}
-            where kapowarr_volume_id = ?
-              and truth_model = ?
-              and verification_status = 'kavita_verified'
-              {unit_filter}
-            """,
-            (int(volume_id), truth_model),
-        ).fetchall()
-        return {row[0] for row in rows}
-    finally:
-        conn.close()
-
-
-def completed_reading_numbers(volume_id):
-    return (
-        completed_numbers_for_table("manga_completion", "kavita_manga", volume_id)
-        | completed_numbers_for_table("manga_coverage", "kavita_manga", volume_id)
-        | completed_numbers_for_table("collection_completion", "kavita_collection", volume_id)
-    )
-
-
-def manga_unit_model_for_volume(volume_id, series_title=None):
-    mod = load_importer()
-    try:
-        return mod.manga_unit_model_for_target({"id": volume_id, "title": series_title or ""})
-    except Exception:
-        return "unknown/manual"
-
-
 def missing_issue_numbers(volume_id):
-    conn = sqlite3.connect(KAPOWARR_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            select i.id, i.issue_number, i.calculated_issue_number
-            from issues i
-            left join issues_files issue_link on issue_link.issue_id = i.id
-            where i.volume_id = ?
-              and i.monitored = 1
-              and issue_link.file_id is null
-            order by i.calculated_issue_number
-            """,
-            (int(volume_id),),
-        ).fetchall()
-    finally:
-        conn.close()
-    model = manga_unit_model_for_volume(volume_id)
-    if model == "chapter":
-        return {}
-    completed = completed_reading_numbers(volume_id)
-    out = {}
-    for row in rows:
-        key = issue_key(row["calculated_issue_number"] or row["issue_number"])
-        normalized = normalize_manga_number(row["calculated_issue_number"] or row["issue_number"])
-        if normalized and normalized in completed:
-            continue
-        if key is not None:
-            out[key] = {"issue_id": row["id"], "issue": row["issue_number"], "calculated": row["calculated_issue_number"]}
-    return out
+    # Kapowarr is retired; there is no live issues/issues_files table to read
+    # a missing-issue list from. Pack-match coverage now comes entirely from
+    # missing_issue_numbers_from_pack_match() via merged_missing_issue_numbers().
+    return {}
 
 
 def pack_match_sample_rows(item):
@@ -2122,15 +2051,9 @@ def reconcile_completed_packs(review_id=None, explicit_path=None, limit=20, max_
 
 
 def resolve_volume_id(series):
-    conn = sqlite3.connect(KAPOWARR_DB)
-    try:
-        row = conn.execute(
-            "select id from volumes where lower(title) = lower(?) and monitored = 1 order by id limit 1",
-            (str(series or ""),),
-        ).fetchone()
-    finally:
-        conn.close()
-    return row[0] if row else None
+    # Kapowarr is retired; there is no live volumes table to resolve a
+    # series title against.
+    return None
 
 
 def candidate_search_terms(item):
@@ -3384,7 +3307,6 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
     skipped_existing = []
     bad_archives = []
     handled_units = set()
-    scan_volume_ids = set()
     scan_folders = set()
     for path, target, row in matched:
         source_unit = str(row.get("source_unit") or row.get("unit_type") or "volume").strip().lower()
@@ -3646,23 +3568,15 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
             commit_with_retry(conn)
             if unit_key[0] and unit_key[2]:
                 handled_units.add(unit_key)
-            volume_id = target_kapowarr_volume_id(target)
-            if volume_id is not None:
-                scan_volume_ids.add(volume_id)
             scan_folders.add(str(target_dir))
         log(event)
         imported.append(event)
+    # Kapowarr is retired; scanning is Kavita/Komga-only now.
     scan_tasks = []
     kavita_tasks = []
     komga_tasks = []
     library_scan_tasks = {"kavita": kavita_tasks, "komga": komga_tasks}
     if not dry_run:
-        for volume_id in sorted(scan_volume_ids):
-            try:
-                result = importer.trigger_kapowarr_scan(volume_id)
-                scan_tasks.append({"volume_id": volume_id, "task_id": result.get("id") if isinstance(result, dict) else result})
-            except Exception as exc:
-                scan_tasks.append({"volume_id": volume_id, "error": str(exc)})
         frontend_sync = sync_pack_library_frontends(importer, scan_folders)
         kavita_tasks = frontend_sync.get("kavita") or []
         komga_tasks = frontend_sync.get("komga") or []

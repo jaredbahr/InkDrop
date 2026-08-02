@@ -138,8 +138,6 @@ LOCAL_CHECKS = (
             "inkdrop_manual_search_worker.py",
             "inkdrop-library-frontends-smoke.py",
             "inkdrop-komga-settings-smoke.py",
-            "inkdrop-kapowarr-shutdown-readiness-smoke.py",
-            "inkdrop-kapowarr-fallback-retirement-smoke.py",
             "inkdrop-planned-path-live-inspection.py",
             "inkdrop-planned-path-inspection-smoke.py",
             "inkdrop-series-compact-payload-smoke.py",
@@ -248,8 +246,6 @@ LOCAL_CHECKS = (
     ("local_folder_only_flow_smoke", 60, [sys.executable, "-B", "inkdrop-local-folder-only-flow-smoke.py"]),
     ("library_frontends_smoke", 120, [sys.executable, "-B", "inkdrop-library-frontends-smoke.py"]),
     ("komga_settings_smoke", 120, [sys.executable, "-B", "inkdrop-komga-settings-smoke.py"]),
-    ("kapowarr_shutdown_readiness_smoke", 120, [sys.executable, "-B", "inkdrop-kapowarr-shutdown-readiness-smoke.py"]),
-    ("kapowarr_fallback_retirement_smoke", 120, [sys.executable, "-B", "inkdrop-kapowarr-fallback-retirement-smoke.py"]),
     ("planned_path_inspection_smoke", 60, [sys.executable, "-B", "inkdrop-planned-path-inspection-smoke.py"]),
     ("series_compact_payload_smoke", 60, [sys.executable, "-B", "inkdrop-series-compact-payload-smoke.py"]),
     ("ui_state_endpoint_contract_smoke", 60, [sys.executable, "-B", "inkdrop-ui-state-endpoint-contract-smoke.py"]),
@@ -410,7 +406,118 @@ def should_print_stdout(item):
     return len(stdout.splitlines()) <= 6
 
 
+SCRIPT_SEARCH_DIRS = ("", "tests", "scripts")
+
+# Checks that cannot run against a public export, each with the reason and the
+# thing it needs. A check is skipped only when its stated dependency is actually
+# missing, so all of these still run here, where the dependency exists. If a
+# dependency ever does ship publicly, the check starts running again on its own
+# rather than staying silently switched off.
+#
+# Nothing goes on this list to make a red check green. Every entry is a check
+# whose subject is not part of what the public repo contains.
+EXPORT_SKIPPED_CHECKS = {
+    # Assert against internal design documents. Exporting those docs to satisfy
+    # the check would publish internal planning material.
+    "inkdrop-komga-settings-smoke.py": ("reads the internal folder-completion plan", "docs/inkdrop/folder-based-completion-plan.md"),
+    "inkdrop-library-frontends-smoke.py": ("reads the internal folder-completion plan", "docs/inkdrop/folder-based-completion-plan.md"),
+    "inkdrop-operational-ui-static-smoke.py": ("reads the internal UI gap register", "docs/inkdrop/UI_BACKEND_GAPS.md"),
+    "inkdrop-public-security-smoke.py": ("reads the internal runtime-config contract", "docs/inkdrop/public-runtime-config-contract.md"),
+    "inkdrop-standalone-entrypoints-smoke.py": ("reads the internal service inventory", "docs/inkdrop/service-inventory.md"),
+    # Drive a browser harness that is not part of the published tree.
+    "inkdrop-auth-ui-smoke.py": ("drives an internal browser harness", "web/tests/auth-visual-browser-smoke.js"),
+    "inkdrop-manual-search-ui-smoke.py": ("drives an internal browser harness", "web/tests/manual-search-browser-smoke.js"),
+    # Deliberately absent: inkdrop-settings-backup-browser-smoke.py. Its harness
+    # does ship, and Node runs it, so there is no honest reason to exclude it --
+    # it needs a real browser, which CI may well provide. Left in so a failure
+    # there is a real signal instead of something silenced on a wrong premise.
+    # Exercises an internal audit tool.
+    "inkdrop-duplicate-live-task-audit-smoke.py": ("exercises an internal audit tool", "tools/inkdrop_duplicate_live_task_audit.py"),
+    # Needs this project's own host layout, not a generic checkout.
+    "inkdrop-series-autopilot-cron-lock-smoke.py": ("needs the maintainer host's cron layout", "inkdrop-source-worker.sh"),
+    # Asserts against absolute maintainer paths (/home/<user>, /mnt/...), so it
+    # is deliberately kept out of the export rather than published with them.
+    "inkdrop-source-worker-service-smoke.py": ("asserts on maintainer host paths", "inkdrop-source-worker.sh"),
+    # Inspect or rebuild the export itself, so they have nothing to say when run
+    # from inside one. inkdrop-public-export-runnable-smoke.py covers this
+    # ground from the outside, which is the only place the answer is meaningful.
+    "inkdrop-public-repo-export-smoke.py": ("re-exports the repo; meaningless inside an export", "docs/inkdrop/beta-readme-approved-20260730.md"),
+    "inkdrop-public-docker-runtime-smoke.py": ("checks the pre-export tree", "docs/inkdrop/beta-readme-approved-20260730.md"),
+    "inkdrop-public-release-safety-audit.py": ("audits the pre-export tree", "docs/inkdrop/beta-readme-approved-20260730.md"),
+    "inkdrop-planned-path-live-inspection.py": ("live inspection tool, not a self-contained check", "docs/inkdrop/beta-readme-approved-20260730.md"),
+}
+
+
+def export_skip_reason(name):
+    """Why this check does not apply here, or None when it should run."""
+    entry = EXPORT_SKIPPED_CHECKS.get(Path(name).name)
+    if entry is None:
+        return None
+    reason, requires = entry
+    if (ROOT / requires).exists():
+        return None
+    return f"{reason} ({requires} is not part of this tree)"
+
+
+def resolve_script(name):
+    """Find a script whether it sits at the repo root or in an export subfolder.
+
+    This repo keeps its scripts at the root; the public export files them under
+    tests/ and scripts/. Resolving at run time means one list of checks works in
+    both layouts, so the export never has to rewrite this file and the two can
+    not drift apart. Unknown names come back unchanged and fail loudly at the
+    subprocess, rather than being silently skipped.
+    """
+    # A name that already resolves from the working directory is returned
+    # unchanged. Some of these commands run inside the container rather than on
+    # the host, where an absolute host path means nothing -- rewriting one broke
+    # the container preflight, which could not find inkdrop_preflight.py.
+    if (ROOT / name).is_file():
+        return name
+    for folder in SCRIPT_SEARCH_DIRS:
+        if not folder:
+            continue
+        candidate = ROOT / folder / name
+        if candidate.is_file():
+            return (Path(folder) / name).as_posix()
+    return name
+
+
+def resolve_command(command):
+    return [resolve_script(part) if isinstance(part, str) and part.endswith((".py", ".sh")) else part for part in command]
+
+
+def check_env(env=None):
+    """Run child scripts with the repo root importable.
+
+    A relocated script's own directory is what Python puts on sys.path, so a
+    test under tests/ cannot import the root modules it exercises without this.
+    """
+    resolved = dict(os.environ if env is None else env)
+    existing = resolved.get("PYTHONPATH", "")
+    root = str(ROOT)
+    if root not in existing.split(os.pathsep):
+        resolved["PYTHONPATH"] = os.pathsep.join([root, existing]) if existing else root
+    return resolved
+
+
 def run_command(name, command, *, env=None, timeout=None):
+    for part in command:
+        if not isinstance(part, str) or not part.endswith((".py", ".sh")):
+            continue
+        reason = export_skip_reason(part)
+        if reason:
+            return {
+                "name": name,
+                "command": display_command(command),
+                "returncode": 0,
+                "skipped": True,
+                "skip_reason": reason,
+                "stdout": f"skipped: {reason}",
+                "stderr": "",
+            }
+    command = resolve_command(command)
+    env = check_env(env)
     try:
         started = subprocess.run(
             command,

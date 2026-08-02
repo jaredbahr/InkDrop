@@ -7,8 +7,8 @@ import importlib.util
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
-INSPECTOR_PATH = ROOT / "inkdrop-planned-path-live-inspection.py"
+ROOT = Path(__file__).resolve().parents[1]
+INSPECTOR_PATH = ROOT / "tests/inkdrop-planned-path-live-inspection.py"
 
 
 def load_inspector():

@@ -33,7 +33,6 @@ ENV_WEB_BASE_URL = "INKDROP_WEB_BASE_URL"
 ENV_CONTAINER_WEB_BASE_URL = "INKDROP_CONTAINER_WEB_BASE_URL"
 ENV_WORKER_API_KEY = "INKDROP_WORKER_API_KEY"
 ENV_KAVITA_DB = "INKDROP_KAVITA_DB"
-ENV_KAPOWARR_DB = "INKDROP_KAPOWARR_DB"
 LEGACY_ENV_STATE_DIR = "KAVITA_ACQUIRE_STATE_DIR"
 LEGACY_ENV_KAVITA_DB = "INKDROP_KAVITA_DB_PATH"
 ENV_WORKER_STATUS_FILE = "INKDROP_WORKER_STATUS_FILE"
@@ -270,15 +269,6 @@ def compatible_log_paths(canonical_name, *legacy_names, environ=None):
     root = log_dir(environ)
     names = (canonical_name, *legacy_names)
     return tuple(root / Path(str(name)).name for name in names if str(name or "").strip())
-
-
-def kapowarr_db_path(environ=None):
-    return optional_adapter_db_path(
-        environ,
-        env_key=ENV_KAPOWARR_DB,
-        adapter_dir="kapowarr",
-        filename="Kapowarr.db",
-    )
 
 
 def state_db_path(environ=None):

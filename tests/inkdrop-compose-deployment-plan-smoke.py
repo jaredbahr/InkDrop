@@ -15,7 +15,7 @@ def require(condition, message):
 
 
 def main():
-    repo_root = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[1]
     install_doc = (repo_root / "docs" / "inkdrop" / "arr-stack-deployment-plan.md").read_text(encoding="utf-8")
     require(
         "docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml config" in install_doc,
@@ -64,7 +64,6 @@ def main():
             "INKDROP_SLSKD_API_BASE_URL: ${INKDROP_SLSKD_API_BASE_URL:-}",
             "INKDROP_KAVITA_URL: ${INKDROP_KAVITA_URL:-}",
             "INKDROP_KOMGA_URL: ${INKDROP_KOMGA_URL:-}",
-            "INKDROP_KAPOWARR_URL: ${INKDROP_KAPOWARR_URL:-}",
         ):
             require(needle in block, f"proposed service block should keep {needle} blank by default")
         require(

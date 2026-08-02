@@ -27,6 +27,7 @@ except Exception:
     inkdrop_state = None
 
 import inkdrop_runtime_config
+import inkdrop_qbittorrent_auth
 import inkdrop_download_clients
 
 CONFIG_DIR = inkdrop_runtime_config.config_dir()
@@ -672,8 +673,12 @@ def load_qbit_settings():
     if config and not config.get("enabled", True):
         raise RuntimeError("qBittorrent provider is disabled in InkDrop settings")
     settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
+    # An API key authenticates on its own (qBittorrent >= 5.2.0), so when one is
+    # set we never look for a username/password and never fall back to the
+    # qbit_manage config file for them.
+    api_key = str(settings.get("api_key") or os.environ.get("INKDROP_QBITTORRENT_API_KEY") or "").strip()
     qbt = {}
-    if not all(str(settings.get(key) or "").strip() for key in ("username", "password")):
+    if not api_key and not all(str(settings.get(key) or "").strip() for key in ("username", "password")):
         try:
             import yaml
 
@@ -691,12 +696,15 @@ def load_qbit_settings():
         host = "http://" + host
     user = str(settings.get("username") or settings.get("user") or os.environ.get("INKDROP_QBITTORRENT_USERNAME") or qbt.get("user") or "").strip()
     password = str(settings.get("password") or settings.get("pass") or os.environ.get("INKDROP_QBITTORRENT_PASSWORD") or qbt.get("pass") or "").strip()
-    if not user or not password:
-        raise RuntimeError("qBittorrent username/password are not set in InkDrop settings or qbit_manage config")
+    if not api_key and not (user and password):
+        raise RuntimeError(
+            "qBittorrent needs an API key, or a username and password, in InkDrop settings or qbit_manage config"
+        )
     return {
         "host": host,
         "user": user,
         "pass": password,
+        "api_key": api_key,
         "comics_category": str(settings.get("comics_category") or "comics").strip() or "comics",
         "ebooks_category": str(settings.get("ebooks_category") or "readarr").strip() or "readarr",
         "comics_save_path": str(settings.get("comics_save_path") or "/downloads/comics").strip() or "/downloads/comics",
@@ -1081,14 +1089,7 @@ def qbit_add(
             raise RuntimeError("Prowlarr torrent payload identity is missing")
 
     session = http.Session()
-    login = session.post(
-        qbit["host"] + "/api/v2/auth/login",
-        data={"username": qbit["user"], "password": qbit["pass"]},
-        timeout=20,
-    )
-    login.raise_for_status()
-    if login.status_code not in {200, 204}:
-        raise RuntimeError("qBittorrent login failed")
+    inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=20)
 
     existing = qbit_visible_torrents(
         session,

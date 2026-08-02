@@ -25,6 +25,7 @@ except Exception:
     inkdrop_state = None
 
 import inkdrop_runtime_config
+import inkdrop_qbittorrent_auth
 import inkdrop_internal_jobs
 import inkdrop_artifact_acceptance
 import inkdrop_manual_search
@@ -42,7 +43,6 @@ except Exception:
 CONFIG_DIR = inkdrop_runtime_config.config_dir()
 STATE_DIR = inkdrop_runtime_config.state_dir()
 LOG_DIR = inkdrop_runtime_config.log_dir()
-KAPOWARR_DB = inkdrop_runtime_config.kapowarr_db_path()
 ACQUIRE_PATH = Path(os.environ.get("INKDROP_ACQUIRE_MODULE") or Path(__file__).resolve().with_name("inkdrop_acquire.py"))
 INKDROP_STATE_DB = STATE_DIR / (inkdrop_state.STATE_DB_NAME if inkdrop_state else "inkdrop-state.sqlite3")
 COMPLETION_DB = STATE_DIR / "imported-files.sqlite3"
@@ -321,13 +321,6 @@ def queue_mode_enabled():
     return boolish_value(inkdrop_app_setting_value("automation.queue_mode", True), True)
 
 
-def kapowarr_missing_fallback_enabled():
-    # Retired in Build 165. Legacy DB/env values are intentionally inert.
-    return False
-
-
-def kapowarr_missing_db_fallback_enabled():
-    return kapowarr_missing_fallback_enabled()
 
 
 def normalize_protocol_name(value):
@@ -1609,11 +1602,7 @@ def qbit_incomplete_series(acquire, series_names, timeout_seconds=None):
             if str(path or "").strip()
         }
         session = requests.Session()
-        session.post(
-            qbit["host"] + "/api/v2/auth/login",
-            data={"username": qbit["user"], "password": qbit["pass"]},
-            timeout=(2.0, timeout_seconds),
-        ).raise_for_status()
+        inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=(2.0, timeout_seconds))
         resp = session.get(qbit["host"] + "/api/v2/torrents/info", timeout=(2.0, timeout_seconds))
         resp.raise_for_status()
         torrents = resp.json()
@@ -1653,9 +1642,6 @@ def qbit_incomplete_series(acquire, series_names, timeout_seconds=None):
     return active
 
 
-KAPOWARR_FOLDER_CACHE = {}
-
-
 def sync_inkdrop_state_for_missing():
     if inkdrop_state is None or not INKDROP_STATE_DB.exists():
         return {"ok": False, "reason": "inkdrop_state_unavailable"}
@@ -1671,29 +1657,6 @@ def sync_inkdrop_state_for_missing():
     except Exception as exc:
         audit("inkdrop_state_missing_sync_failed", {"error": f"{type(exc).__name__}: {exc}"})
         return {"ok": False, "error": str(exc)}
-
-
-def kapowarr_folder_for_volume(volume_id):
-    if volume_id in (None, ""):
-        return None
-    if not kapowarr_missing_db_fallback_enabled():
-        return None
-    key = str(volume_id)
-    if key in KAPOWARR_FOLDER_CACHE:
-        return KAPOWARR_FOLDER_CACHE[key]
-    if not KAPOWARR_DB.exists():
-        KAPOWARR_FOLDER_CACHE[key] = None
-        return None
-    con = sqlite3.connect(KAPOWARR_DB)
-    try:
-        row = con.execute("select folder from volumes where id = ? limit 1", (int(volume_id),)).fetchone()
-        folder = row[0] if row and row[0] else None
-    except Exception:
-        folder = None
-    finally:
-        con.close()
-    KAPOWARR_FOLDER_CACHE[key] = folder
-    return folder
 
 
 def inkdrop_monitored_series_names():
@@ -1725,31 +1688,10 @@ def inkdrop_monitored_series_names():
         con.close()
 
 
-def kapowarr_monitored_series_names():
-    if not kapowarr_missing_db_fallback_enabled():
-        return tuple()
-    con = sqlite3.connect(KAPOWARR_DB)
-    try:
-        rows = con.execute(
-            """
-            select distinct title
-            from volumes
-            where monitored = 1
-              and title is not null
-            order by lower(title)
-            """
-        ).fetchall()
-        return tuple(row[0] for row in rows)
-    finally:
-        con.close()
-
-
 def monitored_series_names():
     if queue_mode_enabled():
-        names = inkdrop_monitored_series_names()
-        if names:
-            return names
-    return kapowarr_monitored_series_names()
+        return inkdrop_monitored_series_names()
+    return tuple()
 
 
 def library_path_roots():
@@ -1855,7 +1797,7 @@ def inkdrop_missing_row_from_queue_record(row):
     row = row if isinstance(row, dict) else dict(row or {})
     raw = json.loads(row.get("queue_raw_json") or "{}") if row.get("queue_raw_json") else {}
     kapowarr_id = row.get("kapowarr_id") if row.get("kapowarr_id") not in (None, "") else raw.get("kapowarr_id")
-    folder = raw.get("folder") or kapowarr_folder_for_volume(kapowarr_id)
+    folder = raw.get("folder")
     issue_number = row.get("issue_number") or raw.get("issue") or raw.get("chapter")
     if not row.get("title") or not issue_number:
         return None
@@ -1920,73 +1862,19 @@ def inkdrop_missing_row_from_queue_record(row):
     }
 
 
-def kapowarr_missing_issues(series_names, fresh_days=None):
-    if not kapowarr_missing_db_fallback_enabled():
-        return []
-    filters = [
-        "v.monitored = 1",
-        "i.monitored = 1",
-        "ifs.file_id is null",
-    ]
-    params = []
-    if series_names:
-        placeholders = ",".join("?" for _ in series_names)
-        filters.append(f"v.title in ({placeholders})")
-        params.extend(series_names)
-    if fresh_days:
-        cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - fresh_days * 86400))
-        filters.append("coalesce(i.date, '') >= ?")
-        params.append(cutoff)
-    order = "i.date desc, v.title, i.calculated_issue_number" if fresh_days else "v.title, i.calculated_issue_number"
-    sql = f"""
-        select
-            v.id as volume_id,
-            v.title as title,
-            v.alt_title as alt_title,
-            v.publisher as publisher,
-            v.year as year,
-            v.special_version as special_version,
-            v.folder as folder,
-            i.id as issue_id,
-            i.issue_number as issue_number,
-            i.calculated_issue_number as calculated_issue_number
-        from volumes v
-        join issues i on i.volume_id = v.id
-        left join issues_files ifs on ifs.issue_id = i.id
-        where {" and ".join(filters)}
-        order by {order}
-    """
-    con = sqlite3.connect(KAPOWARR_DB)
-    con.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in con.execute(sql, params)]
-    finally:
-        con.close()
-
-
 def missing_issues(series_names, fresh_days=None):
     if queue_mode_enabled():
-        rows = inkdrop_queue_missing_issues(series_names, fresh_days=fresh_days)
-        if rows or not kapowarr_missing_fallback_enabled():
-            return rows
-    return kapowarr_missing_issues(series_names, fresh_days=fresh_days)
+        return inkdrop_queue_missing_issues(series_names, fresh_days=fresh_days)
+    return []
 
 
 def missing_source_summary(rows):
     inkdrop_rows = sum(1 for row in rows if row.get("inkdrop_queue_row"))
-    kapowarr_rows = sum(1 for row in rows if not row.get("inkdrop_queue_row"))
-    if inkdrop_rows:
-        source = "inkdrop_queue"
-    elif queue_mode_enabled() and not kapowarr_missing_fallback_enabled():
-        source = "inkdrop_queue_empty"
-    else:
-        source = "kapowarr"
+    source = "inkdrop_queue" if inkdrop_rows else "inkdrop_queue_empty"
     return {
         "missing_source": source,
         "inkdrop_queue_rows": inkdrop_rows,
-        "kapowarr_rows": kapowarr_rows,
         "queue_mode": queue_mode_enabled(),
-        "kapowarr_missing_fallback": kapowarr_missing_fallback_enabled(),
     }
 
 
@@ -3172,88 +3060,13 @@ def english_confidence(result):
 
 
 def pack_match_estimate(volume_id, pack_info):
-    if volume_id in (None, ""):
-        return {
-            "useful_missing_count": 0,
-            "already_present_count": 0,
-            "unknown_unmatched_count": 1,
-            "useful_missing_sample": [],
-            "already_present_sample": [],
-            "coverage_source": "missing_volume_context",
-        }
-    if not kapowarr_missing_db_fallback_enabled():
-        return {
-            "useful_missing_count": 0,
-            "already_present_count": 0,
-            "unknown_unmatched_count": 1,
-            "useful_missing_sample": [],
-            "already_present_sample": [],
-            "coverage_source": "kapowarr_fallback_disabled",
-        }
-    ranges = (pack_info or {}).get("ranges") or []
-    keywords = {str(item).lower() for item in ((pack_info or {}).get("keywords") or [])}
-    completed_numbers = completed_numbers_for_volume_id(volume_id)
-    complete_series_pack = "complete" in keywords and not any(
-        item.get("start") is not None and item.get("end") is not None
-        for item in ranges
-    )
-    numbers = set()
-    for item in ranges:
-        start = item.get("start")
-        end = item.get("end")
-        if start is None or end is None:
-            continue
-        numbers.update(range(int(start), int(end) + 1))
-    con = sqlite3.connect(KAPOWARR_DB)
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute(
-            """
-            select
-                i.id,
-                i.issue_number,
-                i.calculated_issue_number,
-                exists (
-                    select 1 from issues_files issue_link
-                    where issue_link.issue_id = i.id
-                ) as has_file
-            from issues i
-            where i.volume_id = ?
-              and i.monitored = 1
-            order by i.calculated_issue_number
-            """,
-            (int(volume_id),),
-        ).fetchall()
-    finally:
-        con.close()
-    useful = []
-    existing = []
-    unknown = 0
-    for row in rows:
-        try:
-            number = int(float(row["calculated_issue_number"] or row["issue_number"]))
-        except (TypeError, ValueError):
-            unknown += 1
-            continue
-        if numbers and number not in numbers:
-            continue
-        item = {"issue_id": row["id"], "issue": row["issue_number"], "calculated": row["calculated_issue_number"]}
-        normalized = normalize_manga_number(row["calculated_issue_number"] or row["issue_number"])
-        if row["has_file"] or (normalized and normalized in completed_numbers):
-            if normalized and normalized in completed_numbers and not row["has_file"]:
-                item["presence"] = "kavita_verified"
-            existing.append(item)
-        else:
-            useful.append(item)
-    if not numbers and not complete_series_pack:
-        unknown = max(unknown, len(rows))
     return {
-        "useful_missing_count": len(useful),
-        "already_present_count": len(existing),
-        "unknown_unmatched_count": unknown,
-        "useful_missing_sample": useful[:20],
-        "already_present_sample": existing[:20],
-        "coverage_source": "complete_keyword" if complete_series_pack else ("explicit_range" if numbers else "unknown"),
+        "useful_missing_count": 0,
+        "already_present_count": 0,
+        "unknown_unmatched_count": 1,
+        "useful_missing_sample": [],
+        "already_present_sample": [],
+        "coverage_source": "missing_volume_context" if volume_id in (None, "") else "kapowarr_fallback_disabled",
     }
 
 

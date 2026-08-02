@@ -90,7 +90,7 @@ docker compose -f docker-compose.yml -f deploy/compose.network.example.yml up -d
 This attaches only the `inkdrop` web container to that network. The repository
 worker still uses the default project network unless you add a matching worker
 override. The network override does not turn Prowlarr, SABnzbd, qBittorrent,
-SLSKD, Kavita, Komga, Kapowarr, or Suwayomi into active config; set those
+SLSKD, Kavita, Komga, or Suwayomi into active config; set those
 adapter URLs separately when you choose to enable them.
 The public smoke suite treats `.env.example` and `docker-compose.yml` as one
 contract: every documented `INKDROP_*` setting must be passed into the
@@ -139,8 +139,8 @@ Optional before enabling automation:
   an operator explicitly saves the Settings value.
 - Configure `INKDROP_SAB_PATH_MAPPINGS` or `INKDROP_UNC_PATH_MAPPINGS` only
   when download-client paths differ from InkDrop container paths.
-- Set `INKDROP_KAPOWARR_DB` or `INKDROP_KAVITA_DB` only for deliberate
-  migration/visibility compatibility.
+- Set `INKDROP_KAVITA_DB` only for deliberate migration/visibility
+  compatibility.
 - Monitoring a series does not enable Automatic Search. Set
   `INKDROP_QUEUE_RUNNER_AUTOPILOT_ENABLED=1` in the packet `.env`, then run
   `docker compose up -d --force-recreate inkdrop inkdrop-worker`. Confirm the
@@ -150,8 +150,7 @@ Optional before enabling automation:
 Expected clean-install warnings:
 
 - `optional_adapters_unconfigured` is normal until providers are configured.
-- Kapowarr and Kavita are migration/visibility adapters, not first-run
-  requirements.
+- Kavita is a migration/visibility adapter, not a first-run requirement.
 - Missing or unwritable library roots block import readiness even when the web
   and worker containers are healthy.
 - Direct host runs may report `python_dependencies_missing` or
@@ -181,8 +180,8 @@ for expected clean-install warnings:
 - `python_dependencies_missing`: required Python packages missing from the
   current host environment
 
-Kapowarr and Kavita are intentionally not clean-install warnings; they are
-adapter paths only, not first-run requirements.
+Kavita is intentionally not a clean-install warning; it is an adapter path
+only, not a first-run requirement.
 
 The same output also reports archive-tool availability. `7z` is the primary
 tool InkDrop uses for CBR/RAR inspection and pack extraction; `unrar-free` (or
@@ -546,9 +545,9 @@ Optional adapters are considered configured only when their required connection
 settings are present, or when an adapter-specific local DB/config path actually
 exists inside the container. Placeholder defaults such as
 `/config/kavita/kavita.db` do not by themselves make a fresh install depend on
-Kavita or Kapowarr; the example `.env` and Compose defaults leave
-`INKDROP_KAPOWARR_DB` and `INKDROP_KAVITA_DB` blank unless an operator is
-deliberately migrating from those tools.
+Kavita; the example `.env` and Compose defaults leave
+`INKDROP_KAVITA_DB` blank unless an operator is deliberately migrating from
+that tool.
 The `configured_adapters` preflight block includes `configured_by`,
 `missing_required_keys`, existing-path evidence, and a short `reason` for each
 adapter so operators can tell unconfigured adapters apart from broken mounted
@@ -560,7 +559,7 @@ add books after import. Mounted reader databases may still be useful for
 read-only visibility checks, but scan/add API calls require an explicit URL.
 
 Likewise, the web Settings provider templates do not seed localhost service
-URLs for Prowlarr, SLSKD, Kavita, Komga, or Kapowarr. Add those endpoints only
+URLs for Prowlarr, SLSKD, Kavita, or Komga. Add those endpoints only
 when the service is reachable from the InkDrop container. Preflight validates
 configured service endpoints as full `http://` or `https://` URLs, so use
 values like `http://prowlarr:9696` rather than bare hostnames.
@@ -583,7 +582,7 @@ library adapters, metadata providers, source providers, download clients,
 manual staging, security summary, backup/export, and local-folder-only mode.
 External adapters remain optional in that payload; a clean local-folder-only
 install should be able to complete without qBittorrent, SABnzbd, SLSKD,
-Prowlarr, Suwayomi, Kavita, Komga, Kapowarr, or ComicVine configured.
+Prowlarr, Suwayomi, Kavita, Komga, or ComicVine configured.
 
 ## Authentication
 
@@ -747,7 +746,7 @@ docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet 
 ```
 
 Do not mount another application's SQLite database or config folder just
-because it exists. Kapowarr, Kavita, and Komga are compatibility or visibility
+because it exists. Kavita and Komga are compatibility or visibility
 adapters, not required runtime dependencies for a clean InkDrop install.
 For a copy/adapt service block, preflight commands, and rollback checklist,
 see `docs/inkdrop/arr-stack-deployment-plan.md`.
@@ -906,7 +905,7 @@ Fresh Docker installs should prefer normal service URLs such as
 `http://prowlarr:9696` over localhost-style trust defaults.
 
 Fresh installs should not require maintainer-specific home directories, media
-mounts, Kapowarr, Kavita, Komga, Prowlarr, SLSKD, SABnzbd, or qBittorrent.
+mounts, Kavita, Komga, Prowlarr, SLSKD, SABnzbd, or qBittorrent.
 Those are optional adapters as the standalone migration continues.
 
 Suwayomi is also optional. Leave `INKDROP_SUWAYOMI_API_BASE_URL` blank until

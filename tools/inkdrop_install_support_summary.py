@@ -53,10 +53,6 @@ ADAPTER_GUIDANCE = {
         "impact": "Komga visibility sync is unavailable.",
         "next_step": "Set INKDROP_KOMGA_URL only if you want optional Komga sync.",
     },
-    "kapowarr": {
-        "impact": "The optional legacy integration is unavailable.",
-        "next_step": "Leave this blank for standalone installs unless you are migrating from a Kapowarr-backed setup.",
-    },
 }
 
 RELEASE_GATE_COMMAND = "python -B tools/inkdrop_public_release_check.py --docker --require-docker"
@@ -129,7 +125,6 @@ def _install_defaults():
             "suwayomi_api_base_url": "",
             "kavita_url": "",
             "komga_url": "",
-            "kapowarr_url": "",
         },
         "compose_service_suggestions": {
             "prowlarr_url": "http://prowlarr:9696",

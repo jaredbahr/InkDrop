@@ -1046,7 +1046,6 @@ def review_id_for(item):
             item.get("issue"),
             item.get("autopilot_queue_key"),
             item.get("queue_identity"),
-            item.get("kapowarr_id") or item.get("volume_id"),
             item.get("comicvine_id"),
             item.get("query"),
             (item.get("candidate") or {}).get("title"),
@@ -1086,10 +1085,6 @@ def identity_values_for_item(item):
     queue_identity = str(item.get("queue_identity") or "").strip()
     if queue_identity:
         values.append(queue_identity)
-    for field in ("kapowarr_id", "volume_id", "kapowarrId", "volumeId"):
-        value = item.get(field)
-        if value not in (None, ""):
-            values.append(f"kapowarr:{value}")
     for field in ("comicvine_id", "comicvineId"):
         value = item.get(field)
         if value not in (None, ""):
@@ -1128,9 +1123,7 @@ def issue_metadata_index():
         }
         series_keys.discard("")
         identity_values = identity_values_for_item(watch)
-        queue_identity = ""
-        if watch.get("kapowarrId") not in (None, ""):
-            queue_identity = f"kapowarr:{watch.get('kapowarrId')}"
+        queue_identity = identity_values[0] if identity_values else ""
         issues = []
         known = watch.get("knownIssues")
         if isinstance(known, dict):
@@ -1152,7 +1145,6 @@ def issue_metadata_index():
                 "year": watch.get("year") or "",
                 "publisher": watch.get("publisher") or "",
                 "watch_id": watch.get("id") or "",
-                "kapowarr_id": watch.get("kapowarrId") or "",
                 "comicvine_id": watch.get("comicvineId") or "",
                 "queue_identity": queue_identity,
             }
@@ -1186,7 +1178,6 @@ def issue_metadata_for_item(item):
         "year": (item or {}).get("year") or (item or {}).get("watch_year") or "",
         "publisher": (item or {}).get("publisher") or (item or {}).get("watch_publisher") or "",
         "watch_id": (item or {}).get("watch_id") or "",
-        "kapowarr_id": (item or {}).get("kapowarr_id") or (item or {}).get("volume_id") or "",
         "comicvine_id": (item or {}).get("comicvine_id") or "",
         "queue_identity": (item or {}).get("queue_identity") or "",
     }
@@ -2511,8 +2502,6 @@ def queue_source_review_item(row):
         "year": row.get("watch_year") or row.get("year") or "",
         "watch_year": row.get("watch_year") or row.get("year") or "",
         "media_type": row.get("media_type") or "",
-        "volume_id": row.get("volume_id") or row.get("kapowarr_id") or "",
-        "kapowarr_id": row.get("kapowarr_id") or row.get("volume_id") or "",
         "comicvine_id": row.get("comicvine_id") or "",
         "watch_id": row.get("watch_id") or "",
         "series_id": row.get("series_id") or "",
@@ -2631,9 +2620,15 @@ def queue_probe_priority(row):
         retry_after = float((row or {}).get("retry_after") or 0)
     except (TypeError, ValueError):
         retry_after = 0
+    # A never-attempted row has no retry_after (0) and must not outrank a row
+    # whose cooldown already elapsed -- both are equally eligible right now.
+    # Comparing raw epoch timestamps here previously ranked every untried row
+    # ahead of any row with a real retry_after, permanently starving retried
+    # candidates once the untried backlog exceeded the per-pass selection cap.
+    retry_wait = max(0.0, retry_after - time.time())
     return (
         bucket,
-        retry_after,
+        retry_wait,
         normalize((row or {}).get("series") or ""),
         token_number(queue_source_issue(row)) or 999999,
         queue_source_issue(row),
@@ -2711,8 +2706,6 @@ def combine_source_review_items(*groups):
                 str(
                     item.get("autopilot_queue_key")
                     or item.get("queue_identity")
-                    or item.get("kapowarr_id")
-                    or item.get("volume_id")
                     or item.get("comicvine_id")
                     or ""
                 ),
@@ -2728,8 +2721,6 @@ def combine_source_review_items(*groups):
                     "search_query",
                     "year",
                     "watch_year",
-                    "volume_id",
-                    "kapowarr_id",
                     "comicvine_id",
                     "watch_id",
                     "queue_identity",
@@ -3179,24 +3170,6 @@ def comicvine_edition_target_has_standalone_alternative(comicvine_id, series_tit
     api_key = str(settings.get("api_key") or "").strip()
     base_url = str(config.get("base_url") or COMICVINE_API).rstrip("/")
     if not api_key:
-        # The InkDrop-native provider setting is commonly left blank when the
-        # key actually lives in Kapowarr's own config (the same fallback
-        # inkdrop_web.py's load_comicvine_key() uses).
-        try:
-            kapowarr_db = inkdrop_runtime_config.kapowarr_db_path()
-            if kapowarr_db and Path(kapowarr_db).exists():
-                con = sqlite3.connect(f"file:{kapowarr_db}?mode=ro", uri=True)
-                try:
-                    row = con.execute(
-                        "select value from config where key='comicvine_api_key'"
-                    ).fetchone()
-                finally:
-                    con.close()
-                if row and row[0]:
-                    api_key = str(row[0]).strip()
-        except Exception:
-            pass
-    if not api_key:
         return None
 
     plain_title = strip_edition_descriptors(series_title)
@@ -3574,6 +3547,22 @@ def source_queries(item):
             queries.append(f"{canonical_title} {suffix}")
     if canonical_title and first_suffix and not alias_mentions_issue(canonical_title, issue) and not title_has_numbering(canonical_title):
         queries.append(f"{canonical_title} {first_suffix}")
+    # The alternate title variant gets its bare and media-qualified forms too,
+    # not only the later "complete"/"collection" ones below. A metadata title
+    # can be a bad Soulseek query while the shelf name is a good one: uploaders
+    # file "Naoki Urasawa's 20th Century Boys" under Manga/URASAWA Naoki/20th
+    # Century Boys, so the canonical title matches almost no filenames. Live
+    # counts for that series -- the canonical query returns 1 file from 1 peer
+    # on every run, while "20th Century Boys manga" returns 1,058 files from 19
+    # peers and was never being generated at all.
+    #
+    # These sit after the first numbered query on purpose. Finding the wanted
+    # issue still leads; this only stops a bad canonical title from being the
+    # only broad query a series ever gets.
+    for title in preferred_titles[1:2]:
+        if alias_mentions_issue(title, issue) or title_has_numbering(title):
+            continue
+        queries.extend(broad_series_query_variants(title, media_query_qualifier)[:2])
     for title in preferred_titles[:2]:
         if alias_mentions_issue(title, issue) or title_has_numbering(title):
             continue
@@ -3843,11 +3832,14 @@ def derive_query_offset(queries, cache_entry, refresh_reason="", force=False):
     queries = list(queries or [])
     if force or not queries or not isinstance(cache_entry, dict):
         return 0
-    # Retry errors from the same starting point. Scheduled no-candidate probes
-    # rotate so less-common alias/part/volume variants eventually get searched.
+    # Only a changed query plan invalidates the stored rotation position --
+    # the offset was computed against a query list that no longer exists.
+    # Every other refresh reason (candidate_recheck, retry_probe_error,
+    # schema/verdict upgrades) previously hit a blanket "return 0" too, which
+    # meant a periodically-rechecked item (has cached candidates but nothing
+    # passed matching) restarted at the anchor query every single recheck
+    # and never rotated through the rest of the query list.
     if refresh_reason == "query_plan_changed":
-        return 0
-    if refresh_reason:
         return 0
     if str(cache_entry.get("status") or "") not in {"searched_no_candidates", "no_query"}:
         return 0
@@ -4082,6 +4074,10 @@ def merge_slskd_search_responses(existing, observed):
 
 DEFAULT_SLSKD_SEARCH_MIN_INTERVAL_SECONDS = 5.0
 DEFAULT_SLSKD_SEARCH_MAX_PER_HOUR = 60
+DEFAULT_SLSKD_REPEAT_QUERY_COOLDOWN_SECONDS = 24 * 3600
+# One peer answering is a search that got cut short, not an answer about what
+# the network holds.
+MIN_REUSABLE_SEARCH_RESPONSES = 2
 
 
 def slskd_search_min_interval_seconds():
@@ -4144,6 +4140,81 @@ def recent_slskd_search_start_times(max_age_seconds=3600):
     return starts
 
 
+def slskd_repeat_query_cooldown_seconds():
+    try:
+        value = float(
+            os.environ.get("INKDROP_SLSKD_REPEAT_QUERY_COOLDOWN_SECONDS")
+            or DEFAULT_SLSKD_REPEAT_QUERY_COOLDOWN_SECONDS
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_SLSKD_REPEAT_QUERY_COOLDOWN_SECONDS
+    return max(0.0, min(value, 7 * 24 * 3600))
+
+
+def reusable_slskd_search(query, max_age_seconds):
+    """The most recent finished search for this exact text, if it still stands.
+
+    Soulseek has no index to re-crawl: a search asks whoever is online right
+    now what they are sharing. Asking the same question again an hour later
+    gets the same peers and the same files back. Live check on this deployment:
+    "Vagabond manga" ran 16 times in 19 hours and returned ~1,700 files every
+    time, and one wanted series can hold ~100 rows that all build the same
+    broad series query, so the per-row cooldown never sees a repeat.
+
+    Reuse what SLSKD already stored instead of starting another real search on
+    the operator's account. Only reuse a search that actually found something --
+    if the last identical query came back empty, let a new one run, so this can
+    never pin a row to an old miss.
+
+    "Finished" is not the same as "representative", and the difference is not
+    cosmetic. A Soulseek search ends either because it ran out of room for
+    replies or because it ran out of time, and the timed-out ones on this
+    deployment range from 0 to 185 peers. The live search for "Injustice Gods
+    Among Us comic" timed out having heard back from exactly one peer, while
+    the run of single issues it was looking for is widely shared. Reusing that
+    for a day would pin the series to one peer's shelf.
+
+    So reuse only the strongest snapshot this query has produced inside the
+    window, and never a single-peer answer. A thinner, newer search does not
+    displace a richer one, and a query that has only ever answered thinly is
+    left to run again.
+    """
+    if max_age_seconds <= 0:
+        return None
+    wanted = normalize(query)
+    if not wanted:
+        return None
+    try:
+        rows = slskd_get("/searches", timeout=5)
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    cutoff = now() - max_age_seconds
+    matching = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("isComplete"):
+            continue
+        if normalize(row.get("searchText")) != wanted:
+            continue
+        if int(row.get("fileCount") or 0) <= 0:
+            continue
+        started_at = _parse_slskd_started_at(row.get("startedAt"))
+        if started_at is None or started_at < cutoff:
+            continue
+        matching.append((started_at, int(row.get("responseCount") or 0), row))
+    if not matching:
+        return None
+    best_responses = max(responses for _, responses, _ in matching)
+    if best_responses < MIN_REUSABLE_SEARCH_RESPONSES:
+        return None
+    # Newest among the richest, so reuse tracks the best answer we have seen
+    # rather than the most recent one.
+    richest = [row for row in matching if row[1] >= best_responses]
+    richest.sort(key=lambda row: row[0], reverse=True)
+    return richest[0][2]
+
+
 def enforce_slskd_search_pacing(deadline=None):
     """Keep new Soulseek-network search initiations at a safe, human-plausible pace.
 
@@ -4176,11 +4247,32 @@ def enforce_slskd_search_pacing(deadline=None):
         time.sleep(wait_for)
 
 
-def slskd_search(query, wait_seconds=8, deadline=None):
+def slskd_search(query, wait_seconds=8, deadline=None, reuse_recent_seconds=0):
     remaining = seconds_remaining(deadline)
     if remaining is not None and remaining < 1:
         raise TimeoutError("SLSKD probe budget exhausted before query")
     require_slskd_ready_for_search()
+    # Automatic passes opt into reuse; a person who just pressed Search has not,
+    # and always gets a live query.
+    recent = reusable_slskd_search(query, reuse_recent_seconds) if reuse_recent_seconds else None
+    if recent:
+        try:
+            reused = slskd_get(
+                f"/searches/{recent.get('id')}/responses",
+                timeout=min(15, max(1, int(seconds_remaining(deadline) or 15))),
+            )
+        except Exception:
+            reused = None
+        if isinstance(reused, list) and reused:
+            log(
+                "slskd_search_reused_recent",
+                query=query,
+                started_at=recent.get("startedAt"),
+                age_seconds=round(now() - (_parse_slskd_started_at(recent.get("startedAt")) or now()), 1),
+                file_count=recent.get("fileCount"),
+                response_count=len(reused),
+            )
+            return reused
     enforce_slskd_search_pacing(deadline)
     search_id = str(uuid.uuid4())
     conflict_errors = []
@@ -4699,8 +4791,8 @@ def identity_context_rows():
             "publisher": row.get("publisher") or row.get("watch_publisher") or "",
             "year": row.get("watch_year") or row.get("year") or "",
             "watch_id": row.get("watch_id") or row.get("id") or "",
-            "kapowarr_id": row.get("kapowarr_id") or row.get("volume_id") or row.get("kapowarrId") or "",
             "comicvine_id": row.get("comicvine_id") or row.get("comicvineId") or "",
+            "mangadex_id": row.get("mangadex_id") or row.get("mangadexId") or "",
             "queue_identity": row.get("queue_identity") or identities[0],
         })
 
@@ -4731,7 +4823,7 @@ def identity_context_rows():
         existing_numbers = set(existing.get("issue_numbers") or [])
         existing_numbers.update(row.get("issue_numbers") or [])
         existing["issue_numbers"] = sorted(existing_numbers)
-        for field in ("publisher", "year", "watch_id", "kapowarr_id", "comicvine_id", "queue_identity"):
+        for field in ("publisher", "year", "watch_id", "comicvine_id", "queue_identity"):
             if not existing.get(field) and row.get(field):
                 existing[field] = row.get(field)
     IDENTITY_CONTEXT_CACHE = list(deduped.values())
@@ -4748,8 +4840,43 @@ def duplicate_identity_rows_for_item(item):
         return []
     item_identities = set(identity_values_for_item(item))
     if not item_identities:
-        return rows
-    return [row for row in rows if not (set(row.get("identities") or []) & item_identities)]
+        candidates = rows
+    else:
+        candidates = [row for row in rows if not (set(row.get("identities") or []) & item_identities)]
+    return [row for row in candidates if not manga_companion_row(row, item)]
+
+
+def manga_companion_row(row, item):
+    """A ComicVine/MangaDex companion pair (manga_companion_links) is the
+    same real series tracked under two provider identities by design -- not
+    a genuine duplicate sibling. Their per-record publisher/year can
+    legitimately disagree (e.g. a ComicVine record enriched via a Kapowarr
+    metadata adapter vs. a MangaDex chapter record), which otherwise reads
+    as one record's evidence "pointing at" the other and blocks real
+    candidates for the series against itself.
+    """
+    if inkdrop_state is None or not INKDROP_STATE_DB.exists():
+        return False
+    item_comicvine = str((item or {}).get("comicvine_id") or "").strip()
+    item_mangadex = str((item or {}).get("mangadex_id") or "").strip()
+    row_comicvine = str(row.get("comicvine_id") or "").strip()
+    row_mangadex = str(row.get("mangadex_id") or "").strip()
+    pairs = []
+    if row_comicvine and item_mangadex:
+        pairs.append((f"comicvine:{row_comicvine}", f"mangadex:{item_mangadex}"))
+    if item_comicvine and row_mangadex:
+        pairs.append((f"comicvine:{item_comicvine}", f"mangadex:{row_mangadex}"))
+    for comicvine_series_id, mangadex_series_id in pairs:
+        try:
+            if inkdrop_state.manga_companion_pair_is_linked(
+                INKDROP_STATE_DB,
+                comicvine_series_id=comicvine_series_id,
+                mangadex_series_id=mangadex_series_id,
+            ):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def identity_word_tokens(value):
@@ -4914,13 +5041,20 @@ def western_comic_language_confidence_blocker(filename, candidate, item):
             "western comic SLSKD candidate uses an ambiguous HQ source folder "
             "without English release/source confidence"
         )
-    if english_source_confidence_reason(filename, candidate, item):
-        return ""
-    publisher = item_publisher_text(item) or "western comic publisher"
-    return (
-        "western comic SLSKD candidate lacks English release/source confidence "
-        f"for publisher {display_clean(publisher)}"
-    )
+    # A plain, standard-format filename ("Series 009 (2022).cbr") is the
+    # normal shape of a legitimate English-language western comic release --
+    # scene releases essentially never embed the publisher's name. Requiring
+    # positive proof (an explicit marker, a publisher name literally in the
+    # filename, a 3+ file exact-series directory cohort, or prior learned
+    # history) before allowing a candidate through inverted the burden of
+    # proof: it penalized clean, tidy filenames with no release-group tag
+    # while source_language_blocker() above already catches real negative
+    # evidence (explicit non-English script/markers). Confirmed live against
+    # 474r4x14's library: "What's The Furthest Place from Here 009
+    # (2022).cbr" was blocked by this while "Chew 012 (2010).cbr" from the
+    # same user only passed because of the learned-history fallback -- not
+    # because it was actually less "English" than the other file.
+    return ""
 
 
 def years_from_value(value):
@@ -5054,7 +5188,6 @@ def sibling_item_for_identity(item, sibling):
         "year": sibling.get("year") or "",
         "watch_year": sibling.get("year") or "",
         "watch_id": sibling.get("watch_id") or "",
-        "kapowarr_id": sibling.get("kapowarr_id") or "",
         "comicvine_id": sibling.get("comicvine_id") or "",
         "queue_identity": sibling.get("queue_identity") or sibling.get("identity") or "",
     }
@@ -5083,137 +5216,6 @@ def duplicate_identity_mismatch_count(series):
     return count
 
 
-def target_kapowarr_ids_for_item(item):
-    ids = set()
-    if not isinstance(item, dict):
-        return ids
-    for field in ("kapowarr_id", "volume_id", "kapowarrId", "volumeId"):
-        try:
-            value = int(item.get(field) or 0)
-        except (TypeError, ValueError):
-            value = 0
-        if value > 0:
-            ids.add(value)
-    queue_identity = str(item.get("queue_identity") or "")
-    for value in re.findall(r"\bkapowarr\D+(\d+)\b", queue_identity, flags=re.I):
-        try:
-            ids.add(int(value))
-        except (TypeError, ValueError):
-            continue
-    return ids
-
-
-def historical_route_outside_sibling_issue_coverage(siblings, actual_ids, target_issue):
-    if target_issue is None or not actual_ids:
-        return []
-    actual_ids = {int(value) for value in actual_ids if str(value).isdigit() or isinstance(value, int)}
-    if not actual_ids:
-        return []
-    covered_ids = set()
-    reasons = []
-    for sibling in siblings or []:
-        try:
-            sibling_id = int(sibling.get("kapowarr_id") or 0)
-        except (TypeError, ValueError):
-            sibling_id = 0
-        if sibling_id not in actual_ids:
-            continue
-        issue_numbers = []
-        for value in sibling.get("issue_numbers") or []:
-            try:
-                issue_numbers.append(int(value))
-            except (TypeError, ValueError):
-                continue
-        if not issue_numbers:
-            return []
-        covered_ids.add(sibling_id)
-        max_issue = max(issue_numbers)
-        if target_issue <= max_issue:
-            return []
-        min_issue = min(issue_numbers)
-        span = str(max_issue) if min_issue == max_issue else f"{min_issue}-{max_issue}"
-        reasons.append(
-            f"prior duplicate identity route ignored because Kapowarr {sibling_id} only covers issue(s) {span}; target issue {target_issue}"
-        )
-    if covered_ids != actual_ids:
-        return []
-    return reasons
-
-
-def candidate_identity_family_signature(filename):
-    leaf = filename_leaf(filename)
-    text = str(leaf or filename or "").lower()
-    text = re.sub(r"\b(?:v|vol|volume)\s*\.?\s*\d+(?:\.\d+)?\b", " volume ", text, flags=re.I)
-    text = re.sub(r"\b(?:ch|chapter|issue|book|part)\s*\.?#?\s*\d+(?:\.\d+)?\b", " issue ", text, flags=re.I)
-    text = re.sub(r"#\s*\d+(?:\.\d+)?\b", " issue ", text)
-    text = re.sub(r"\b(?:19|20)\d{2}\b", " year ", text)
-    text = re.sub(r"\b\d+(?:\.\d+)?\b", " number ", text)
-    return normalize(text)
-
-
-def parse_identity_mismatch_ids(row):
-    text = " ".join(
-        str(value or "")
-        for value in (
-            (row or {}).get("detail"),
-            (row or {}).get("failure_label"),
-            (row or {}).get("reason"),
-        )
-    )
-    actual_ids = set()
-    expected_ids = set()
-    for actual, expected in re.findall(r"\((\d+)\s+instead\s+of\s+(\d+)\)", text, flags=re.I):
-        try:
-            actual_ids.add(int(actual))
-            expected_ids.add(int(expected))
-        except (TypeError, ValueError):
-            continue
-    return actual_ids, expected_ids
-
-
-def candidate_identity_history(filename, item, candidate=None):
-    series_key = normalize((item or {}).get("series") or (item or {}).get("query") or "")
-    family = candidate_identity_family_signature(filename)
-    if not series_key or not family:
-        return {"actual_ids": set(), "expected_ids": set(), "rows": []}
-    candidate_username = normalize((candidate or {}).get("username") or "")
-    actions = load_actions()
-    bad = actions.get("manual_source_bad_candidates") if isinstance(actions, dict) else {}
-    if not isinstance(bad, dict):
-        return {"actual_ids": set(), "expected_ids": set(), "rows": []}
-    actual_ids = set()
-    expected_ids = set()
-    rows = []
-    for values in bad.values():
-        if not isinstance(values, list):
-            continue
-        for row in values:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("reason") or "") != "identity_mismatch":
-                continue
-            if normalize(row.get("series") or "") != series_key:
-                continue
-            row_filename = (
-                row.get("filename")
-                or row.get("detected_filename")
-                or row.get("source_path")
-                or ""
-            )
-            if candidate_identity_family_signature(row_filename) != family:
-                continue
-            row_username = normalize(row.get("username") or "")
-            if candidate_username and row_username and candidate_username != row_username:
-                continue
-            row_actual, row_expected = parse_identity_mismatch_ids(row)
-            if not row_actual:
-                continue
-            actual_ids.update(row_actual)
-            expected_ids.update(row_expected)
-            rows.append(row)
-    return {"actual_ids": actual_ids, "expected_ids": expected_ids, "rows": rows}
-
-
 def duplicate_identity_gate(filename, item, candidate=None):
     siblings = duplicate_identity_rows_for_item(item)
     if not siblings:
@@ -5238,31 +5240,6 @@ def duplicate_identity_gate(filename, item, candidate=None):
     for year in sorted(target_years):
         if year in candidate_years:
             target_hits.append(year)
-
-    target_kapowarr_ids = target_kapowarr_ids_for_item(item)
-    history = candidate_identity_history(filename, item, candidate=candidate)
-    history_actual_ids = history.get("actual_ids") or set()
-    if history_actual_ids and target_kapowarr_ids:
-        matching_history = history_actual_ids & target_kapowarr_ids
-        if matching_history:
-            target_hits.extend(f"prior verified Kapowarr {value}" for value in sorted(matching_history))
-        else:
-            target_issue = identity_issue_number_value((item or {}).get("issue") or (item or {}).get("issue_number"))
-            impossible_sibling_reasons = historical_route_outside_sibling_issue_coverage(
-                siblings,
-                history_actual_ids,
-                target_issue,
-            )
-            if impossible_sibling_reasons:
-                target_hits.extend(impossible_sibling_reasons)
-            else:
-                shown = ", ".join(str(value) for value in sorted(history_actual_ids)[:3])
-                expected = ", ".join(str(value) for value in sorted(target_kapowarr_ids)[:3])
-                return (
-                    f"prior verification routes this candidate family to Kapowarr {shown}, not {expected}",
-                    [],
-                    [],
-                )
 
     conflict_hits = []
     for sibling in siblings:
@@ -8167,8 +8144,6 @@ ITEM_CONTEXT_FIELDS = (
     "watch_year",
     "watch_publisher",
     "publisher",
-    "volume_id",
-    "kapowarr_id",
     "comicvine_id",
     "watch_id",
     "series_id",
@@ -10530,20 +10505,42 @@ def candidates_from_responses(responses, item, *, deadline=None, max_files=None,
                 if deadline is not None and seconds_remaining(deadline) <= 0:
                     processing_timed_out = True
                     break
-                if file_cap is not None and checked_file_count >= file_cap:
-                    processing_file_cap_reached = True
-                    break
                 if not isinstance(raw_row, dict):
                     continue
                 row = {**raw_row, "IsLocked": True} if force_locked else raw_row
                 filename = file_get(row, "filename")
                 if not filename:
                     continue
+                ext = extension_for(filename)
+                if ext not in COMIC_EXTENSIONS:
+                    # A file whose extension is not in COMIC_EXTENSIONS is
+                    # rejected by item_match_details() on that basis alone,
+                    # regardless of series/item -- so it can never become a
+                    # candidate. Charging it against the enumeration budget
+                    # let a junk-heavy response (e.g. an audio-dominated
+                    # folder ordered ahead of the real comic files) exhaust
+                    # file_cap before the actual wanted file was ever
+                    # reached. Reject it for free instead of spending budget
+                    # on a result that was never in question.
+                    if len(rejections) < 2000:
+                        rejections.append((
+                            filename,
+                            {
+                                "matched": False,
+                                "score": -100,
+                                "reasons": [],
+                                "penalties": [f"unsupported extension {ext or 'no extension'}"],
+                            },
+                        ))
+                    continue
+                if file_cap is not None and checked_file_count >= file_cap:
+                    processing_file_cap_reached = True
+                    break
                 checked_file_count += 1
                 candidate = {
                     "filename": str(filename),
                     "size": int(file_get(row, "size", 0) or 0),
-                    "extension": extension_for(filename),
+                    "extension": ext,
                     "username": str(username or ""),
                     "upload_speed": int(upload_speed or 0),
                     "queue_length": int(queue_length or 0),
@@ -11674,7 +11671,12 @@ def probe_item(
             # once results settle (see the quiet-period break below), so a
             # longer floor costs nothing for titles that answer fast; it only
             # matters for the slow ones this was silently giving up on.
-            responses = slskd_search(query, wait_seconds=max(50, int(wait_seconds or 0)), deadline=deadline)
+            responses = slskd_search(
+                query,
+                wait_seconds=max(50, int(wait_seconds or 0)),
+                deadline=deadline,
+                reuse_recent_seconds=slskd_repeat_query_cooldown_seconds(),
+            )
             response_count += len(responses)
             observation_used = (
                 int(shared_observation_budget.get("used") or 0)
@@ -11960,9 +11962,23 @@ def refresh_cached_candidate_verdicts(
     return refreshed, True
 
 
-def refresh_cache_candidate_verdicts(cache, items):
+def verdict_refresh_budget_seconds(probe_budget_seconds):
+    """Seconds this pass may spend reconciling cached verdicts before searching.
+
+    Reconciliation is bookkeeping; searching is the work. Give it a slice of the
+    pass and no more, so a large or fully-invalidated cache can never spend the
+    whole provider window before the first query goes out.
+    """
+    try:
+        budget = float(probe_budget_seconds or 0)
+    except (TypeError, ValueError):
+        budget = 0.0
+    return max(5.0, min(15.0, budget * 0.25))
+
+
+def refresh_cache_candidate_verdicts(cache, items, deadline=None):
     if not isinstance(cache, dict):
-        return {}, 0
+        return {}, 0, 0
     item_by_review_id = {
         str(item.get("review_id") or ""): item
         for item in items or []
@@ -11970,19 +11986,47 @@ def refresh_cache_candidate_verdicts(cache, items):
     }
     context_signature = auto_grab_context_signature()
     refreshed_count = 0
+    skipped_count = 0
     # Only reconcile rows in the active probe window.  Production caches can
     # contain years of inactive searches; walking and re-scoring every cached
     # candidate here can consume the entire bounded provider window before the
     # first network query is attempted.
-    for review_id, item in item_by_review_id.items():
+    #
+    # The row window alone is not a bound.  The context signature folds in the
+    # auto-grab learning data, which every completed transfer rewrites, so a
+    # normal production pass finds *every* cached verdict stale and re-scores
+    # the whole window.  Measured on the live cache that is ~118s of work
+    # against a 90s subprocess timeout: the probe was killed mid-reconcile,
+    # every pass, having issued no query and written no cache.  Walk the rows
+    # the probe is most likely to select first and stop at the deadline.
+    #
+    # Within a priority bucket, take the least-recently reconciled row first.
+    # Probe priority alone is stable, so a fixed order would hand the budget to
+    # the same head every pass and never reconcile the tail -- the rows holding
+    # candidates sort last and are exactly the expensive ones. Oldest-first
+    # rotates the whole window across passes instead of starving it.
+    def refresh_order(entry):
+        review_id, item = entry
+        cached = cache.get(review_id)
+        try:
+            reconciled_at = float((cached or {}).get("auto_grab_verdict_refreshed_at") or 0)
+        except (TypeError, ValueError):
+            reconciled_at = 0.0
+        return (item_probe_priority(item, cache), reconciled_at)
+
+    ordered = sorted(item_by_review_id.items(), key=refresh_order)
+    for review_id, item in ordered:
         entry = cache.get(review_id)
         if not isinstance(entry, dict):
+            continue
+        if deadline is not None and now() >= deadline:
+            skipped_count += 1
             continue
         refreshed, changed = refresh_cached_candidate_verdicts(entry, item=item, context_signature=context_signature)
         if changed:
             cache[review_id] = refreshed
             refreshed_count += 1
-    return cache, refreshed_count
+    return cache, refreshed_count, skipped_count
 
 
 def cache_refresh_reason(cache_entry, queries=None):
@@ -12171,8 +12215,6 @@ def probe_issue_key(entry):
     identity = (
         entry.get("autopilot_queue_key")
         or entry.get("queue_identity")
-        or entry.get("kapowarr_id")
-        or entry.get("volume_id")
         or entry.get("comicvine_id")
         or ""
     )
@@ -12250,7 +12292,7 @@ def cached_review_target_matches_item(cached, item):
     if not cached_unit[0] or not cached_unit[1] or cached_unit != item_unit:
         return False
     matched_durable_id = False
-    for field in ("queue_identity", "series_id", "watch_id", "kapowarr_id", "volume_id", "comicvine_id"):
+    for field in ("queue_identity", "series_id", "watch_id", "comicvine_id"):
         cached_value = str(cached.get(field) or "").strip()
         item_value = str(item.get(field) or "").strip()
         if cached_value and item_value:
@@ -12500,7 +12542,18 @@ def run(args):
                     issue=alias_item.get("issue"),
                 )
         items = scoped
-    cache, refreshed_cached_verdict_count = refresh_cache_candidate_verdicts(cache, all_items)
+    cache, refreshed_cached_verdict_count, skipped_cached_verdict_count = refresh_cache_candidate_verdicts(
+        cache,
+        all_items,
+        deadline=started_at + verdict_refresh_budget_seconds(probe_budget_seconds),
+    )
+    if skipped_cached_verdict_count:
+        log(
+            "verdict_refresh_budget_reached",
+            refreshed=refreshed_cached_verdict_count,
+            deferred=skipped_cached_verdict_count,
+            budget_seconds=round(verdict_refresh_budget_seconds(probe_budget_seconds), 1),
+        )
     active_scope_items = items if (args.series or review_id_filter) else all_items
     active_review_ids = {str(item.get("review_id") or "") for item in active_scope_items}
     for item in all_items:
@@ -12651,7 +12704,13 @@ def run(args):
         cache_entry = cache.get(review_id)
         queries = source_queries(item)
         refresh_reason = cache_refresh_reason(cache_entry, queries)
-        if should_skip_cache(cache_entry, args.cooldown_hours, force=args.force or bool(refresh_reason)):
+        # Only a changed query plan makes the cached cooldown timestamp
+        # meaningless. Every other refresh reason previously bypassed
+        # cooldown_hours too (bool(refresh_reason) is true for any non-empty
+        # string), so a periodic candidate_recheck or a schema/verdict
+        # upgrade marker re-searched on every pass regardless of the
+        # configured cooldown -- see Wild Strawberry (finding 8).
+        if should_skip_cache(cache_entry, args.cooldown_hours, force=args.force or refresh_reason == "query_plan_changed"):
             cache[review_id] = attach_staged_detection(copy_item_context(cache_entry or {"review_id": review_id}, item), item)
             skipped.append(review_id)
             continue

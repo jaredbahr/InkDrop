@@ -128,6 +128,18 @@ def download_client_schemas():
         "verify_tls": {"kind": "boolean", "default": True},
     }
     return {
+        "qbittorrent": {
+            "client": "qbittorrent",
+            "display_name": "qBittorrent",
+            "protocol": "torrent",
+            "settings": {
+                **common,
+                # qBittorrent 5.2.0 and newer can authenticate with an API key
+                # instead of a Web UI account. Either credential works on its own.
+                "api_key": {"kind": "secret", "write_only": True, "masked": True},
+            },
+            "controls": ["pause", "resume", "remove"],
+        },
         "transmission": {
             "client": "transmission",
             "display_name": "Transmission",

@@ -4,7 +4,7 @@
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "inkdrop_web.py"
 STATE = ROOT / "inkdrop_state.py"
 IMPORTER = ROOT / "inkdrop_completed_import.py"

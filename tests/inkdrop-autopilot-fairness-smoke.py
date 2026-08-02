@@ -913,7 +913,7 @@ with mock.patch.object(autopilot, "manual_review_index", return_value={}), mock.
     autopilot, "slskd_index", return_value={}
 ), mock.patch.object(autopilot, "reconciliation_index", return_value={}), mock.patch.object(
     autopilot, "import_status_index", return_value={}
-), mock.patch.object(autopilot, "kapowarr_folder_prefixes_by_volume_id", return_value={}), mock.patch.object(
+), mock.patch.object(
     autopilot, "read_waiting_records", return_value=slow_waiting
 ), mock.patch.object(
     autopilot, "read_manual_source_resolved_records", return_value=({}, {})

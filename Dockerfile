@@ -78,6 +78,7 @@ COPY \
     inkdrop_download_client_config.py \
     inkdrop_download_client_api.py \
     inkdrop_download_client_routing.py \
+    inkdrop_qbittorrent_auth.py \
     inkdrop_secret_store.py \
     inkdrop_db.py \
     inkdrop_client_status.py \

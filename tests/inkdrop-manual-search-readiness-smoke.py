@@ -11,7 +11,7 @@ import inkdrop_source_providers as providers
 import inkdrop_source_worker_adapters as adapters
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "docs" / "inkdrop" / "fixtures" / "manual-search-provider-results.json"
 
 

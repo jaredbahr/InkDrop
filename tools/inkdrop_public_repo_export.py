@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -38,30 +39,84 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "docs/inkdrop/arr-stack-deployment-plan.md",
     "docs/inkdrop/docker-first-install.md",
     "docs/inkdrop/releases/current.json",
-    "docs/inkdrop/releases/v0.1.0-alpha.22.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.23.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.24.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.25.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.26.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.27.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.28.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.29.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.30.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.31.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.32.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.33.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.34.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.35.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.36.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.37.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.38.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.39.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.40.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.41.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.42.md",
-    "docs/inkdrop/releases/v0.1.0-alpha.43.md",
     "docs/inkdrop/fixtures/manual-search-provider-results.json",
     "inkdrop-auth-api-key-smoke.py",
+    "inkdrop-no-kapowarr-comicvine-key-fallback-smoke.py",
+    "inkdrop-slskd-companion-duplicate-identity-smoke.py",
+    "inkdrop-slskd-no-kapowarr-identity-smoke.py",
+    "inkdrop-import-cache-truthfulness-smoke.py",
+    "inkdrop-manga-volume-satisfies-wanted-chapter-smoke.py",
+    "inkdrop-mangadex-content-rating-smoke.py",
+    "inkdrop-qbit-auth-smoke.py",
+    "inkdrop-slskd-clean-filename-english-confidence-smoke.py",
+    "inkdrop-slskd-junk-extension-budget-smoke.py",
+    "inkdrop-slskd-queue-priority-starvation-smoke.py",
+    "inkdrop-slskd-refresh-reason-cooldown-smoke.py",
+    "inkdrop-activity-truth-smoke.py",
+    "inkdrop-archive-conversion-smoke.py",
+    "inkdrop-archive-conversion-wiring-smoke.py",
+    "inkdrop-auth-add-series-http-smoke.py",
+    "inkdrop-auth-http-smoke.py",
+    "inkdrop-auth-password-policy-smoke.py",
+    "inkdrop-auth-route-inventory-smoke.py",
+    "inkdrop-auth-security-closure-smoke.py",
+    "inkdrop-auth-security-smoke.py",
+    "inkdrop-auth-state-preservation-smoke.py",
+    "inkdrop-auth-ui-smoke.py",
+    "inkdrop-comicvine-optional-scheduler-smoke.py",
+    "inkdrop-deferred-sync-smoke.py",
+    "inkdrop-download-client-routing-smoke.py",
+    "inkdrop-download-clients-round2-smoke.py",
+    "inkdrop-duplicate-live-task-audit-smoke.py",
+    "inkdrop-internal-jobs-auth-smoke.py",
+    "inkdrop-issue-identity-smoke.py",
+    "inkdrop-issue-monitor-toggle-smoke.py",
+    "inkdrop-library-adoption-smoke.py",
+    "inkdrop-manual-search-prowlarr-repair-smoke.py",
+    "inkdrop-manual-search-ui-smoke.py",
+    "inkdrop-notifications-wiring-smoke.py",
+    "inkdrop-operational-ui-static-smoke.py",
+    "inkdrop-operator-contracts-smoke.py",
+    "inkdrop-portability-export-smoke.py",
+    "inkdrop-provider-queue-filter-evidence-smoke.py",
+    "inkdrop-prowlarr-health-smoke.py",
+    "inkdrop-qa-candidate-manifest-smoke.py",
+    "inkdrop-series-activity-ui-smoke.py",
+    "inkdrop-series-autopilot-cron-lock-smoke.py",
+    "inkdrop-series-detail-performance-smoke.py",
+    "inkdrop-settings-parity-batch-smoke.py",
+    "inkdrop-singleton-search-coverage-smoke.py",
+    "inkdrop-slskd-absolute-edition-gate-smoke.py",
+    "inkdrop-slskd-collected-edition-year-conflict-smoke.py",
+    "inkdrop-slskd-coverage-selection-smoke.py",
+    "inkdrop-slskd-failover-smoke.py",
+    "inkdrop-slskd-query-rotation-smoke.py",
+    "inkdrop-slskd-series-run-handoff-smoke.py",
+    "inkdrop-slskd-wait-seconds-floor-smoke.py",
+    "inkdrop-source-worker-lane-lock-smoke.sh",
+    "inkdrop-source-worker-scheduler-smoke.py",
+    "inkdrop-ui-mutation-client-smoke.py",
+    "inkdrop-utorrent-rtorrent-smoke.py",
+    "inkdrop_auth_contracts.py",
+    "inkdrop_backup_restore.py",
+    "inkdrop_comicscodes_discovery.py",
+    "inkdrop_container_healthcheck.py",
+    "inkdrop_download_client_api.py",
+    "inkdrop_download_client_config.py",
+    "inkdrop_incident_recovery.py",
+    "inkdrop_internal_jobs.py",
+    "inkdrop_mangadex_direct.py",
+    "inkdrop_manual_search.py",
+    "inkdrop_manual_search_core.py",
+    "inkdrop_manual_search_executor.py",
+    "inkdrop_manual_search_worker.py",
+    "inkdrop_manual_source_autoresolve.py",
+    "inkdrop_preflight.py",
+    "inkdrop_public_contracts.py",
+    "inkdrop_rss_discovery.py",
+    "inkdrop_runtime_config.py",
+    "inkdrop_secret_store.py",
+    "inkdrop_service_inventory.py",
     "inkdrop-auth-enforcement-smoke.py",
     "inkdrop-autopilot-fairness-smoke.py",
     "inkdrop-automatic-search-recall-smoke.py",
@@ -89,8 +144,6 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop-direct-source-certification-smoke.py",
     "inkdrop-source-worker-jobs-smoke.py",
     "inkdrop-library-import-plan-smoke.py",
-    "inkdrop-kapowarr-shutdown-readiness-smoke.py",
-    "inkdrop-kapowarr-fallback-retirement-smoke.py",
     "inkdrop-komga-settings-smoke.py",
     "inkdrop-library-frontends-smoke.py",
     "inkdrop-library-identity-reader-truth-smoke.py",
@@ -109,6 +162,10 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop-planned-path-live-inspection.py",
     "inkdrop-provider-test-contract-smoke.py",
     "inkdrop-public-repo-export-smoke.py",
+    "inkdrop-autopilot-provider-budget-smoke.py",
+    "tools/inkdrop_qa_candidate_manifest.py",
+    "tools/inkdrop_run_smoke_suite.py",
+    "inkdrop-public-export-runnable-smoke.py",
     "inkdrop-public-release-safety-audit.py",
     "inkdrop-release-notes-version-smoke.py",
     "inkdrop-github-release-contract-smoke.py",
@@ -130,6 +187,8 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop-standalone-entrypoints-smoke.py",
     "inkdrop-ui-state-endpoint-contract-smoke.py",
     "web/tests/fixtures/history-taxonomy-v2.json",
+    "web/tests/fixtures/auth-first-run.html",
+    "web/tests/fixtures/manual-search.html",
     "web/tests/settings-backup-restore-browser-smoke.js",
     "web/tests/fixtures/download-clients-settings.html",
     "web/tests/download-clients-settings-browser-smoke.js",
@@ -277,13 +336,26 @@ __pycache__/
 
 def export_content_overrides(root: Path = ROOT):
     """Paths whose shipped content differs from the working-tree file."""
-    return {
+    overrides = {
         "README.md": public_readme_bytes(root),
         "docker-compose.yml": public_compose_bytes(root),
         "Dockerfile": public_dockerfile_bytes(root),
         ".gitignore": PUBLIC_GITIGNORE.encode("utf-8"),
         ".dockerignore": _filtered_ignore_bytes(root, ".dockerignore"),
+        PUBLIC_WORKFLOW_PATH: public_workflow_bytes(root),
     }
+    # Relocated scripts need their repo-root resolution re-pointed. This runs
+    # through the override map rather than at copy time so the manifest hashes
+    # the bytes that actually ship; hashing the pre-rewrite file would leave the
+    # manifest describing something the repo does not contain.
+    for source in sorted(Path(root).glob("*.py")):
+        relative = Path(source.name)
+        if not is_relocatable_test_script(relative):
+            continue
+        rewritten = relocated_script_bytes(Path(root), relative)
+        if rewritten is not None:
+            overrides[relative.as_posix()] = rewritten
+    return overrides
 
 
 FORBIDDEN_PUBLIC_PATHS = {
@@ -338,6 +410,99 @@ FORBIDDEN_SUFFIXES = {
     ".bak",
     ".tmp",
 }
+
+
+_ROOT_FROM_FILE = re.compile(r"Path\(__file__\)\.resolve\(\)\.parent(?!s|\.)")
+_ROOT_FROM_FILE_SHORT = re.compile(r"Path\(__file__\)\.parent(?!s|\.)")
+_WITH_NAME = re.compile(
+    r"Path\(__file__\)(?:\.resolve\(\))?\.with_name\(\s*[\"'](?P<name>[^\"']+)[\"']\s*\)"
+)
+_JOINED_NAME = re.compile(
+    r"(?P<lead>[A-Za-z_][A-Za-z0-9_]*\s*/\s*)[\"'](?P<name>[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:py|sh))[\"']"
+)
+
+
+def relocated_script_bytes(root: Path, relative: Path):
+    """Re-point a script's idea of the repository root after the export moves it.
+
+    Tests sit beside the modules they import in this repo, so they resolve the
+    repo root as their own directory. The export files them under tests/, which
+    silently breaks that: `ROOT / "inkdrop_web.py"` starts looking inside tests/.
+    Returns None when a file needs no rewriting, so unchanged files keep being
+    copied rather than round-tripped through this.
+
+    The matching PYTHONPATH problem is handled at run time by the release check,
+    not here, because rewriting every bare import would be a far larger edit.
+    """
+    source = resolve_source(root, relative)
+    if source.suffix != ".py":
+        return None
+    depth = len(export_destination(relative).parts) - 1
+    if depth < 1:
+        return None
+    text = source.read_text(encoding="utf-8")
+    # ".parent.parent" first: rewriting ".parent" alone would corrupt it.
+    updated = text.replace(
+        "Path(__file__).resolve().parent.parent",
+        f"Path(__file__).resolve().parents[{depth + 1}]",
+    )
+    updated = _ROOT_FROM_FILE.sub(f"Path(__file__).resolve().parents[{depth}]", updated)
+    updated = _ROOT_FROM_FILE_SHORT.sub(f"Path(__file__).resolve().parents[{depth}]", updated)
+
+    # with_name() means "the file next to me", which held while tests sat beside
+    # the modules they exercise. After the move the neighbour may have stayed at
+    # the root or moved elsewhere, so each name is re-resolved through the same
+    # destination map the export uses rather than assumed to travel along.
+    def _retarget(match):
+        name = match.group("name")
+        dest = export_destination(Path(name)).as_posix()
+        parts = "".join(f' / "{part}"' for part in dest.split("/"))
+        return f"(Path(__file__).resolve().parents[{depth}]{parts})"
+
+    updated = _WITH_NAME.sub(_retarget, updated)
+
+    # `SOMETHING / "inkdrop-foo.sh"` is a path built from the repo root, so the
+    # literal has to name where that file actually lands. Only rewritten when
+    # the name belongs to a file this repo has and the export moves elsewhere,
+    # which keeps same-named strings used for other purposes untouched.
+    def _retarget_joined(match):
+        name = match.group("name")
+        if not (Path(root) / name).is_file():
+            return match.group(0)
+        dest = export_destination(Path(name))
+        if dest == Path(name):
+            return match.group(0)
+        return f'{match.group("lead")}"{dest.as_posix()}"'
+
+    updated = _JOINED_NAME.sub(_retarget_joined, updated)
+    if updated == text:
+        return None
+    return updated.encode("utf-8")
+
+
+PUBLIC_WORKFLOW_PATH = ".github/workflows/inkdrop-public-release.yml"
+_WORKFLOW_SCRIPT = re.compile(r"(?P<lead>python3? -B )(?P<name>[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:py|sh))")
+
+
+def public_workflow_bytes(root: Path = ROOT):
+    """Point the workflow at where each script lands in the export.
+
+    The workflow runs scripts by their working-tree path, which is the repo
+    root. Once the export files them under tests/ and scripts/ those commands
+    resolve to nothing, and the failure is a plain "can't open file" in CI. Every
+    public run failed this way after the reorg. Names the export does not ship
+    are left alone so they surface as a loud missing file rather than being
+    quietly rewritten into a different wrong path.
+    """
+    text = (root / PUBLIC_WORKFLOW_PATH).read_text(encoding="utf-8")
+
+    def _point_at_export(match):
+        name = match.group("name")
+        if not (root / name).is_file():
+            return match.group(0)
+        return match.group("lead") + export_destination(Path(name)).as_posix()
+
+    return _WORKFLOW_SCRIPT.sub(_point_at_export, text).encode("utf-8")
 
 
 def _normalize(relative):
@@ -433,13 +598,29 @@ def current_release_note_path(root: Path = ROOT):
     return relative
 
 
+def is_superseded_release_note(relative, current_note):
+    """True for a release note that is not the release the public repo is on.
+
+    Every prior note is a snapshot of an internal build -- the alpha ones are even
+    titled "Private Alpha Update N". The current note arrives dynamically through
+    the release contract, so nothing else under the notes directory should ever be
+    exported, and listing one in PUBLIC_REPO_EXTRA_PATHS must not be able to
+    override that. 22 alpha notes reached the public repo exactly that way.
+    """
+    if relative.parent != RELEASE_NOTES_ROOT or relative.suffix.lower() != ".md":
+        return False
+    return current_note is None or relative != current_note
+
+
 def public_repo_paths():
     paths = set(docker_context_paths())
     paths.update(PUBLIC_REPO_EXTRA_PATHS)
     dynamic_missing = []
     dynamic_forbidden = []
+    current_note = None
     try:
-        paths.add(current_release_note_path().as_posix())
+        current_note = current_release_note_path()
+        paths.add(current_note.as_posix())
     except FileNotFoundError as exc:
         dynamic_missing.append(str(exc).strip("'"))
     except ValueError as exc:
@@ -456,6 +637,9 @@ def public_repo_paths():
             missing.append(relative.as_posix())
             continue
         if is_forbidden_public_path(relative):
+            forbidden.append(relative.as_posix())
+            continue
+        if is_superseded_release_note(relative, current_note):
             forbidden.append(relative.as_posix())
             continue
         clean.append(relative)

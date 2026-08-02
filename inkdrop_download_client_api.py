@@ -14,6 +14,7 @@ import requests
 import inkdrop_download_client_config as config_store
 import inkdrop_download_clients
 import inkdrop_operator_contracts
+import inkdrop_qbittorrent_auth
 import inkdrop_state
 
 
@@ -36,13 +37,32 @@ class SafeSession:
 
     def __init__(self):
         self._session = requests.Session()
+        # Persistent per-session headers, so auth helpers can arm this the same
+        # way they arm a real requests.Session.
+        self.headers = {}
 
     def _call(self, method, url, **kwargs):
-        kwargs["timeout"] = min(float(kwargs.get("timeout") or TEST_TIMEOUT_SECONDS), TEST_TIMEOUT_SECONDS)
+        timeout = kwargs.get("timeout") or TEST_TIMEOUT_SECONDS
+        if isinstance(timeout, tuple):
+            timeout = tuple(min(float(part), TEST_TIMEOUT_SECONDS) for part in timeout)
+        else:
+            timeout = min(float(timeout), TEST_TIMEOUT_SECONDS)
+        kwargs["timeout"] = timeout
         kwargs["allow_redirects"] = False
+        if self.headers:
+            kwargs["headers"] = {**self.headers, **(kwargs.get("headers") or {})}
         response = self._session.request(method, url, **kwargs)
-        if 300 <= int(getattr(response, "status_code", 200) or 200) < 400:
-            raise RuntimeError("redirects are not permitted for download-client tests")
+        status = int(getattr(response, "status_code", 200) or 200)
+        if 300 <= status < 400:
+            # Tests do not follow redirects, so say where it wanted to go --
+            # otherwise a proxy that adds a trailing slash or upgrades to HTTPS
+            # reads as a generic connectivity failure.
+            target = str((getattr(response, "headers", None) or {}).get("Location") or "").strip()
+            raise RuntimeError(
+                f"the URL redirected (HTTP {status}"
+                + (f" to {target[:200]}" if target else "")
+                + "). Configure the client with the address it redirects to."
+            )
         return response
 
     def get(self, url, **kwargs):
@@ -174,14 +194,26 @@ def _sanitize(value, depth=0):
 
 
 def _qbit_test(settings, http):
-    base = settings["base_url"].rstrip("/")
-    if settings.get("username"):
-        response = http.post(base + "/api/v2/auth/login", data={"username": settings["username"], "password": settings.get("password", "")}, verify=settings.get("verify_tls", True))
-        if response.status_code in {401, 403} or str(getattr(response, "text", "")).strip().lower() != "ok.":
-            raise PermissionError("qBittorrent authentication failed")
+    base = inkdrop_qbittorrent_auth.normalize_base_url(settings["base_url"])
+    auth = inkdrop_qbittorrent_auth.authenticate_settings(http, settings, timeout=TEST_TIMEOUT_SECONDS)
     response = http.get(base + "/api/v2/app/version", verify=settings.get("verify_tls", True))
+    if inkdrop_qbittorrent_auth.has_api_key(settings) and response.status_code in {401, 403}:
+        # The key never touches the login endpoint, so this is the first place
+        # a bad or too-old key can show up. Say which, rather than "connectivity".
+        raise inkdrop_qbittorrent_auth.QbitAuthError(
+            "qBittorrent rejected the API key. Check the key was copied whole, and that this "
+            f"server runs {inkdrop_qbittorrent_auth.MIN_API_KEY_VERSION} or newer -- API keys "
+            "do not exist in earlier versions, which reject them the same way.",
+            kind="api_key",
+            status=response.status_code,
+        )
     response.raise_for_status()
-    return {"ok": True, "client": "qbittorrent", "version": str(response.text or "").strip()[:128]}
+    return {
+        "ok": True,
+        "client": "qbittorrent",
+        "auth_method": auth["method"],
+        "version": str(response.text or "").strip()[:128],
+    }
 
 
 def _sab_test(settings, http):
@@ -214,10 +246,19 @@ def _run_test(settings, *, http=None):
         return {"ok": False, "client_type": client_type, "error_type": "unsupported", "reason": "adapter is not implemented"}
     try:
         result = dict(tester(settings, http or SafeSession()) or {})
-    except PermissionError:
-        result = {"ok": False, "error_type": "authentication", "reason": "authentication failed"}
+    except inkdrop_qbittorrent_auth.QbitAuthError as exc:
+        # Keep the cause. A banned IP, a rejected Host header, and a wrong
+        # password all need different things from the user, and flattening them
+        # into "authentication failed" sends people to re-type a good password.
+        result = {"ok": False, "error_type": "authentication", "auth_failure": exc.kind, "reason": exc.reason}
+    except PermissionError as exc:
+        result = {"ok": False, "error_type": "authentication", "reason": str(exc) or "authentication failed"}
     except ValueError as exc:
         result = {"ok": False, "error_type": "configuration", "reason": str(exc)}
+    except RuntimeError as exc:
+        # Our own adapters raise RuntimeError with an explanation already
+        # written for the user; the bare class name below would discard it.
+        result = {"ok": False, "error_type": "connectivity", "reason": str(exc)[:512] or "RuntimeError"}
     except Exception as exc:
         result = {"ok": False, "error_type": "connectivity", "reason": type(exc).__name__}
     result.update({"client_type": client_type, "duration_ms": round((time.monotonic() - started) * 1000, 1)})

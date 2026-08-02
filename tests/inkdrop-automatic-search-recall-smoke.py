@@ -782,6 +782,134 @@ with mock.patch.object(slskd, "refresh_cached_candidate_verdicts", return_value=
 require(refresh.call_count == 1, refresh.call_args_list)
 require(refresh.call_args.args[0]["review_id"] == "active-1", refresh.call_args_list)
 
+# Reconciling cached verdicts has to stop at its deadline. Every completed
+# transfer rewrites the auto-grab learning data, which changes the context
+# signature and marks every cached verdict stale, so this loop's real cost is
+# the whole window and not the handful that actually changed. Unbounded, it ate
+# the entire 90s probe subprocess before a single query went out: the probe was
+# killed mid-reconcile every pass and never wrote a cache, so well-seeded
+# content sat Wanted forever.
+window = [
+    {"review_id": f"row-{index}", "series": "Berserk", "issue": str(index)}
+    for index in range(6)
+]
+deadline_cache = {
+    item["review_id"]: {"review_id": item["review_id"], "candidates": [{"filename": "Berserk v01.cbz"}]}
+    for item in window
+}
+slow_clock = {"t": 1000.0}
+
+
+def _slow_refresh(entry, item=None, context_signature=None, force=False, bad_review_ids=None):
+    slow_clock["t"] += 10.0
+    return dict(entry), True
+
+
+with mock.patch.object(slskd, "now", lambda: slow_clock["t"]):
+    with mock.patch.object(slskd, "refresh_cached_candidate_verdicts", side_effect=_slow_refresh) as refresh:
+        _, refreshed, deferred = slskd.refresh_cache_candidate_verdicts(
+            deadline_cache, window, deadline=slow_clock["t"] + 25.0
+        )
+require(refreshed + deferred == len(window), (refreshed, deferred))
+require(deferred > 0, (refreshed, deferred, "deadline never stopped the reconcile loop"))
+require(refresh.call_count < len(window), refresh.call_count)
+
+# ...and with no deadline the whole window still reconciles, so bounding the
+# pass never silently drops rows a caller asked for.
+slow_clock["t"] = 1000.0
+with mock.patch.object(slskd, "now", lambda: slow_clock["t"]):
+    with mock.patch.object(slskd, "refresh_cached_candidate_verdicts", side_effect=_slow_refresh):
+        _, refreshed_all, deferred_all = slskd.refresh_cache_candidate_verdicts(
+            {key: dict(value) for key, value in deadline_cache.items()}, window
+        )
+require(refreshed_all == len(window) and deferred_all == 0, (refreshed_all, deferred_all))
+
+# The budget is a slice of the pass, never the whole thing.
+require(slskd.verdict_refresh_budget_seconds(30) <= 30 * 0.5, slskd.verdict_refresh_budget_seconds(30))
+require(slskd.verdict_refresh_budget_seconds(0) >= 5, slskd.verdict_refresh_budget_seconds(0))
+require(slskd.verdict_refresh_budget_seconds(10_000) <= 15, slskd.verdict_refresh_budget_seconds(10_000))
+
+# A metadata title can be a bad Soulseek query while the shelf name is a good
+# one. Uploaders file "Naoki Urasawa's 20th Century Boys" under
+# Manga/URASAWA Naoki/20th Century Boys, so the canonical title matches almost
+# no filenames: live, it returns 1 file from 1 peer on every run, while
+# "20th Century Boys manga" returns 1,058 files from 19 peers -- and that query
+# was never generated at all. Only the alternate variant's later
+# "complete"/"collection" forms were reaching the plan.
+authored = {"series": "Naoki Urasawa's 20th Century Boys", "issue": "6",
+            "issue_title": "Volume 6", "media_type": "manga"}
+authored_queries = slskd.source_queries(authored)
+stripped = [q for q in authored_queries if "naoki" not in slskd.normalize(q)]
+require(any(slskd.normalize(q) == "20th century boys" for q in stripped),
+        ("bare alternate title must be searchable", authored_queries[:12]))
+require(any(slskd.normalize(q) == "20th century boys manga" for q in stripped),
+        ("media-qualified alternate title must be searchable", authored_queries[:12]))
+# ...without pushing the wanted issue out of the front of the plan. A pass only
+# fires two queries, so finding the issue has to keep leading.
+require(any("6" in query for query in authored_queries[1:4]),
+        ("a numbered query must stay near the front", authored_queries[:6]))
+# A series with a single title variant must be unchanged by any of this.
+plain = slskd.source_queries({"series": "Vagabond", "issue": "5",
+                              "issue_title": "Volume 5", "media_type": "manga"})
+require(plain[0] == "Vagabond" and plain[1] == "Vagabond manga", plain[:4])
+
+# An automatic pass must not re-ask Soulseek a question it asked an hour ago.
+# One series can hold ~100 wanted rows that all build the same broad series
+# query, so the per-row probe cooldown never sees the repeat: "Vagabond manga"
+# ran 16 times in 19 hours live, returning ~1,700 files every time.
+history = [
+    {"id": "old-hit", "searchText": "Vagabond manga", "isComplete": True,
+     "fileCount": 1732, "responseCount": 23, "startedAt": "2026-08-01T02:54:22.4652549Z"},
+    {"id": "old-empty", "searchText": "Obscure Title", "isComplete": True,
+     "fileCount": 0, "responseCount": 0, "startedAt": "2026-08-01T02:54:22.4652549Z"},
+    {"id": "running", "searchText": "Berserk", "isComplete": False,
+     "fileCount": 900, "responseCount": 40, "startedAt": "2026-08-01T02:54:22.4652549Z"},
+    # A search that timed out after one peer answered. Real shape, taken from
+    # the live "Injustice Gods Among Us comic" search: finished, 150 files, one
+    # peer -- while the run of single issues it wanted is widely shared.
+    {"id": "one-peer", "searchText": "Injustice Gods Among Us comic", "isComplete": True,
+     "fileCount": 150, "responseCount": 1, "startedAt": "2026-08-01T02:54:22.4652549Z"},
+    # Same query asked twice: a rich answer, then a thin one a minute later.
+    {"id": "rich", "searchText": "Love and Rockets", "isComplete": True,
+     "fileCount": 5756, "responseCount": 250, "startedAt": "2026-08-01T02:50:00Z"},
+    {"id": "thin-but-newer", "searchText": "Love and Rockets", "isComplete": True,
+     "fileCount": 90, "responseCount": 3, "startedAt": "2026-08-01T02:59:00Z"},
+]
+frozen_now = slskd._parse_slskd_started_at("2026-08-01T03:10:00Z")
+with mock.patch.object(slskd, "now", lambda: frozen_now):
+    with mock.patch.object(slskd, "slskd_get", return_value=history):
+        day = 24 * 3600
+        require(slskd.reusable_slskd_search("Vagabond manga", day)["id"] == "old-hit",
+                "a fresh identical search should be reused")
+        # Casing/spacing differences are the same question.
+        require(slskd.reusable_slskd_search("vagabond   MANGA", day) is not None,
+                "normalized query text should match")
+        # A query that found nothing must re-run, or a row pins to an old miss.
+        require(slskd.reusable_slskd_search("Obscure Title", day) is None,
+                "empty prior results must never be reused")
+        # Never reuse a search that has not finished.
+        require(slskd.reusable_slskd_search("Berserk", day) is None,
+                "incomplete searches must never be reused")
+        # A finished search is not automatically a representative one. Soulseek
+        # searches end on a timer as well as on a response limit, so a one-peer
+        # answer must not pin the query for a day.
+        require(slskd.reusable_slskd_search("Injustice Gods Among Us comic", day) is None,
+                "a single-peer search must never be reused")
+        # When the same query has answered richly and then thinly, reuse the
+        # rich snapshot -- a thin newer search must not displace it.
+        picked = slskd.reusable_slskd_search("Love and Rockets", day)
+        require(picked is not None and picked["id"] == "rich", picked)
+        # Outside the window it is a fresh question again.
+        require(slskd.reusable_slskd_search("Vagabond manga", 60) is None,
+                "reuse must respect the cooldown window")
+        # Manual search opts out entirely.
+        require(slskd.reusable_slskd_search("Vagabond manga", 0) is None,
+                "cooldown 0 must disable reuse")
+    # A history lookup that fails must fall through to a live search, not block.
+    with mock.patch.object(slskd, "slskd_get", side_effect=RuntimeError("slskd down")):
+        require(slskd.reusable_slskd_search("Vagabond manga", 24 * 3600) is None,
+                "reuse must fail open when history is unavailable")
+
 # Inline provider writes must either hold the scheduled worker lock or defer
 # cleanly. They must never race SQLite and collapse into a zero-attempt failure.
 with mock.patch.object(autopilot, "held_source_worker_lock") as held:

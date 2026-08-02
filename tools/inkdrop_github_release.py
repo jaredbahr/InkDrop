@@ -54,8 +54,12 @@ def load_contract(path=DEFAULT_CONTRACT, root=ROOT):
     version = str(payload.get("version") or "").strip()
     tag = str(payload.get("tag") or "").strip()
     name = str(payload.get("name") or "").strip()
-    if not re.fullmatch(r"\d+\.\d+\.\d+-[0-9A-Za-z.-]+", version):
-        raise ValueError("release version must be a prerelease semantic version")
+    # Versions are the bare number now (0.1.02); the older suffixed forms
+    # (0.1.01-beta, 0.1.0-alpha.98) still validate so historical contracts and
+    # any re-publish of an old tag keep working. The patch keeps its leading
+    # zero, so this deliberately is not a strict semver check.
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
+        raise ValueError("release version must be a dotted version, optionally with a prerelease suffix")
     if tag != f"v{version}":
         raise ValueError("release tag must be v + version")
     if not name or payload.get("prerelease") is not True:

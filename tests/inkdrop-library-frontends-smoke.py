@@ -6,7 +6,7 @@ from pathlib import Path
 import inkdrop_library_frontends
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "inkdrop_web.py"
 IMPORTER = ROOT / "inkdrop_completed_import.py"
 PACK_IMPORT = ROOT / "inkdrop_pack_import.py"

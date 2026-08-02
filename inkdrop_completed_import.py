@@ -26,6 +26,7 @@ except Exception:
     inkdrop_state = None
 
 import inkdrop_runtime_config
+import inkdrop_qbittorrent_auth
 
 try:
     import inkdrop_language
@@ -57,8 +58,6 @@ MAX_IMPORT_STATUS_EVENT_BYTES = 64 * 1024 * 1024
 REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
 MANUAL_REVIEW_ACTIONS_FILE = STATE_DIR / "manual-review-actions.json"
 MANUAL_SOURCE_AUTORESOLVE_STATUS_FILE = STATE_DIR / "manual-source-autoresolve-status.json"
-KAPOWARR_DB = inkdrop_runtime_config.kapowarr_db_path()
-KAPOWARR_API = os.environ.get("INKDROP_KAPOWARR_URL") or ""
 KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
 KAVITA_API = os.environ.get("INKDROP_KAVITA_URL") or ""
 KAVITA_COMIC_ROOT = os.environ.get("INKDROP_KAVITA_COMIC_ROOT") or "/data/comics"
@@ -627,32 +626,49 @@ def comic_archive_suffix(path):
     return inkdrop_artifact_acceptance.comic_archive_suffix(path)
 
 
-def archive_entry_names(path):
+def archive_entry_names_status(path):
+    """Return (names, readable).
+
+    "The archive holds no ComicInfo" and "we could not open the archive" used to
+    both come back as an empty list, and a caller cannot tell a fact from a
+    failure. That is only a missed opportunity until something *persists* the
+    answer: a momentary 7z error or a locked file then becomes a stored
+    "confirmed no metadata", and every later read is served the wrong fact from
+    cache while the file itself is perfectly readable.
+    """
     ext = comic_archive_suffix(path)
     if ext == ".cbz":
         try:
             with zipfile.ZipFile(path) as archive:
-                return archive.namelist()
+                return archive.namelist(), True
         except (OSError, zipfile.BadZipFile):
-            return []
+            return [], False
     if ext == ".cbr":
-        proc = subprocess.run(
-            ["7z", "l", "-slt", str(path)],
-            text=True,
-            errors="replace",
-            capture_output=True,
-            timeout=120,
-        )
+        try:
+            proc = subprocess.run(
+                ["7z", "l", "-slt", str(path)],
+                text=True,
+                errors="replace",
+                capture_output=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return [], False
         if proc.returncode != 0:
-            return []
+            return [], False
         entries = []
         for line in proc.stdout.splitlines():
             if line.startswith("Path = "):
                 name = line[7:].strip()
                 if name:
                     entries.append(name)
-        return entries
-    return []
+        return entries, True
+    # Not a comic archive at all: nothing to read, and that is a fact.
+    return [], True
+
+
+def archive_entry_names(path):
+    return archive_entry_names_status(path)[0]
 
 
 # These members are metadata (ComicInfo.xml and friends), never payload. Both
@@ -780,26 +796,44 @@ def is_internal_import_path(path, root=None):
     return any(part.startswith("_") or part in INTERNAL_IMPORT_DIR_NAMES for part in parts)
 
 
-def read_comicinfo(path):
+def read_comicinfo_status(path):
+    """Return (comicinfo, readable). See archive_entry_names_status."""
     path = Path(path)
     if comic_archive_suffix(path) not in {".cbz", ".cbr"}:
-        return {}
-    names = [name for name in archive_entry_names(path) if name.lower().endswith("comicinfo.xml")]
+        return {}, True
+    entries, readable = archive_entry_names_status(path)
+    if not readable:
+        return {}, False
+    names = [name for name in entries if name.lower().endswith("comicinfo.xml")]
     if not names:
-        return {}
+        return {}, True
+    return _read_comicinfo_members(path, names)
+
+
+def read_comicinfo(path):
+    return read_comicinfo_status(path)[0]
+
+
+def _read_comicinfo_members(path, names):
+    """Return (comicinfo, readable) for an archive known to list a ComicInfo."""
+    path = Path(path)
     preferred = sorted(names, key=lambda item: ("/" in item, len(item)))[0]
     raw = archive_member_text(path, preferred)
     if not raw:
-        return {}
+        # The listing said this member exists, so an empty extract is a failed
+        # read, not a document that happens to be empty.
+        return {}, False
     try:
         root = ET.fromstring(raw)
     except ET.ParseError:
-        return {"raw": raw}
+        # We read the document fine; it is the document that is malformed. That
+        # is a fact about the file and is safe to remember.
+        return {"raw": raw}, True
     out = {"raw": raw, "comicinfo_path": preferred}
     for child in root:
         tag = child.tag.split("}", 1)[-1]
         out[tag] = (child.text or "").strip()
-    return out
+    return out, True
 
 
 def comicinfo_language_gate(path):
@@ -2145,10 +2179,27 @@ def collection_completion_stats():
     }
 
 
+def _log_safe_value(value):
+    """Last-resort coercion for anything json.dumps cannot take."""
+    if isinstance(value, (bytes, bytearray)):
+        return f"<{len(value)} bytes>"
+    return repr(value)[:512]
+
+
 def log(event):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({**event, "ts": time.time()}, sort_keys=True) + "\n")
+    # An import that has already copied the file and committed the ledger must
+    # not be undone by a failure to write a log line. Nothing downstream reads
+    # this file to decide correctness, so a dropped line is a diagnostic loss,
+    # while an exception raised here marks a successfully imported file as a bad
+    # candidate -- which is what a real CBR import carrying raw ComicInfo bytes
+    # did in production.
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({**event, "ts": time.time()}, sort_keys=True, default=_log_safe_value)
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + chr(10))
+    except Exception:
+        pass
 
 
 def sync_inkdrop_import_results():
@@ -2827,12 +2878,6 @@ def app_setting_value(key, default=None):
     return default
 
 
-def completed_import_kapowarr_adapter_enabled():
-    # Retired in Build 165. The guarded compatibility implementation remains
-    # unreachable for one rollback window.
-    return False
-
-
 def media_management_library_visibility_required():
     return bool_setting(
         {"required": app_setting_value("media_management.library_visibility_required", False)},
@@ -3417,7 +3462,19 @@ def repack_cbr_to_cbz(source, dest):
             # fighting that write, rather than being discarded outright.
             archive.writestr("ComicInfo.xml.source-embedded", source_comicinfo)
     tmp_cbz.replace(dest)
-    meta.update({"page_count": len(images), "source_format": "cbr", "dest_format": "cbz"})
+    # The raw XML has now been written into the archive, which was its only
+    # purpose. Drop it here rather than letting it ride along in meta: this dict
+    # ends up inside an import event that gets json.dumps'd, and bytes are not
+    # serializable. A real CBR import crashed on exactly that after the file was
+    # already copied and the ledger already committed, leaving a false "bad
+    # candidate" for 17 minutes until unrelated self-healing undid it.
+    meta.pop("source_comicinfo_xml", None)
+    meta.update({
+        "page_count": len(images),
+        "source_format": "cbr",
+        "dest_format": "cbz",
+        "source_comicinfo_embedded": bool(source_comicinfo),
+    })
     return meta
 
 
@@ -3836,169 +3893,6 @@ def manga_archive_normalization_chapter_number(source_path, event=None, canonica
     return None
 
 
-def load_kapowarr_api_key():
-    if not completed_import_kapowarr_adapter_enabled():
-        raise RuntimeError("Kapowarr completed-import adapter is disabled")
-    conn = sqlite_connect(KAPOWARR_DB)
-    try:
-        row = conn.execute("select value from config where key='api_key'").fetchone()
-    finally:
-        conn.close()
-    if not row or not row[0]:
-        raise RuntimeError("Kapowarr API key missing")
-    return row[0]
-
-
-def kapowarr_api(method, path, json_body=None, timeout=60):
-    if not completed_import_kapowarr_adapter_enabled():
-        raise RuntimeError("Kapowarr completed-import adapter is disabled")
-    if not str(KAPOWARR_API or "").strip():
-        raise RuntimeError("Kapowarr URL is not configured; set INKDROP_KAPOWARR_URL to use the Kapowarr adapter.")
-    response = requests.request(
-        method,
-        KAPOWARR_API.rstrip("/") + "/" + path.lstrip("/"),
-        params={"api_key": load_kapowarr_api_key()},
-        json=json_body,
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("error"):
-        raise RuntimeError(f"Kapowarr API error: {payload.get('error')}")
-    return payload.get("result")
-
-
-def trigger_kapowarr_scan(volume_id):
-    return kapowarr_api(
-        "POST",
-        "/system/tasks",
-        json_body={"cmd": "refresh_and_scan", "volume_id": int(volume_id)},
-        timeout=8,
-    )
-
-
-def kapowarr_tasks():
-    result = kapowarr_api("GET", "/system/tasks", timeout=8)
-    return result if isinstance(result, list) else []
-
-
-def kapowarr_task_busy_for_volume(volume_id):
-    volume_id = int(volume_id)
-    for task in kapowarr_tasks():
-        if not isinstance(task, dict):
-            continue
-        action = str(task.get("action") or "")
-        if action in {"update_all", "search_all"}:
-            return True
-        try:
-            task_volume_id = int(task.get("volume_id"))
-        except (TypeError, ValueError):
-            task_volume_id = None
-        if task_volume_id == volume_id:
-            return True
-    return False
-
-
-def queue_kapowarr_scan(volume_id):
-    volume_id = int(volume_id)
-    if not completed_import_kapowarr_adapter_enabled():
-        return {"volume_id": volume_id, "skipped": "kapowarr_completed_import_adapter_disabled"}
-    if kapowarr_task_busy_for_volume(volume_id):
-        return {"volume_id": volume_id, "skipped": "kapowarr_task_already_running"}
-    result = trigger_kapowarr_scan(volume_id)
-    task_id = result.get("id") if isinstance(result, dict) else result
-    return {"volume_id": volume_id, "task_id": task_id}
-
-
-def kapowarr_issue_number_value(value):
-    normalized = normalize_manga_number(value)
-    if not normalized:
-        return None
-    try:
-        return float(normalized)
-    except (TypeError, ValueError):
-        return None
-
-
-def kapowarr_issue_id_for_item(conn, item):
-    explicit = item.get("matched_kapowarr_issue_id")
-    if explicit:
-        try:
-            return int(explicit)
-        except (TypeError, ValueError):
-            pass
-    volume_id = item.get("matched_kapowarr_id")
-    if not volume_id:
-        return None
-    issue_number = None
-    for key in ("issue_number", "canonical_issue_number", "normalized_number", "canonical_number"):
-        issue_number = kapowarr_issue_number_value(item.get(key))
-        if issue_number is not None:
-            break
-    if issue_number is None and item.get("dest"):
-        issue_number = kapowarr_issue_number_value(extract_issue_number(item.get("dest")))
-    if issue_number is None:
-        return None
-    row = conn.execute(
-        """
-        select id
-        from issues
-        where volume_id = ?
-          and calculated_issue_number = ?
-        limit 1
-        """,
-        (int(volume_id), issue_number),
-    ).fetchone()
-    return int(row[0]) if row else None
-
-
-def kapowarr_manual_match_file(volume_id, kapowarr_path, issue_id):
-    payload = [{
-        "filepath": kapowarr_path,
-        "issue_ids": [int(issue_id)],
-        "general_file": False,
-        "forced_match": True,
-    }]
-    return kapowarr_api(
-        "PUT",
-        f"/volumes/{int(volume_id)}/manualmatch",
-        json_body=payload,
-        timeout=20,
-    )
-
-
-def kapowarr_linked_host_path_for_item(conn, item):
-    volume_id = item.get("matched_kapowarr_id") or item.get("kapowarr_volume_id")
-    if not volume_id:
-        return None
-    try:
-        volume_id = int(volume_id)
-    except (TypeError, ValueError):
-        return None
-    issue_id = kapowarr_issue_id_for_item(conn, item)
-    if not issue_id:
-        return None
-    row = conn.execute(
-        """
-        select f.filepath
-        from files f
-        join issues_files issue_link on issue_link.file_id = f.id
-        join issues i on i.id = issue_link.issue_id
-        where i.volume_id = ?
-          and i.id = ?
-        order by f.id desc
-        limit 1
-        """,
-        (volume_id, int(issue_id)),
-    ).fetchone()
-    if not row or not row[0]:
-        return None
-    host_path = host_path_from_kavita_path(row[0])
-    if not host_path:
-        return None
-    return Path(host_path)
-
-
 def normalize_kavita_api_url(value):
     base_url = str(value or KAVITA_API).strip().rstrip("/")
     if not base_url:
@@ -4321,12 +4215,6 @@ def reader_expectation_for_import(item, dest_path, kavita_conn=None):
     return expectation
 
 
-def host_path_to_kapowarr(path):
-    path = Path(path)
-    rel = path.relative_to(COMIC_ROOT)
-    return f"{KAPOWARR_COMIC_ROOT}/{rel.as_posix()}"
-
-
 def trigger_kavita_library_scan(folder, mode, folder_scan_status_code=None, details=None):
     return inkdrop_library_frontends.trigger_kavita_library_scan(
         folder,
@@ -4368,40 +4256,6 @@ def kavita_library_id_for_folder(folder):
     finally:
         conn.close()
     return inkdrop_library_frontends.kavita_library_id_for_folder(folder, rows)
-
-
-def kapowarr_missing_counts(volume_ids):
-    if not volume_ids or not completed_import_kapowarr_adapter_enabled():
-        return {}
-    conn = sqlite_connect(KAPOWARR_DB)
-    try:
-        counts = {}
-        for volume_id in sorted({int(v) for v in volume_ids}):
-            row = conn.execute(
-                """
-                select
-                    v.title,
-                    count(i.id),
-                    sum(case when exists (
-                        select 1 from issues_files issue_link
-                        where issue_link.issue_id = i.id
-                    ) then 0 else 1 end)
-                from volumes v
-                left join issues i on i.volume_id = v.id and i.monitored = 1
-                where v.id = ?
-                group by v.id
-                """,
-                (volume_id,),
-            ).fetchone()
-            if row:
-                counts[str(volume_id)] = {
-                    "title": row[0],
-                    "monitored": int(row[1] or 0),
-                    "missing": int(row[2] or 0),
-                }
-        return counts
-    finally:
-        conn.close()
 
 
 def manga_issue_number_from_item(item):
@@ -4790,19 +4644,6 @@ def record_collection_completion(item, result):
     metadata_ids = completion_metadata_identity_fields(item, result)
     issue_ids = {}
     volume_id = item.get("matched_kapowarr_id") or result.get("volume_id")
-    if volume_id and completed_import_kapowarr_adapter_enabled():
-        conn_k = sqlite_connect(KAPOWARR_DB)
-        conn_k.row_factory = sqlite3.Row
-        try:
-            for row in conn_k.execute(
-                "select id, issue_number, calculated_issue_number from issues where volume_id=?",
-                (int(volume_id),),
-            ):
-                number = normalize_manga_number(row["calculated_issue_number"] or row["issue_number"])
-                if number:
-                    issue_ids[number] = row["id"]
-        finally:
-            conn_k.close()
     now = time.time()
     conn = connect()
     written = 0
@@ -5024,7 +4865,9 @@ def verify_imported_items(
         poll_library_visibility = bool(poll_kavita)
     else:
         poll_library_visibility = bool(poll_library_visibility)
-    kapowarr_adapter_enabled = completed_import_kapowarr_adapter_enabled()
+    # Kapowarr is retired; there is no live volume/missing-issue data to
+    # summarize.
+    missing_counts = {}
     library_visibility_required = media_management_library_visibility_required()
     library_visibility_checks_enabled = bool(
         library_visibility_required
@@ -5032,13 +4875,6 @@ def verify_imported_items(
         or media_management_library_visibility_checks_enabled()
     )
     kavita_visibility_enabled = bool(library_visibility_checks_enabled and kavita_visibility_adapter_enabled())
-    volume_ids = set()
-    if kapowarr_adapter_enabled:
-        for item in imported:
-            volume_id = item.get("matched_kapowarr_id")
-            if volume_id:
-                volume_ids.add(int(volume_id))
-    missing_counts = kapowarr_missing_counts(volume_ids)
     try:
         komga_settings = load_komga_settings()
     except Exception as exc:
@@ -5054,7 +4890,6 @@ def verify_imported_items(
 
     def check_once():
         checked = []
-        kapowarr_conn = sqlite_connect(KAPOWARR_DB) if kapowarr_adapter_enabled else None
         kavita_conn = sqlite_connect(KAVITA_DB) if kavita_visibility_enabled else None
         try:
             for item in imported:
@@ -5089,89 +4924,18 @@ def verify_imported_items(
                     checked.append(result)
                     continue
                 dest_path = Path(dest)
-                if (
-                    kapowarr_adapter_enabled
-                    and
-                    is_kapowarr_truth_model(result["truth_model"])
-                    and completion_has_kapowarr_truth_anchor(item)
-                    and not dest_path.exists()
-                ):
-                    recovered_path = kapowarr_linked_host_path_for_item(kapowarr_conn, item)
-                    if recovered_path and recovered_path.exists():
-                        result["original_dest"] = dest
-                        result["dest"] = str(recovered_path)
-                        result["recovered_dest"] = True
-                        dest_path = recovered_path
                 result["host_exists"] = dest_path.exists()
                 if result["host_exists"] and kind_from_path(dest_path) == "comics":
                     result["comicinfo_status"] = comicinfo_status(dest_path)
-                    kapowarr_path = None
-                    if (
-                        kapowarr_adapter_enabled
-                        and is_kapowarr_truth_model(result["truth_model"])
-                        and completion_has_kapowarr_truth_anchor(item)
-                    ):
-                        try:
-                            kapowarr_path = host_path_to_kapowarr(dest_path)
-                        except ValueError:
-                            kapowarr_path = None
-                    if kapowarr_path:
-                        kapowarr_row = kapowarr_conn.execute(
-                            """
-                            select f.id, count(issue_link.issue_id)
-                            from files f
-                            left join issues_files issue_link on issue_link.file_id = f.id
-                            where f.filepath = ?
-                            group by f.id
-                            """,
-                            (kapowarr_path,),
-                        ).fetchone()
-                        if kapowarr_row:
-                            result["kapowarr_linked"] = int(kapowarr_row[1] or 0) > 0
-                            result["kapowarr_issue_links"] = int(kapowarr_row[1] or 0)
-                        if (
-                            not result["kapowarr_linked"]
-                            and is_kapowarr_truth_model(result["truth_model"]) and completion_has_kapowarr_truth_anchor(item)
-                            and volume_id
-                            and result["comicinfo_status"] == "present"
-                        ):
-                            issue_id = kapowarr_issue_id_for_item(kapowarr_conn, item)
-                            manual_match = {
-                                "attempted": bool(issue_id),
-                                "issue_id": issue_id,
-                                "filepath": kapowarr_path,
-                            }
-                            if issue_id:
-                                try:
-                                    kapowarr_manual_match_file(volume_id, kapowarr_path, issue_id)
-                                    manual_match["ok"] = True
-                                except Exception as exc:
-                                    manual_match["ok"] = False
-                                    manual_match["error"] = str(exc)
-                                kapowarr_row = kapowarr_conn.execute(
-                                    """
-                                    select f.id, count(issue_link.issue_id)
-                                    from files f
-                                    left join issues_files issue_link on issue_link.file_id = f.id
-                                    where f.filepath = ?
-                                    group by f.id
-                                    """,
-                                    (kapowarr_path,),
-                                ).fetchone()
-                                if kapowarr_row:
-                                    result["kapowarr_linked"] = int(kapowarr_row[1] or 0) > 0
-                                    result["kapowarr_issue_links"] = int(kapowarr_row[1] or 0)
-                            else:
-                                manual_match["ok"] = False
-                                manual_match["error"] = "no_exact_kapowarr_issue_id"
-                            result["kapowarr_manual_match"] = manual_match
+                    # Kapowarr is retired: it is never the adapter of record
+                    # for a fresh import, but a historical truth anchor on an
+                    # older row still needs to report as adapter-disabled
+                    # rather than a hard verification failure.
                     result["kapowarr_status"] = (
                         "adapter_disabled"
-                        if not kapowarr_adapter_enabled and completion_has_kapowarr_truth_anchor(item)
+                        if completion_has_kapowarr_truth_anchor(item)
                         else
-                        "linked"
-                        if result["kapowarr_linked"]
-                        else "kapowarr_linked_optional"
+                        "kapowarr_linked_optional"
                         if result["truth_model"] == "kavita_manga"
                         else "not_linked"
                     )
@@ -5197,8 +4961,6 @@ def verify_imported_items(
                 checked.append(result)
             return checked
         finally:
-            if kapowarr_conn is not None:
-                kapowarr_conn.close()
             if kavita_conn is not None:
                 kavita_conn.close()
 
@@ -5333,24 +5095,8 @@ COMPLETION_IDENTITY_TABLES = (
 
 
 def kapowarr_completion_identity_maps():
-    if not completed_import_kapowarr_adapter_enabled() or not KAPOWARR_DB.exists():
-        return {}, {}
-    conn = sqlite_connect(KAPOWARR_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        volume_map = {
-            int(row["id"]): str(row["comicvine_id"])
-            for row in conn.execute("select id, comicvine_id from volumes where comicvine_id is not null")
-            if row["id"] is not None and row["comicvine_id"] not in (None, "")
-        }
-        issue_map = {
-            int(row["id"]): str(row["comicvine_id"])
-            for row in conn.execute("select id, comicvine_id from issues where comicvine_id is not null")
-            if row["id"] is not None and row["comicvine_id"] not in (None, "")
-        }
-        return volume_map, issue_map
-    finally:
-        conn.close()
+    # Kapowarr is retired; there is no live volume/issue identity map.
+    return {}, {}
 
 
 def canonical_completion_identity_for_row(row, volume_map, issue_map):
@@ -6437,59 +6183,11 @@ def canonical_comic_dest(target_dir, source, target, source_unit=None):
     issue_number = target_issue_number or extract_issue_number(source)
     if issue_number is None:
         return unique_dest(target_dir, source), None
-    volume_id = target_kapowarr_volume_id(target)
-    if volume_id is None or not completed_import_kapowarr_adapter_enabled() or not KAPOWARR_DB.exists():
-        pretty_issue = format_issue_number(issue_number)
-        if not pretty_issue:
-            return unique_dest(target_dir, source), None
-        source_text = " ".join([Path(source).stem, Path(source).parent.name])
-        volume_style = (
-            is_manga_target(target)
-            and str(source_unit or "").strip().lower() in {"volume", "pack"}
-        ) or (
-            bool(re.search(r"\b(?:v|vol|volume)[\s._-]*0*\d{1,5}(?:\.\d+)?\b", source_text, re.I))
-            and not re.search(r"(?:^|[\s._\-\(\[])#\s*\d|\bissue[\s._-]*\d", source_text, re.I)
-        )
-        series = safe_filename_part(target.get("title") or Path(source).parent.name)
-        if volume_style and is_manga_target(target):
-            filename = f"{series} v{format_volume_number(issue_number) or pretty_issue}"
-        else:
-            filename = f"{series} #{pretty_issue}"
-        year = target.get("year")
-        if year:
-            filename += f" ({year})"
-        filename += source.suffix.lower()
-        return unique_dest_name(target_dir, filename), {
-            "canonical_filename": filename,
-            "canonical_issue_number": pretty_issue,
-            "canonical_issue_title": None,
-            "canonical_year": year,
-            "canonical_source": "inkdrop_series_target",
-        }
-    conn = sqlite_connect(KAPOWARR_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            """
-            select i.issue_number, i.calculated_issue_number, i.date, i.title as issue_title, v.title, v.year
-            from issues i
-            join volumes v on v.id = i.volume_id
-            where i.volume_id = ?
-              and abs(i.calculated_issue_number - ?) < 0.001
-            order by i.id
-            limit 1
-            """,
-            (volume_id, issue_number),
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row:
-        return unique_dest(target_dir, source), None
-    pretty_issue = format_issue_number(row["issue_number"] or row["calculated_issue_number"])
+    # Kapowarr is retired; naming always uses InkDrop's own series target,
+    # never Kapowarr's own issue metadata.
+    pretty_issue = format_issue_number(issue_number)
     if not pretty_issue:
         return unique_dest(target_dir, source), None
-    year = issue_year(row["date"], row["year"])
-    series = safe_filename_part(row["title"] or target.get("title"))
     source_text = " ".join([Path(source).stem, Path(source).parent.name])
     volume_style = (
         is_manga_target(target)
@@ -6498,38 +6196,22 @@ def canonical_comic_dest(target_dir, source, target, source_unit=None):
         bool(re.search(r"\b(?:v|vol|volume)[\s._-]*0*\d{1,5}(?:\.\d+)?\b", source_text, re.I))
         and not re.search(r"(?:^|[\s._\-\(\[])#\s*\d|\bissue[\s._-]*\d", source_text, re.I)
     )
+    series = safe_filename_part(target.get("title") or Path(source).parent.name)
     if volume_style and is_manga_target(target):
-        pretty_volume = format_volume_number(row["issue_number"] or row["calculated_issue_number"])
-        if not pretty_volume:
-            return unique_dest(target_dir, source), None
-        filename = f"{series} v{pretty_volume}"
+        filename = f"{series} v{format_volume_number(issue_number) or pretty_issue}"
     else:
         filename = f"{series} #{pretty_issue}"
+    year = target.get("year")
     if year:
         filename += f" ({year})"
     filename += source.suffix.lower()
     return unique_dest_name(target_dir, filename), {
         "canonical_filename": filename,
         "canonical_issue_number": pretty_issue,
-        "canonical_issue_title": row["issue_title"],
+        "canonical_issue_title": None,
         "canonical_year": year,
+        "canonical_source": "inkdrop_series_target",
     }
-
-
-def kapowarr_folder_to_host(folder):
-    folder = str(folder or "").strip()
-    if not folder.startswith(KAPOWARR_COMIC_ROOT):
-        return None
-    rel = folder[len(KAPOWARR_COMIC_ROOT):].lstrip("/")
-    return COMIC_ROOT / rel
-
-
-def kapowarr_folder_to_manga_host(folder):
-    folder = str(folder or "").strip()
-    if not folder.startswith(KAPOWARR_COMIC_ROOT):
-        return None
-    rel = folder[len(KAPOWARR_COMIC_ROOT):].lstrip("/")
-    return MANGA_ROOT / rel
 
 
 def target_kapowarr_volume_id(target):
@@ -6556,16 +6238,13 @@ def import_event_scan_folder(event, fallback_dir=None):
     return str(fallback_dir) if fallback_dir else None
 
 
-def add_target_scan_requests(target, target_dir, kapowarr_scan_volume_ids, kavita_scan_folders, event=None):
-    volume_id = target_kapowarr_volume_id(target)
-    kapowarr_adapter_enabled = completed_import_kapowarr_adapter_enabled()
-    if volume_id is not None and kapowarr_adapter_enabled:
-        kapowarr_scan_volume_ids.add(volume_id)
+def add_target_scan_requests(target, target_dir, kavita_scan_folders, event=None):
+    # Kapowarr is retired; scanning is Kavita-only now.
     scan_folder = import_event_scan_folder(event, target_dir)
     if scan_folder:
         kavita_scan_folders.add(str(scan_folder))
     if isinstance(event, dict):
-        event["scan_source"] = "kapowarr_and_kavita" if volume_id is not None and kapowarr_adapter_enabled else "kavita_only"
+        event["scan_source"] = "kavita_only"
 
 
 def host_path_from_kavita_path(value):
@@ -6730,63 +6409,8 @@ def annotate_target_alias_conflicts(targets):
 
 
 def load_comic_targets(series_filter=None):
-    filters = {normalize(item) for item in (series_filter or []) if normalize(item)}
+    # Kapowarr is retired; targets come only from InkDrop's own series data.
     targets = inkdrop_series_targets(series_filter)
-    seen_native = {str(target.get("native_series_id") or "") for target in targets if target.get("native_series_id")}
-    seen_titles = {normalize(target.get("title")) for target in targets if normalize(target.get("title"))}
-    if not completed_import_kapowarr_adapter_enabled() or not KAPOWARR_DB.exists():
-        return annotate_target_alias_conflicts(targets)
-    conn = sqlite_connect(KAPOWARR_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            select id, title, alt_title, year, publisher, folder, comicvine_id, special_version
-            from volumes
-            where folder is not null
-              and title is not null
-            """
-        ).fetchall()
-    finally:
-        conn.close()
-    for row in rows:
-        host_folder = kapowarr_folder_to_host(row["folder"])
-        if not host_folder:
-            continue
-        comicvine_id = row["comicvine_id"]
-        metadata_provider = "comicvine" if comicvine_id not in (None, "") else "kapowarr"
-        metadata_id = comicvine_id if comicvine_id not in (None, "") else row["id"]
-        native_series_id = f"comicvine:{comicvine_id}" if comicvine_id not in (None, "") else None
-        aliases = []
-        append_comic_target_aliases(aliases, row["title"])
-        if row["alt_title"]:
-            append_comic_target_aliases(aliases, row["alt_title"])
-        title_norm = normalize(row["title"])
-        if filters and title_norm not in filters:
-            continue
-        if native_series_id and native_series_id in seen_native:
-            continue
-        if not native_series_id and title_norm in seen_titles:
-            continue
-        targets.append(
-            {
-                "id": row["id"],
-                "kapowarr_id": row["id"],
-                "inkdrop_series_id": native_series_id,
-                "title": row["title"],
-                "year": row["year"],
-                "publisher": row["publisher"],
-                "media_type": "manga" if is_manga_target({"title": row["title"], "publisher": row["publisher"]}) else "comic",
-                "folder": str(host_folder),
-                "comicvine_id": comicvine_id,
-                "metadata_provider": metadata_provider,
-                "metadata_id": str(metadata_id) if metadata_id not in (None, "") else None,
-                "native_series_id": native_series_id,
-                "special_version": row["special_version"],
-                "target_source": "kapowarr_adapter",
-                "aliases": [normalize(alias) for alias in aliases if normalize(alias)],
-            }
-        )
     return annotate_target_alias_conflicts(targets)
 
 
@@ -7627,13 +7251,13 @@ def load_qbit_incomplete_paths(kind):
         return set()
     try:
         qbit = load_qbit_settings()
-        if not qbit.get("user") or not qbit.get("pass"):
+        if not qbit.get("api_key") and not (qbit.get("user") and qbit.get("pass")):
             raise RuntimeError("qBittorrent credentials are unavailable")
         target_category = qbit["comics_category"] if kind == "comics" else qbit["ebooks_category"]
         target_save_path = qbit["comics_save_path"] if kind == "comics" else qbit["ebooks_save_path"]
         category_keys = {normalize(target_category)}
         if kind == "comics":
-            category_keys.update({normalize("comics"), normalize("kapowarr")})
+            category_keys.update({normalize("comics")})
         else:
             category_keys.update({normalize("readarr")})
         save_paths = {
@@ -7642,12 +7266,7 @@ def load_qbit_incomplete_paths(kind):
             if str(path or "").strip()
         }
         session = requests.Session()
-        login = session.post(
-            qbit["host"] + "/api/v2/auth/login",
-            data={"username": qbit["user"], "password": qbit["pass"]},
-            timeout=15,
-        )
-        login.raise_for_status()
+        inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=15)
         torrents = session.get(qbit["host"] + "/api/v2/torrents/info", timeout=20).json()
         incomplete = set()
         for torrent in torrents:
@@ -7752,38 +7371,6 @@ def matching_target_alias(words, target):
         if contains_sequence(words, alias_words) and len(alias) > len(best):
             best = alias
     return best
-
-
-def target_has_issue_number(target, number):
-    formatted = format_issue_number(number)
-    if not target or not formatted or not completed_import_kapowarr_adapter_enabled() or not KAPOWARR_DB.exists():
-        return False
-    try:
-        wanted = float(number)
-        volume_id = int(target.get("id"))
-    except (TypeError, ValueError):
-        return False
-    conn = sqlite_connect(KAPOWARR_DB)
-    try:
-        row = conn.execute(
-            """
-            select 1
-            from issues
-            where volume_id = ?
-              and (
-                issue_number = ?
-                or issue_number = ?
-                or abs(calculated_issue_number - ?) < 0.001
-              )
-            limit 1
-            """,
-            (volume_id, formatted, str(int(wanted)) if wanted.is_integer() else str(wanted), wanted),
-        ).fetchone()
-        return bool(row)
-    except sqlite3.Error:
-        return False
-    finally:
-        conn.close()
 
 
 def filename_has_range_or_pack(path):
@@ -8033,7 +7620,7 @@ def classify_import_filename_safety(path, target=None, kind="comics", trusted_is
         if trusted_missing_number_ok:
             score += 2
             evidence.append("trusted_single_issue_artifact_title")
-    elif source_number_fmt and (explicit_unit or target_has_issue_number(target, source_number)):
+    elif source_number_fmt and explicit_unit:
         score += 2
         evidence.append(f"filename_unit:{source_number_fmt}")
     elif source_number_fmt and native_manga_bare_number_is_safe(path, target, title_alias, source_number, collection_target):
@@ -8565,7 +8152,6 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
     pending_imports = load_pending_imports(kind) if pending_only else []
     if pending_only and not explicit_sources and not manual_inbox and not suwayomi_staging and not slskd_staging:
         sources = pending_only_source_roots(sources, pending_imports)
-    kapowarr_scan_volume_ids = set()
     kavita_scan_folders = set()
     kavita_force_library_scan_folders = set()
     cutoff = 0.0
@@ -9027,7 +8613,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     if pending_only:
                         append_pending_status(kind, path, "imported", existing_dest, target, pending_imports)
                     if kind == "comics" and target:
-                        add_target_scan_requests(target, target_dir, kapowarr_scan_volume_ids, kavita_scan_folders, event)
+                        add_target_scan_requests(target, target_dir, kavita_scan_folders, event)
                     continue
             if not dry_run:
                 same_file = find_same_file(target_dir, path, digest)
@@ -9093,7 +8679,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     log({**event, "event": "existing_same_file_recorded"})
                     imported.append(event)
                     if kind == "comics" and target:
-                        add_target_scan_requests(target, target_dir, kapowarr_scan_volume_ids, kavita_scan_folders, event)
+                        add_target_scan_requests(target, target_dir, kavita_scan_folders, event)
                     if pending_only:
                         append_pending_status(kind, path, "imported", same_file, target, pending_imports)
                     continue
@@ -9447,7 +9033,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     )
                     conn.commit()
                     if kind == "comics" and target:
-                        add_target_scan_requests(target, dest.parent, kapowarr_scan_volume_ids, kavita_scan_folders, event)
+                        add_target_scan_requests(target, dest.parent, kavita_scan_folders, event)
                         if manga_import_needs_library_scan(event):
                             kavita_force_library_scan_folders.add(str(dest.parent))
                     if pending_only:
@@ -9492,7 +9078,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 )
                 conn.commit()
                 if kind == "comics" and target:
-                    add_target_scan_requests(target, target_dir, kapowarr_scan_volume_ids, kavita_scan_folders, event)
+                    add_target_scan_requests(target, target_dir, kavita_scan_folders, event)
                     if manga_import_needs_library_scan(event):
                         kavita_force_library_scan_folders.add(str(target_dir))
                 if pending_only:
@@ -9513,18 +9099,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 )
         if max_files and len(imported) >= max_files:
             break
-    missing_before = kapowarr_missing_counts(kapowarr_scan_volume_ids) if kind == "comics" else {}
+    # Kapowarr is retired; there is no live volume data to count missing
+    # issues against or queue a rescan for.
+    missing_before = {}
     kapowarr_scan_tasks = []
-    if not dry_run and kind == "comics":
-        for volume_id in sorted(kapowarr_scan_volume_ids):
-            try:
-                queued = queue_kapowarr_scan(volume_id)
-                kapowarr_scan_tasks.append(queued)
-                event = "kapowarr_refresh_scan_skipped" if queued.get("skipped") else "kapowarr_refresh_scan_queued"
-                log({"event": event, **queued})
-            except Exception as exc:
-                kapowarr_scan_tasks.append({"volume_id": volume_id, "error": str(exc)})
-                log({"event": "kapowarr_refresh_scan_failed", "volume_id": volume_id, "error": str(exc)})
     frontend_sync = (
         sync_library_frontend_folders(
             kavita_scan_folders,
@@ -9547,7 +9125,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
         if not dry_run and kind == "comics" and imported
         else {}
     )
-    missing_after = kapowarr_missing_counts(kapowarr_scan_volume_ids) if not dry_run and kind == "comics" else {}
+    missing_after = {}
     if verification.get("failure_count"):
         append_manual_review(
             "import_verification_failed",
@@ -9651,16 +9229,6 @@ def verify_last_status():
         return
     status = json.loads(IMPORT_STATUS_PATH.read_text(encoding="utf-8"))
     imported = status.get("imported") or []
-    kapowarr_adapter_enabled = completed_import_kapowarr_adapter_enabled()
-    volume_ids = (
-        {
-            int(item["matched_kapowarr_id"])
-            for item in imported
-            if item.get("matched_kapowarr_id")
-        }
-        if kapowarr_adapter_enabled
-        else set()
-    )
     folders = {
         str(Path(item["dest"]).parent)
         for item in imported
@@ -9675,17 +9243,10 @@ def verify_last_status():
         for item in imported
         if item.get("dest") and manga_import_needs_library_scan(item)
     }
-    missing_before = kapowarr_missing_counts(volume_ids)
+    # Kapowarr is retired; there is no live volume data to count missing
+    # issues against or queue a rescan for.
+    missing_before = {}
     kapowarr_scan_tasks = []
-    for volume_id in sorted(volume_ids):
-        try:
-            queued = queue_kapowarr_scan(volume_id)
-            kapowarr_scan_tasks.append(queued)
-            event = "verify_kapowarr_refresh_scan_skipped" if queued.get("skipped") else "verify_kapowarr_refresh_scan_queued"
-            log({"event": event, **queued})
-        except Exception as exc:
-            kapowarr_scan_tasks.append({"volume_id": volume_id, "error": str(exc)})
-            log({"event": "verify_kapowarr_refresh_scan_failed", "volume_id": volume_id, "error": str(exc)})
     frontend_sync = sync_library_frontend_folders(
         folders,
         force_library_scan_folders=force_library_scan_folders,
@@ -9700,7 +9261,7 @@ def verify_last_status():
     if kapowarr_scan_tasks or kavita_scan_tasks or komga_scan_tasks:
         time.sleep(20)
     verification = verify_imported_items(imported, poll_library_visibility=True)
-    missing_after = kapowarr_missing_counts(volume_ids)
+    missing_after = {}
     if verification.get("failure_count"):
         append_manual_review(
             "import_verification_failed",
@@ -9735,13 +9296,13 @@ def main():
     parser.add_argument("--min-age-seconds", type=int, default=600)
     parser.add_argument("--ignore-cutoff", action="store_true")
     parser.add_argument("--matched-only", action="store_true")
-    parser.add_argument("--all-series", action="store_true", help="Allow comic imports for every Kapowarr series; default requires --series")
+    parser.add_argument("--all-series", action="store_true", help="Allow comic imports for every InkDrop series target; default requires --series")
     parser.add_argument("--pending-only", action="store_true", help="Only import files matching InkDrop pending-import records")
     parser.add_argument("--manual-inbox", action="store_true", help="Only import from the deliberate manual inbox folders")
     parser.add_argument("--suwayomi-staging", action="store_true", help="Only import from the isolated Suwayomi manga staging folder")
     parser.add_argument("--slskd-staging", action="store_true", help="Only import from the isolated SLSKD download staging folder")
     parser.add_argument("--source-file", action="append", help="Import one exact source file selected by reconciliation; repeatable")
-    parser.add_argument("--trusted-volume-id", help="For an explicit source file, trust this Kapowarr volume id as the import target")
+    parser.add_argument("--trusted-volume-id", help="For an explicit source file, trust this InkDrop series target id as the import target")
     parser.add_argument("--trusted-series-id", help="For an explicit source file, trust this InkDrop/native series id as the import target")
     parser.add_argument("--trusted-issue", help="For an explicit source file, require this watched issue number when present")
     parser.add_argument("--trusted-issue-title", help="For an explicit source file, carry the native watched issue title as import evidence")
@@ -9757,7 +9318,7 @@ def main():
         action="store_true",
         help="Copy/import and queue frontend scans, but return while optional library visibility is still pending",
     )
-    parser.add_argument("--series", action="append", help="Only import files matching this Kapowarr series title; repeatable")
+    parser.add_argument("--series", action="append", help="Only import files matching this series title; repeatable")
     parser.add_argument("--verify-last-status", action="store_true", help="Rescan and verify the latest import-status without copying new files")
     parser.add_argument("--verify-pack-imports", action="store_true", help="Recheck pack-imported files and sync verified rows into InkDrop state")
     parser.add_argument("--audit-pack-duplicates", action="store_true", help="Report verified pack imports that left same-hash duplicate files outside the verified destination")

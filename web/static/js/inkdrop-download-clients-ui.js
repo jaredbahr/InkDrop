@@ -12,7 +12,7 @@
     nzbget: "NZBGet", slskd: "SLSKD",
   };
   const FALLBACK_FIELDS = {
-    qbittorrent: {username: {}, password: {kind: "secret"}, verify_tls: {kind: "boolean", default: true}},
+    qbittorrent: {username: {}, password: {kind: "secret"}, api_key: {kind: "secret"}, verify_tls: {kind: "boolean", default: true}},
     sabnzbd: {api_key: {kind: "secret"}, verify_tls: {kind: "boolean", default: true}},
     slskd: {api_key: {kind: "secret"}, verify_tls: {kind: "boolean", default: true}},
     transmission: {username: {}, password: {kind: "secret"}, category: {}, label: {}, download_path: {}, verify_tls: {kind: "boolean", default: true}},
@@ -22,6 +22,12 @@
     rtorrent: {username: {}, password: {kind: "secret"}, category: {}, label: {}, download_path: {}, verify_tls: {kind: "boolean", default: true}},
   };
   const SECRET_LABELS = {password: "Password", api_key: "API Key"};
+  // Per-client notes for credentials that are alternatives rather than extras.
+  const SECRET_HELP = {
+    "qbittorrent:password": "Use this with the username for a normal Web UI login. Leave both blank if you are using an API key instead.",
+    "qbittorrent:api_key": "qBittorrent 5.2.0 and newer can issue an API key (it starts with qbt_). A key replaces the username and password rather than adding to them, so fill in one or the other.",
+    "nzbget:api_key": "Use this instead of the username and password if your NZBGet exposes an API key.",
+  };
   const SLSKD_ADVANCED = [
     ["wait_seconds", "Search Wait Seconds", "How long InkDrop waits for each bounded SLSKD search to return results.", 1],
     ["max_queries", "Max Queries", "Maximum query variants InkDrop may send during one SLSKD probe.", 1],
@@ -205,12 +211,16 @@
     return {...(FALLBACK_FIELDS[type] || {}), ...(registry?.fields || {})};
   }
 
-  function appendSecret(form, instance, key) {
+  function appendSecret(form, instance, key, type) {
     const configured = !!instance?.secret_fields?.[key]?.configured;
+    const specific = SECRET_HELP[`${type}:${key}`];
+    const base = configured
+      ? "A secret is saved. Leave this blank to keep it; InkDrop never returns the saved value."
+      : "Stored separately and never returned by the API.";
     const input = field(form, SECRET_LABELS[key] || key.replace(/_/g, " "), `secret:${key}`, {
       type: "password", autocomplete: "new-password",
       placeholder: configured ? "Saved; leave blank to keep" : "Not set",
-      help: configured ? "A secret is saved. Leave this blank to keep it; InkDrop never returns the saved value." : "Stored separately and never returned by the API.",
+      help: specific ? `${specific} ${base}` : base,
     });
     input.dataset.secretName = key;
     if (configured) {
@@ -321,7 +331,7 @@
     checkbox(form, "Enabled", "enabled", !!instance.enabled, "Disabled clients keep their settings but are skipped by routing and Test All.");
     field(form, "URL", "base_url", {type: "url", value: instance.base_url || "", required: !!instance.enabled, placeholder: "http://download-client:port", help: "HTTP or HTTPS endpoint without embedded credentials, query parameters, or fragments."});
     if (Object.prototype.hasOwnProperty.call(fields, "username")) field(form, "Username", "username", {value: instance.username || "", autocomplete: "username"});
-    secretFields(type, registry).forEach(key => appendSecret(form, instance, key));
+    secretFields(type, registry).forEach(key => appendSecret(form, instance, key, type));
     field(form, "Priority", "priority", {type: "number", value: instance.priority || 100, min: 1, max: 1000, required: true, help: "Lower numbers are preferred when more than one enabled client can handle the same protocol."});
     if (Object.prototype.hasOwnProperty.call(fields, "category") || ["qbittorrent", "sabnzbd", "transmission", "deluge", "nzbget", "utorrent", "rtorrent"].includes(type)) field(form, "Default category", "category", {value: instance.category || "", help: "Category applied when a provider does not specify a media-specific category."});
     if (Object.prototype.hasOwnProperty.call(fields, "label")) field(form, "Label", "label", {value: instance.settings?.label || "", help: "Client label used to identify InkDrop-owned work."});

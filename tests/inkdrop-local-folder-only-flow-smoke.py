@@ -60,7 +60,6 @@ def main():
         configured = created["configured_adapters"]
         for adapter in (
             "comicvine",
-            "kapowarr",
             "kavita",
             "komga",
             "prowlarr",
@@ -74,7 +73,6 @@ def main():
 
         warnings = created["warning_summary"]["optional_adapters_unconfigured"]
         require(warnings == ["comicvine", "prowlarr", "qbittorrent", "sabnzbd", "slskd", "suwayomi"], "optional source/download warnings should be stable")
-        require("kapowarr" not in warnings, "Kapowarr migration adapter should not warn in clean local mode")
         require("kavita" not in warnings, "Kavita visibility adapter should not warn in clean local mode")
         require("komga" not in warnings, "Komga visibility adapter should not warn in clean local mode")
 

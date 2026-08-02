@@ -95,7 +95,7 @@ _add("POST", {
     "/api/comicvine/grab", "/api/watch/grab", "/api/grab", "/api/import",
     "/api/inkdrop-state/series/run", "/api/inkdrop-state/series/update", "/api/inkdrop-state/wanted/run", "/api/inkdrop-state/queue/run",
     "/api/inkdrop-state/series/covers/refresh", "/api/inkdrop-state/library-frontends/sync",
-    "/api/inkdrop-state/sync", "/api/manga-unit/set", "/api/issue-monitor/set", "/api/kapowarr/sync",
+    "/api/inkdrop-state/sync", "/api/manga-unit/set", "/api/issue-monitor/set",
     "/api/missing/process", "/api/missing/recheck", "/api/missing/fresh", "/api/missing/hot",
     "/api/rss/discover", "/api/comicscodes/discover", "/api/slskd-source-probe/run",
     "/api/source-probe", "/api/series-autopilot/run", "/api/series-autopilot/normalize",

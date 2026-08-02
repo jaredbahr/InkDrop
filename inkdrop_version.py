@@ -290,8 +290,14 @@ def validate_update_manifest(payload, now=None, max_age_seconds=UPDATE_MANIFEST_
         raise ValueError("update manifest is not validated")
     version = _update_semver(payload.get("version"))
     prerelease = payload.get("prerelease")
-    if not isinstance(prerelease, bool) or prerelease != ("-" in version):
-        raise ValueError("prerelease flag does not match version")
+    if not isinstance(prerelease, bool):
+        raise ValueError("prerelease flag must be a boolean")
+    # The flag used to be inferred from a "-" in the version. Versions carry no
+    # stage suffix now (0.1.02), so a suffix-less build may still be a
+    # prerelease and the flag has to be believed. The one combination still
+    # rejected is a suffixed version claiming not to be one.
+    if "-" in version and not prerelease:
+        raise ValueError("a version with a prerelease suffix must set prerelease")
     channel = str(payload.get("channel") or "").strip().lower()
     if channel not in {"qa", "alpha", "beta", "stable"}:
         raise ValueError("unsupported update channel")
