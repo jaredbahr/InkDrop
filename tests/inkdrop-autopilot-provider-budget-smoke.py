@@ -719,76 +719,89 @@ def main():
 
         original_process_with_progress = autopilot.run_process_with_progress
         original_runtime_limited_child_timeout = autopilot.runtime_limited_child_timeout
+        original_slskd_status_file = autopilot.SLSKD_SOURCE_PROBE_STATUS_FILE
         try:
-            captured_slskd_call = {}
+            with tempfile.TemporaryDirectory() as slskd_status_tmp:
+                autopilot.SLSKD_SOURCE_PROBE_STATUS_FILE = Path(slskd_status_tmp) / "slskd-source-probe-status.json"
+                captured_slskd_call = {}
 
-            def capture_slskd_call(cmd, **kwargs):
-                captured_slskd_call["cmd"] = list(cmd)
-                captured_slskd_call["timeout"] = kwargs.get("timeout")
-                return 0, '{"ok": true, "source": "slskd"}', ""
+                def capture_slskd_call(cmd, **kwargs):
+                    captured_slskd_call["cmd"] = list(cmd)
+                    captured_slskd_call["timeout"] = kwargs.get("timeout")
+                    # The probe now writes its full result to STATUS_FILE and only
+                    # prints a small bounded summary to stdout (PASS33-STAB-P1-01
+                    # fix) -- match that contract instead of returning the full
+                    # payload on stdout.
+                    run_token = cmd[cmd.index("--run-token") + 1]
+                    autopilot.write_json(
+                        autopilot.SLSKD_SOURCE_PROBE_STATUS_FILE,
+                        {"ok": True, "source": "slskd", "run_token": run_token},
+                    )
+                    return 0, '{"ok": true, "run_token": "' + run_token + '"}', ""
 
-            autopilot.run_process_with_progress = capture_slskd_call
-            autopilot.runtime_limited_child_timeout = lambda timeout, _deadline: timeout
-            boundary_args = args(
-                skip_slskd=False,
-                slskd_probe_budget_seconds=300,
-                slskd_max_total=1,
-                slskd_max_per_series=1,
-                slskd_wait_seconds=1,
-                slskd_max_queries=1,
-                slskd_cooldown_hours=1,
-                force_slskd=False,
-                slskd_auto_grab_max=1,
-                source_lock_wait_seconds=0,
-            )
-            boundary_timeout = autopilot.slskd_source_timeout_seconds(boundary_args)
-            boundary_payload = autopilot.run_slskd(
-                "Boundary SLSKD Series",
-                boundary_args,
-                deadline=time.time() + boundary_timeout + autopilot.RUNTIME_CHILD_CLEANUP_SECONDS,
-            )
-            require(boundary_payload.get("ok") is True, boundary_payload)
-            require(captured_slskd_call.get("timeout") == boundary_timeout, captured_slskd_call)
-            budget_index = captured_slskd_call["cmd"].index("--probe-budget-seconds") + 1
-            require(
-                captured_slskd_call["cmd"][budget_index]
-                == str(
-                    boundary_timeout
-                    - autopilot.RUNTIME_CHILD_CLEANUP_SECONDS
-                    - autopilot.SLSKD_HANDOFF_RESERVE_SECONDS
-                ),
-                captured_slskd_call,
-            )
-
-            autopilot.run_process_with_progress = lambda *_args, **_kwargs: (2, "", "provider process failed")
-            slskd_args = args(
-                skip_slskd=False,
-                slskd_probe_budget_seconds=30,
-                slskd_max_total=1,
-                slskd_max_per_series=1,
-                slskd_wait_seconds=1,
-                slskd_max_queries=1,
-                slskd_cooldown_hours=1,
-                force_slskd=False,
-                slskd_auto_grab_max=1,
-                source_lock_wait_seconds=0,
-            )
-            try:
-                autopilot.run_slskd(
-                    "Failed SLSKD Series",
-                    slskd_args,
-                    provider_observer=observations.append,
+                autopilot.run_process_with_progress = capture_slskd_call
+                autopilot.runtime_limited_child_timeout = lambda timeout, _deadline: timeout
+                boundary_args = args(
+                    skip_slskd=False,
+                    slskd_probe_budget_seconds=300,
+                    slskd_max_total=1,
+                    slskd_max_per_series=1,
+                    slskd_wait_seconds=1,
+                    slskd_max_queries=1,
+                    slskd_cooldown_hours=1,
+                    force_slskd=False,
+                    slskd_auto_grab_max=1,
+                    source_lock_wait_seconds=0,
                 )
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("nonzero SLSKD provider process did not fail")
-            slskd_failure = observations.pop()
-            require(slskd_failure["source"] == "slskd", slskd_failure)
-            require(slskd_failure["failed"] is True and slskd_failure["healthy"] is False, slskd_failure)
+                boundary_timeout = autopilot.slskd_source_timeout_seconds(boundary_args)
+                boundary_payload = autopilot.run_slskd(
+                    "Boundary SLSKD Series",
+                    boundary_args,
+                    deadline=time.time() + boundary_timeout + autopilot.RUNTIME_CHILD_CLEANUP_SECONDS,
+                )
+                require(boundary_payload.get("ok") is True, boundary_payload)
+                require(captured_slskd_call.get("timeout") == boundary_timeout, captured_slskd_call)
+                budget_index = captured_slskd_call["cmd"].index("--probe-budget-seconds") + 1
+                require(
+                    captured_slskd_call["cmd"][budget_index]
+                    == str(
+                        boundary_timeout
+                        - autopilot.RUNTIME_CHILD_CLEANUP_SECONDS
+                        - autopilot.SLSKD_HANDOFF_RESERVE_SECONDS
+                    ),
+                    captured_slskd_call,
+                )
+
+                autopilot.run_process_with_progress = lambda *_args, **_kwargs: (2, "", "provider process failed")
+                slskd_args = args(
+                    skip_slskd=False,
+                    slskd_probe_budget_seconds=30,
+                    slskd_max_total=1,
+                    slskd_max_per_series=1,
+                    slskd_wait_seconds=1,
+                    slskd_max_queries=1,
+                    slskd_cooldown_hours=1,
+                    force_slskd=False,
+                    slskd_auto_grab_max=1,
+                    source_lock_wait_seconds=0,
+                )
+                try:
+                    autopilot.run_slskd(
+                        "Failed SLSKD Series",
+                        slskd_args,
+                        provider_observer=observations.append,
+                    )
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("nonzero SLSKD provider process did not fail")
+                slskd_failure = observations.pop()
+                require(slskd_failure["source"] == "slskd", slskd_failure)
+                require(slskd_failure["failed"] is True and slskd_failure["healthy"] is False, slskd_failure)
         finally:
             autopilot.run_process_with_progress = original_process_with_progress
             autopilot.runtime_limited_child_timeout = original_runtime_limited_child_timeout
+            autopilot.SLSKD_SOURCE_PROBE_STATUS_FILE = original_slskd_status_file
     finally:
         autopilot.held_source_worker_lock = original_lock
         autopilot.inkdrop_source_worker_cli = original_cli

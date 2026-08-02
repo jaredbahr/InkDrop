@@ -185,6 +185,7 @@ HOT_SWEEP_LOG = LOG_DIR / "hot-release-sweep.log"
 MISSING_ACQUIRE_LOG = LOG_DIR / "missing-acquire-cron.log"
 RSS_DISCOVERY_LOG = LOG_DIR / "rss-discovery.log"
 RSS_DISCOVERY_STATUS_FILE = STATE_DIR / "rss-discovery-status.json"
+RSS_DISCOVERY_STATUS_STALE_MINUTES = 90
 COMICSCODES_DISCOVERY_LOG = LOG_DIR / "comicscodes-discovery.log"
 COMICSCODES_DISCOVERY_STATUS_FILE = STATE_DIR / "comicscodes-discovery-status.json"
 SLSKD_SOURCE_PROBE_STATUS_FILE = STATE_DIR / "slskd-source-probe-status.json"
@@ -1571,6 +1572,7 @@ HTML = r"""<!doctype html>
     let packReviewLastEndpointState = null;
     let packReviewLastEndpointAt = 0;
     let packReviewFastPollTimer = null;
+    let statusFastPollTimer = null;
     let activeInkdropSectionPayload = null;
     let activeInkdropPrimarySection = "series";
     let activeInkdropViewSection = "series";
@@ -3850,7 +3852,7 @@ HTML = r"""<!doctype html>
       const tone = statusTone(data, model);
       const status = activityLinked ? "Activity" : (model?.running ? "Working" : plainAutomationStatus(data, model));
       const partial = Boolean(data.status_partial);
-      el.className = `status-pill ${tone}${partial ? " partial" : ""}${activityLinked ? " activity-linked" : ""}`;
+      el.className = `status-pill ${tone}${partial ? " partial" : ""}${activityLinked ? " activity-linked" : ""}${model?.running ? " running" : ""}`;
       el.dataset.statusSurface = activityLinked ? "activity-dock" : "automation";
       el.title = partial
         ? statusPartialSnapshotText(data, model?.detail || data.detail || "Full status is refreshing in the background.")
@@ -6952,6 +6954,7 @@ HTML = r"""<!doctype html>
         renderPackReviewBannerFromStatus(data);
         refreshPackReviewBannerState();
         refreshWorkerActivities();
+        updateStatusFastPoll(data);
       } catch (err) {
         if (lastStatusData) {
           const fallback = {...lastStatusData, status_cache: "refresh_failed"};
@@ -6964,6 +6967,7 @@ HTML = r"""<!doctype html>
           renderLibraryTruthPanel(fallback);
           renderAutomationStatus(fallback);
           renderPackReviewBannerFromStatus(fallback);
+          updateStatusFastPoll(fallback);
         } else {
           serverActivities = [];
           renderHeaderStatus(null);
@@ -6973,6 +6977,7 @@ HTML = r"""<!doctype html>
           renderWorkflowSnapshot(null);
           renderLibraryTruthPanel(null);
           renderAutomationStatus(null);
+          updateStatusFastPoll(null);
         }
         renderActivities();
         refreshPackReviewBannerState();
@@ -7068,6 +7073,30 @@ HTML = r"""<!doctype html>
       } else if (packReviewFastPollTimer) {
         clearInterval(packReviewFastPollTimer);
         packReviewFastPollTimer = null;
+      }
+    }
+
+    // Automatic Search and the series-autopilot worker only change state between
+    // the base 60s status poll, so a user can watch a stalled 75-second-old "Idle"
+    // label while a search is actually running. Mirrors updatePackReviewFastPoll:
+    // poll every 8s (same cadence, same /status.json the server already caches for
+    // 15s) only while something is actually in flight, so idle periods stay cheap.
+    function statusNeedsFastPoll(data) {
+      if (!data) return false;
+      if (data.series_autopilot_in_progress === true) return true;
+      if (automationStatusModel(data)?.running) return true;
+      if (runningActivityCount(currentServerActivities(data)) > 0) return true;
+      return false;
+    }
+
+    function updateStatusFastPoll(data) {
+      if (statusNeedsFastPoll(data)) {
+        if (!statusFastPollTimer) {
+          statusFastPollTimer = setInterval(refreshStatus, 8000);
+        }
+      } else if (statusFastPollTimer) {
+        clearInterval(statusFastPollTimer);
+        statusFastPollTimer = null;
       }
     }
 
@@ -10521,10 +10550,22 @@ HTML = r"""<!doctype html>
           action: () => openLinkedInkdropSection("download_tasks", row),
         };
       } else if (laneKey === "queue-provider-wait") {
+        const waitSourceKey = String(
+          row?.download_task?.source
+          || row?.current_source
+          || row?.source
+          || row?.provider_id
+          || row?.source_provider_id
+          || ""
+        ).trim().toLowerCase();
+        const waitingOn = source || "the next source";
+        const waitingOnDetail = waitSourceKey === "comicscodes"
+          ? `${waitingOn} (a built-in scanner that hands finds to your download client)`
+          : waitingOn;
         prompt = {
           tone: "warn",
           title: "Waiting on source",
-          detail: "InkDrop is waiting on provider health, cooldown, limits, or availability. This is automatic wait time, not something you need to fix right now.",
+          detail: `InkDrop is waiting on ${waitingOnDetail} for health, cooldown, or availability — not something to fix right now.`,
           reason: causeLabel || "provider/source wait",
         };
       } else if (laneKey === "queue-retry") {
@@ -13615,6 +13656,9 @@ HTML = r"""<!doctype html>
           openManualSearchForRow(selectedRows[0]);
         }, {requiresSelection: true});
         appendArrTableButton(left, "Manual Review", "Open Manual Review decisions", () => openInkdropFilteredSection("manual_review", "actionable"), {tone: "bad"});
+      }
+      if (key === "manual_review") {
+        appendArrTableButton(left, "Ignore Selected", "Hide selected wanted items from Manual Review after confirmation. Files are not deleted.", () => runBulkManualReviewIgnore(), {requiresSelection: true, tone: "warn"});
       }
       if (["wanted", "manual_review"].includes(key)) {
         const selected = document.createElement("span");
@@ -17723,6 +17767,47 @@ HTML = r"""<!doctype html>
       if (confirmed) await reviewAction("/api/manual-review/ignore", {review_id: item.review_id});
     }
 
+    async function runBulkManualReviewIgnore() {
+      const items = selectedInkdropTableSourceRows("manual_review")
+        .map(row => manualReviewActionRow(row))
+        .filter(Boolean);
+      if (!items.length) {
+        toast("Select one or more Manual Review rows first.", false, "inkdropSectionPanel");
+        return;
+      }
+      const names = items.map(item => item.series || item.title || item.query || "Manual Review item");
+      const preview = names.slice(0, 5).join(", ") + (names.length > 5 ? `, +${names.length - 5} more` : "");
+      const confirmed = await openInkdropConfirmModal({
+        title: "Ignore Selected Manual Review Items",
+        actionTitle: `Ignore ${items.length} wanted item${items.length === 1 ? "" : "s"}`,
+        copy: "This stops these items from appearing in Manual Review. Existing history and evidence stay available.",
+        subject: `${items.length} item${items.length === 1 ? "" : "s"}`,
+        meta: [preview].filter(Boolean),
+        details: [
+          {text: "This does not delete files.", tone: "good"},
+          {text: "InkDrop will stop surfacing these review rows.", tone: "warn"},
+        ],
+        confirmLabel: `Ignore ${items.length} item${items.length === 1 ? "" : "s"}`,
+        tone: "warn",
+      });
+      if (!confirmed) return;
+      let ignored = 0;
+      let failed = 0;
+      for (const item of items) {
+        try {
+          await api("/api/manual-review/ignore", {review_id: item.review_id});
+          ignored += 1;
+        } catch (_err) {
+          failed += 1;
+        }
+      }
+      closeManualReviewDecisionModal();
+      await loadInkdropSection("manual_review", null, {keepExisting: true});
+      loadInkdropCore(false);
+      refreshStatus();
+      toast(`Ignored ${ignored} Manual Review item${ignored === 1 ? "" : "s"}${failed ? `, ${failed} failed` : ""}.`, failed === 0, "inkdropSectionPanel");
+    }
+
     function appendManualReviewDecisionFact(parent, label, value) {
       if (!parent || !value) return;
       const key = document.createElement("div");
@@ -17843,7 +17928,7 @@ HTML = r"""<!doctype html>
         appendManualReviewDecisionFact(facts, "Wanted issue", manualReviewIssueCopy(item) || item.issue || item.query);
         appendManualReviewDecisionFact(facts, "Candidate", manualReviewCandidateCopy(item));
         appendManualReviewDecisionFact(facts, "Provider / source", manualReviewSourceCopy(item));
-        appendManualReviewDecisionFact(facts, "Match evidence", item.match_summary || item.activity_summary || item.reason || manualReviewReasonLabel(item));
+        appendManualReviewDecisionFact(facts, "Match evidence", item.activity_summary || manualReviewReasonLabel(item));
         appendManualReviewDecisionFact(facts, "Why it needs a decision", manualReviewProblemCopy(item));
         appendManualReviewDecisionFact(facts, "No action taken", "InkDrop keeps this row in Manual Review and does not import the candidate from this decision lane.");
       }
@@ -38801,9 +38886,12 @@ def run_slskd_source_probe(payload):
         min(15 * 60, max_per_series * max_queries * (wait_seconds + 4)),
     )
     auto_grab_max = bounded_int(payload.get("autoGrabMax"), SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX, 0, 10)
+    run_token = f"web-manual:{uuid.uuid4()}"
     cmd = [
         python_command(),
         str(SLSKD_SOURCE_PROBE_SCRIPT),
+        "--run-token",
+        run_token,
         "--max-total",
         str(max_total),
         "--max-per-series",
@@ -38846,7 +38934,20 @@ def run_slskd_source_probe(payload):
         }
     if proc.returncode != 0:
         raise RuntimeError(error or output or f"command failed: {proc.returncode}")
-    return json.loads(output or "{}")
+    # The probe writes its full result to SLSKD_SOURCE_PROBE_STATUS_FILE and
+    # only prints a small bounded summary to stdout (see
+    # inkdrop_slskd_source_probe.py) -- printing the full result to a pipe
+    # used to deadlock the child on large output (PASS33-STAB-P1-01). Read the
+    # real result back from the status file and confirm it matches this
+    # request's run_token before trusting it.
+    status = read_json_file(SLSKD_SOURCE_PROBE_STATUS_FILE, {}) or {}
+    if not isinstance(status, dict) or str(status.get("run_token") or "") != run_token:
+        raise RuntimeError(
+            "SLSKD probe exited cleanly but its status file does not match this request "
+            f"(expected run_token={run_token!r}, found {(status or {}).get('run_token')!r}); "
+            f"stdout summary was: {output[:500]!r}"
+        )
+    return status
 
 
 def host_path_for_kavita_path(path):
@@ -42555,6 +42656,26 @@ def sabnzbd_api_health(timeout=4.0):
         }
 
 
+QBIT_STATE_STATUS_MAP = {
+    "pauseddl": "paused",
+    "pausedup": "completed_in_client",
+    "queueddl": "queued",
+    "queuedup": "completed_in_client",
+    "stalleddl": "stalled",
+    "stalledup": "completed_in_client",
+    "checkingdl": "queued",
+    "checkingup": "completed_in_client",
+    "checkingresumedata": "queued",
+    "forceddl": "downloading",
+    "forcedup": "completed_in_client",
+    "metadl": "downloading",
+    "allocating": "downloading",
+    "downloading": "downloading",
+    "uploading": "completed_in_client",
+    "moving": "downloading",
+}
+
+
 def qbittorrent_transfer_snapshots(timeout=4.0):
     try:
         acquire = load_acquire_module()
@@ -42576,7 +42697,10 @@ def qbittorrent_transfer_snapshots(timeout=4.0):
             progress = float(torrent.get("progress") or 0)
             raw_state = str(torrent.get("state") or "").strip()
             state_key = raw_state.lower()
-            status = "completed_in_client" if progress >= 0.999 else "downloading"
+            if progress >= 0.999:
+                status = "completed_in_client"
+            else:
+                status = QBIT_STATE_STATUS_MAP.get(state_key, "downloading")
             if any(token in state_key for token in ("error", "missing")):
                 status = "failed_download"
             save_path = str(torrent.get("save_path") or "").strip()
@@ -42614,6 +42738,21 @@ def qbittorrent_transfer_snapshots(timeout=4.0):
         return {"ok": False, "client": "qbittorrent", "available": False, "error": f"{type(exc).__name__}: {message}"}
 
 
+SAB_QUEUE_STATUS_MAP = {
+    "paused": "paused",
+    "queued": "queued",
+    "grabbing": "queued",
+    "fetching": "queued",
+    "checking": "checking",
+    "verifying": "checking",
+    "repairing": "checking",
+    "extracting": "checking",
+    "moving": "checking",
+    "running": "downloading",
+    "downloading": "downloading",
+}
+
+
 def sabnzbd_transfer_snapshots(timeout=4.0, history_limit=200):
     try:
         acquire = load_acquire_module()
@@ -42643,11 +42782,12 @@ def sabnzbd_transfer_snapshots(timeout=4.0, history_limit=200):
                 progress = float(str(percentage).rstrip("%")) / 100.0 if percentage not in (None, "") else None
             except (TypeError, ValueError):
                 progress = None
+            slot_status_key = str(slot.get("status") or "").strip().lower()
             snapshots.append(
                 {
                     "client": "sabnzbd",
                     "source": "sabnzbd",
-                    "status": "downloading",
+                    "status": SAB_QUEUE_STATUS_MAP.get(slot_status_key, "downloading"),
                     "client_state": slot.get("status"),
                     "title": name,
                     "name": name,
@@ -42967,10 +43107,14 @@ def source_health_summary(
             return None
         return round((time.time() - path.stat().st_mtime) / 60, 1)
 
+    rss_age_minutes = age(RSS_DISCOVERY_STATUS_FILE)
+    rss_stale = rss_age_minutes is None or rss_age_minutes >= RSS_DISCOVERY_STATUS_STALE_MINUTES
     rss_source_status = str(rss_status.get("status") or "unknown")
-    feed_status = str(rss_status.get("feed_status") or "unknown")
-    rss_candidates = int(rss_status.get("candidates_found") or 0)
-    if rss_source_status.upper() == "OK" and rss_candidates == 0:
+    feed_status = "" if rss_stale else str(rss_status.get("feed_status") or "unknown")
+    rss_candidates = int(rss_status.get("candidates_found") or 0) if not rss_stale else 0
+    if rss_stale:
+        rss_label = "not reporting recently"
+    elif rss_source_status.upper() == "OK" and rss_candidates == 0:
         rss_label = "OK quiet"
     else:
         rss_label = rss_source_status

@@ -73,8 +73,15 @@ def _calling_site():
         here = Path(__file__).name
         for frame in reversed(traceback.extract_stack()[:-2]):
             name = Path(frame.filename).name
-            if name not in {here, "contextlib.py"}:
-                return f"{name}:{frame.lineno}:{frame.name}"
+            if name in {here, "contextlib.py"}:
+                continue
+            # Skip the thin connection wrappers too. inkdrop_state.connect() is
+            # what every state write actually calls, so reporting it names the
+            # wrapper on every single warning and attributes nothing -- which is
+            # exactly what the first deploy of this logged.
+            if frame.name in {"connect", "connect_read", "connection"}:
+                continue
+            return f"{name}:{frame.lineno}:{frame.name}"
     except Exception:
         pass
     return "unknown"

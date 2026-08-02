@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import posixpath
 import re
 import requests
 import shutil
@@ -102,7 +103,7 @@ COMIC_DEST = Path(os.environ.get("INKDROP_COMIC_INCOMING_ROOT") or Path(os.envir
 COMIC_ROOT = Path(os.environ.get("INKDROP_COMIC_ROOT") or "/library/comics")
 MANGA_ROOT = Path(os.environ.get("INKDROP_MANGA_ROOT") or "/library/manga")
 KAPOWARR_COMIC_ROOT = "/comics"
-QBIT_CONTAINER_DOWNLOAD_ROOT = "/downloads"
+QBIT_CONTAINER_DOWNLOAD_ROOT = os.environ.get("INKDROP_QBITTORRENT_CONTAINER_DOWNLOAD_ROOT") or "/downloads"
 QBIT_HOST_DOWNLOAD_ROOT = Path(os.environ.get("INKDROP_QBITTORRENT_DOWNLOAD_ROOT") or STAGING_DIR / "downloads")
 QBIT_BROAD_TAGS = {"inkdrop", "kavita-acquire"}
 PACK_DUPLICATE_QUARANTINE_ROOT = Path(os.environ.get("INKDROP_PACK_DUPLICATE_QUARANTINE_ROOT") or QUARANTINE_DIR / "pack-duplicates")
@@ -290,8 +291,8 @@ COLLECTION_RANGE_RULES = {
     ("monstress", "book three"): (37, 54),
 }
 MANGA_SCAN_POLL_SECONDS = 20
-MANGA_SCAN_TIMEOUT_SECONDS = 600
-SOURCE_FILE_SCAN_TIMEOUT_SECONDS = 420
+MANGA_SCAN_TIMEOUT_SECONDS = int(os.environ.get("INKDROP_MANGA_SCAN_TIMEOUT_SECONDS") or 600)
+SOURCE_FILE_SCAN_TIMEOUT_SECONDS = int(os.environ.get("INKDROP_SOURCE_FILE_SCAN_TIMEOUT_SECONDS") or 420)
 
 
 def normalize_series(value):
@@ -3102,9 +3103,25 @@ def import_status_sync_mode_env_value():
 
 def import_status_queue_backed_source_file_child():
     argv = list(sys.argv[1:])
+    # inkdrop_slskd_staging_sweep.py's per-file child (process_one_file) is
+    # the actual queue-backed invocation this exists to detect, and it never
+    # sends --trusted-series-id -- only --trusted-issue, extracted from the
+    # staged filename (see its cmd list). That mismatch meant this always
+    # returned False for the sweep, so every one of its per-file children ran
+    # the full sync_inkdrop_import_results() (43 stages, itself the write-lock
+    # holder PR 129 fixed for the bulk pass) instead of deferring to the
+    # separate periodic completed-import-comics job that already reconciles
+    # everything in far fewer passes. --trusted-issue is an equally trusted,
+    # queue-tracked target identity, just under a different flag name.
+    trusted_target_flag_present = any(
+        arg in ("--trusted-series-id", "--trusted-issue")
+        or arg.startswith("--trusted-series-id=")
+        or arg.startswith("--trusted-issue=")
+        for arg in argv
+    )
     return (
         any(arg == "--source-file" or arg.startswith("--source-file=") for arg in argv)
-        and any(arg == "--trusted-series-id" or arg.startswith("--trusted-series-id=") for arg in argv)
+        and trusted_target_flag_present
         and no_wait_for_library_scan_flag_present(argv)
     )
 
@@ -7237,12 +7254,39 @@ def touch_kavita_scan_folder(folder, source=None):
         return False
 
 
+def qbit_container_download_root(qbit):
+    """Container-side root above the user's configured save paths.
+
+    Falls back to QBIT_CONTAINER_DOWNLOAD_ROOT when qBittorrent's own save
+    paths aren't a sane pair to derive a common root from (e.g. only one is
+    customized), since guessing wrong here would misclassify a completed
+    file as still-downloading rather than the other way around.
+    """
+    if not qbit:
+        return QBIT_CONTAINER_DOWNLOAD_ROOT
+    configured = [
+        str(qbit.get("comics_save_path") or "").rstrip("/"),
+        str(qbit.get("ebooks_save_path") or "").rstrip("/"),
+    ]
+    configured = [path for path in configured if path.startswith("/")]
+    if not configured:
+        return QBIT_CONTAINER_DOWNLOAD_ROOT
+    try:
+        # qBittorrent's own save paths are always POSIX-style container paths
+        # regardless of the host OS InkDrop itself runs on.
+        common_root = posixpath.commonpath(configured) if len(configured) > 1 else posixpath.dirname(configured[0])
+    except ValueError:
+        return QBIT_CONTAINER_DOWNLOAD_ROOT
+    return common_root if common_root and common_root != "/" else QBIT_CONTAINER_DOWNLOAD_ROOT
+
+
 def qbit_host_path(save_path, file_name, qbit=None):
     save_path = str(save_path or "").rstrip("/")
     file_name = str(file_name or "").lstrip("/")
-    if not save_path.startswith(QBIT_CONTAINER_DOWNLOAD_ROOT):
+    container_root = qbit_container_download_root(qbit)
+    if not save_path.startswith(container_root):
         return None
-    rel_save = save_path[len(QBIT_CONTAINER_DOWNLOAD_ROOT):].lstrip("/")
+    rel_save = save_path[len(container_root):].lstrip("/")
     return QBIT_HOST_DOWNLOAD_ROOT / rel_save / file_name
 
 

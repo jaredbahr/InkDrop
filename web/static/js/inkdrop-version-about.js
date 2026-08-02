@@ -49,15 +49,18 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.03",
-      slug: "v0-1-03",
+      version: "v0.1.04",
+      slug: "v0-1-04",
       released_at: "2026-08-02",
-      title: "Search tries the right title, and the System page stops hanging",
-      summary: "Search now tries the title people actually share files under instead of burning its budget on one nobody uses, and a real print-run marker on the exact issue you wanted no longer gets rejected. The System page also stops hanging if a request stalls.",
+      title: "SLSKD stops crying wolf, and a wrong print-run stops auto-grabbing",
+      summary: "\"SLSKD is not working\" reports traced to a pipe deadlock giving false timeouts on searches that had already finished. A wrong-volume auto-grab bug and a queue tiebreak that permanently excluded 149 series from search are fixed too.",
       highlights: [
-        "Searches for licensed creator-credit titles (like \"Naoki Urasawa's Monster\") now try the title people actually share files under, instead of spending the whole budget on one nobody uses.",
-        "A volume/print-run marker like \"v1 #19\" no longer gets treated as a mismatch when it's exactly the issue you wanted — that was silently blocking real grabs.",
-        "The System page no longer hangs on a silent \"Loading...\" if a request stalls; you'll see what failed instead."
+        "SLSKD probes that had already finished were being logged and retried as timeouts — 374 times in a single day. Fixed.",
+        "A candidate with the wrong volume or print run (e.g. \"v2 #19\" when you wanted \"v1 #19\") could be auto-grabbed as a safe match. It's now blocked or sent to Manual Review instead.",
+        "149 series, including every League of Extraordinary Gentlemen issue, were never being searched via SLSKD at all — a broken staleness tiebreak locked them out of the rotation permanently.",
+        "RSS discovery had been silently stalled for about three weeks by a slow database query, not the feed or the matcher.",
+        "SLSKD, Prowlarr, Torznab, and Newznab searches all try a few more query variants on a genuine zero-result search instead of waiting on a future pass.",
+        "Manual Review was hiding real \"needs you\" decisions imported from the legacy review feed — they're visible again, with a new bulk-ignore action."
       ]
     })
   ]);

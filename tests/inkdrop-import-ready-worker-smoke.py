@@ -1881,6 +1881,184 @@ def smoke_import_ready_rejection_requeues():
                 fail(f"rejected import-ready source attempt was not recorded: {attempts}")
 
 
+def smoke_wrong_series_or_subseries_rejection_is_terminal():
+    """A sibling-series/subseries identity mismatch can never resolve by re-checking the same file.
+
+    Root cause found against live production data: an already-completed SABnzbd
+    download whose filename is a different subseries (a real title,
+    "The League of Extraordinary Gentlemen - The Tempest 05 (of 06)", matched
+    against a wanted issue of "The League of Extraordinary Gentlemen") was
+    rejected at import time with reason wrong_series_or_subseries, but marked
+    retry_eligible -- the same treatment as a genuinely transient failure like
+    bad_archive or a network error. That sent the exact same doomed local file
+    back through periodic import-ready reconciliation over and over: 161
+    identical rejection events over about a week for one issue, none of which
+    could ever have produced a different outcome, because the file's name
+    never changes. wrong_series_or_subseries must be terminal, matching how
+    DURABLE_BAD_SOURCE_REASONS already treats it in inkdrop_missing_acquire.py.
+    """
+    if "requests" not in sys.modules:
+        sys.modules["requests"] = types.SimpleNamespace()
+    try:
+        import inkdrop_reconcile_imports
+    except FileNotFoundError as exc:
+        if "inkdrop_completed_import.py" in str(exc):
+            return
+        raise
+    with tempfile.TemporaryDirectory(prefix="inkdrop-wrong-subseries-terminal-smoke-", ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        state_db = root / "inkdrop-state.sqlite3"
+        now = time.time()
+        local_path = str(
+            root
+            / "The.League.of.Extraordinary.Gentlemen.-.The.Tempest.05.of.06.2018.Digital.Zone-Empire"
+            / "The League of Extraordinary Gentlemen - The Tempest 05 (of 06) (2018) (Digital) (Zone-Empire).cbr"
+        )
+        with inkdrop_state.connect(state_db) as con:
+            inkdrop_state.init_schema(con)
+            con.execute(
+                """
+                insert into series(id, title, media_type, metadata_provider, metadata_id, source, created_at, updated_at, raw_json)
+                values(?,?,?,?,?,?,?,?,?)
+                """,
+                ("comicvine:6569", "The League of Extraordinary Gentlemen", "comic", "comicvine", "6569", "inkdrop_series", now, now, "{}"),
+            )
+            con.execute(
+                """
+                insert into issues(id, series_id, issue_number, normalized_number, title, created_at, updated_at, raw_json)
+                values(?,?,?,?,?,?,?,?)
+                """,
+                ("comicvine:6569:issue:3298", "comicvine:6569", "5", "5", "Some Deep, Organizing Power...", now, now, "{}"),
+            )
+            con.execute(
+                """
+                insert into wanted_items(id, series_id, issue_id, reason, status, created_at, updated_at, raw_json)
+                values(?,?,?,?,?,?,?,?)
+                """,
+                ("wanted:comicvine:6569:issue:3298", "comicvine:6569", "comicvine:6569:issue:3298", "missing", "in_progress", now, now, "{}"),
+            )
+            con.execute(
+                """
+                insert into queue_items(id, wanted_id, series_id, issue_id, state, current_source, query, last_event, active, created_at, updated_at, raw_json)
+                values(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "queue-loeg-3298",
+                    "wanted:comicvine:6569:issue:3298",
+                    "comicvine:6569",
+                    "comicvine:6569:issue:3298",
+                    "importing",
+                    "sabnzbd",
+                    "The League of Extraordinary Gentlemen",
+                    "SABnzbd completed in client; import worker will scan it",
+                    1,
+                    now,
+                    now,
+                    "{}",
+                ),
+            )
+            con.execute(
+                """
+                insert into download_tasks(
+                    id, queue_id, wanted_id, series_id, issue_id, source, provider, protocol,
+                    download_client, external_id, title, status, state, category, local_path,
+                    started_at, updated_at, completed_at, raw_json
+                ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "task-loeg-3298",
+                    "queue-loeg-3298",
+                    "wanted:comicvine:6569:issue:3298",
+                    "comicvine:6569",
+                    "comicvine:6569:issue:3298",
+                    "prowlarr",
+                    "DOGnzb",
+                    "usenet",
+                    "SABnzbd",
+                    "nzo-loeg",
+                    "The.League.of.Extraordinary.Gentlemen.-.The.Tempest.05.of.06.2018.Digital.Zone-Empire",
+                    "completed_in_client",
+                    "import_ready",
+                    "comics",
+                    local_path,
+                    now,
+                    now,
+                    now,
+                    "{}",
+                ),
+            )
+            con.commit()
+        old_state = inkdrop_reconcile_imports.INKDROP_STATE_DB
+        old_module = inkdrop_reconcile_imports.inkdrop_state
+        try:
+            inkdrop_reconcile_imports.INKDROP_STATE_DB = state_db
+            inkdrop_reconcile_imports.inkdrop_state = inkdrop_state
+            result = inkdrop_reconcile_imports.record_inkdrop_import_ready_rejection(
+                {
+                    "queue_id": "queue-loeg-3298",
+                    "download_task_id": "task-loeg-3298",
+                    "download_client": "SABnzbd",
+                    "protocol": "usenet",
+                    "task_title": "The.League.of.Extraordinary.Gentlemen.-.The.Tempest.05.of.06.2018.Digital.Zone-Empire",
+                    "local_path": local_path,
+                },
+                {
+                    "state": "wrong_series_or_subseries",
+                    "reason": "related subseries or untrusted publication suffix",
+                    "local_path": local_path,
+                },
+            )
+        finally:
+            inkdrop_reconcile_imports.INKDROP_STATE_DB = old_state
+            inkdrop_reconcile_imports.inkdrop_state = old_module
+        if not result.get("ok"):
+            fail(f"wrong_series_or_subseries rejection did not persist: {result}")
+        with sqlite3.connect(state_db) as con:
+            task = con.execute(
+                "select status, state, retry_eligible from download_tasks where id='task-loeg-3298'"
+            ).fetchone()
+            if task != ("wrong_series_or_subseries", "failed", 0):
+                fail(f"a sibling-series identity mismatch must be terminal (retry_eligible=0), not retried forever: {task}")
+            attempts = con.execute(
+                "select status, retry_eligible, display_phase, failure_reason from source_attempts where queue_id='queue-loeg-3298'"
+            ).fetchall()
+            if ("failed", 0, "problem", "related subseries or untrusted publication suffix") not in attempts:
+                fail(f"the recorded evidence must show this as a closed failure, not a scheduled retry: {attempts}")
+
+        # A genuinely transient rejection reason must be unaffected -- only the
+        # sibling-series identity mismatch is terminal.
+        with inkdrop_state.connect(state_db) as con:
+            con.execute(
+                "update download_tasks set state='import_ready', status='completed_in_client', retry_eligible=null where id='task-loeg-3298'"
+            )
+            con.commit()
+        try:
+            inkdrop_reconcile_imports.INKDROP_STATE_DB = state_db
+            inkdrop_reconcile_imports.inkdrop_state = inkdrop_state
+            transient_result = inkdrop_reconcile_imports.record_inkdrop_import_ready_rejection(
+                {
+                    "queue_id": "queue-loeg-3298",
+                    "download_task_id": "task-loeg-3298",
+                    "download_client": "SABnzbd",
+                    "protocol": "usenet",
+                    "task_title": "The.League.of.Extraordinary.Gentlemen.-.The.Tempest.05.of.06.2018.Digital.Zone-Empire",
+                    "local_path": local_path,
+                },
+                {"state": "bad_archive", "reason": "cbr_extract_failed", "local_path": local_path},
+            )
+        finally:
+            inkdrop_reconcile_imports.INKDROP_STATE_DB = old_state
+            inkdrop_reconcile_imports.inkdrop_state = old_module
+        if not transient_result.get("ok"):
+            fail(f"bad_archive rejection did not persist: {transient_result}")
+        with sqlite3.connect(state_db) as con:
+            task = con.execute(
+                "select status, state, retry_eligible from download_tasks where id='task-loeg-3298'"
+            ).fetchone()
+            if task != ("bad_archive", "failed", 1):
+                fail(f"a transient rejection reason must stay retry-eligible: {task}")
+
+
 def smoke_failed_import_attempt_requeues_import_ready_download():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
@@ -4267,6 +4445,24 @@ def smoke_import_ready_child_defers_broad_import_status_sync():
                 "--no-wait-for-library-scan",
             ]
             shape_result = inkdrop_completed_import.write_import_status({"kind": "comics", "imported_count": 1})
+            # The real inkdrop_slskd_staging_sweep.py per-file child -- the
+            # actual queue-backed invocation this deferral exists for -- never
+            # sends --trusted-series-id, only --trusted-issue extracted from
+            # the staged filename (see process_one_file's cmd list). Confirmed
+            # against inkdrop_slskd_staging_sweep.py directly, not assumed.
+            inkdrop_completed_import.sys.argv = [
+                "inkdrop_completed_import.py",
+                "--kind",
+                "comics",
+                "--slskd-staging",
+                "--all-series",
+                "--source-file",
+                str(root / "Absolute Batman 003.cbz"),
+                "--trusted-issue",
+                "3",
+                "--no-wait-for-library-scan",
+            ]
+            sweep_shape_result = inkdrop_completed_import.write_import_status({"kind": "comics", "imported_count": 1})
             def locked_legacy_status(path, payload):
                 if Path(path) == inkdrop_completed_import.IMPORT_STATUS_PATH:
                     raise PermissionError("shared compatibility status is locked")
@@ -4291,9 +4487,11 @@ def smoke_import_ready_child_defers_broad_import_status_sync():
         fail(f"legacy queue-backed source-file child did not defer broad status sync without env: {legacy_shape_result}")
     if not shape_result.get("deferred") or shape_result.get("reason") != "import_status_sync_deferred":
         fail(f"library-neutral queue-backed source-file child did not defer broad status sync without env: {shape_result}")
+    if not sweep_shape_result.get("deferred") or sweep_shape_result.get("reason") != "import_status_sync_deferred":
+        fail(f"the real slskd-staging-sweep per-file shape (--trusted-issue, not --trusted-series-id) must defer too: {sweep_shape_result}")
     if not locked_result.get("deferred") or locked_result.get("legacy_status_written") is not False:
         fail(f"locked compatibility status incorrectly failed a durable import event: {locked_result}")
-    if event_count != 4:
+    if event_count != 5:
         fail(f"deferred import statuses were not preserved independently: {event_count}")
 
 
@@ -7532,6 +7730,7 @@ def main():
     smoke_verified_manga_import_results_backfill_completion_tables()
     smoke_stale_completion_retraction_records_history()
     smoke_import_ready_rejection_requeues()
+    smoke_wrong_series_or_subseries_rejection_is_terminal()
     smoke_failed_import_attempt_requeues_import_ready_download()
     smoke_import_ready_records_existing_planned_destination()
     smoke_import_ready_timeout_recovers_imported_file()

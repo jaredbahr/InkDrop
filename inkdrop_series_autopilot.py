@@ -77,6 +77,7 @@ STATUS_FILE = STATE_DIR / "series-autopilot-status.json"
 LOG_FILE = LOG_DIR / "series-autopilot.log"
 MANUAL_REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
 MANUAL_REVIEW_ACTIONS_FILE = STATE_DIR / "manual-review-actions.json"
+RSS_DISCOVERY_STATUS_FILE = STATE_DIR / "rss-discovery-status.json"
 SLSKD_SOURCE_PROBE_STATUS_FILE = STATE_DIR / "slskd-source-probe-status.json"
 SLSKD_SOURCE_PROBE_CACHE_FILE = STATE_DIR / "slskd-source-probe-cache.json"
 SLSKD_AUTO_GRAB_STATE_FILE = STATE_DIR / "slskd-auto-grab-state.json"
@@ -11297,6 +11298,41 @@ def _direct_download_action(action):
     return client in {"inkdrop_direct", "inkdrop_page_pack"}
 
 
+def record_rss_discovery_status_from_source_worker_result(result):
+    """Keep the RSS health widget honest: it used to only see the retired
+    standalone discover_rss.py run, which stopped executing once RSS moved
+    onto the shared source-worker path, so it kept reporting a month-old
+    snapshot as current. Write what the source-worker path actually saw."""
+
+    result = result if isinstance(result, dict) else {}
+    now = time.time()
+    ok = bool(result.get("ok", True))
+    actions = result.get("actions") if isinstance(result.get("actions"), list) else []
+    reviews = result.get("reviews") if isinstance(result.get("reviews"), list) else []
+    status = "OK"
+    if result.get("skipped_busy"):
+        status = "WATCH"
+    elif not ok:
+        status = "WATCH"
+    summary = {
+        "mode": "source_worker",
+        "source": "getcomics-rss-discovery",
+        "status": status,
+        "candidates_found": len(actions) + len(reviews),
+        "auto_grabbed": len(actions),
+        "sent_to_review": len(reviews),
+        "attempted_total": int(result.get("attempted_total") or 0),
+        "missing_candidates": int(result.get("missing_candidates") or 0),
+        "last_poll": now,
+        "finished_at": now,
+        "reason": result.get("reason") or "",
+    }
+    try:
+        write_json(RSS_DISCOVERY_STATUS_FILE, summary)
+    except OSError:
+        pass
+
+
 def apply_source_worker_rss_result_to_queue(queue, result):
     touched = {"actions": 0, "reviews": 0, "staged": 0}
     staged_queue_ids = set()
@@ -11343,6 +11379,7 @@ def apply_source_worker_rss_result_to_queue(queue, result):
     applied = apply_result_to_queue(queue, filtered, "rss")
     touched["actions"] += int(applied.get("actions") or 0)
     touched["reviews"] += int(applied.get("reviews") or 0)
+    record_rss_discovery_status_from_source_worker_result(result)
     return touched
 
 
@@ -11867,11 +11904,14 @@ def run_slskd(
         )
     except (TypeError, ValueError):
         lock_wait_seconds = DEFAULT_SLSKD_SOURCE_LOCK_WAIT_SECONDS
+    call_id = provider_call_id("slskd")
     probe_cmd = [
         python_command(),
         str(SLSKD_SOURCE_PROBE_SCRIPT),
         "--series",
         series,
+        "--run-token",
+        call_id,
         "--max-total",
         str(max_total if max_total is not None else args.slskd_max_total),
         "--max-per-series",
@@ -11916,7 +11956,6 @@ def run_slskd(
                 "reason": "SLSKD probe is already running; this pass will retry on the next autopilot cycle.",
             }
         started_monotonic = time.monotonic()
-        call_id = provider_call_id("slskd")
         if not provider_start_allowed(provider_observer, "slskd", series, started_monotonic, call_id):
             return {
                 "ok": False,
@@ -11965,12 +12004,38 @@ def run_slskd(
     stdout = (stdout or "").strip()
     stderr = (stderr or "").strip()
     try:
-        payload = parse_command_json(returncode, stdout, stderr)
+        payload = slskd_probe_result_from_status_file(returncode, stdout, stderr, call_id)
     except Exception as exc:
         observe_provider_result(provider_observer, "slskd", series, started_monotonic, error=exc, call_id=call_id)
         raise
     observe_provider_result(provider_observer, "slskd", series, started_monotonic, payload=payload, call_id=call_id)
     return payload
+
+
+def slskd_probe_result_from_status_file(returncode, stdout, stderr, run_token):
+    """Read the SLSKD probe's real result back from SLSKD_SOURCE_PROBE_STATUS_FILE.
+
+    The probe used to print its full result (candidates, cache items, etc. --
+    observed at hundreds of KB in production) to stdout. subprocess pipes have a
+    small, fixed OS buffer; run_process_with_progress() polls proc.wait() without
+    draining the pipes, so once the child's write() blocked on a full pipe it could
+    never exit, and the parent misreported a real, already-finished probe as a
+    timeout on every retry (PASS33-STAB-P1-01). The probe now keeps stdout to a
+    small bounded summary and writes the full result to STATUS_FILE instead; read
+    it from there and confirm its run_token matches this invocation so a stale or
+    missing file (child crashed before writing, wrote nothing) fails loudly instead
+    of silently being treated as this attempt's result.
+    """
+    if returncode != 0:
+        raise RuntimeError(stderr or stdout or f"command failed: {returncode}")
+    status = read_json(SLSKD_SOURCE_PROBE_STATUS_FILE, {}) or {}
+    if not isinstance(status, dict) or str(status.get("run_token") or "") != str(run_token or ""):
+        raise RuntimeError(
+            "SLSKD probe exited cleanly but its status file does not match this run "
+            f"(expected run_token={run_token!r}, found {(status or {}).get('run_token')!r}); "
+            f"stdout summary was: {stdout[:500]!r}"
+        )
+    return status
 
 
 def slskd_source_timeout_seconds(args, *, max_total=None, max_queries=None, probe_budget_seconds=None, **_unused):

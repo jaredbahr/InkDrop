@@ -248,17 +248,44 @@ require(
 )
 
 with (
-    mock.patch.object(probe, "slskd_search", side_effect=[[], []]),
+    mock.patch.object(probe, "slskd_search", side_effect=[[], [], [], []]),
     mock.patch.object(probe, "detected_staged_files", return_value=[]),
 ):
     clean_entry = probe.probe_item(descender, max_queries=2)
 require(clean_entry["status"] == "searched_no_candidates", clean_entry)
+# The 2 planned queries came back a clean zero and the pool still had untried
+# variants, so probe_item immediately expanded into SEARCH_EXPANSION_MAX_QUERIES
+# (2) more instead of waiting for a future scheduled pass to rotate to them.
+require(clean_entry["query_expansion_count"] == 2, clean_entry)
+require(
+    [attempt["query"] for attempt in clean_entry["queries"]]
+    == ["Descender", "Descender comics", "Descender 15", "Descender manga"],
+    clean_entry["queries"],
+)
 require(clean_entry["query_rotation_evidence"]["all_attempts_completed_clean_zero"] is True, clean_entry)
-require(clean_entry["query_rotation_evidence"]["completed_attempt_count"] == 2, clean_entry)
+require(clean_entry["query_rotation_evidence"]["completed_attempt_count"] == 4, clean_entry)
 require(
     probe.retry_rotates_without_anchor(queries, clean_entry),
     "all-clean-zero evidence did not rotate",
 )
+
+# A clean-zero cycle with no untried variants left in the pool (max_queries
+# already covers the whole plan) must not manufacture expansion queries.
+with (
+    mock.patch.object(probe, "slskd_search", return_value=[]),
+    mock.patch.object(probe, "detected_staged_files", return_value=[]),
+):
+    full_coverage_entry = probe.probe_item(descender, max_queries=len(queries))
+require(full_coverage_entry["query_expansion_count"] == 0, full_coverage_entry)
+
+# A provider error mixed into an otherwise-empty planned batch is not a
+# genuine zero result and must not trigger expansion.
+with (
+    mock.patch.object(probe, "slskd_search", side_effect=[TimeoutError("bounded timeout"), []]),
+    mock.patch.object(probe, "detected_staged_files", return_value=[]),
+):
+    error_mixed_entry = probe.probe_item(descender, max_queries=2)
+require(error_mixed_entry["query_expansion_count"] == 0, error_mixed_entry)
 
 # Once a broad query has produced a safe exact-unit candidate, do not spend a
 # second provider call. Durable known-bad annotation must run before that stop;

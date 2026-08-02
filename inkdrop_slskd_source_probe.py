@@ -151,12 +151,27 @@ def env_int(name, default):
 
 SLSKD_QUEUE_ATTEMPT_RECORD_ATTEMPTS = max(1, env_int("INKDROP_SLSKD_QUEUE_ATTEMPT_RECORD_ATTEMPTS", 6))
 SLSKD_QUEUE_ATTEMPT_RECORD_INITIAL_DELAY = 0.75
-PROBE_SCHEMA_VERSION = 61
+PROBE_SCHEMA_VERSION = 62
 QUERY_PLAN_VERSION = 8
 QUERY_ROTATION_EVIDENCE_VERSION = 1
+# Extra query attempts a probe cycle may fire immediately after its planned
+# batch comes back a clean zero, before waiting on the next scheduled pass's
+# cross-cycle rotation to reach the rest of the query pool. Kept small on
+# purpose -- this exists to close a coverage gap, not to multiply request
+# volume against a rate-limited provider.
+SEARCH_EXPANSION_MAX_QUERIES = 2
 CANDIDATE_RECHECK_SECONDS = 20 * 60
 CANDIDATE_HEADLINE_SECONDS = 45 * 60
 ACTIVE_CACHE_SECONDS = 7 * 86400
+# prune_verified_probe_records() (inkdrop_manual_source_autoresolve.py) only
+# drops an entry once its queue row reaches verified/satisfied/superseded, so
+# it never catches rows whose queue item was deleted outright or that simply
+# went untouched for a long time. This is the general backstop: age out
+# anything nobody has checked in CACHE_ENTRY_RETENTION_SECONDS, then enforce
+# CACHE_MAX_ENTRIES as a hard cap so cache size can't grow without bound even
+# under heavy churn.
+CACHE_ENTRY_RETENTION_SECONDS = env_int("INKDROP_SLSKD_CACHE_RETENTION_SECONDS", 30 * 86400)
+CACHE_MAX_ENTRIES = env_int("INKDROP_SLSKD_CACHE_MAX_ENTRIES", 3000)
 TRANSIENT_BAD_CANDIDATE_RETRY_SECONDS = env_int("INKDROP_SLSKD_TRANSIENT_BAD_CANDIDATE_RETRY_SECONDS", 30 * 60)
 TRANSIENT_BAD_CANDIDATE_REASONS = {
     "resolver_error",
@@ -236,7 +251,8 @@ SERIES_PACK_COMPLETE_MIN_COVERAGE = max(2, min(env_int("INKDROP_SLSKD_SERIES_PAC
 SERIES_PACK_COMPLETE_MIN_RATIO_PCT = max(10, min(env_int("INKDROP_SLSKD_SERIES_PACK_COMPLETE_MIN_RATIO_PCT", 75), 100))
 SERIES_PACK_COMPLETE_MAX_DIRECTORIES = max(1, min(env_int("INKDROP_SLSKD_SERIES_PACK_COMPLETE_MAX_DIRECTORIES", 3), 25))
 DEFAULT_PROBE_BUDGET_SECONDS = 5 * 60
-STAGED_SCAN_MAX_SECONDS = 8
+STAGED_SCAN_MAX_SECONDS = max(1, env_int("INKDROP_SLSKD_STAGED_SCAN_MAX_SECONDS", 8))
+STAGED_SCAN_MAX_ENTRIES = max(100, env_int("INKDROP_SLSKD_STAGED_SCAN_MAX_ENTRIES", 5000))
 STAGED_FILE_SCAN_CACHE = {}
 SERIES_RUN_EPHEMERAL_CANDIDATES = {}
 ISSUE_METADATA_CACHE = None
@@ -2632,7 +2648,14 @@ def queue_probe_priority(row):
     # window and starve forever, the same failure mode this function was
     # already fixed for once, just moved one tiebreak level down. Break the
     # tie by staleness (oldest touched first) so the backlog rotates and
-    # every row eventually surfaces regardless of series name.
+    # every row eventually surfaces regardless of series name. A row that has
+    # never been touched has been stale the longest -- infinitely long ago --
+    # so it must sort ahead of a row touched moments ago, not behind it.
+    # (A prior version of this line mapped "never touched" to +inf, which
+    # sorts *last*: once any row in a tied bucket picked up a real ts, it
+    # would permanently outrank the entire untouched majority forever, and a
+    # backlog that starts fully untouched -- the real, measured state of
+    # production -- never rotates at all. Confirmed against a live snapshot.)
     try:
         last_touched = float((row or {}).get("ts") or 0)
     except (TypeError, ValueError):
@@ -2640,7 +2663,7 @@ def queue_probe_priority(row):
     return (
         bucket,
         retry_wait,
-        last_touched if last_touched > 0 else float("inf"),
+        last_touched,
         normalize((row or {}).get("series") or ""),
         token_number(queue_source_issue(row)) or 999999,
         queue_source_issue(row),
@@ -4134,6 +4157,24 @@ DEFAULT_SLSKD_REPEAT_QUERY_COOLDOWN_SECONDS = 24 * 3600
 # One peer answering is a search that got cut short, not an answer about what
 # the network holds.
 MIN_REUSABLE_SEARCH_RESPONSES = 2
+# A Manual Search run that comes back with literally nothing gets a small,
+# bounded second chance from later entries in the same priority-ordered query
+# pool, rather than leaving an operator staring at zero results because the
+# query cap happened to land before a variant that would have found the file.
+# This never fires on a provider error/timeout/rate-limit outcome -- only a
+# search that actually ran to completion and found nothing.
+DEFAULT_SLSKD_MANUAL_ZERO_RESULT_EXPANSION_QUERIES = 2
+
+
+def slskd_manual_zero_result_expansion_max_queries():
+    try:
+        value = int(
+            os.environ.get("INKDROP_SLSKD_MANUAL_ZERO_RESULT_EXPANSION_QUERIES")
+            or DEFAULT_SLSKD_MANUAL_ZERO_RESULT_EXPANSION_QUERIES
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_SLSKD_MANUAL_ZERO_RESULT_EXPANSION_QUERIES
+    return max(0, min(value, 2))
 
 
 def slskd_search_min_interval_seconds():
@@ -6914,6 +6955,12 @@ def unexpected_series_subtitle_blocker(filename, item):
         expected_words |= set(context_words(alias_title))
     issue_title = set(issue_title_words(item))
     wanted = issue_number((item or {}).get("issue"))
+    wanted_run_number = issue_number(
+        (item or {}).get("volume_number")
+        or (item or {}).get("volume")
+        or (item or {}).get("book_volume")
+        or (item or {}).get("manga_volume")
+    )
     target_year_numbers = set()
     for year in identity_years_for_item(item):
         try:
@@ -6990,12 +7037,17 @@ def unexpected_series_subtitle_blocker(filename, item):
                 if (
                     re.match(r"^(?:v|vols?|volumes?|books?)0*\d{1,4}$", word)
                     and segment_years & target_year_numbers
+                    and (wanted_run_number is None or attached_value == wanted_run_number)
                 ):
                     # A bare volume/book marker whose own segment carries the
                     # wanted item's real publication year names which
                     # numbered run this is, not a different subseries -- a
                     # genuinely different real-world volume carries a
-                    # different year here instead.
+                    # different year here instead. But the year alone must
+                    # not excuse a marker that KNOWABLY conflicts with the
+                    # wanted item's own run number: an unrelated "v99"
+                    # sitting next to the right year is still the wrong run
+                    # when we actually know which run we want.
                     continue
                 suspicious.append(word)
                 continue
@@ -8741,6 +8793,71 @@ def update_autopilot_queue_from_waiting_record(record):
     }
 
 
+def touch_autopilot_queue_probe_row(item):
+    """Stamp the persisted queue row's staleness marker after a genuine probe.
+
+    queue_probe_priority() breaks a retry_wait=0 tie by this field so the
+    backlog rotates instead of the same alphabetically-early rows winning
+    the per-pass selection window forever. A row that finds a candidate
+    already gets touched by update_autopilot_queue_from_staged_entry/
+    update_autopilot_queue_from_waiting_record, but a row that is searched
+    and finds nothing -- the common case -- was never touched at all, so it
+    never lost its turn to the rest of the backlog.
+    """
+
+    item = item if isinstance(item, dict) else {}
+    if not item.get("autopilot_queue"):
+        return {"updated": False, "reason": "not_autopilot_queue"}
+    queue = read_json(SERIES_AUTOPILOT_QUEUE_FILE, {}) or {}
+    items = queue.get("items") if isinstance(queue, dict) else {}
+    if not isinstance(items, dict):
+        return {"updated": False, "reason": "queue_missing"}
+    queue_key = str(item.get("autopilot_queue_key") or "").strip()
+    row = items.get(queue_key) if queue_key else None
+    if not isinstance(row, dict):
+        item_review_id = str(item.get("review_id") or "").strip()
+        item_series = normalize(item.get("series"))
+        item_issue_keys = issue_number_keys(item.get("issue"))
+        item_identity = str(item.get("queue_identity") or "").strip()
+        for key, candidate in items.items():
+            if not isinstance(candidate, dict):
+                continue
+            if item_review_id and str(candidate.get("review_id") or "") == item_review_id:
+                queue_key = key
+                row = candidate
+                break
+            same_identity = not item_identity or str(candidate.get("queue_identity") or "") == item_identity
+            same_series = normalize(candidate.get("series")) == item_series
+            same_issue = bool(issue_number_keys(candidate.get("issue")) & item_issue_keys)
+            if same_identity and same_series and same_issue:
+                queue_key = key
+                row = candidate
+                break
+    if not isinstance(row, dict):
+        return {"updated": False, "reason": "queue_row_not_found", "queue_key": queue_key}
+    now_ts = now()
+    row["ts"] = now_ts
+    row["ts_iso"] = utc_stamp(now_ts)
+    db_patch = {}
+    if inkdrop_state is not None:
+        try:
+            db_patch = inkdrop_state.patch_queue_item_state(
+                INKDROP_STATE_DB,
+                queue_key,
+                raw_updates={"ts": now_ts, "ts_iso": row["ts_iso"]},
+                source="slskd",
+                event_type="slskd_probe_touch",
+                updated_at=now_ts,
+            )
+        except Exception as exc:
+            db_patch = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            log("inkdrop_state_queue_patch_failed", reason="slskd_probe_touch", queue_key=queue_key, error=db_patch["error"])
+    if db_patch.get("ok"):
+        return {"updated": True, "queue_key": queue_key, "db_authoritative": True}
+    write_json(SERIES_AUTOPILOT_QUEUE_FILE, queue)
+    return {"updated": True, "queue_key": queue_key, "db_authoritative": False}
+
+
 def staged_attempt_id(entry, detected):
     queue_key = str((entry or {}).get("autopilot_queue_key") or "").strip()
     review_id = str((entry or {}).get("review_id") or "").strip()
@@ -10340,13 +10457,13 @@ def scan_staged_file_candidates():
                 )
 
                 scanned += len(dirnames)
-                if scanned > 5000 or now() > deadline:
+                if scanned > STAGED_SCAN_MAX_ENTRIES or now() > deadline:
                     truncated = True
                     break
 
                 for filename in filenames:
                     scanned += 1
-                    if scanned > 5000 or now() > deadline:
+                    if scanned > STAGED_SCAN_MAX_ENTRIES or now() > deadline:
                         truncated = True
                         break
                     if extension_for(filename) not in COMIC_EXTENSIONS:
@@ -11495,7 +11612,11 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_
     query_cap = max(1, min(int(max_queries or 1), 6))
     result_cap = max(1, min(int(candidate_limit or AUTO_GRAB_CANDIDATE_LIMIT), AUTO_GRAB_CANDIDATE_LIMIT))
     supplied = [str(row or "").strip() for row in (explicit_queries or []) if str(row or "").strip()]
-    planned_queries = manual_search_query_variants(item, supplied)[:query_cap]
+    full_query_pool = manual_search_query_variants(item, supplied)
+    planned_queries = full_query_pool[:query_cap]
+    expansion_pool = full_query_pool[query_cap:]
+    expansion_budget = slskd_manual_zero_result_expansion_max_queries()
+    expansion_queries_added = 0
     attempts = []
     candidate_groups = []
     response_count = 0
@@ -11506,7 +11627,7 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_
     failure_status = ""
     failure_reason = ""
 
-    for query in planned_queries:
+    for query_index, query in enumerate(planned_queries):
         remaining = seconds_remaining(deadline)
         if remaining is not None and remaining <= 0:
             failure_status = "provider_timeout"
@@ -11573,6 +11694,30 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_
                 # for diagnostics, but cannot prevent the next bounded query
                 # from finding healthy compatible sibling evidence.
                 break
+            if (
+                query_index == len(planned_queries) - 1
+                and not failure_status
+                and not any(candidate_groups)
+                and expansion_queries_added < expansion_budget
+                and expansion_pool
+            ):
+                # The planned batch ran to completion and genuinely found
+                # nothing -- not a timeout, not a rate-limit, not a cap. Give
+                # it one bounded look further down the same priority-ordered
+                # pool before telling the operator "zero results". This is
+                # exactly the PR #158 gap generalized: a good variant can sit
+                # just past the query cap and never get tried.
+                # Manual Search discovery deliberately never writes to the
+                # shared log (see the other bounded-query tests asserting
+                # this) -- an operator's search terms are not automatic-pass
+                # telemetry. The expansion is instead visible the same way
+                # every other attempt is: through the fingerprinted evidence
+                # returned below and the durable per-run diagnostics it feeds.
+                add_count = min(expansion_budget - expansion_queries_added, len(expansion_pool))
+                added = expansion_pool[:add_count]
+                expansion_pool = expansion_pool[add_count:]
+                planned_queries.extend(added)
+                expansion_queries_added += add_count
         except SLSKDProviderUnavailable:
             failure_status = "provider_unavailable"
             failure_reason = "slskd_provider_unavailable"
@@ -11680,6 +11825,8 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_
         "evidence": {
             "contract_version": 1,
             "planned_query_count": len(planned_queries),
+            "base_query_count": query_cap,
+            "zero_result_expansion_query_count": expansion_queries_added,
             "completed_query_count": completed_query_count,
             "response_count": response_count,
             "candidate_count": len(merged),
@@ -11723,7 +11870,10 @@ def probe_item(
     }
     shared_observation_budget = directory_observation_budget if isinstance(directory_observation_budget, dict) else None
     response_count = 0
-    for query in planned_queries:
+    early_stop_reason = None
+
+    def run_query(query, attempt_total):
+        nonlocal response_count, early_stop_reason
         remaining = seconds_remaining(deadline)
         if remaining is not None and remaining < 8:
             attempts.append({
@@ -11731,10 +11881,11 @@ def probe_item(
                 "skipped": "probe_budget_exhausted",
                 "remaining_seconds": round(remaining, 1),
             })
-            break
+            early_stop_reason = "probe_budget_exhausted"
+            return False
         started = now()
         if progress:
-            progress(item=item, query=query, attempt_index=len(attempts) + 1, attempt_total=len(planned_queries))
+            progress(item=item, query=query, attempt_index=len(attempts) + 1, attempt_total=attempt_total)
         try:
             # Soulseek responses for less-common titles routinely arrive well
             # after even a 25s snapshot -- confirmed live: a real query for
@@ -11802,7 +11953,9 @@ def probe_item(
             attempts.append(attempt)
             if cumulative_auto_counts["auto_grab_safe"]:
                 attempt["search_stop_reason"] = "safe_exact_candidate_found"
-                break
+                early_stop_reason = "safe_exact_candidate_found"
+                return False
+            return True
         except SLSKDProviderUnavailable as exc:
             status_payload = exc.status if isinstance(exc.status, dict) else {}
             connected = status_payload.get("isConnected") if "isConnected" in status_payload else None
@@ -11830,7 +11983,8 @@ def probe_item(
                 error=f"{type(exc).__name__}: {exc}",
                 provider_state=status_payload.get("state"),
             )
-            break
+            early_stop_reason = "provider_unavailable"
+            return False
         except Exception as exc:
             attempt = {"query": query, "elapsed_seconds": round(now() - started, 1), "error": f"{type(exc).__name__}: {exc}"}
             if slskd_unavailable_error(exc):
@@ -11839,6 +11993,53 @@ def probe_item(
                 attempt["transient_error"] = True
             attempts.append(attempt)
             log("probe_query_error", review_id=item.get("review_id"), query=query, error=f"{type(exc).__name__}: {exc}")
+            return True
+
+    for query in planned_queries:
+        if not run_query(query, len(planned_queries)):
+            break
+
+    # Zero-result expansion: a cycle that cleanly exhausts its planned batch
+    # (no candidates, no errors/skips/provider-waits -- query_attempt_completed_
+    # clean_zero is the same "genuine zero" test the cross-cycle rotation
+    # evidence above already relies on) still has untried variants sitting in
+    # the query pool that the cross-cycle rotation wouldn't reach until a
+    # future scheduled pass. Try a couple of them now instead of waiting.
+    # Bounded by SEARCH_EXPANSION_MAX_QUERIES, and each extra query still goes
+    # through run_query -> slskd_search -> enforce_slskd_search_pacing and the
+    # same per-query deadline check above, so an already-rate-limited or
+    # budget-exhausted provider gets provider_unavailable/probe_budget_exhausted
+    # handling exactly like the planned batch, never a bypass of it.
+    expansion_queries = []
+    if early_stop_reason is None and not merge_query_candidates(candidate_groups, item):
+        executed_attempts = [attempt for attempt in attempts if not attempt.get("skipped")]
+        if executed_attempts and all(query_attempt_completed_clean_zero(attempt) for attempt in executed_attempts):
+            already_planned = {normalize(planned_query) for planned_query in planned_queries}
+            expansion_queries = [
+                candidate_query for candidate_query in queries
+                if normalize(candidate_query) not in already_planned
+            ][:SEARCH_EXPANSION_MAX_QUERIES]
+    if expansion_queries:
+        log(
+            "probe_query_expansion_triggered",
+            review_id=item.get("review_id"),
+            series=item.get("series"),
+            issue=item.get("issue"),
+            planned_query_count=len(planned_queries),
+            expansion_query_count=len(expansion_queries),
+            expansion_queries=expansion_queries,
+            query_pool_size=len(queries),
+        )
+        for query in expansion_queries:
+            if not run_query(query, len(planned_queries) + len(expansion_queries)):
+                break
+        log(
+            "probe_query_expansion_result",
+            review_id=item.get("review_id"),
+            expansion_query_count=len(expansion_queries),
+            found_candidate=bool(merge_query_candidates(candidate_groups, item)),
+            stop_reason=early_stop_reason,
+        )
     best_candidates = merge_query_candidates(candidate_groups, item)
     status = "available" if best_candidates else ("searched_no_candidates" if attempts else "no_query")
     provider_wait_statuses = {"api_error", "provider_unavailable", "provider_wait"}
@@ -11853,6 +12054,7 @@ def probe_item(
     failed_candidate_count = sum(1 for row in best_candidates if (row or {}).get("manual_source_bad_candidate"))
     if best_candidates and failed_candidate_count == len(best_candidates):
         status = "failed_candidates_exhausted"
+    effective_max_queries = max_queries + len(expansion_queries)
     entry = {
         "schema_version": PROBE_SCHEMA_VERSION,
         "auto_grab_context_signature": auto_grab_context_signature(),
@@ -11872,7 +12074,7 @@ def probe_item(
             queries,
             query_offset,
             sum(1 for attempt in attempts if not attempt.get("skipped")),
-            max_queries=max_queries,
+            max_queries=effective_max_queries,
             include_anchor=include_anchor,
         ),
         "query_signature": query_signature(queries),
@@ -11885,6 +12087,7 @@ def probe_item(
         "auto_grab_blocked_count": auto_counts["blocked"],
         "candidates": best_candidates,
         "series_directory_observation_summary": directory_observation_summary,
+        "query_expansion_count": len(expansion_queries),
     }
     api_error_attempt = next((attempt for attempt in attempts if attempt.get("status") in provider_wait_statuses), None)
     if api_error_attempt:
@@ -12158,6 +12361,45 @@ def cache_entry_is_active(cache_entry):
     if int(cache_entry.get("candidate_count") or 0) > 0 and int(cache_entry.get("detected_count") or 0) <= 0:
         return checked_at > now() - CANDIDATE_HEADLINE_SECONDS
     return True
+
+
+def evict_stale_cache_entries(cache, *, now_ts=None, retention_seconds=None, max_entries=None):
+    """Bound the persisted probe cache: age out untouched rows, then cap total count.
+
+    Rows with no parseable checked_at are kept (unknown age; safer than guessing),
+    so this only removes entries we can positively confirm are stale.
+    """
+    if not isinstance(cache, dict):
+        return cache, {"evicted_by_age": 0, "evicted_by_cap": 0, "kept": 0}
+    now_ts = now() if now_ts is None else float(now_ts)
+    retention_seconds = CACHE_ENTRY_RETENTION_SECONDS if retention_seconds is None else max(0, int(retention_seconds))
+    max_entries = CACHE_MAX_ENTRIES if max_entries is None else max(0, int(max_entries))
+    cutoff = now_ts - retention_seconds
+
+    def checked_at_of(entry):
+        try:
+            return float((entry or {}).get("checked_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    kept = {}
+    evicted_by_age = 0
+    for key, entry in cache.items():
+        if not isinstance(entry, dict):
+            continue
+        checked_at = checked_at_of(entry)
+        if checked_at and checked_at < cutoff:
+            evicted_by_age += 1
+            continue
+        kept[key] = entry
+
+    evicted_by_cap = 0
+    if max_entries and len(kept) > max_entries:
+        ordered = sorted(kept.items(), key=lambda pair: checked_at_of(pair[1]), reverse=True)
+        evicted_by_cap = len(ordered) - max_entries
+        kept = dict(ordered[:max_entries])
+
+    return kept, {"evicted_by_age": evicted_by_age, "evicted_by_cap": evicted_by_cap, "kept": len(kept)}
 
 
 def retain_cached_candidates_after_empty_retry(previous_entry, fresh_entry, item):
@@ -12575,6 +12817,14 @@ def run(args):
     started_at = now()
     probe_budget_seconds = max(30, int(getattr(args, "probe_budget_seconds", DEFAULT_PROBE_BUDGET_SECONDS) or DEFAULT_PROBE_BUDGET_SECONDS))
     cache = read_json(CACHE_FILE, {}) or {}
+    cache, cache_eviction = evict_stale_cache_entries(cache, now_ts=started_at)
+    if cache_eviction["evicted_by_age"] or cache_eviction["evicted_by_cap"]:
+        log(
+            "slskd_cache_evicted",
+            evicted_by_age=cache_eviction["evicted_by_age"],
+            evicted_by_cap=cache_eviction["evicted_by_cap"],
+            kept=cache_eviction["kept"],
+        )
     review_id_filter = str(getattr(args, "review_id", "") or "").strip()
     publish_probe_progress(
         dry_run=bool(args.dry_run),
@@ -12834,7 +13084,17 @@ def run(args):
                 entry = retained
         cache[review_id] = entry
         checked.append(entry)
-        log("probe_item", review_id=review_id, series=item.get("series"), issue=item.get("issue"), status=entry.get("status"), candidate_count=entry.get("candidate_count"), probe_reason=entry.get("probe_reason"))
+        queue_row_touch = touch_autopilot_queue_probe_row(item)
+        log(
+            "probe_item",
+            review_id=review_id,
+            series=item.get("series"),
+            issue=item.get("issue"),
+            status=entry.get("status"),
+            candidate_count=entry.get("candidate_count"),
+            probe_reason=entry.get("probe_reason"),
+            queue_row_ts_touched=bool(queue_row_touch.get("updated")),
+        )
         if int((entry.get("series_directory_observation_summary") or {}).get("observed_directory_count") or 0):
             # Reuse a safe cohort before probing another issue in this series.
             immediate_handoff = apply_series_directory_opportunities(
@@ -12947,6 +13207,8 @@ def run(args):
         auto_failed_count += int(value.get("failed_candidate_count") or 0)
     result = {
         "ok": True,
+        "run_token": str(getattr(args, "run_token", "") or ""),
+        "cache_evicted": cache_eviction,
         "dry_run": False,
         "schema_version": PROBE_SCHEMA_VERSION,
         "state": "finished",
@@ -13049,7 +13311,25 @@ def run(args):
             result["policy"] = "SLSKD auto-grab live mode picks the best eligible candidate per row, starts it in SLSKD, marks the row waiting, and imports only through the existing verified Manual Source autoresolver."
     SERIES_RUN_EPHEMERAL_CANDIDATES.clear()
     write_json(STATUS_FILE, result)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    # The full result (result["items"] alone has been observed at hundreds of
+    # KB in production) used to be printed here. The parent reads it back off
+    # a subprocess pipe with a small, fixed OS buffer (commonly 64KiB, as low
+    # as 8KiB in some container runtimes); once the child's write() blocks on
+    # a full pipe the parent never sees it exit and the whole probe gets
+    # misreported as a timeout even though the real work already finished and
+    # is sitting in STATUS_FILE. Keep stdout to a small, bounded summary and
+    # let the parent read the real result from STATUS_FILE instead.
+    print(json.dumps({
+        "ok": result.get("ok"),
+        "run_token": result.get("run_token"),
+        "status_file": str(STATUS_FILE),
+        "checked_count": result.get("checked_count"),
+        "candidate_count": result.get("candidate_count"),
+        "available_review_count": result.get("available_review_count"),
+        "auto_grab_safe_count": result.get("auto_grab_safe_count"),
+        "cache_evicted": result.get("cache_evicted"),
+        "probe_elapsed_seconds": result.get("probe_elapsed_seconds"),
+    }))
     return result
 
 
@@ -13068,6 +13348,7 @@ def main():
     parser.add_argument("--auto-grab-dry-run", action="store_true", help="Audit auto-grab-safe SLSKD candidates without starting downloads.")
     parser.add_argument("--auto-grab-live", action="store_true", help="Start exactly gated SLSKD downloads and mark rows waiting.")
     parser.add_argument("--auto-grab-max", type=int, default=None, help="Maximum auto-grab-safe rows to process when auto-grab is enabled.")
+    parser.add_argument("--run-token", default="", help="Opaque token the caller stamps into the result so it can confirm STATUS_FILE reflects this invocation, not a stale prior run.")
     args = parser.parse_args()
     provider_settings = apply_slskd_provider_settings()
     apply_quality_language_rules()

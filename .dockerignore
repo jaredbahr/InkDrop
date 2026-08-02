@@ -185,9 +185,6 @@ __pycache__
 *.cbr
 *.pdf
 *.epub
-# Build 165's hyphenated retirement smoke ships in the public source export,
-# not the importable runtime image. Runtime modules it exercises are allowlisted above.
-inkdrop-kapowarr-fallback-retirement-smoke.py
 backups/
 config/
 state/

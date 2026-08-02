@@ -158,6 +158,15 @@
       background: var(--accent);
       box-shadow: 0 0 0 4px rgba(114, 210, 255, .14);
     }
+    .status-pill.running .status-dot {
+      animation: activity-pulse 1.2s ease-in-out infinite;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .status-pill.running .status-dot,
+      .activity-status.running .activity-status-dot {
+        animation: none;
+      }
+    }
     .status-sub {
       color: var(--muted);
       font-size: 12px;

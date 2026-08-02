@@ -141,11 +141,14 @@ Optional before enabling automation:
   when download-client paths differ from InkDrop container paths.
 - Set `INKDROP_KAVITA_DB` only for deliberate migration/visibility
   compatibility.
-- Monitoring a series does not enable Automatic Search. Set
-  `INKDROP_QUEUE_RUNNER_AUTOPILOT_ENABLED=1` in the packet `.env`, then run
-  `docker compose up -d --force-recreate inkdrop inkdrop-worker`. Confirm the
-  UI reports Automatic Search enabled, worker healthy, scheduler active, and
-  either running or idle.
+- Monitoring a series does not enable Automatic Search. The closed-alpha
+  packet ships with `INKDROP_QUEUE_RUNNER_AUTOPILOT_ENABLED=1` already set;
+  no manual step is needed there. For a development source build (which
+  still ships with it off, matching `.env.example`), set
+  `INKDROP_QUEUE_RUNNER_AUTOPILOT_ENABLED=1` in `.env`, then run
+  `docker compose up -d --force-recreate inkdrop inkdrop-worker`. Either way,
+  confirm the UI reports Automatic Search enabled, worker healthy, scheduler
+  active, and either running or idle.
 
 Expected clean-install warnings:
 

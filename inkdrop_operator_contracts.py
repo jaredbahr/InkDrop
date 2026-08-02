@@ -141,6 +141,16 @@ def manual_review_contract(row):
     else:
         actions = list(HUMAN_REASON_ACTIONS.get(reason_code, ()))
 
+    if not actions and state == "needs_you" and row.get("legacy_manual_review") and bool(row.get("manual_review_actionable") or row.get("actionable")):
+        # The legacy manual-review feed (manual-review.jsonl) uses an open reason
+        # vocabulary that predates HUMAN_REASON_ACTIONS -- e.g. "weak_filename_unit_evidence"
+        # or "candidate_title_mismatch" -- and already decided this row needs a
+        # human before it ever reached this contract. An unmapped reason_code here
+        # means "not yet named," not "safe to retry automatically"; trust that
+        # upstream decision instead of silently dropping the row from every
+        # Manual Review filter.
+        actions = list(HUMAN_REASON_ACTIONS["manual_review"])
+
     retry_eligible = bool(row.get("retry_eligible"))
     automation_will_retry = bool(
         row.get("automation_will_retry")

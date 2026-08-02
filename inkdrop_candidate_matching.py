@@ -1152,9 +1152,20 @@ def candidate_compatibility(candidate, wanted_item=None):
         and not evidence.get("coverage_start")
         and not evidence.get("coverage_end")
     )
+    # Authoritative print-run identity for the wanted issue (which real-world
+    # numbered volume/book it belongs to, e.g. Love and Rockets v1 #19 vs the
+    # unrelated v2 #19) versus whatever run number the candidate itself
+    # asserts. Computed once and reused below: a print-run marker alongside
+    # the exact wanted issue number is only "one claim, not two conflicting
+    # ones" when that marker actually names the wanted run.
+    target_run_number = target.get("volume_number")
+    evidence_run_number = evidence.get("volume_number") or evidence.get("book_number")
     # A print-run marker ("v1 #19") alongside the exact wanted issue number is
     # not two conflicting unit claims, it's one -- the volume digit names
-    # which real-world numbered run the issue belongs to.
+    # which real-world numbered run the issue belongs to -- but only when
+    # that digit actually is the wanted run. "v2 #19" restates the issue
+    # number and asserts a different, wrong run in the same breath; it is
+    # not hierarchical evidence just because the issue number also matches.
     hierarchical_issue_identity = bool(
         target.get("unit_type") in ISSUE_UNITS
         and evidence.get("issue_number")
@@ -1164,6 +1175,7 @@ def candidate_compatibility(candidate, wanted_item=None):
         and not evidence.get("chapter_number")
         and not evidence.get("coverage_start")
         and not evidence.get("coverage_end")
+        and (not evidence_run_number or not target_run_number or evidence_run_number == target_run_number)
     )
     if evidence.get("conflicts") or (
         evidence.get("ambiguous") and not hierarchical_chapter_identity and not hierarchical_issue_identity
@@ -1212,6 +1224,29 @@ def candidate_compatibility(candidate, wanted_item=None):
             blocked.append("wrong_unit_type")
         elif evidence.get("issue_number") and wanted and evidence.get("issue_number") != wanted:
             blocked.append("wrong_issue_number")
+        elif (
+            evidence.get("issue_number")
+            and evidence.get("issue_number") == wanted
+            and evidence_run_number
+            and target_run_number
+            and evidence_run_number != target_run_number
+        ):
+            # The issue number matches, but the candidate names a different
+            # numbered print run/volume than the wanted issue actually
+            # belongs to -- "v2 #19" is not "v1 #19" just because both say
+            # "#19". A matching bare number is not enough on its own.
+            blocked.append("wrong_volume_number")
+        elif (
+            evidence.get("issue_number")
+            and evidence.get("issue_number") == wanted
+            and evidence_run_number
+            and not target_run_number
+        ):
+            # The candidate asserts a specific print run/volume and the
+            # wanted item's own run identity isn't known -- this could be
+            # the right run or a different one; a human needs to confirm
+            # it, an automatic pass must not guess.
+            review.append("print_run_not_confirmed")
         elif evidence.get("issue_number") and evidence.get("issue_number") == wanted:
             # A volume/book marker alongside the matching issue number
             # identifies which numbered run the issue belongs to; it is not
@@ -1289,6 +1324,7 @@ def _explanation(reason, target, source):
     messages = {
         "wrong_unit_type": "The result is a different unit type than the wanted target.",
         "wrong_volume_number": f"Wanted volume {target.get('volume_number')}; result identifies volume {source.get('volume_number') or source.get('book_number')}.",
+        "print_run_not_confirmed": f"Result identifies print run/volume {source.get('volume_number') or source.get('book_number')}; the wanted issue's own print run is not confirmed, so this cannot be auto-approved.",
         "wrong_issue_number": f"Wanted issue {target.get('issue_number')}; result identifies issue {source.get('issue_number')}.",
         "wrong_chapter_number": f"Wanted chapter {target.get('chapter_number')}; result identifies chapter {source.get('chapter_number')}.",
         "coverage_not_unit_number": "A collected coverage range is not the artifact's own issue or chapter number.",

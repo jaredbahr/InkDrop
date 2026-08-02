@@ -2629,9 +2629,27 @@ def archive_member_names(path):
     return names
 
 
+EXTRACT_TIMEOUT_BASE_SECONDS = env_int("INKDROP_PACK_EXTRACT_TIMEOUT_BASE_SECONDS", 1200)
+EXTRACT_TIMEOUT_BYTES_PER_SECOND = env_int("INKDROP_PACK_EXTRACT_TIMEOUT_BYTES_PER_SECOND", 5 * 1024 * 1024)
+EXTRACT_TIMEOUT_MAX_SECONDS = env_int("INKDROP_PACK_EXTRACT_TIMEOUT_MAX_SECONDS", 3 * 3600)
+
+
+def extract_archive_timeout_seconds(path):
+    try:
+        archive_bytes = Path(path).stat().st_size
+    except OSError:
+        archive_bytes = 0
+    scaled = archive_bytes / EXTRACT_TIMEOUT_BYTES_PER_SECOND if EXTRACT_TIMEOUT_BYTES_PER_SECOND > 0 else 0
+    return max(EXTRACT_TIMEOUT_BASE_SECONDS, min(scaled, EXTRACT_TIMEOUT_MAX_SECONDS))
+
+
 def extract_archive(path, dest):
     dest.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(["7z", "x", "-y", f"-o{dest}", str(path)], capture_output=True, text=True, timeout=1200)
+    timeout = extract_archive_timeout_seconds(path)
+    try:
+        proc = subprocess.run(["7z", "x", "-y", f"-o{dest}", str(path)], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"7z extraction timed out after {int(timeout)}s for {path}")
     if proc.returncode != 0:
         raise RuntimeError(f"7z extraction failed for {path}: {proc.stderr or proc.stdout}")
 

@@ -189,6 +189,47 @@ def wrapper_fixtures():
         zero = slskd.manual_search_discovery(item, ["private zero query"], max_queries=1)
     require(zero["completed"] and zero["status"] == "zero_results", "a completed empty provider call must be a true zero")
 
+    with (
+        mock.patch.object(slskd, "manual_search_query_variants", return_value=["q1", "q2", "q3", "q4", "q5", "q6"]),
+        mock.patch.object(slskd, "slskd_search", return_value=[]) as expansion_search,
+        mock.patch.object(slskd, "candidates_from_responses", return_value=([], {"rejected_file_count": 0})),
+    ):
+        expanded = slskd.manual_search_discovery(item, [], max_queries=1)
+    require(expanded["completed"] and expanded["status"] == "zero_results", "an exhausted expansion pool must still resolve to a true, reportable zero")
+    require(
+        [call.args[0] for call in expansion_search.call_args_list] == ["q1", "q2", "q3"],
+        f"a genuine zero at a 1-query cap must expand by exactly 2 more from the same priority-ordered pool, never more: {expansion_search.call_args_list}",
+    )
+    require(expanded["evidence"]["zero_result_expansion_query_count"] == 2, f"evidence must report the expansion count that actually ran: {expanded['evidence']}")
+    require(len(expanded["evidence"]["attempts"]) == 3, "every expansion attempt must be visible in the returned evidence")
+
+    with mock.patch.object(slskd, "slskd_search", side_effect=TimeoutError("late")) as failure_search:
+        failed = slskd.manual_search_discovery(item, ["private timeout query"], max_queries=1)
+    require(not failed["completed"] and failed["status"] == "provider_timeout", "a provider timeout must not be reinterpreted as a zero to expand from")
+    require(failure_search.call_count == 1, "a real provider failure must not spend the zero-result expansion budget")
+
+    with (
+        mock.patch.object(slskd, "manual_search_query_variants", return_value=["q1", "q2", "q3"]),
+        mock.patch.object(
+            slskd,
+            "slskd_search",
+            return_value=[{"username": "peer", "files": [{"filename": "Something 001.cbz", "size": 1_000_000}]}],
+        ) as found_search,
+        mock.patch.object(
+            slskd,
+            "candidates_from_responses",
+            return_value=([{"filename": "Something 001.cbz", "username": "peer", "size": 1_000_000}], {"rejected_file_count": 0}),
+        ),
+        mock.patch.object(
+            slskd,
+            "annotate_auto_grab_verdicts",
+            side_effect=lambda candidates, _item: [dict(c, auto_grab={"verdict": "blocked", "blockers": ["wrong_issue_number"]}) for c in candidates],
+        ),
+    ):
+        found_but_blocked = slskd.manual_search_discovery(item, [], max_queries=1)
+    require(found_but_blocked["status"] != "zero_results", "any raw candidate evidence, even one later blocked, is not a zero to expand from")
+    require(found_search.call_count == 1, "expansion must not fire once a query has returned any candidate evidence")
+
     with mock.patch.object(slskd, "slskd_search", side_effect=slskd.SLSKDProviderUnavailable("offline")):
         unavailable = slskd.manual_search_discovery(item, ["private unavailable query"], max_queries=1)
     require(not unavailable["completed"] and unavailable["status"] == "provider_unavailable", "provider unavailability must not masquerade as zero")

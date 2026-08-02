@@ -2610,16 +2610,97 @@ def prowlarr_categoryless_fallback_requests(row, plan, wanted_item=None, limit=2
     return requests
 
 
-def _indexer_query_variants(row, wanted_item=None, *, provider_prefix="", max_queries_default=3):
+# Extra query-text variants an indexer-style provider (Prowlarr, Torznab,
+# Newznab) tries immediately after its planned batch executes cleanly with
+# zero combined results -- the same "the pool had more, it just wasn't tried"
+# gap SLSKD's probe_item()/manual_search_discovery() already close for
+# Soulseek, generalized here because indexer_source_queries() has the exact
+# same pool-then-hard-truncate shape (values[:limit], tail simply dropped)
+# with no cross-cycle rotation to ever reach the tail otherwise. Kept small
+# and bounded on purpose -- each extra query is still a full request through
+# the normal fetch path below, so an already rate-limited/unavailable
+# provider gets the same handling as the planned batch, never a bypass.
+SEARCH_EXPANSION_MAX_QUERIES = 2
+
+
+def _indexer_max_query_variants(row, *, provider_prefix="", max_queries_default=3):
     policy = (row or {}).get("policy") if isinstance((row or {}).get("policy"), dict) else {}
     provider_prefix = str(provider_prefix or "").strip().lower()
     prefix_max_key = f"{provider_prefix}_max_query_variants" if provider_prefix else ""
-    prefix_pack_key = f"{provider_prefix}_weekly_pack_query_limit" if provider_prefix else ""
-    max_queries = providers.int_value(
+    return providers.int_value(
         policy.get(prefix_max_key)
         or policy.get("indexer_max_query_variants")
         or policy.get("max_query_variants"),
         max_queries_default,
+    )
+
+
+def _indexer_query_expansion_pool(
+    wanted_item,
+    *,
+    policy,
+    planned_max_queries,
+    include_series_fallback,
+    max_expansion=SEARCH_EXPANSION_MAX_QUERIES,
+):
+    """The untried tail of the same priority-ordered pool the planned batch was cut from."""
+    planned_queries = indexer_source_queries(
+        wanted_item,
+        max_queries=planned_max_queries,
+        policy=policy,
+        include_series_fallback=include_series_fallback,
+    )
+    full_pool = indexer_source_queries(
+        wanted_item,
+        max_queries=planned_max_queries + max_expansion,
+        policy=policy,
+        include_series_fallback=include_series_fallback,
+    )
+    already_planned = {str(query or "").strip().lower() for query in planned_queries}
+    return [
+        query for query in full_pool
+        if str(query or "").strip().lower() not in already_planned
+    ][:max_expansion]
+
+
+def prowlarr_search_expansion_requests(row, plan, wanted_item=None, limit=20):
+    policy = (row or {}).get("policy") if isinstance((row or {}).get("policy"), dict) else {}
+    max_queries = providers.int_value(
+        policy.get("prowlarr_max_query_variants") or policy.get("max_query_variants"),
+        3,
+    )
+    expansion_queries = _indexer_query_expansion_pool(
+        wanted_item,
+        policy=policy,
+        planned_max_queries=max_queries,
+        include_series_fallback=_comic_series_fallback_queries_enabled(row, wanted_item),
+    )
+    requests = []
+    for index, query in enumerate(expansion_queries):
+        request = prowlarr_search_request(
+            row,
+            plan,
+            wanted_item,
+            limit=limit,
+            query=query,
+            request_id=f"prowlarr_search_expansion_{index}",
+        )
+        if request:
+            request["query_group"] = "volume" if _is_volume_wanted_item(wanted_item) else "issue"
+            request["pack_query"] = False
+            request["query_expansion"] = True
+            requests.append(request)
+    return requests
+
+
+def _indexer_query_variants(row, wanted_item=None, *, provider_prefix="", max_queries_default=3):
+    policy = (row or {}).get("policy") if isinstance((row or {}).get("policy"), dict) else {}
+    provider_prefix = str(provider_prefix or "").strip().lower()
+    prefix_pack_key = f"{provider_prefix}_weekly_pack_query_limit" if provider_prefix else ""
+    max_queries = _indexer_max_query_variants(
+        row,
+        provider_prefix=provider_prefix,
+        max_queries_default=max_queries_default,
     )
     weekly_pack_limit = providers.int_value(
         policy.get(prefix_pack_key)
@@ -2753,6 +2834,57 @@ def newznab_search_requests(row, plan, wanted_item=None, limit=20):
             request["query_index"] = index
             requests.append(request)
     return requests
+
+
+def _indexer_family_expansion_requests(row, plan, wanted_item, limit, *, provider_prefix, request_builder, request_id_prefix):
+    policy = (row or {}).get("policy") if isinstance((row or {}).get("policy"), dict) else {}
+    max_queries = _indexer_max_query_variants(row, provider_prefix=provider_prefix)
+    expansion_queries = _indexer_query_expansion_pool(
+        wanted_item,
+        policy=policy,
+        planned_max_queries=max_queries,
+        include_series_fallback=_comic_series_fallback_queries_enabled(row, wanted_item),
+    )
+    requests = []
+    for index, query in enumerate(expansion_queries):
+        request = request_builder(
+            row,
+            plan,
+            wanted_item,
+            limit=limit,
+            query=query,
+            request_id=f"{request_id_prefix}_{index}",
+        )
+        if request:
+            request["query_group"] = "volume" if _is_volume_wanted_item(wanted_item) else "issue"
+            request["pack_query"] = False
+            request["query_expansion"] = True
+            requests.append(request)
+    return requests
+
+
+def torznab_search_expansion_requests(row, plan, wanted_item=None, limit=20):
+    return _indexer_family_expansion_requests(
+        row,
+        plan,
+        wanted_item,
+        limit,
+        provider_prefix="torznab",
+        request_builder=torznab_search_request,
+        request_id_prefix="torznab_search_expansion",
+    )
+
+
+def newznab_search_expansion_requests(row, plan, wanted_item=None, limit=20):
+    return _indexer_family_expansion_requests(
+        row,
+        plan,
+        wanted_item,
+        limit,
+        provider_prefix="newznab",
+        request_builder=newznab_search_request,
+        request_id_prefix="newznab_search_expansion",
+    )
 
 
 def indexer_pack_detail_request(
@@ -3564,14 +3696,18 @@ def adapter_fetch_plan(row, plan, wanted_item=None, limit=20):
     elif adapter_family == "prowlarr_indexer":
         requests = prowlarr_search_requests(row, plan, wanted_item, limit=limit)
         fallback_requests = prowlarr_categoryless_fallback_requests(row, plan, wanted_item, limit=limit)
+        expansion_requests = prowlarr_search_expansion_requests(row, plan, wanted_item, limit=limit) if requests else []
         if requests:
-            out["payload_mode"] = "prowlarr_multi_search" if len(requests) > 1 or fallback_requests else "single_payload"
+            out["payload_mode"] = "prowlarr_multi_search" if len(requests) > 1 or fallback_requests or expansion_requests else "single_payload"
             out["requests"].extend(requests)
             out["query_variants"] = [request.get("params", {}).get("query") for request in requests]
             if fallback_requests:
                 out["categoryless_fallback_requests"] = fallback_requests
                 out["categoryless_fallback_indexer_ids"] = _prowlarr_categoryless_fallback_indexer_ids(row)
                 out["estimated_request_count"] = len(requests) + len(fallback_requests)
+            if expansion_requests:
+                out["expansion_requests"] = expansion_requests
+                out["estimated_request_count"] = len(requests) + len(fallback_requests) + len(expansion_requests)
         else:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_prowlarr_base_url"
@@ -3586,19 +3722,25 @@ def adapter_fetch_plan(row, plan, wanted_item=None, limit=20):
             out["reason"] = "missing_indexer_discovery_base_url"
     elif adapter_family == "torznab_indexer":
         requests = torznab_search_requests(row, plan, wanted_item, limit=limit)
+        expansion_requests = torznab_search_expansion_requests(row, plan, wanted_item, limit=limit) if requests else []
         if requests:
-            out["payload_mode"] = "indexer_multi_search" if len(requests) > 1 else "single_payload"
+            out["payload_mode"] = "indexer_multi_search" if len(requests) > 1 or expansion_requests else "single_payload"
             out["requests"].extend(requests)
             out["query_variants"] = [request.get("params", {}).get("q") for request in requests]
+            if expansion_requests:
+                out["expansion_requests"] = expansion_requests
         else:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_torznab_base_url"
     elif adapter_family == "newznab_indexer":
         requests = newznab_search_requests(row, plan, wanted_item, limit=limit)
+        expansion_requests = newznab_search_expansion_requests(row, plan, wanted_item, limit=limit) if requests else []
         if requests:
-            out["payload_mode"] = "indexer_multi_search" if len(requests) > 1 else "single_payload"
+            out["payload_mode"] = "indexer_multi_search" if len(requests) > 1 or expansion_requests else "single_payload"
             out["requests"].extend(requests)
             out["query_variants"] = [request.get("params", {}).get("q") for request in requests]
+            if expansion_requests:
+                out["expansion_requests"] = expansion_requests
         else:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_newznab_base_url"
@@ -5143,6 +5285,58 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
                     item["_inkdrop_categoryless_fallback"] = True
                     item["_inkdrop_categoryless_fallback_primary_request_id"] = request.get("primary_request_id") or ""
                     combined_results.append(item)
+        query_expansion_count = 0
+        if (
+            not combined_results
+            and variant_counts
+            and fetch_plan.get("expansion_requests")
+        ):
+            # The planned batch (and, for Prowlarr, its categoryless fallback)
+            # executed cleanly -- every request that ran returned a response,
+            # combined across all of them is still zero -- so reach into the
+            # untried tail of the same query pool before finalizing the zero.
+            # Same clean-zero gate the categoryless-fallback step above
+            # already uses in this function, so behavior stays consistent
+            # within this file rather than introducing a stricter/different
+            # bar for what counts as "genuinely nothing found."
+            for request in fetch_plan.get("expansion_requests") or []:
+                request_index = len(variant_counts)
+                response, error = _safe_response_payload(http_get, request)
+                result["requests_made"].append(request)
+                query = _indexer_request_query(request)
+                if error:
+                    partial_errors.append(
+                        {
+                            "stage": "indexer_query_expansion",
+                            "request_id": request.get("request_id"),
+                            "purpose": request.get("purpose"),
+                            "url_hash": providers.url_hash(str(request.get("url") or "")),
+                            "query": query,
+                            "error": error,
+                        }
+                    )
+                    continue
+                response_key = f"query_{len(variant_counts)}"
+                result["response_headers"][response_key] = response["headers"]
+                rows = _indexer_payload_results_for_adapter(adapter_family, response.get("payload"), row)
+                variant_counts.append({"query": query, "results": len(rows), "query_expansion": True})
+                query_expansion_count += 1
+                for result_index, item in enumerate(rows):
+                    if not isinstance(item, dict):
+                        continue
+                    key = _indexer_result_identity(item)
+                    if key in seen_results:
+                        continue
+                    seen_results.add(key)
+                    item = dict(item)
+                    item["_inkdrop_query_variant"] = query
+                    item["_inkdrop_query_group"] = request.get("query_group") or ""
+                    item["_inkdrop_request_id"] = request.get("request_id") or ""
+                    item["_inkdrop_pack_query"] = False
+                    item["_inkdrop_query_index"] = request_index
+                    item["_inkdrop_query_result_index"] = result_index
+                    item["_inkdrop_query_expansion"] = True
+                    combined_results.append(item)
         if not variant_counts and partial_errors:
             result["reason"] = "http_request_failed"
             result["error"] = partial_errors[0].get("error")
@@ -5156,6 +5350,8 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
         if fetch_plan.get("categoryless_fallback_requests"):
             payload["categoryless_fallback_indexer_ids"] = list(fetch_plan.get("categoryless_fallback_indexer_ids") or [])
             payload["categoryless_fallback_request_count"] = len(fetch_plan.get("categoryless_fallback_requests") or [])
+        if fetch_plan.get("expansion_requests"):
+            payload["query_expansion_count"] = query_expansion_count
         if partial_errors:
             payload["partial_errors"] = partial_errors
         if fetch_plan.get("adapter_family") in INDEXER_RESULT_ADAPTER_FAMILIES:

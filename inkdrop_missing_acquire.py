@@ -2116,6 +2116,26 @@ def limited_queries(queries, args):
     return values
 
 
+# Extra query variants tried immediately after a planned per-issue batch runs
+# to completion with a genuine clean zero (every query executed, none
+# errored, nothing chosen) -- unlike SLSKD's probe_item(), this file's
+# query_variants_for_row()/limited_queries() truncation has no cross-run
+# rotation at all, so a title's pool tail is otherwise never reached by any
+# later scheduled pass, not just reached slowly. Kept small and bounded for
+# the same reason SLSKD's fix is: this closes a coverage gap, it does not
+# multiply request volume against Prowlarr's per-run search budget.
+SEARCH_EXPANSION_MAX_QUERIES = 2
+
+
+def expansion_queries_beyond(planned_queries, full_pool, *, max_expansion=SEARCH_EXPANSION_MAX_QUERIES):
+    """The untried tail of full_pool that planned_queries didn't already cover."""
+    already_planned = {normalize(query) for query in planned_queries}
+    return [
+        query for query in full_pool
+        if normalize(query) not in already_planned
+    ][:max_expansion]
+
+
 COLLECTED_EDITION_RE = re.compile(
     r"\b(?:book|books|tpb|trade\s+paperback|hardcover|hc|v|vol(?:ume)?)\.?\s*0*\d{1,3}\b",
     re.I,
@@ -2402,7 +2422,16 @@ def record_durable_bad_source_result(series, issue_number, result_or_title, reas
         return None
 
 
+TRANSIENT_SEND_FAILURE_REASONS = {
+    "download_client_unavailable",
+}
+
+
 def remember_bad_result(cache, series, issue_number, result_or_title, reason, *, record_durable=True):
+    if str(reason or "").strip().lower() in TRANSIENT_SEND_FAILURE_REASONS:
+        # The download client being briefly unreachable says nothing about
+        # whether this release is good, so it must not blacklist it.
+        return
     release = release_title(result_or_title)
     if not release:
         return
@@ -5447,7 +5476,41 @@ def filter_quality_allowed_results(
     return allowed, blocked_samples
 
 
+CONNECTIVITY_FAILURE_EXCEPTION_NAMES = {
+    "ConnectionError",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "Timeout",
+    "ConnectionRefusedError",
+    "RemoteDisconnected",
+    "NewConnectionError",
+    "MaxRetryError",
+}
+CONNECTIVITY_FAILURE_TEXT_MARKERS = (
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "failed to establish a new connection",
+    "max retries exceeded",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "read timed out",
+    "connect timeout",
+    "no route to host",
+)
+
+
+def is_connectivity_failure(exc):
+    for candidate in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if candidate is not None and type(candidate).__name__ in CONNECTIVITY_FAILURE_EXCEPTION_NAMES:
+            return True
+    text = redact_error(exc).lower()
+    return any(marker in text for marker in CONNECTIVITY_FAILURE_TEXT_MARKERS)
+
+
 def send_failure_reason(exc, default):
+    if is_connectivity_failure(exc):
+        return "download_client_unavailable"
     text = redact_error(exc).lower()
     if "duplicate nzb" in text:
         return "failed_download_duplicate_nzb"
@@ -5872,100 +5935,124 @@ def retry_failed_downloads(args):
                 )
             )
         if not pack_candidates:
-            for query in limited_queries(query_variants_for_row(row, is_manga=is_manga, unit_model=unit_model), args):
-                if search_budget_exhausted():
-                    budget_stopped = True
-                    note_budget_skip(row, tried_queries)
-                    break
-                tried_queries.append(query)
-                try:
-                    results = prowlarr_search_with_budget(
-                        acquire,
-                        query,
-                        "comics",
-                        args,
-                        search_deadline=search_deadline,
-                        limit=args.limit,
-                    )
-                except Exception as exc:
-                    attempt_status, attempt_reason = prowlarr_exception_attempt(exc)
-                    item = {
-                        "series": title,
-                        "issue": issue,
-                        "query": query,
-                        "failed_release": failure.get("title"),
-                        "error": redact_error(exc),
-                        **row_context,
-                    }
-                    item["retryable"] = attempt_status == "retry_scheduled"
-                    if item["retryable"]:
-                        summary["skipped"].append({"reason": attempt_reason, **item})
-                        audit(attempt_reason, item)
-                    else:
-                        summary["review"].append({"reason": "alternate_search_error", **item})
-                    record_inkdrop_queue_attempt(
-                        row,
-                        attempt_status,
-                        attempt_reason if item["retryable"] else "alternate_search_error",
-                        query=query,
-                        dry_run=args.dry_run,
-                        extra={"error": redact_error(exc), "failed_release": failure.get("title"), "retryable": item["retryable"]},
-                    )
-                    if not args.dry_run and not item["retryable"]:
-                        review("alternate_search_error", item)
-                        mark_alternate_attempt(title, issue, "alternate_search_error", redact_error(exc))
-                    if item["retryable"] and search_budget_exhausted():
+            def run_alternate_query_batch(queries_to_try):
+                # Wraps the per-query attempt in a callable, returning why it
+                # stopped, so the exact same logic can run a second time on
+                # the pool's untried tail (below) without duplicating it --
+                # mirrors probe_item()'s run_query() closure in
+                # inkdrop_slskd_source_probe.py.
+                nonlocal budget_stopped, chosen, chosen_query
+                executed_any = False
+                for query in queries_to_try:
+                    if search_budget_exhausted():
                         budget_stopped = True
                         note_budget_skip(row, tried_queries)
-                    chosen = None
-                    break
-                results, quality_blocked_samples = filter_quality_allowed_results(
-                    acquire,
-                    row,
-                    title,
-                    issue,
-                    results,
-                    query=query,
-                    is_manga=is_manga,
-                    unit_model=unit_model,
-                    quality_rules=quality_rules,
-                    dry_run=args.dry_run,
-                )
-                sample_results.extend(sample for sample in quality_blocked_samples if sample not in sample_results)
-                results, known_bad_samples = filter_known_bad_results(
-                    cache,
-                    row,
-                    title,
-                    issue,
-                    results,
-                    query=query,
-                    dry_run=args.dry_run,
-                )
-                sample_results.extend(sample for sample in known_bad_samples if sample not in sample_results)
-                if results:
-                    for result in results[:5]:
-                        sample_results.append(sample_result(
-                            title, issue, result, is_manga=is_manga, unit_model=unit_model,
-                            quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
-                        ))
-                        add_pack_candidate(
-                            pack_candidates,
+                        return "budget_stopped"
+                    tried_queries.append(query)
+                    executed_any = True
+                    try:
+                        results = prowlarr_search_with_budget(
                             acquire,
-                            row,
                             query,
-                            result,
-                            "retry_failed_pack",
-                            is_manga=is_manga,
-                            unit_model=unit_model,
-                            quality_rules=quality_rules,
+                            "comics",
+                            args,
+                            search_deadline=search_deadline,
+                            limit=args.limit,
                         )
-                chosen = choose_acceptable(
-                    title, issue, results, is_manga=is_manga, unit_model=unit_model,
-                    quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
-                )
-                if chosen:
-                    chosen_query = query
-                    break
+                    except Exception as exc:
+                        attempt_status, attempt_reason = prowlarr_exception_attempt(exc)
+                        item = {
+                            "series": title,
+                            "issue": issue,
+                            "query": query,
+                            "failed_release": failure.get("title"),
+                            "error": redact_error(exc),
+                            **row_context,
+                        }
+                        item["retryable"] = attempt_status == "retry_scheduled"
+                        if item["retryable"]:
+                            summary["skipped"].append({"reason": attempt_reason, **item})
+                            audit(attempt_reason, item)
+                        else:
+                            summary["review"].append({"reason": "alternate_search_error", **item})
+                        record_inkdrop_queue_attempt(
+                            row,
+                            attempt_status,
+                            attempt_reason if item["retryable"] else "alternate_search_error",
+                            query=query,
+                            dry_run=args.dry_run,
+                            extra={"error": redact_error(exc), "failed_release": failure.get("title"), "retryable": item["retryable"]},
+                        )
+                        if not args.dry_run and not item["retryable"]:
+                            review("alternate_search_error", item)
+                            mark_alternate_attempt(title, issue, "alternate_search_error", redact_error(exc))
+                        if item["retryable"] and search_budget_exhausted():
+                            budget_stopped = True
+                            note_budget_skip(row, tried_queries)
+                        chosen = None
+                        return "error_stop"
+                    results, quality_blocked_samples = filter_quality_allowed_results(
+                        acquire,
+                        row,
+                        title,
+                        issue,
+                        results,
+                        query=query,
+                        is_manga=is_manga,
+                        unit_model=unit_model,
+                        quality_rules=quality_rules,
+                        dry_run=args.dry_run,
+                    )
+                    sample_results.extend(sample for sample in quality_blocked_samples if sample not in sample_results)
+                    results, known_bad_samples = filter_known_bad_results(
+                        cache,
+                        row,
+                        title,
+                        issue,
+                        results,
+                        query=query,
+                        dry_run=args.dry_run,
+                    )
+                    sample_results.extend(sample for sample in known_bad_samples if sample not in sample_results)
+                    if results:
+                        for result in results[:5]:
+                            sample_results.append(sample_result(
+                                title, issue, result, is_manga=is_manga, unit_model=unit_model,
+                                quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
+                            ))
+                            add_pack_candidate(
+                                pack_candidates,
+                                acquire,
+                                row,
+                                query,
+                                result,
+                                "retry_failed_pack",
+                                is_manga=is_manga,
+                                unit_model=unit_model,
+                                quality_rules=quality_rules,
+                            )
+                    batch_chosen = choose_acceptable(
+                        title, issue, results, is_manga=is_manga, unit_model=unit_model,
+                        quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
+                    )
+                    if batch_chosen:
+                        chosen = batch_chosen
+                        chosen_query = query
+                        return "chosen"
+                return "clean_zero" if executed_any else "no_queries_executed"
+
+            planned_queries = limited_queries(query_variants_for_row(row, is_manga=is_manga, unit_model=unit_model), args)
+            batch_outcome = run_alternate_query_batch(planned_queries)
+            if batch_outcome == "clean_zero":
+                # The planned batch ran to completion and genuinely found
+                # nothing -- not a budget stop, not a provider error. Reach
+                # into the same pool's untried tail before giving up this
+                # pass, same gate SLSKD's probe_item()/manual_search_discovery()
+                # already use for "genuine zero."
+                full_pool = query_variants_for_row(row, is_manga=is_manga, unit_model=unit_model)
+                expansion_queries = expansion_queries_beyond(planned_queries, full_pool)
+                if expansion_queries:
+                    run_alternate_query_batch(expansion_queries)
         if budget_stopped and not pack_candidates:
             summary["skipped"].append({
                 "reason": "search_budget_exhausted",
@@ -6500,184 +6587,219 @@ def main():
                 )
             )
         if not pack_candidates:
-            for query in limited_queries(query_variants_for_row(row, is_manga=is_manga, unit_model=unit_model), args):
-                if search_budget_exhausted():
-                    budget_stopped = True
-                    note_budget_skip(row, tried_queries)
-                    break
-                if normalize(query) in pending:
-                    continue
-                tried_queries.append(query)
-                cache_key = f"{title}|{row['issue_number']}|{query}"
-                if no_result.get(cache_key, 0) >= cutoff:
-                    continue
-                try:
-                    results = prowlarr_search_with_budget(
-                        acquire,
-                        query,
-                        "comics",
-                        args,
-                        search_deadline=search_deadline,
-                        limit=args.limit,
-                    )
-                except Exception as exc:
-                    attempt_status, attempt_reason = prowlarr_exception_attempt(exc)
-                    item = {
-                        "series": title,
-                        "issue": row["issue_number"],
-                        "query": query,
-                        "tried_queries": tried_queries,
-                        "source_strategy": "manga" if is_manga else "comic",
-                        "error": redact_error(exc),
-                        **row_context,
-                    }
-                    item["retryable"] = attempt_status == "retry_scheduled"
-                    if item["retryable"]:
-                        summary["skipped"].append({"reason": attempt_reason, **item})
-                        audit(attempt_reason, item)
-                    else:
-                        summary["review"].append({"reason": "prowlarr_search_error", **item})
-                        audit("prowlarr_search_error", item)
-                    record_inkdrop_queue_attempt(
-                        row,
-                        attempt_status,
-                        attempt_reason,
-                        query=query,
-                        dry_run=args.dry_run,
-                        extra={"error": redact_error(exc), "tried_queries": tried_queries, "retryable": item["retryable"]},
-                    )
-                    if not args.dry_run and not item["retryable"]:
-                        review("prowlarr_search_error", item)
-                    if item["retryable"] and search_budget_exhausted():
+            def run_issue_query_batch(queries_to_try):
+                # Wraps the per-query attempt in a callable, returning why it
+                # stopped, so the exact same logic can run a second time on
+                # the pool's untried tail (below) without duplicating it --
+                # mirrors probe_item()'s run_query() closure in
+                # inkdrop_slskd_source_probe.py. A candidate that was found
+                # but skipped only because its title is already pending
+                # elsewhere is real evidence, not a clean zero -- it must
+                # still block expansion, matching manual_search_discovery()'s
+                # "any raw candidate evidence, even one later blocked, is not
+                # a zero to expand from" gate -- so it does NOT return early;
+                # the original loop's behavior of trying the remaining
+                # planned queries in that case is preserved exactly.
+                nonlocal budget_stopped, sent_issue, found_any_results
+                executed_any = False
+                found_any_candidate = False
+                for query in queries_to_try:
+                    if search_budget_exhausted():
                         budget_stopped = True
                         note_budget_skip(row, tried_queries)
-                    break
-                results, quality_blocked_samples = filter_quality_allowed_results(
-                    acquire,
-                    row,
-                    title,
-                    row["issue_number"],
-                    results,
-                    query=query,
-                    is_manga=is_manga,
-                    unit_model=unit_model,
-                    quality_rules=quality_rules,
-                    dry_run=args.dry_run,
-                )
-                sample_results.extend(sample for sample in quality_blocked_samples if sample not in sample_results)
-                results, known_bad_samples = filter_known_bad_results(
-                    cache,
-                    row,
-                    title,
-                    row["issue_number"],
-                    results,
-                    query=query,
-                    dry_run=args.dry_run,
-                )
-                sample_results.extend(sample for sample in known_bad_samples if sample not in sample_results)
-                chosen = choose_acceptable(
-                    title, row["issue_number"], results, is_manga=is_manga, unit_model=unit_model,
-                    quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
-                )
-                audit("search", {"series": title, "issue": row["issue_number"], "query": query, "results": len(results), "matched": bool(chosen)})
-                if not chosen:
-                    no_result[cache_key] = time.time()
-                    if results:
-                        found_any_results = True
-                        for result in results[:5]:
-                            sample = sample_result(
-                                title, row["issue_number"], result, is_manga=is_manga, unit_model=unit_model,
-                                quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
-                            )
-                            if sample not in sample_results:
-                                sample_results.append(sample)
-                            add_pack_candidate(
-                                pack_candidates,
-                                acquire,
-                                row,
-                                query,
-                                result,
-                                "missing_acquire_pack",
-                                is_manga=is_manga,
-                                unit_model=unit_model,
-                                quality_rules=quality_rules,
-                            )
-                    continue
-                if normalize(chosen.get("title")) in pending:
-                    continue
-                try:
-                    ensure_send_allowed(cache, title, row["issue_number"], chosen)
-                    outcome = send(acquire, chosen, query, args.dry_run)
-                except Exception as exc:
-                    failure_reason = send_failure_reason(exc, "download_client_send_failed")
-                    remember_bad_result(cache, title, row["issue_number"], chosen, failure_reason)
-                    record_source_failure(
+                        return "budget_stopped"
+                    if normalize(query) in pending:
+                        continue
+                    tried_queries.append(query)
+                    cache_key = f"{title}|{row['issue_number']}|{query}"
+                    if no_result.get(cache_key, 0) >= cutoff:
+                        continue
+                    executed_any = True
+                    try:
+                        results = prowlarr_search_with_budget(
+                            acquire,
+                            query,
+                            "comics",
+                            args,
+                            search_deadline=search_deadline,
+                            limit=args.limit,
+                        )
+                    except Exception as exc:
+                        attempt_status, attempt_reason = prowlarr_exception_attempt(exc)
+                        item = {
+                            "series": title,
+                            "issue": row["issue_number"],
+                            "query": query,
+                            "tried_queries": tried_queries,
+                            "source_strategy": "manga" if is_manga else "comic",
+                            "error": redact_error(exc),
+                            **row_context,
+                        }
+                        item["retryable"] = attempt_status == "retry_scheduled"
+                        if item["retryable"]:
+                            summary["skipped"].append({"reason": attempt_reason, **item})
+                            audit(attempt_reason, item)
+                        else:
+                            summary["review"].append({"reason": "prowlarr_search_error", **item})
+                            audit("prowlarr_search_error", item)
+                        record_inkdrop_queue_attempt(
+                            row,
+                            attempt_status,
+                            attempt_reason,
+                            query=query,
+                            dry_run=args.dry_run,
+                            extra={"error": redact_error(exc), "tried_queries": tried_queries, "retryable": item["retryable"]},
+                        )
+                        if not args.dry_run and not item["retryable"]:
+                            review("prowlarr_search_error", item)
+                        if item["retryable"] and search_budget_exhausted():
+                            budget_stopped = True
+                            note_budget_skip(row, tried_queries)
+                        return "error_stop"
+                    results, quality_blocked_samples = filter_quality_allowed_results(
+                        acquire,
+                        row,
                         title,
                         row["issue_number"],
-                        release_title(chosen),
-                        failure_reason,
-                        source=result_source(chosen),
-                        protocol=result_protocol(chosen),
-                        download_url_hash=result_download_url_hash(chosen),
+                        results,
                         query=query,
+                        is_manga=is_manga,
+                        unit_model=unit_model,
+                        quality_rules=quality_rules,
+                        dry_run=args.dry_run,
                     )
-                    item = {
+                    sample_results.extend(sample for sample in quality_blocked_samples if sample not in sample_results)
+                    results, known_bad_samples = filter_known_bad_results(
+                        cache,
+                        row,
+                        title,
+                        row["issue_number"],
+                        results,
+                        query=query,
+                        dry_run=args.dry_run,
+                    )
+                    sample_results.extend(sample for sample in known_bad_samples if sample not in sample_results)
+                    batch_chosen = choose_acceptable(
+                        title, row["issue_number"], results, is_manga=is_manga, unit_model=unit_model,
+                        quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
+                    )
+                    audit("search", {"series": title, "issue": row["issue_number"], "query": query, "results": len(results), "matched": bool(batch_chosen)})
+                    if not batch_chosen:
+                        no_result[cache_key] = time.time()
+                        if results:
+                            found_any_results = True
+                            for result in results[:5]:
+                                sample = sample_result(
+                                    title, row["issue_number"], result, is_manga=is_manga, unit_model=unit_model,
+                                    quality_rules=quality_rules, wanted_unit_type=row.get("unit_type"),
+                                )
+                                if sample not in sample_results:
+                                    sample_results.append(sample)
+                                add_pack_candidate(
+                                    pack_candidates,
+                                    acquire,
+                                    row,
+                                    query,
+                                    result,
+                                    "missing_acquire_pack",
+                                    is_manga=is_manga,
+                                    unit_model=unit_model,
+                                    quality_rules=quality_rules,
+                                )
+                        continue
+                    found_any_candidate = True
+                    if normalize(batch_chosen.get("title")) in pending:
+                        continue
+                    try:
+                        ensure_send_allowed(cache, title, row["issue_number"], batch_chosen)
+                        outcome = send(acquire, batch_chosen, query, args.dry_run)
+                    except Exception as exc:
+                        failure_reason = send_failure_reason(exc, "download_client_send_failed")
+                        remember_bad_result(cache, title, row["issue_number"], batch_chosen, failure_reason)
+                        record_source_failure(
+                            title,
+                            row["issue_number"],
+                            release_title(batch_chosen),
+                            failure_reason,
+                            source=result_source(batch_chosen),
+                            protocol=result_protocol(batch_chosen),
+                            download_url_hash=result_download_url_hash(batch_chosen),
+                            query=query,
+                        )
+                        item = {
+                            "series": title,
+                            "issue": row["issue_number"],
+                            "query": query,
+                            "tried_queries": tried_queries,
+                            "source_strategy": "manga" if is_manga else "comic",
+                            "manga_unit_model": unit_model,
+                            "candidate": candidate_payload(batch_chosen),
+                            "error": redact_error(exc),
+                            "failure_reason": failure_reason,
+                            "note": "Downloader rejected or failed to accept the selected result; no pending import was recorded.",
+                            **row_context,
+                        }
+                        review_reason = failure_reason if failure_reason == "failed_download_duplicate_nzb" else "download_client_send_failed"
+                        summary["review"].append({"reason": review_reason, **item})
+                        audit(review_reason, item)
+                        record_inkdrop_queue_attempt(
+                            row,
+                            "error",
+                            failure_reason,
+                            query=query,
+                            candidate=batch_chosen,
+                            dry_run=args.dry_run,
+                            extra={"error": redact_error(exc), "review_reason": review_reason},
+                        )
+                        if not args.dry_run:
+                            review(review_reason, item)
+                        sent_issue = True
+                        return "send_failed"
+                    action = {
                         "series": title,
                         "issue": row["issue_number"],
                         "query": query,
-                        "tried_queries": tried_queries,
-                        "source_strategy": "manga" if is_manga else "comic",
+                        "title": batch_chosen.get("title"),
+                        "indexer": batch_chosen.get("indexer"),
+                        "protocol": batch_chosen.get("protocol"),
+                        "seeders": batch_chosen.get("seeders"),
                         "manga_unit_model": unit_model,
-                        "candidate": candidate_payload(chosen),
-                        "error": redact_error(exc),
-                        "failure_reason": failure_reason,
-                        "note": "Downloader rejected or failed to accept the selected result; no pending import was recorded.",
+                        "source_unit": batch_chosen.get("source_unit"),
+                        "volume_supersession": mixed_chapter_supersession_follow_up(unit_model, batch_chosen.get("source_unit")),
+                        "outcome": outcome,
                         **row_context,
                     }
-                    review_reason = failure_reason if failure_reason == "failed_download_duplicate_nzb" else "download_client_send_failed"
-                    summary["review"].append({"reason": review_reason, **item})
-                    audit(review_reason, item)
+                    summary["actions"].append(action)
+                    sent_by_series[title] = sent_by_series.get(title, 0) + 1
+                    audit("selected", action)
                     record_inkdrop_queue_attempt(
                         row,
-                        "error",
-                        failure_reason,
+                        "sent" if not args.dry_run else "dry_run",
+                        "sent to downloader",
                         query=query,
-                        candidate=chosen,
+                        candidate=batch_chosen,
+                        outcome=outcome,
                         dry_run=args.dry_run,
-                        extra={"error": redact_error(exc), "review_reason": review_reason},
                     )
-                    if not args.dry_run:
-                        review(review_reason, item)
                     sent_issue = True
-                    break
-                action = {
-                    "series": title,
-                    "issue": row["issue_number"],
-                    "query": query,
-                    "title": chosen.get("title"),
-                    "indexer": chosen.get("indexer"),
-                    "protocol": chosen.get("protocol"),
-                    "seeders": chosen.get("seeders"),
-                    "manga_unit_model": unit_model,
-                    "source_unit": chosen.get("source_unit"),
-                    "volume_supersession": mixed_chapter_supersession_follow_up(unit_model, chosen.get("source_unit")),
-                    "outcome": outcome,
-                    **row_context,
-                }
-                summary["actions"].append(action)
-                sent_by_series[title] = sent_by_series.get(title, 0) + 1
-                audit("selected", action)
-                record_inkdrop_queue_attempt(
-                    row,
-                    "sent" if not args.dry_run else "dry_run",
-                    "sent to downloader",
-                    query=query,
-                    candidate=chosen,
-                    outcome=outcome,
-                    dry_run=args.dry_run,
-                )
-                sent_issue = True
-                break
+                    return "sent"
+                return "clean_zero" if (executed_any and not found_any_candidate) else "not_clean"
+
+            planned_queries = limited_queries(query_variants_for_row(row, is_manga=is_manga, unit_model=unit_model), args)
+            batch_outcome = run_issue_query_batch(planned_queries)
+            if batch_outcome == "clean_zero":
+                # The whole planned batch executed cleanly and genuinely
+                # found nothing -- no budget stop, no provider error, no
+                # candidate evidence at all (blocked-by-pending counts as
+                # evidence, see above). Reach into the pool's untried tail
+                # before this pass gives up, instead of waiting on a future
+                # scheduled pass that would just re-plan the identical
+                # capped batch -- this file has no cross-run rotation at all
+                # for the per-issue pool, unlike SLSKD's query_offset.
+                full_pool = query_variants_for_row(row, is_manga=is_manga, unit_model=unit_model)
+                expansion_queries = expansion_queries_beyond(planned_queries, full_pool)
+                if expansion_queries:
+                    run_issue_query_batch(expansion_queries)
         if budget_stopped and not pack_candidates:
             summary["skipped"].append({
                 "reason": "search_budget_exhausted",

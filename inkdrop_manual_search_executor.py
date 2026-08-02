@@ -494,6 +494,7 @@ def _run_slskd(context: dict[str, Any], queries: list[dict[str, Any]], profile: 
         "returned_result_count": int(evidence.get("response_count") or 0),
         "partial_error_count": int(evidence.get("partial_error_count") or 0),
         "candidate_count": len(candidates),
+        "zero_result_expansion_query_count": int(evidence.get("zero_result_expansion_query_count") or 0),
         "query_attempt_summary": ",".join(
             f"{int(row.get('query_ordinal') or 0)}:{str(row.get('query_fingerprint') or '')[:16]}:{_provider_key(row.get('status'))}"
             for row in (evidence.get("attempts") or [])[:6]

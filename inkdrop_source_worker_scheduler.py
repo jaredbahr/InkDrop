@@ -284,7 +284,16 @@ def _queue_rows(
         params.extend(retryable_clients)
         params.append(now - RETRYABLE_FAILED_HANDOFF_RECOVERY_SECONDS)
     ordered_cte = f"""
-        with ranked_queue as (
+        with series_initial_search_priority as (
+        select series_id, max(created_at) as series_initial_search_priority_at
+        from history_events
+        where lower(event_type)='series_added'
+        group by series_id
+        ), series_latest_source_attempt as (
+        select series_id, max(coalesce(completed_at, started_at, 0)) as series_latest_source_attempt_at
+        from source_attempts
+        group by series_id
+        ), ranked_queue as (
         select q.id, q.wanted_id, q.series_id, q.issue_id, q.state,
                q.current_source, q.query, q.last_event, q.active,
                q.created_at, q.updated_at, q.retry_after, q.retry_after_iso,
@@ -298,17 +307,8 @@ def _queue_rows(
                i.metadata_id as issue_metadata_id,
                i.kapowarr_issue_id,
                w.status as wanted_status, w.priority as wanted_priority,
-               (
-                   select max(he.created_at)
-                   from history_events he
-                   where he.series_id=q.series_id
-                     and lower(coalesce(he.event_type,''))='series_added'
-               ) as series_initial_search_priority_at,
-               (
-                   select max(coalesce(sa.completed_at, sa.started_at, 0))
-                   from source_attempts sa
-                   where sa.series_id=q.series_id
-               ) as series_latest_source_attempt_at
+               sisp.series_initial_search_priority_at,
+               slsa.series_latest_source_attempt_at
                , row_number() over (
                    partition by coalesce(nullif(trim(q.series_id), ''), q.id)
                    order by
@@ -320,6 +320,8 @@ def _queue_rows(
         left join series s on s.id=q.series_id
         left join issues i on i.id=q.issue_id
         left join wanted_items w on w.id=q.wanted_id
+        left join series_initial_search_priority sisp on sisp.series_id=q.series_id
+        left join series_latest_source_attempt slsa on slsa.series_id=q.series_id
         where {" and ".join(clauses)}
         ), ordered_queue as (
         select *, row_number() over (

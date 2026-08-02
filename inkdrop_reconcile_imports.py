@@ -4465,11 +4465,13 @@ def import_ready_rejection_task_status(state, reason):
     return "failed_download"
 
 
-def import_ready_rejection_message(row, chosen):
+def import_ready_rejection_message(row, chosen, retry_eligible=True):
     client = inkdrop_reconciliation_client((row or {}).get("download_client"))
     label = "SABnzbd" if client == "sab" else "qBittorrent" if client == "qbit" else client or "Download client"
     reason = str((chosen or {}).get("reason") or (chosen or {}).get("state") or "not_importable").strip()
-    return f"{label} completed file was not importable ({reason}); automatic retry scheduled"
+    if retry_eligible:
+        return f"{label} completed file was not importable ({reason}); automatic retry scheduled"
+    return f"{label} completed file was not importable ({reason}); this candidate cannot become importable by re-checking the same file, no retry scheduled"
 
 
 def record_inkdrop_import_ready_rejection(row, chosen):
@@ -4489,7 +4491,19 @@ def record_inkdrop_import_ready_rejection(row, chosen):
     failure_reason = str(chosen.get("reason") or state or "import_ready_rejected").strip()
     local_path = str(chosen.get("local_path") or row.get("local_path") or "").strip()
     task_title = str(row.get("task_title") or row.get("query") or row.get("series_title") or "").strip()
-    message = import_ready_rejection_message(row, chosen)
+    # wrong_series_or_subseries means the *identity* of the already-downloaded
+    # file is wrong -- a sibling-series/subseries title mismatch that
+    # rechecking the same local path can never change. Every other rejection
+    # state here (bad_archive, false_positive, stale_no_local_file, ...) can
+    # plausibly resolve on a later look (a mid-repair archive settling, a
+    # metadata refresh). Marking this one retry_eligible sent it right back
+    # into recover_retryable_failed_staged_import_ready_records(), which just
+    # re-runs the same identity check against the same file forever -- live
+    # production data: one League of Extraordinary Gentlemen issue re-checked
+    # 164 times, another 247 times, over several days, never once eligible.
+    retry_eligible = task_status != "wrong_series_or_subseries"
+    task_display_phase_on_reject = "retry_later" if retry_eligible else "problem"
+    message = import_ready_rejection_message(row, chosen, retry_eligible=retry_eligible)
 
     def mark_task_failed():
         with inkdrop_state.connect(
@@ -4541,7 +4555,7 @@ def record_inkdrop_import_ready_rejection(row, chosen):
                            state='failed',
                            lifecycle_phase='failed_candidate',
                            failure_reason=?,
-                           retry_eligible=1,
+                           retry_eligible=?,
                            updated_at=?,
                            completed_at=coalesce(completed_at, ?),
                            outcome=?,
@@ -4552,6 +4566,7 @@ def record_inkdrop_import_ready_rejection(row, chosen):
                     (
                         task_status,
                         failure_reason,
+                        1 if retry_eligible else 0,
                         ts,
                         ts,
                         outcome,
@@ -4583,11 +4598,19 @@ def record_inkdrop_import_ready_rejection(row, chosen):
                         """
                         update source_attempts
                            set status=?, lifecycle_phase='failed_candidate', outcome='failed',
-                               display_phase='retry_later', failure_reason=?, retry_eligible=1,
+                               display_phase=?, failure_reason=?, retry_eligible=?,
                                completed_at=coalesce(completed_at, ?), raw_json=?
                          where id=?
                         """,
-                        (task_status, failure_reason, ts, json.dumps(attempt_raw, sort_keys=True), task["source_attempt_id"]),
+                        (
+                            task_status,
+                            task_display_phase_on_reject,
+                            failure_reason,
+                            1 if retry_eligible else 0,
+                            ts,
+                            json.dumps(attempt_raw, sort_keys=True),
+                            task["source_attempt_id"],
+                        ),
                     )
                 updated += 1
             con.commit()
@@ -4606,10 +4629,10 @@ def record_inkdrop_import_ready_rejection(row, chosen):
         "provider": client or "download_client",
         "protocol": row.get("protocol"),
         "download_client": client or "download_client",
-        "status": "retry_scheduled",
+        "status": "retry_scheduled" if retry_eligible else "failed",
         "reason": message,
         "failure_reason": failure_reason,
-        "retry_eligible": True,
+        "retry_eligible": retry_eligible,
         "title": task_title,
         "source_path": local_path,
         "matched_local_path": local_path,

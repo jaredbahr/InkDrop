@@ -200,6 +200,8 @@ def normalize_transfer_status(task, raw=None, now=None):
         transfer_state, import_stage = "paused", None
     elif client in {"utorrent", "rtorrent"} and status == "active":
         transfer_state, import_stage = "downloading", None
+    elif client in {"qbittorrent", "sabnzbd"} and status == "paused":
+        transfer_state, import_stage = "paused", None
     elif "queue" in status or "wait" in status:
         transfer_state, import_stage = "queued", None
     elif active:
