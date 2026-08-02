@@ -40,6 +40,7 @@ BOOLEAN_KEYS = {
     "quality.allow_non_english",
     "quality.allow_packs",
     "quality.allow_pdfs",
+    "quality.allow_raw_image_page_folders",
     "setup.external_adapters_optional",
     "setup.local_folder_only_mode",
     "setup.public_network_warning_acknowledged",

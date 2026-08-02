@@ -14,16 +14,23 @@ def require(condition, message):
 
 
 # Broad directory discovery is the anchor so one response can cover sibling
-# issues. Provider-native comics/manga vocabulary is second; exact unit
-# variants remain available when the broad searches do not settle the row.
+# issues; the numbered issue query is second. Provider-native comics/manga
+# vocabulary is no longer front-loaded here (PASS: manga query priority,
+# 2026-08-02) -- live slskd data showed a "<title> manga"/"<title> comics"
+# qualified query consistently underperforms the plain title badly (e.g.
+# Deadman Wonderland: 1582 files/113 peers plain vs. 197 files/13 peers
+# qualified, with the qualified query's one uniquely-found peer a duplicate
+# of a match the plain query already had), so it no longer spends one of
+# the first two guaranteed query slots; exact unit variants still remain
+# available when the broad searches do not settle the row.
 descender = {"series": "Descender", "issue": "15", "year": "2016"}
 queries = probe.source_queries(descender)
-require(queries[:4] == ["Descender", "Descender comics", "Descender 15", "Descender manga"], queries[:8])
+require(queries[:4] == ["Descender", "Descender 15", "Descender cbz", "Descender cbr"], queries[:8])
 initial = probe.rotated_query_batch(queries, max_queries=2, offset=0)
-require(initial == ["Descender", "Descender comics"], initial)
+require(initial == queries[:2], initial)
 
 fairy_tail = {"series": "Fairy Tail", "issue": "25", "media_type": "manga"}
-require(probe.source_queries(fairy_tail)[:2] == ["Fairy Tail", "Fairy Tail manga"], probe.source_queries(fairy_tail)[:6])
+require(probe.source_queries(fairy_tail)[:2] == ["Fairy Tail", "Fairy Tail 25"], probe.source_queries(fairy_tail)[:6])
 
 clean_attempts = [
     {"query": queries[0], "response_count": 0, "candidate_count": 0},
@@ -38,7 +45,7 @@ cache_entry = {
 }
 require(probe.retry_rotates_without_anchor(queries, cache_entry), "same-plan no-result retry did not rotate")
 retry = probe.rotated_query_batch(queries, max_queries=2, offset=0, include_anchor=False)
-require(retry == ["Descender comics", "Descender 15"], retry)
+require(retry == queries[1:3], retry)
 require(len(retry) == 2 and queries[0] not in retry, "retry repaid the failed anchor or changed its cap")
 
 # If the bounded deadline permits only one retry query, that attempted variant
@@ -52,7 +59,7 @@ next_offset = probe.next_query_offset(
 )
 require(next_offset == 1, next_offset)
 next_retry = probe.rotated_query_batch(queries, max_queries=2, offset=next_offset, include_anchor=False)
-require(next_retry == ["Descender 15", "Descender manga"], next_retry)
+require(next_retry == queries[2:4], next_retry)
 
 with (
     mock.patch.object(probe, "seconds_remaining", side_effect=[100, 0]),
@@ -67,7 +74,7 @@ with (
         deadline=123,
     )
 require(deadline_entry["query_anchor_included"] is False, deadline_entry)
-require(deadline_entry["queries"][0]["query"] == "Descender comics", deadline_entry["queries"])
+require(deadline_entry["queries"][0]["query"] == queries[1], deadline_entry["queries"])
 require(deadline_entry["queries"][1].get("skipped") == "probe_budget_exhausted", deadline_entry["queries"])
 require(deadline_entry["next_query_offset"] == 1, deadline_entry)
 # A budget skip records a query that was never sent.  It cannot contradict the
@@ -258,8 +265,7 @@ require(clean_entry["status"] == "searched_no_candidates", clean_entry)
 # (2) more instead of waiting for a future scheduled pass to rotate to them.
 require(clean_entry["query_expansion_count"] == 2, clean_entry)
 require(
-    [attempt["query"] for attempt in clean_entry["queries"]]
-    == ["Descender", "Descender comics", "Descender 15", "Descender manga"],
+    [attempt["query"] for attempt in clean_entry["queries"]] == queries[:4],
     clean_entry["queries"],
 )
 require(clean_entry["query_rotation_evidence"]["all_attempts_completed_clean_zero"] is True, clean_entry)

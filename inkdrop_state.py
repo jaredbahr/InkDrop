@@ -50130,6 +50130,246 @@ def source_attempt_filter_options(db_path):
     return options
 
 
+# The subset of FOCUS_ENTITY_KEYS (see row_matches_focus()) that map to real
+# source_attempts columns. import_id/review_id aren't columns on this table
+# (import_id only exists via a join to import_results, and review_id isn't
+# a source_attempts concept at all), so they're intentionally left out here.
+SOURCE_ATTEMPT_FOCUS_COLUMNS = {
+    "series_id": "series_id",
+    "issue_id": "issue_id",
+    "wanted_id": "wanted_id",
+    "queue_id": "queue_id",
+    "source_attempt_id": "id",
+}
+
+
+def source_attempt_focus_where(focus):
+    """OR-matched WHERE fragment for whichever focus keys are present,
+    mirroring row_matches_focus()'s "any focus key matches" semantics --
+    the same rule the row table already uses to scope to one series."""
+    focus = focus if isinstance(focus, dict) else {}
+    clauses, params = [], []
+    for key, column in SOURCE_ATTEMPT_FOCUS_COLUMNS.items():
+        value = focus.get(key)
+        if value in (None, "", [], {}):
+            continue
+        clauses.append(f"{column} = ?")
+        params.append(str(value))
+    if not clauses:
+        return "", []
+    return " and (" + " or ".join(clauses) + ")", params
+
+
+def source_attempt_filter_options_for_focus(db_path, focus=None):
+    """Series/issue/wanted/queue-scoped counts for the Attempts summary chips.
+
+    source_attempt_filter_options() always rolls up the whole database --
+    there is no way to scope it to one series. The Attempts screen is
+    reachable scoped to a single series (its row table already narrows
+    correctly via focus_rows()), but the summary counts above that table
+    came from the unscoped function regardless, so a user drilling into one
+    series' evidence saw whole-database noise mislabeled as being about that
+    series. With no focus this returns exactly source_attempt_filter_options()'s
+    own result (same function, same cache), so every existing caller that
+    doesn't pass a focus is completely unaffected.
+    """
+    focus_where, focus_params = source_attempt_focus_where(focus)
+    if not focus_where:
+        return source_attempt_filter_options(db_path)
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return []
+
+    identity_specs = []
+    for value, (_label, sources) in SOURCE_ATTEMPT_FILTERS.items():
+        identity_specs.append((f"{value}_count", sources))
+    for value, aliases in SOURCE_ATTEMPT_ALIASES.items():
+        if value in {"sabnzbd", "qbittorrent"}:
+            identity_specs.append((f"{value}_count", aliases))
+    identity_values = {
+        alias: {
+            str(value or "").strip().lower()
+            for value in values or []
+            if str(value or "").strip()
+        }
+        for alias, values in identity_specs
+    }
+    identity_counts = {alias: 0 for alias, _values in identity_specs}
+    counts = {}
+    aggregate_counts = {
+        "all_count": 0,
+        "transferring_count": 0,
+        "importing_count": 0,
+        "productive_count": 0,
+        "no_candidate_count": 0,
+        "problem_count": 0,
+    }
+    transferring_statuses = {
+        "sent",
+        "download_started",
+        "downloading",
+        "started_waiting",
+        "already_downloading",
+        "waiting_for_transfer",
+        "transfer_in_progress",
+        "transfer_settling",
+        "waiting_for_staged_file",
+        "staged_file_settling",
+    }
+    importing_statuses = {
+        "import_busy",
+        "verification_pending",
+        "imported_not_resolved",
+        "preview_importable",
+        "ready_import",
+        "staged_file_ready",
+    }
+
+    def rollup_key(value):
+        text = str(value or "").strip().lower()
+        return "" if text in {"", "unknown"} else text
+
+    with connect_read(db_path) as con:
+        rows = con.execute(
+            f"""
+            select lower(coalesce(nullif(provider_id,''),'unknown')) as provider_id,
+                   lower(coalesce(nullif(source_type,''),'source')) as source_type,
+                   lower(coalesce(nullif(lifecycle_phase,''),'observed')) as lifecycle_phase,
+                   lower(coalesce(nullif(source,''),'unknown')) as source,
+                   lower(coalesce(nullif(provider,''),'unknown')) as provider,
+                   lower(coalesce(nullif(download_client,''),'unknown')) as download_client,
+                   status,
+                   count(*) as total
+            from source_attempts
+            where lower(coalesce(status, '')) != ?
+            {focus_where}
+            group by lower(coalesce(nullif(provider_id,''),'unknown')),
+                     lower(coalesce(nullif(source_type,''),'source')),
+                     lower(coalesce(nullif(lifecycle_phase,''),'observed')),
+                     lower(coalesce(nullif(source,''),'unknown')),
+                     lower(coalesce(nullif(provider,''),'unknown')),
+                     lower(coalesce(nullif(download_client,''),'unknown')),
+                     status
+            """,
+            (COALESCED_SOURCE_ATTEMPT_STATUS, *focus_params),
+        ).fetchall()
+        historical_row = con.execute(
+            f"select count(*) as count from source_attempts where lower(coalesce(status, '')) = ? {focus_where}",
+            (COALESCED_SOURCE_ATTEMPT_STATUS, *focus_params),
+        ).fetchone()
+        historical_count = int(historical_row["count"] or 0) if historical_row else 0
+    for row in rows:
+        total = int(row["total"] or 0)
+        if total <= 0:
+            continue
+        provider_id = rollup_key(row["provider_id"])
+        source = rollup_key(row["source"])
+        provider = rollup_key(row["provider"])
+        download_client = rollup_key(row["download_client"])
+        lifecycle_phase = rollup_key(row["lifecycle_phase"]) or "observed"
+        status = str(row["status"] or "").strip().lower()
+        primary = provider_id or source or "unknown"
+        counts[primary] = int(counts.get(primary) or 0) + total
+        aggregate_counts["all_count"] += total
+        identity_keys = {key for key in (provider_id, source, provider, download_client) if key}
+        for alias, values in identity_values.items():
+            if identity_keys.intersection(values):
+                identity_counts[alias] = int(identity_counts.get(alias) or 0) + total
+        if lifecycle_phase == "downloading" or status in transferring_statuses:
+            aggregate_counts["transferring_count"] += total
+        if lifecycle_phase in {"staged_or_importing", "verifying"} or status in importing_statuses:
+            aggregate_counts["importing_count"] += total
+        outcome = source_attempt_outcome(status, lifecycle_phase)
+        if outcome == "productive" or lifecycle_phase == "active":
+            aggregate_counts["productive_count"] += total
+        elif outcome == "no_candidate":
+            aggregate_counts["no_candidate_count"] += total
+        elif outcome == "problem":
+            aggregate_counts["problem_count"] += total
+    options = [{"value": "all", "label": "All", "count": int(aggregate_counts["all_count"] or 0)}]
+    for value, (label, sources) in SOURCE_ATTEMPT_FILTERS.items():
+        options.append({"value": value, "label": label, "count": int(identity_counts.get(f"{value}_count") or 0)})
+    options.append({"value": "transferring", "label": "Transferring", "count": int(aggregate_counts["transferring_count"] or 0)})
+    options.append({"value": "importing", "label": "Importing", "count": int(aggregate_counts["importing_count"] or 0)})
+    options.append({"value": "productive", "label": "Productive", "count": int(aggregate_counts["productive_count"] or 0)})
+    options.append({"value": "no_candidate", "label": "No Candidate", "count": int(aggregate_counts["no_candidate_count"] or 0)})
+    options.append({"value": "problems", "label": "Problems", "count": int(aggregate_counts["problem_count"] or 0)})
+    if historical_count:
+        options.append({"value": "historical", "label": "Historical", "count": historical_count})
+    for value, aliases in SOURCE_ATTEMPT_ALIASES.items():
+        if value not in {"sabnzbd", "qbittorrent"}:
+            continue
+        count = int(identity_counts.get(f"{value}_count") or 0)
+        options.append({"value": value, "label": source_display_label(value), "count": count})
+    for source, count in counts.items():
+        if source == "unknown":
+            continue
+        options.append({"value": source, "label": source_display_label(source), "count": count})
+    return options
+
+
+def reset_source_attempts(db_path, *, series_id=None, issue_id=None, wanted_id=None, queue_id=None, source_attempt_id=None):
+    """Delete source_attempts rows (and their history_events) for one real,
+    explicit scope -- per-series, per-issue, per-wanted-item, per-queue-row,
+    or a single attempt.
+
+    This is the diagnostic ledger behind the Attempts screen, not a ledger
+    anything else depends on for correctness (matching/scoring/candidate-
+    acceptance decisions never read it back) -- clearing it only removes
+    evidence rows, never state used to decide what to search for or grab
+    next. There is no "clear everything" mode here on purpose: the request
+    this was built for is "reset one series/item's noisy history", and a
+    truly global wipe (with no scope at all) is a different, much larger
+    blast radius than that -- callers who need one can be added deliberately
+    later, not get one for free by omitting every argument.
+    """
+    scope = {
+        "series_id": str(series_id).strip() if series_id else "",
+        "issue_id": str(issue_id).strip() if issue_id else "",
+        "wanted_id": str(wanted_id).strip() if wanted_id else "",
+        "queue_id": str(queue_id).strip() if queue_id else "",
+        "source_attempt_id": str(source_attempt_id).strip() if source_attempt_id else "",
+    }
+    scope = {key: value for key, value in scope.items() if value}
+    if not scope:
+        raise ValueError("reset_source_attempts requires at least one of series_id/issue_id/wanted_id/queue_id/source_attempt_id")
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {"ok": False, "reason": "state_db_missing", "db_path": str(db_path), "deleted_count": 0}
+    where_sql, params = source_attempt_focus_where(
+        {
+            "series_id": scope.get("series_id"),
+            "issue_id": scope.get("issue_id"),
+            "wanted_id": scope.get("wanted_id"),
+            "queue_id": scope.get("queue_id"),
+            "source_attempt_id": scope.get("source_attempt_id"),
+        }
+    )
+    # source_attempt_focus_where() prefixes with " and (...)" for appending
+    # after an existing WHERE clause; here it is the only condition.
+    where_sql = "where " + where_sql[len(" and ("):-1] if where_sql else "where 0"
+    with connect(db_path) as con:
+        init_schema(con)
+        con.commit()
+        con.execute("begin immediate")
+        ids = [row["id"] for row in con.execute(f"select id from source_attempts {where_sql}", params).fetchall()]
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            con.execute(
+                f"delete from history_events where entity_type='source_attempt' and entity_id in ({placeholders})",
+                ids,
+            )
+            con.execute(f"delete from source_attempts where id in ({placeholders})", ids)
+            update_sync_meta(con, time.time(), "source_attempts_reset")
+        con.commit()
+    # These are read caches over source_attempts; a deletion this function
+    # just committed must not keep serving pre-deletion counts for the rest
+    # of either cache's TTL.
+    SOURCE_ATTEMPT_FILTER_OPTIONS_CACHE.update({"db_path": None, "ts": 0.0, "options": None})
+    return {"ok": True, "scope": scope, "deleted_count": len(ids)}
+
+
 def source_attempt_rows(db_path, limit=80, source_filter=None):
     db_path = Path(db_path)
     if not db_path.exists():
@@ -59852,14 +60092,124 @@ def history_view_summary(db_path):
     return summary
 
 
-def history_state_view(db_path, limit=80, history_filter=None, focus=None, summary_mode=None, row_mode=None):
+def resolve_series_ids_by_title(db_path, query_text, limit=6):
+    """Series whose title/sort_title contains query_text, best match first.
+
+    The series table tops out in the low thousands of rows even on a large
+    library, so an unindexed substring scan here is cheap -- unlike the same
+    approach against history_events, which is why History search resolves
+    to a series first and then re-uses recent_history()'s indexed
+    series_id focus path instead of scanning history_events by text.
+    """
+    query_text = str(query_text or "").strip()
+    if not query_text:
+        return []
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    needle = query_text.lower()
+    like = f"%{needle}%"
+    with connect_read(path) as con:
+        rows = con.execute(
+            """
+            select id, title
+            from series
+            where lower(title) like ? or lower(coalesce(sort_title,'')) like ?
+            order by
+                case when lower(title)=? then 0 else 1 end,
+                length(title) asc
+            limit ?
+            """,
+            (like, like, needle, max(1, int(limit or 6))),
+        ).fetchall()
+    return [{"id": row["id"], "title": row["title"]} for row in rows]
+
+
+def recent_history_search(db_path, query_text, limit=80, history_filter=None):
+    """History rows for every series whose title matches query_text.
+
+    Resolves the free-text query to series ids first, then re-uses
+    recent_history()'s existing indexed series_id focus branch (proven at
+    ~0.3-0.5s on a 1.5M-row production table, see
+    idx_history_bucket_series_created) once per matched series and merges
+    in Python. This deliberately avoids extending recent_history()'s SQL
+    with a text predicate over history_events itself: the unbounded
+    LEFT-JOIN focus branches in that function are already known to take
+    ~79s on prod for non-series-id focus shapes, and a message/title LIKE
+    scan over 1.5M+ rows would land in that same slow bucket.
+    """
+    matches = resolve_series_ids_by_title(db_path, query_text)
+    if not matches:
+        return [], []
+    history_filter = history_filter_key(history_filter)
+    per_series_limit = max(int(limit or 80), 40)
+    merged = {}
+    for match in matches:
+        for row in recent_history(db_path, per_series_limit, history_filter=history_filter, focus={"series_id": match["id"]}):
+            merged[row.get("id")] = row
+    ordered = sorted(
+        merged.values(),
+        key=lambda row: (safe_float(row.get("created_at"), 0), str(row.get("id") or "")),
+        reverse=True,
+    )
+    return ordered, matches
+
+
+def dedupe_repeated_history_rows(rows):
+    """Collapse repeated re-confirmations of the same issue into one row.
+
+    A recurring managed-folder scan re-emits an identical "verified"
+    history row for files that were already verified on a previous pass --
+    on production this repeats every ~20-30 minutes for the same set of
+    already-imported issues, at roughly 300 rows per pass. That's real
+    write volume, not a bug in this function's input, but showing every
+    occurrence buries the one NEW event a user is actually looking for
+    under hundreds of reconfirmations of things they already have. Keeps
+    the newest occurrence and folds the rest into repeat_count/first_seen.
+    Rows carry no issue_id (series-level/provider-level events) are left
+    alone -- collapsing those risks merging unrelated events that just
+    happen to share generic message text.
+    """
+    seen = {}
+    out = []
+    for row in rows or []:
+        issue_key = str(row.get("issue_id") or "").strip()
+        message_key = str(row.get("message") or "").strip().lower()
+        if not issue_key or not message_key:
+            out.append(row)
+            continue
+        dedupe_key = (issue_key, str(row.get("event_type") or ""), message_key)
+        existing = seen.get(dedupe_key)
+        if existing is not None:
+            existing["repeat_count"] = int(existing.get("repeat_count") or 1) + 1
+            existing["first_seen_at"] = row.get("created_at")
+            continue
+        row = dict(row)
+        row["repeat_count"] = 1
+        row["first_seen_at"] = row.get("created_at")
+        seen[dedupe_key] = row
+        out.append(row)
+    return out
+
+
+def history_state_view(db_path, limit=80, history_filter=None, focus=None, summary_mode=None, row_mode=None, search=None):
     path = Path(db_path)
     if not path.exists():
         return {"ok": False, "reason": "state_db_missing", "view": "history", "db_path": str(path)}
     history_filter = history_filter_key(history_filter)
     focus = normalize_focus_entities(focus)
+    search = str(search or "").strip()
+    search_matches = None
     fetch_limit = 5000 if focus else max(1, min(int(limit or 80), 300))
-    rows = recent_history(path, fetch_limit, history_filter=history_filter, focus=focus)
+    if search and not focus:
+        capped_limit = max(1, min(int(limit or 80), 300))
+        rows, search_matches = recent_history_search(path, search, capped_limit, history_filter=history_filter)
+        rows = dedupe_repeated_history_rows(rows) if history_filter != "all" else rows
+        rows = rows[:capped_limit]
+    else:
+        rows = recent_history(path, fetch_limit, history_filter=history_filter, focus=focus)
+        if not focus and history_filter != "all":
+            rows = dedupe_repeated_history_rows(rows)
     focused_match_count = None
     focused_count_sampled = False
     if focus:
@@ -59870,7 +60220,12 @@ def history_state_view(db_path, limit=80, history_filter=None, focus=None, summa
     loaded_count = len(rows)
     filters = history_filter_options(path)
     selected_filter = next((item for item in filters if item.get("value") == history_filter), None)
-    total_count = focused_match_count if focus else max(loaded_count, int((selected_filter or {}).get("count") or 0))
+    if search_matches is not None:
+        total_count = loaded_count
+    elif focus:
+        total_count = focused_match_count
+    else:
+        total_count = max(loaded_count, int((selected_filter or {}).get("count") or 0))
     summary_mode = str(summary_mode or "full").strip().lower().replace("-", "_")
     row_mode = normalize_state_view_row_mode(row_mode)
     summary = history_view_summary(path)
@@ -59899,9 +60254,11 @@ def history_state_view(db_path, limit=80, history_filter=None, focus=None, summa
         "history_scope": "download_import_lifecycle" if history_filter == "activity" else history_filter,
         "history_candidate_limit": 10000 if history_filter in {"activity", "downloads"} else 1000,
         "history_grouped": False,
-        "total_count_sampled": focused_count_sampled if focus else True,
+        "total_count_sampled": False if search_matches is not None else (focused_count_sampled if focus else True),
         "focused_result_limit": fetch_limit if focus else None,
         "history_taxonomy_version": HISTORY_TAXONOMY_VERSION,
+        "history_search": search or None,
+        "history_search_matches": search_matches,
         "filters": filters,
         "related_views": [
             {
@@ -66622,7 +66979,7 @@ def operational_row_sort_value(row, sort_key):
     return (safe_float(row.get("updated_at") or row.get("last_activity_at") or row.get("created_at"), 0.0), stable_id)
 
 
-def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None):
+def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None):
     perf_started_at = time.perf_counter()
     key = str(view or "").strip().lower()
     key = STATE_VIEW_ALIAS_MAP.get(key, key)
@@ -66806,6 +67163,7 @@ def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None
             focus=focus,
             summary_mode=summary_mode,
             row_mode=row_mode,
+            search=history_search,
         )
     summary_mode_key = str(summary_mode or "").strip().lower().replace("-", "_")
     row_mode_key = normalize_state_view_row_mode(row_mode)
@@ -67081,7 +67439,11 @@ def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None
     elif key == "source_memory":
         total_count = bad_source_candidate_count(db_path, source_filter)
     elif key == "source_attempts":
-        source_attempt_filters = source_attempt_filter_options(db_path)
+        # Scoped to whatever this view is focused on (e.g. one series), so
+        # the summary counts above the row table describe the same rows the
+        # table itself shows -- see source_attempt_filter_options_for_focus().
+        # With no focus this is exactly source_attempt_filter_options(db_path).
+        source_attempt_filters = source_attempt_filter_options_for_focus(db_path, focus)
         matched_filter = next((item for item in source_attempt_filters if item.get("value") == source_filter), None)
         total_count = int(matched_filter.get("count") or 0) if matched_filter else loaded_count
     elif key == "download_tasks":

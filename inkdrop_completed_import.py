@@ -6306,6 +6306,15 @@ def inkdrop_series_targets(series_filter=None):
               )
             """
         ).fetchall()
+        # One batched count for every series instead of one query per series in
+        # the loop below -- trusted_issue_missing_source_number_is_safe() needs
+        # to tell a genuine one-shot/graphic-novel comic (exactly one issue)
+        # apart from issue 1 of an ongoing run, and a per-row count(*) here
+        # would turn this into an O(series) query fan-out.
+        issue_counts = {
+            row["series_id"]: int(row["issue_count"] or 0)
+            for row in conn.execute("select series_id, count(*) as issue_count from issues group by series_id")
+        }
     except sqlite3.Error:
         return []
     finally:
@@ -6358,6 +6367,7 @@ def inkdrop_series_targets(series_filter=None):
                 "special_version": None,
                 "target_source": "inkdrop_series",
                 "aliases": [normalize(alias) for alias in aliases if normalize(alias)],
+                "canonical_issue_count": issue_counts.get(row["id"], 0),
             }
         )
     return targets
@@ -7049,7 +7059,24 @@ def trusted_issue_missing_source_number_is_safe(path, target, trusted_issue, com
     expected = format_issue_number(trusted_issue)
     if expected != "001":
         return False
-    if not target or not is_manga_target(target) or not target_single_issue_artifact_title(target):
+    if not target:
+        return False
+    manga_singleton = is_manga_target(target) and target_single_issue_artifact_title(target)
+    try:
+        canonical_issue_count = int(target.get("canonical_issue_count") or 0)
+    except (TypeError, ValueError):
+        canonical_issue_count = 0
+    # A comic series InkDrop's own catalog carries exactly one issue for is a
+    # one-shot/graphic novel/OGN by definition, regardless of what its real
+    # (non-generic) issue title says. target_single_issue_artifact_title()
+    # above only recognizes a literal placeholder title such as "TPB" or
+    # "One Shot" -- a metadata provider essentially never uses that for a
+    # real, titled release like "Superman: Whatever Happened to the Man of
+    # Tomorrow?", so every comic one-shot with a genuine title was falling
+    # through this gate and getting rejected on every download attempt,
+    # from every peer, forever.
+    comic_singleton = not is_manga_target(target) and canonical_issue_count == 1
+    if not manga_singleton and not comic_singleton:
         return False
     if extract_issue_number(path) is not None:
         return False
@@ -7077,7 +7104,17 @@ def trusted_issue_missing_source_number_is_safe(path, target, trusted_issue, com
         or matching_target_alias(clean_words(Path(path).parent.name), target)
     ):
         return False
-    if not filename_year_matches(path, target):
+    # A one-shot/graphic novel is routinely re-released as a later digital
+    # edition or reprint with its own cover date -- the real report this was
+    # traced from was labelled "(2009)" for a story InkDrop's own metadata
+    # still carries under its 1997 original print year. Requiring an exact
+    # year match here would reject every legitimate reprint of a comic
+    # one-shot; the alias match plus the absence of any conflicting pack/
+    # range/chapter/volume marker above already carry the real identity
+    # confidence for this path, so year is left as a bonus (still scored in
+    # classify_import_filename_safety()) rather than a hard gate. The manga
+    # path's existing, already-relied-upon behavior is left untouched.
+    if manga_singleton and not filename_year_matches(path, target):
         return False
     return True
 

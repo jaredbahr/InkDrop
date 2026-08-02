@@ -1215,6 +1215,19 @@
       margin: 8px 0 10px;
     }
     .core-filter-bar[hidden] { display: none; }
+    .history-search-box {
+      flex: 1 1 100%;
+      display: grid;
+      gap: 4px;
+    }
+    .history-search-box input {
+      width: 100%;
+      max-width: 420px;
+    }
+    .history-search-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
     .core-filter-bar.laned {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));

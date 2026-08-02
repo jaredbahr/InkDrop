@@ -188,6 +188,17 @@ RSS_DISCOVERY_STATUS_FILE = STATE_DIR / "rss-discovery-status.json"
 RSS_DISCOVERY_STATUS_STALE_MINUTES = 90
 COMICSCODES_DISCOVERY_LOG = LOG_DIR / "comicscodes-discovery.log"
 COMICSCODES_DISCOVERY_STATUS_FILE = STATE_DIR / "comicscodes-discovery-status.json"
+# A gated source's health snapshot (rss/comicscodes) is read from its own
+# discovery status file, and a blocking state (backoff/watch/etc.) stops the
+# autopilot ladder from ever invoking that discovery script again -- which is
+# also the only thing that refreshes the status file. If the last refresh
+# predates this, the block has outlived its own longest legitimate backoff
+# (12h) and is a stale artifact rather than a live condition, so it's
+# reported as unknown instead of a blocking state to let the ladder retry
+# and find out. Confirmed live 2026-08-02: comics.codes answered normally
+# (HTTP 200, real feed) while its recorded health was still "backoff" from a
+# check 33 days earlier.
+SOURCE_HEALTH_GATE_RETRY_AFTER_MINUTES = 16 * 60
 SLSKD_SOURCE_PROBE_STATUS_FILE = STATE_DIR / "slskd-source-probe-status.json"
 SLSKD_SOURCE_PROBE_CACHE_FILE = STATE_DIR / "slskd-source-probe-cache.json"
 SLSKD_SOURCE_PROBE_LOG = LOG_DIR / "slskd-source-probe.log"
@@ -469,6 +480,7 @@ SERIES_AUTOPILOT_PROWLARR_PROVIDER_TIMEOUT_COOLDOWN_SECONDS = 1800
 SERIES_AUTOPILOT_PROWLARR_PROVIDER_FETCH_FAILURE_WINDOW_SECONDS = 1800
 SERIES_AUTOPILOT_PROWLARR_PROVIDER_FETCH_FAILURE_THRESHOLD = 2
 SERIES_AUTOPILOT_PROWLARR_PROVIDER_FETCH_FAILURE_COOLDOWN_SECONDS = 1800
+SERIES_AUTOPILOT_PROWLARR_NO_RESULT_COOLDOWN_HOURS = 0.33
 SERIES_AUTOPILOT_RSS_SOURCE_WORKER_HTTP_TIMEOUT_SECONDS = 12
 SERIES_AUTOPILOT_RSS_PROVIDER_TIMEOUT_WINDOW_SECONDS = 1800
 SERIES_AUTOPILOT_RSS_PROVIDER_TIMEOUT_THRESHOLD = 3
@@ -487,7 +499,7 @@ SERIES_AUTOPILOT_SLSKD_WAIT_SECONDS = 8
 SERIES_AUTOPILOT_SLSKD_MAX_QUERIES = 5
 SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX = 8
 SERIES_AUTOPILOT_SLSKD_PROBE_BUDGET_SECONDS = 300
-SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS = 0.75
+SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS = 0.0
 SERIES_AUTOPILOT_RETRY_SECONDS = 1800
 MANGA_UNIT_MODELS = {
     "volume",
@@ -914,6 +926,7 @@ HTML = r"""<!doctype html>
             <div class="section-view-mode" id="inkdropSectionViewMode" hidden></div>
             <span class="section-active-filter" id="inkdropSectionActiveFilter">Loading</span>
             <button class="section-refresh" id="inkdropSectionRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh section">Refresh</button>
+            <button class="section-refresh bad" id="inkdropSectionResetAttemptsBtn" type="button" data-arr-control-label="Clear attempts" aria-label="Clear this series' recorded attempts" hidden>Clear attempts</button>
           </div>
         </div>
         <div class="series-add-top-slot" id="seriesAddTopSlot" hidden></div>
@@ -1352,6 +1365,38 @@ HTML = r"""<!doctype html>
         </div>
       </div>
     </section>
+    <section class="series-remove-modal series-library-modal" id="seriesLibraryModal" role="dialog" aria-modal="true" aria-labelledby="seriesLibraryTitle" aria-describedby="seriesLibraryCopy" hidden>
+      <div class="series-remove-dialog">
+        <div class="series-remove-head">
+          <h3 id="seriesLibraryTitle">Move Library</h3>
+          <button class="series-remove-close" id="seriesLibraryClose" type="button" aria-label="Close move library dialog" onclick="closeSeriesLibraryModal()">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="series-remove-alert" id="seriesLibraryAlert">
+            <strong id="seriesLibraryActionTitle">Change content type or root folder</strong>
+            <span id="seriesLibraryCopy">Pick the library this series belongs in. InkDrop can move the existing folder for you, or just update the assignment so future imports land in the right place.</span>
+          </div>
+          <div class="series-remove-series">
+            <strong id="seriesLibraryName">Series</strong>
+            <div class="series-remove-meta" id="seriesLibraryMeta"></div>
+          </div>
+          <div class="inkdrop-text-field">
+            <label id="seriesLibraryDestinationLabel" for="seriesLibraryDestination">Move to</label>
+            <select id="seriesLibraryDestination" onchange="updateSeriesLibraryModalPreview()"></select>
+          </div>
+          <label class="series-remove-option">
+            <input id="seriesLibraryMoveFiles" type="checkbox" onchange="updateSeriesLibraryModalPreview()">
+            Move existing files to the new folder
+            <span id="seriesLibraryMoveFilesCopy">Files stay right where they are unless this is enabled.</span>
+          </label>
+          <div class="series-remove-impact" id="seriesLibraryImpact"></div>
+        </div>
+        <div class="series-remove-foot">
+          <button id="seriesLibraryCancel" type="button" onclick="closeSeriesLibraryModal()">Cancel</button>
+          <button class="series-remove-confirm" id="seriesLibraryConfirm" type="button" disabled onclick="confirmSeriesLibraryMigration()">Move Library</button>
+        </div>
+      </div>
+    </section>
     <section class="series-remove-modal inkdrop-confirm-modal" id="inkdropConfirmModal" role="dialog" aria-modal="true" aria-labelledby="inkdropConfirmTitle" aria-describedby="inkdropConfirmCopy" hidden>
       <div class="series-remove-dialog" id="inkdropConfirmDialog">
         <div class="series-remove-head">
@@ -1468,6 +1513,8 @@ HTML = r"""<!doctype html>
     let inkdropQueueDiagnosticFilter = "all";
     let inkdropQueueProviderFilter = "all";
     let inkdropWantedFilter = "active";
+    let inkdropWantedStage = null;
+    let inkdropWantedStageLabel = "";
     let inkdropSeriesFilter = "all";
     const SERIES_VIEW_MODE_KEY = "inkdrop.seriesViewMode";
     const SERIES_SORT_KEY = "inkdrop.seriesSort";
@@ -1520,12 +1567,18 @@ HTML = r"""<!doctype html>
     const seriesDetailMetadataRefreshTried = new Set();
     let inkdropIssueFilter = "all";
     let inkdropHistoryFilter = "activity";
+    let inkdropHistorySearch = "";
+    let inkdropHistorySearchTimer = null;
     let inkdropImportFilter = "all";
     let inkdropDownloadFilter = "active";
     let inkdropManualReviewFilter = "actionable";
     let focusedSeriesRow = null;
     let seriesRemovePendingRow = null;
     let seriesRemoveRestoreFocus = null;
+    let seriesLibraryPendingRow = null;
+    let seriesLibraryRestoreFocus = null;
+    let seriesLibraryContract = null;
+    let seriesLibraryPreviewToken = 0;
     let recentlyAddedSeriesKeys = [];
     let inkdropConfirmResolve = null;
     let inkdropConfirmRestoreFocus = null;
@@ -9578,7 +9631,10 @@ HTML = r"""<!doctype html>
         inkdropQueueProviderFilter = providerFilter ? String(providerFilter || "all") : "all";
       }
       if (target === "queue_diagnostics") inkdropQueueDiagnosticFilter = value || "all";
-      if (target === "wanted") inkdropWantedFilter = value || "active";
+      if (target === "wanted") {
+        inkdropWantedFilter = value || "active";
+        inkdropWantedStage = null;
+      }
       if (target === "sources") inkdropProviderFilter = value || "visible";
       if (target === "source_memory") inkdropSourceMemoryFilter = value || "all";
       if (target === "source_attempts") inkdropSourceAttemptFilter = value || "acquisition";
@@ -9706,7 +9762,10 @@ HTML = r"""<!doctype html>
         inkdropQueueFilter = filter || "active";
         inkdropQueueProviderFilter = "all";
       }
-      if (target === "wanted") inkdropWantedFilter = filter || "active";
+      if (target === "wanted") {
+        inkdropWantedFilter = filter || "active";
+        inkdropWantedStage = null;
+      }
       if (target === "issues") inkdropIssueFilter = filter || "all";
       if (target === "sources") inkdropProviderFilter = filter || "visible";
       if (target === "source_attempts") inkdropSourceAttemptFilter = filter || "acquisition";
@@ -13645,7 +13704,7 @@ HTML = r"""<!doctype html>
       // word -- Queue and Blocklist were drawing both at once, about 170px
       // apart. One reload control per page, always in the same corner.
       if (key === "wanted") {
-        appendArrTableButton(left, "Search All", "Run the existing guarded missing-content sweep", () => runWantedSearchAll());
+        appendArrTableButton(left, "Search All", "Search every Wanted issue in the library, not just this filtered view, in priority order", () => runWantedSearchAll());
         appendArrTableButton(left, "Search Selected", "Queue searches for selected visible Wanted rows", () => runSelectedWantedSearches(), {requiresSelection: true});
         appendArrTableButton(left, "Manual Search", "Search providers for the single selected Wanted row", () => {
           const selectedRows = selectedInkdropTableSourceRows("wanted");
@@ -14607,8 +14666,72 @@ HTML = r"""<!doctype html>
       return guide;
     }
 
+    // Recover Missing's stage tiles ("Downloading 202", "Needs attention 724",
+    // ...) drill into Wanted using this same label set -- the lifecycle
+    // vocabulary already shown above the Wanted table (Waiting/Searching/
+    // Downloading/Importing/Complete/Failed/Blocked/Needs Review), not a new
+    // parallel filter.
+    const WANTED_STAGE_STATUS_TARGETS = {
+      waiting_to_search: ["Waiting"],
+      searching: ["Searching"],
+      results_found: ["Searching"],
+      downloading: ["Downloading"],
+      checking_download: ["Downloading"],
+      ready_to_import: ["Importing"],
+      importing: ["Importing"],
+      waiting_for_library_scan: ["Waiting"],
+      complete: ["Complete"],
+      needs_attention: ["Needs Review", "Failed", "Blocked"],
+    };
+
+    function wantedRowMatchesStage(row, stageKey) {
+      const targets = WANTED_STAGE_STATUS_TARGETS[stageKey];
+      if (!targets) return true;
+      const model = inkdropSectionRowModel("wanted", row || {});
+      return targets.includes(coreStateLabel(model.state));
+    }
+
+    window.InkDropWantedNav = Object.freeze({
+      openStage(stageKey, label) {
+        inkdropWantedFilter = "all";
+        inkdropWantedStage = stageKey;
+        inkdropWantedStageLabel = label || progressStageLabel(stageKey);
+        setInkdropRouteHash("wanted", {});
+        loadInkdropSection("wanted", null, {scroll: "top"});
+      },
+    });
+
+    function progressStageLabel(stageKey) {
+      const targets = WANTED_STAGE_STATUS_TARGETS[stageKey];
+      return targets ? targets.join("/") : stageKey;
+    }
+
+    function clearWantedStageFilter() {
+      inkdropWantedStage = null;
+      inkdropWantedStageLabel = "";
+      loadInkdropSection("wanted");
+    }
+
+    function renderWantedStageFilterChip(parent, view) {
+      if (String(view || "") !== "wanted" || !inkdropWantedStage) return;
+      const chip = document.createElement("div");
+      chip.className = "missing-recovery-stage-filter";
+      chip.append(document.createTextNode(`Filtered to: ${inkdropWantedStageLabel || inkdropWantedStage}`));
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.textContent = "✕";
+      clear.title = "Clear this filter";
+      clear.addEventListener("click", clearWantedStageFilter);
+      chip.append(clear);
+      parent.appendChild(chip);
+    }
+
     function renderInkdropSectionTable(parent, view, rows=[], viewPayload={}) {
       closeInkdropArrTableMenus();
+      if (String(view || "") === "wanted" && inkdropWantedStage) {
+        rows = (rows || []).filter(row => wantedRowMatchesStage(row, inkdropWantedStage));
+      }
+      renderWantedStageFilterChip(parent, view);
       if (String(view || "") === "sources") {
         const requestedSourceFilter = String(inkdropProviderFilter || "").toLowerCase();
         const payloadSourceFilter = String(viewPayload?.provider_filter || "").toLowerCase();
@@ -16614,6 +16737,7 @@ HTML = r"""<!doctype html>
           row.auto_grab ? "" : "good",
         );
       }
+      if (!row.removed_by_user) appendSeriesDetailAction(commandbar, "Move Library", "Change this series' content type or library root folder", () => openSeriesLibraryModal(row));
       if (!row.removed_by_user) appendSeriesDetailAction(commandbar, "Remove Series", "Remove this series from InkDrop automation", () => removeSeries(row), "danger");
       page.appendChild(commandbar);
 
@@ -16636,6 +16760,7 @@ HTML = r"""<!doctype html>
       meta.className = "series-detail-meta";
       appendSeriesDetailChip(meta, row.publisher || sourceBucketLabel(row.metadata_provider || row.source || ""));
       appendSeriesDetailChip(meta, row.year || "");
+      appendSeriesDetailChip(meta, row.media_type ? coreStateLabel(row.media_type) : "");
       appendSeriesDetailChip(meta, row.monitored === false ? "Unmonitored" : row.monitored ? "Monitored" : "", row.monitored === false ? "" : "good");
       appendSeriesDetailChip(meta, row.auto_grab ? "Auto grab" : "", row.auto_grab ? "good" : "");
       appendSeriesDetailChip(meta, row.provenance_label || row.ownership || "");
@@ -16841,6 +16966,7 @@ HTML = r"""<!doctype html>
         if (value === "series") params.set("series_filter", inkdropSeriesFilter || "all");
         if (value === "issues") params.set("issue_filter", inkdropIssueFilter || "all");
         if (value === "history") params.set("history_filter", inkdropHistoryFilter || "activity");
+        if (value === "history" && inkdropHistorySearch) params.set("history_search", inkdropHistorySearch);
         if (value === "imports") params.set("import_filter", inkdropImportFilter || "all");
         if (value === "manual_review") params.set("manual_review_filter", inkdropManualReviewFilter || "actionable");
         if (ARR_TABLE_SORTABLE_VIEWS.has(value)) {
@@ -16995,15 +17121,14 @@ HTML = r"""<!doctype html>
         if (memoryReason) appendSectionSummaryChip(box, "top reason", coreStateLabel(memoryReason), "", true);
         if (memorySource) appendSectionSummaryChip(box, "top source", sourceBucketLabel(memorySource), "", true);
       } else if (view === "source_attempts") {
-        appendSectionSummaryChip(box, "prowlarr", sectionFilterCount(viewPayload, "prowlarr"));
-        appendSectionSummaryChip(box, "slskd", sectionFilterCount(viewPayload, "slskd"));
-        appendSectionSummaryChip(box, "productive", sectionFilterCount(viewPayload, "productive"), "good");
-        appendSectionSummaryChip(box, "no candidate", sectionFilterCount(viewPayload, "no_candidate"));
-        appendSectionSummaryChip(box, "transferring", sectionFilterCount(viewPayload, "transferring"), "warn");
-        appendSectionSummaryChip(box, "importing", sectionFilterCount(viewPayload, "importing"), "warn");
-        appendSectionSummaryChip(box, "rss", sectionFilterCount(viewPayload, "rss"));
-        appendSectionSummaryChip(box, "downloads", sectionFilterCount(viewPayload, "downloads"));
-        appendSectionSummaryChip(box, "problems", sectionFilterCount(viewPayload, "problems"), "bad");
+        // No chips here on purpose, same reasoning as source_memory just
+        // above: every one of these (productive/no candidate/transferring/
+        // importing/downloads/problems) is already a section-workbench card
+        // right below, with a fuller label and its own detail line. A second
+        // row of the identical numbers in a smaller, less-labelled chip style
+        // doesn't add information -- it just makes a user re-check whether
+        // the two rows actually agree. prowlarr/slskd/rss are still one
+        // click away via the section's own filter menu.
       } else if (view === "download_tasks") {
         appendSectionSummaryChip(box, "active", sectionFilterCount(viewPayload, "active"), "warn");
         appendSectionSummaryChip(box, "downloading", sectionFilterCount(viewPayload, "downloading"), "warn");
@@ -18599,6 +18724,64 @@ HTML = r"""<!doctype html>
       return visible;
     }
 
+    function applyInkdropHistorySearch(nextValue) {
+      const next = String(nextValue ?? "").trim();
+      if (next === inkdropHistorySearch) return;
+      inkdropHistorySearch = next;
+      loadInkdropSection("history", null, {scroll: "top"});
+    }
+
+    // History has thirteen filter chips describing internal event taxonomy
+    // (Lifecycle, Diagnostics, Verification...) and no way to just type a
+    // series name -- the reported pain point was giving up mid-search for a
+    // specific import because nothing on the page let you narrow by title.
+    // This resolves the typed text to a series server-side and re-uses
+    // recent_history()'s indexed per-series focus path (see
+    // recent_history_search in inkdrop_state.py), so it stays fast
+    // regardless of how large history_events has grown.
+    function renderHistorySearchBox(viewPayload) {
+      const wrap = document.createElement("div");
+      wrap.className = "history-search-box";
+      const input = document.createElement("input");
+      input.type = "search";
+      input.placeholder = "Search history by series title...";
+      input.value = inkdropHistorySearch || "";
+      input.setAttribute("aria-label", "Search history by series title");
+      input.oninput = () => {
+        const value = input.value;
+        clearTimeout(inkdropHistorySearchTimer);
+        inkdropHistorySearchTimer = setTimeout(() => applyInkdropHistorySearch(value), 350);
+      };
+      input.onkeydown = (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          clearTimeout(inkdropHistorySearchTimer);
+          applyInkdropHistorySearch(input.value);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          input.value = "";
+          clearTimeout(inkdropHistorySearchTimer);
+          applyInkdropHistorySearch("");
+        }
+      };
+      wrap.appendChild(input);
+      const matches = viewPayload?.history_search_matches;
+      if (inkdropHistorySearch && Array.isArray(matches)) {
+        const note = document.createElement("div");
+        note.className = "history-search-note";
+        if (!matches.length) {
+          note.textContent = `No series title matches "${inkdropHistorySearch}".`;
+        } else {
+          const titles = matches.map(item => item.title).filter(Boolean);
+          note.textContent = matches.length === 1
+            ? `Showing history for ${titles[0]}.`
+            : `Showing history for ${matches.length} matching series: ${titles.join(", ")}.`;
+        }
+        wrap.appendChild(note);
+      }
+      return wrap;
+    }
+
     function renderSectionFilters(viewPayload) {
       const box = $("inkdropSectionFilters");
       if (!box) return;
@@ -18708,6 +18891,9 @@ HTML = r"""<!doctype html>
       box.innerHTML = "";
       const laneFilters = ["queue", "wanted", "manual_review"].includes(view);
       box.className = `core-filter-bar${laneFilters ? " laned views-bar" : ""}`;
+      if (view === "history") {
+        box.appendChild(renderHistorySearchBox(viewPayload));
+      }
       if (laneFilters) {
         const label = document.createElement("div");
         label.className = "section-filter-view-label";
@@ -18797,6 +18983,7 @@ HTML = r"""<!doctype html>
             loadInkdropSection("queue_diagnostics");
           } else if (view === "wanted") {
             inkdropWantedFilter = value;
+            inkdropWantedStage = null;
             loadInkdropSection("wanted");
           } else if (view === "series") {
             inkdropSeriesFilter = value;
@@ -19892,6 +20079,45 @@ HTML = r"""<!doctype html>
         refresh.onclick = key
           ? () => (key === "series" ? refreshInkdropSeriesLibrary(refreshFocus) : loadInkdropSection(key, refreshFocus))
           : null;
+      }
+      const resetAttempts = $("inkdropSectionResetAttemptsBtn");
+      if (resetAttempts) {
+        // Only offered scoped to one series -- a global "clear every source
+        // attempt in the database" button has no confirm copy that could
+        // honestly describe its blast radius, and nobody asked for one.
+        const seriesId = key === "source_attempts" && viewPayload?.focused ? viewPayload?.focus?.series_id : "";
+        const seriesLabel = seriesId ? (viewPayload?.rows || []).find(row => row?.series)?.series || focusDisplayText(viewPayload?.focus) : "";
+        resetAttempts.hidden = !seriesId;
+        resetAttempts.disabled = !seriesId;
+        resetAttempts.onclick = seriesId
+          ? () => resetInkdropSourceAttemptsWithConfirm(seriesId, seriesLabel || "this series")
+          : null;
+      }
+    }
+
+    async function resetInkdropSourceAttemptsWithConfirm(seriesId, seriesLabel) {
+      if (!seriesId) return;
+      const label = seriesLabel || "this series";
+      const confirmed = await openInkdropConfirmModal({
+        title: "Clear Recorded Attempts",
+        actionTitle: `Clear attempts for ${label}`,
+        copy: "This deletes this series' recorded source-search/grab/transfer history from the Attempts screen. It does not touch Wanted, Queue, or Manual Review -- InkDrop keeps searching and grabbing exactly as it would otherwise.",
+        subject: label,
+        details: [
+          {text: "Only this series' Attempts evidence is removed.", tone: "good"},
+          {text: "This cannot be undone.", tone: "bad"},
+        ],
+        confirmLabel: "Clear attempts",
+        tone: "bad",
+      });
+      if (!confirmed) return;
+      try {
+        const data = await api("/api/inkdrop-state/source-attempts/clear", {series_id: seriesId});
+        const deleted = Number(data?.result?.deleted_count || 0);
+        toast(`Cleared ${compactNumber(deleted)} attempt${deleted === 1 ? "" : "s"} for ${label}.`, true, "inkdropSectionPanel");
+        await loadInkdropSection("source_attempts", {series_id: seriesId});
+      } catch (err) {
+        toast(err?.message || `Could not clear attempts for ${label}.`, false, "inkdropSectionPanel");
       }
     }
 
@@ -21499,7 +21725,7 @@ HTML = r"""<!doctype html>
 
     async function runWantedSearchAll() {
       try {
-        const data = await api("/api/missing/fresh", {});
+        const data = await api("/api/missing/process", {});
         toast(processSummaryText(data.result || data) || "Wanted search sweep queued.", true, {section: "queue", filter: "work", label: "Queue · Active"});
         await loadInkdropSection("wanted", null);
         loadInkdropCore(false);
@@ -22015,9 +22241,235 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function seriesLibraryMigrationReasonText(reason, plan={}) {
+      const blockedCount = Number(plan.active_queue_count || 0) + Number(plan.active_download_count || 0);
+      const map = {
+        destination_root_not_allowed: "That folder isn't configured as a library root.",
+        series_has_active_work: blockedCount
+          ? `${compactNumber(blockedCount)} item${blockedCount === 1 ? "" : "s"} for this series ${blockedCount === 1 ? "is" : "are"} downloading or importing right now. Wait for those to finish, then try again.`
+          : "This series has downloads or imports in progress. Wait for those to finish, then try again.",
+        destination_collision: "That folder already has files in it. Clear it out or pick a different root.",
+        destination_claimed_by_other_series: `${plan.claimed_series_title || "Another series"} already uses that folder.`,
+        cross_device_move_not_supported: "That root is on a different drive. InkDrop can't move files across drives.",
+        source_library_path_not_directory: "The current library folder is missing on disk, so there's nothing to move. Turn off file moving to just fix the assignment.",
+        destination_root_not_directory: "That root folder doesn't exist on disk.",
+        media_index_collision: "A file already indexed at the destination would collide with this move.",
+        source_library_path_missing: "This series has no library folder assigned yet.",
+        source_library_path_outside_roots: "This series' current folder isn't under any configured library root.",
+        series_not_found: "This series could not be found.",
+        series_library_migration_busy: "Another move for this series is already in progress.",
+        series_library_contract_changed: "This series changed while the dialog was open. Close and reopen it, then try again.",
+        series_library_pending_cas_failed: "This series changed while the dialog was open. Close and reopen it, then try again.",
+        series_library_finalize_cas_failed: "This series changed mid-move. Reopen the dialog to check its current state.",
+      };
+      if (map[reason]) return map[reason];
+      if (!reason) return "";
+      return `Could not move this series: ${String(reason).replace(/_/g, " ")}.`;
+    }
+
+    async function fetchSeriesLibraryPayload(path, timeoutMs=12000) {
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timeout = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const res = await fetch(path, {cache: "no-store", ...(controller ? {signal: controller.signal} : {})});
+        return await res.json();
+      } finally {
+        if (timeout) window.clearTimeout(timeout);
+      }
+    }
+
+    function renderSeriesLibraryImpact(plan={}) {
+      const impact = $("seriesLibraryImpact");
+      const confirm = $("seriesLibraryConfirm");
+      if (!impact) return;
+      impact.innerHTML = "";
+      if (!plan || !plan.ok) {
+        appendSeriesRemoveChip(impact, seriesLibraryMigrationReasonText(plan?.reason, plan) || "Pick a destination to preview this move.", plan?.reason ? "bad" : "");
+        if (confirm) confirm.disabled = true;
+        return;
+      }
+      if (plan.already_applied) {
+        appendSeriesRemoveChip(impact, "Series is already assigned here.", "good");
+        if (confirm) confirm.disabled = true;
+        return;
+      }
+      appendSeriesRemoveChip(impact, `${plan.destination_media_type ? coreStateLabel(plan.destination_media_type) : "Type"} · ${compactPathTail(plan.destination_path, 2)}`, "good");
+      appendSeriesRemoveChip(impact, plan.move_files ? "Files move now" : "Files stay put", plan.move_files ? "good" : "warn");
+      if (!plan.move_files) {
+        appendSeriesRemoveChip(impact, "Future imports use the new folder; already-downloaded issues stay in the old one.", "warn");
+      }
+      const counts = plan.preserved_counts || {};
+      appendSeriesRemoveChip(impact, `${compactNumber(Number(counts.issues || 0))} issues`, "");
+      appendSeriesRemoveChip(impact, `${compactNumber(Number(counts.imports || 0))} import records`, "");
+      if (plan.recovering) appendSeriesRemoveChip(impact, "Recovering an interrupted move", "warn");
+      if (confirm) confirm.disabled = false;
+    }
+
+    async function updateSeriesLibraryModalPreview() {
+      const row = seriesLibraryPendingRow;
+      const id = row?.id || row?.series_id || "";
+      const select = $("seriesLibraryDestination");
+      const moveFiles = $("seriesLibraryMoveFiles");
+      const confirm = $("seriesLibraryConfirm");
+      const destinationRoot = select?.value || "";
+      if (!id || !destinationRoot) {
+        if (confirm) confirm.disabled = true;
+        renderSeriesLibraryImpact(null);
+        return;
+      }
+      const token = ++seriesLibraryPreviewToken;
+      const params = new URLSearchParams({
+        id,
+        destination_root: destinationRoot,
+        move_files: moveFiles?.checked ? "1" : "0",
+      });
+      try {
+        const payload = await fetchSeriesLibraryPayload(`/api/inkdrop-state/series/library/preview?${params.toString()}`, 12000);
+        if (token !== seriesLibraryPreviewToken) return;
+        renderSeriesLibraryImpact(payload.preview || {ok: false, reason: "invalid_response"});
+      } catch (_err) {
+        if (token !== seriesLibraryPreviewToken) return;
+        renderSeriesLibraryImpact({ok: false, reason: ""});
+        const impact = $("seriesLibraryImpact");
+        if (impact) { impact.innerHTML = ""; appendSeriesRemoveChip(impact, "Could not check this move. Check the connection and try again.", "bad"); }
+      }
+    }
+
+    async function openSeriesLibraryModal(row={}) {
+      const id = row?.id || row?.series_id || "";
+      if (!id) return;
+      seriesLibraryPendingRow = row;
+      seriesLibraryContract = null;
+      seriesLibraryPreviewToken++;
+      seriesLibraryRestoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const modal = $("seriesLibraryModal");
+      const name = $("seriesLibraryName");
+      const meta = $("seriesLibraryMeta");
+      const select = $("seriesLibraryDestination");
+      const moveFiles = $("seriesLibraryMoveFiles");
+      const confirm = $("seriesLibraryConfirm");
+      const impact = $("seriesLibraryImpact");
+      if (!modal) return;
+      const title = row?.title || row?.series || "Series";
+      if (name) name.textContent = title;
+      if (meta) {
+        meta.innerHTML = "";
+        appendSeriesRemoveChip(meta, row.media_type ? coreStateLabel(row.media_type) : "");
+        appendSeriesRemoveChip(meta, seriesManagedFolderText(row));
+      }
+      if (select) select.innerHTML = "<option value=\"\">Loading library roots...</option>";
+      if (moveFiles) { moveFiles.checked = false; moveFiles.disabled = true; }
+      if (confirm) { confirm.disabled = true; confirm.textContent = "Move Library"; }
+      if (impact) impact.innerHTML = "";
+      modal.hidden = false;
+      document.body.dataset.seriesLibraryModalOpen = "true";
+      modal.onclick = event => {
+        if (event.target === modal) closeSeriesLibraryModal();
+      };
+      window.setTimeout(() => $("seriesLibraryCancel")?.focus(), 0);
+      let payload;
+      try {
+        payload = await fetchSeriesLibraryPayload(`/api/inkdrop-state/series/library?id=${encodeURIComponent(id)}`, 12000);
+      } catch (_err) {
+        if (seriesLibraryPendingRow !== row) return;
+        if (select) select.innerHTML = "<option value=\"\">Could not load library roots</option>";
+        if (impact) { impact.innerHTML = ""; appendSeriesRemoveChip(impact, "Could not load this series' library assignment. Check the connection and try again.", "bad"); }
+        return;
+      }
+      if (seriesLibraryPendingRow !== row) return;
+      const contract = payload?.library || {};
+      seriesLibraryContract = contract;
+      if (!contract.ok) {
+        if (select) select.innerHTML = "<option value=\"\">No library roots available</option>";
+        if (impact) { impact.innerHTML = ""; appendSeriesRemoveChip(impact, seriesLibraryMigrationReasonText(contract.reason, contract) || "Could not load this series' library assignment.", "bad"); }
+        return;
+      }
+      if (select) {
+        select.innerHTML = "";
+        const currentRoot = contract.library_root || "";
+        const libraries = contract.libraries || [];
+        if (!libraries.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "No library roots configured";
+          select.appendChild(option);
+        }
+        for (const lib of libraries) {
+          const option = document.createElement("option");
+          option.value = lib.root;
+          const leaf = compactPathTail(lib.root, 2);
+          const typeLabel = lib.media_type ? coreStateLabel(lib.media_type) : "Unlabeled";
+          option.textContent = `${leaf} (${typeLabel})`;
+          if (lib.root === currentRoot) option.selected = true;
+          select.appendChild(option);
+        }
+      }
+      if (moveFiles) {
+        moveFiles.disabled = contract.move_blocked === true;
+        moveFiles.checked = contract.move_blocked !== true;
+      }
+      if (contract.move_blocked) {
+        appendSeriesRemoveChip(impact, seriesLibraryMigrationReasonText("series_has_active_work", contract), "bad");
+      }
+      updateSeriesLibraryModalPreview();
+    }
+
+    function closeSeriesLibraryModal(options={}) {
+      const modal = $("seriesLibraryModal");
+      if (modal) {
+        modal.hidden = true;
+        modal.onclick = null;
+      }
+      document.body.dataset.seriesLibraryModalOpen = "false";
+      seriesLibraryPendingRow = null;
+      seriesLibraryContract = null;
+      seriesLibraryPreviewToken++;
+      if (options.restoreFocus !== false && seriesLibraryRestoreFocus && document.contains(seriesLibraryRestoreFocus)) {
+        seriesLibraryRestoreFocus.focus();
+      }
+      seriesLibraryRestoreFocus = null;
+    }
+
+    async function confirmSeriesLibraryMigration() {
+      const row = seriesLibraryPendingRow;
+      const id = row?.id || row?.series_id || "";
+      const select = $("seriesLibraryDestination");
+      const moveFiles = $("seriesLibraryMoveFiles");
+      const confirm = $("seriesLibraryConfirm");
+      const destinationRoot = select?.value || "";
+      if (!id || !destinationRoot) return;
+      const title = row?.title || row?.series || "this series";
+      if (confirm) {
+        confirm.disabled = true;
+        confirm.textContent = "Moving...";
+      }
+      try {
+        const data = await api("/api/inkdrop-state/series/library/migrate", {
+          id,
+          destination_root: destinationRoot,
+          move_files: moveFiles?.checked === true,
+        }, {timeoutMs: 60000});
+        const result = data.result || {};
+        closeSeriesLibraryModal({restoreFocus: false});
+        const mediaTypeLabel = result.destination_media_type ? coreStateLabel(result.destination_media_type) : "";
+        const movedNote = result.move_files ? " Files moved." : " Future imports will use the new folder; existing files stayed put.";
+        toast(`${title}: library assignment updated${mediaTypeLabel ? ` to ${mediaTypeLabel}` : ""}.${movedNote}`, true, {section: "series", filter: "all", label: "Series · All", focus: {series_id: id}});
+        await loadInkdropSection("series", {series_id: id}, {scroll: "none"});
+        loadInkdropCore(false);
+      } catch (err) {
+        if (confirm) {
+          confirm.disabled = false;
+          confirm.textContent = "Move Library";
+        }
+        const reasonText = seriesLibraryMigrationReasonText(err?.code, {});
+        toast(reasonText || err?.message || "Could not move this series' library.", false, {section: "series", filter: "all", label: "Series · All"});
+      }
+    }
+
     document.addEventListener("keydown", event => {
       if (event.key !== "Escape") return;
       closeInkdropArrTableMenus(null, {returnFocus: true});
+      if (!$("seriesLibraryModal")?.hidden) closeSeriesLibraryModal();
       if (!$("inkdropConfirmModal")?.hidden) closeInkdropConfirmModal(false);
       else if (!$("inkdropTextModal")?.hidden) closeInkdropTextModal(null);
       else if (!$("seriesRemoveModal")?.hidden) closeSeriesRemoveModal();
@@ -22525,7 +22977,7 @@ HTML = r"""<!doctype html>
           local: {label: "Local / inbox preflight", detail: "Checks existing library and manual inboxes before starting new downloads."},
           prowlarr: {label: "Prowlarr indexers", detail: "Searches configured Newznab/Torznab indexers, then hands safe candidates to SAB/qBittorrent."},
           rss: {label: "RSS direct feeds", detail: "Checks configured direct feeds for downloadable comic files or packs."},
-          comicscodes: {label: "ComicsCodes (paused / demoted)", detail: "Kept outside the normal active source rotation while paused or unhealthy. It can still be inspected and manually re-enabled from Advanced sources."},
+          comicscodes: {label: "ComicsCodes direct downloads", detail: "Checks comics.codes for downloadable comic files, with backoff protection if it starts blocking requests."},
           slskd: {label: "SLSKD / Soulseek", detail: "Searches Soulseek through SLSKD, starts eligible candidates, then watches staging for import."},
         },
       });
@@ -22647,11 +23099,6 @@ HTML = r"""<!doctype html>
       return String(provider?.id || provider?.provider_id || provider?.provider || provider?.name || provider?.source || "").trim().toLowerCase();
     }
 
-    function sourceProviderForcedHidden(provider={}) {
-      const identity = sourceProviderIdentity(provider);
-      return identity === "comicscodes" || identity === "comics_codes";
-    }
-
     function sourceProviderIsTrackingEvidence(provider={}) {
       const source = String(provider?.source || "").trim().toLowerCase();
       const capabilities = Array.isArray(provider?.capabilities)
@@ -22682,7 +23129,6 @@ HTML = r"""<!doctype html>
       const integrationClass = String(settings.integration_class || provider?.integration_class || "").trim();
       const supportedClasses = new Set(["DirectFileProvider", "ArchiveItemProvider", "OPDSProvider", "WatchedFolderSource"]);
       return implementation === "implemented"
-        && !sourceProviderForcedHidden(provider)
         && !id.startsWith("generic_")
         && supportedClasses.has(integrationClass)
         && settings.user_addable !== false;
@@ -22716,7 +23162,6 @@ HTML = r"""<!doctype html>
     function sourceProviderHideDefault(provider={}) {
       const visibility = sourceProviderUiVisibility(provider);
       return !!provider?.source_ui_hide_default
-        || sourceProviderForcedHidden(provider)
         || sourceProviderIsVagueRegistryBucket(provider)
         || visibility === "hidden_inactive_tracking"
         || visibility === "hidden_low_producer"
@@ -22745,7 +23190,6 @@ HTML = r"""<!doctype html>
       return provider?.source_ui_hidden_reason
         || provider?.source_recommendation_summary
         || provider?.source_recommendation?.summary
-        || (sourceProviderForcedHidden(provider) ? "ComicsCodes is kept out of the normal source list until its health/backoff state needs operator review." : "")
         || provider?.next_action
         || "Hidden from the default source list.";
     }
@@ -23172,13 +23616,33 @@ HTML = r"""<!doctype html>
       setSettingsDirty(false);
     }
 
-    function resetProviderSettingsCard(card, provider={}) {
+    function providerFieldScopes(card, extraScope) {
+      return extraScope ? [card, extraScope] : [card];
+    }
+
+    function providerFieldQuery(scopes, selector) {
+      for (const node of scopes) {
+        const found = node?.querySelector?.(selector);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function providerFieldQueryAll(scopes, selector) {
+      return scopes.flatMap(node => Array.from(node?.querySelectorAll?.(selector) || []));
+    }
+
+    function resetProviderSettingsCard(card, provider={}, extraScope=null) {
+      // extraScope covers download-client cards, whose Enabled checkbox lives in the
+      // always-visible card head while the rest of the fields live in a body node that
+      // only exists inside the edit modal -- see openProviderCardModal.
+      const scopes = providerFieldScopes(card, extraScope);
       const providerSettings = provider.settings || {};
-      const enabled = card?.querySelector?.("[data-provider-enabled]");
-      const base = card?.querySelector?.("[data-provider-base-url]");
+      const enabled = providerFieldQuery(scopes, "[data-provider-enabled]");
+      const base = providerFieldQuery(scopes, "[data-provider-base-url]");
       if (enabled) enabled.checked = !!provider.enabled;
       if (base) base.value = provider.base_url || "";
-      for (const input of card?.querySelectorAll?.("[data-provider-setting]") || []) {
+      for (const input of providerFieldQueryAll(scopes, "[data-provider-setting]")) {
         const key = input.dataset.providerSetting;
         if (input.dataset.secretField) input.value = "";
         else writeSettingInput(input, providerSettings[key]);
@@ -26535,8 +26999,10 @@ HTML = r"""<!doctype html>
           ? visibleProviders.slice(0, providerRenderLimit)
           : visibleProviders;
         for (const provider of renderedProviders) {
-        const card = document.createElement("details");
+        const isDownloadClientCard = group.key === "download_clients";
+        const card = document.createElement(isDownloadClientCard ? "div" : "details");
         card.className = providerTileGroup ? "settings-card settings-provider-tile" : "settings-card";
+        if (isDownloadClientCard) card.classList.add("settings-card-modal-trigger");
         const providerSettings = provider.settings || {};
         card.dataset.providerId = provider.id || "";
         card.dataset.settingsSearchText = [
@@ -26568,8 +27034,13 @@ HTML = r"""<!doctype html>
           card.dataset.providerRuntimeOnly = "1";
           card.title = "Runtime provider template. Save it to create an InkDrop-owned provider config.";
         }
-        const head = document.createElement("summary");
+        const head = document.createElement(isDownloadClientCard ? "div" : "summary");
         head.className = "settings-card-head";
+        if (isDownloadClientCard) {
+          head.setAttribute("role", "button");
+          head.tabIndex = 0;
+          head.title = `Edit ${settingsProviderDisplayName(provider)} settings`;
+        }
         const titleWrap = document.createElement("div");
         titleWrap.className = "settings-card-title";
         const providerOwnership = String(provider.ownership || "").toLowerCase();
@@ -26732,16 +27203,22 @@ HTML = r"""<!doctype html>
         }
         head.append(titleWrap, summaryBadges, enabledLabel);
         card.appendChild(head);
+        // Everything below is the card's editing body. For most settings groups it
+        // stays inline (bodyTarget === card, an expanding <details>). Download-client
+        // cards instead collect the same content into a detached node that opens in a
+        // modal on click -- see openProviderCardModal below.
+        const bodyTarget = isDownloadClientCard ? document.createElement("div") : card;
+        if (isDownloadClientCard) bodyTarget.className = "settings-card-modal-body";
 
         if (String(provider.id || provider.provider_id || "").toLowerCase() === "suwayomi") {
           const capabilityNote = document.createElement("p");
           capabilityNote.className = "settings-provider-capability-note";
           capabilityNote.textContent = "This source exposes chapters but does not provide reliable volume membership. InkDrop will not automatically use chapter-only evidence to complete this volume.";
-          card.appendChild(capabilityNote);
+          bodyTarget.appendChild(capabilityNote);
         }
 
         if (group.key === "download_clients") {
-          appendDownloadClientOperationalSummary(card, provider);
+          appendDownloadClientOperationalSummary(bodyTarget, provider);
         }
 
         const fields = document.createElement("div");
@@ -26786,7 +27263,7 @@ HTML = r"""<!doctype html>
             toggleText: labelText,
           });
         }
-        card.appendChild(fields);
+        bodyTarget.appendChild(fields);
 
         const meta = document.createElement("div");
         meta.className = "settings-meta";
@@ -26891,8 +27368,8 @@ HTML = r"""<!doctype html>
           secret.title = provider.secret_ref;
           meta.appendChild(secret);
         }
-        card.appendChild(meta);
-        appendProwlarrChildIndexers(card, provider);
+        bodyTarget.appendChild(meta);
+        appendProwlarrChildIndexers(bodyTarget, provider);
 
         const actions = document.createElement("div");
         actions.className = "actions";
@@ -26911,13 +27388,19 @@ HTML = r"""<!doctype html>
         save.title = runtimeTemplateOnly
           ? "Create this disabled provider config in InkDrop settings"
           : `Save ${provider.display_name || provider.id || "provider"} settings`;
-        save.onclick = () => saveProviderSettings(card);
+        save.onclick = () => {
+          saveProviderSettings(card, isDownloadClientCard ? bodyTarget : null);
+          if (isDownloadClientCard) window.InkDropDownloadClients?.closeProviderCardModal?.(providerTarget);
+        };
         if (!runtimeTemplateOnly) {
           const cancel = document.createElement("button");
           cancel.type = "button";
           cancel.textContent = "Cancel";
           cancel.title = `Discard unsaved ${provider.display_name || provider.id || "provider"} changes`;
-          cancel.onclick = () => resetProviderSettingsCard(card, provider);
+          cancel.onclick = () => {
+            resetProviderSettingsCard(card, provider, isDownloadClientCard ? bodyTarget : null);
+            if (isDownloadClientCard) window.InkDropDownloadClients?.closeProviderCardModal?.(providerTarget);
+          };
           actions.appendChild(cancel);
         }
         if (providerIsUserDeletable(provider)) {
@@ -26981,7 +27464,17 @@ HTML = r"""<!doctype html>
           };
           actions.appendChild(problems);
         }
-        card.appendChild(actions);
+        bodyTarget.appendChild(actions);
+        if (isDownloadClientCard) {
+          const openThisProviderModal = () => window.InkDropDownloadClients?.openProviderCardModal?.(providerTarget, settingsProviderDisplayName(provider), provider.description || provider.automation_role || "", bodyTarget, head);
+          head.addEventListener("click", openThisProviderModal);
+          head.addEventListener("keydown", event => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openThisProviderModal();
+            }
+          });
+        }
         if (providerTileGroup && providerIsUserDeletable(provider)) {
           const shell = document.createElement("div");
           shell.className = "settings-provider-tile-shell user-deletable";
@@ -27213,18 +27706,19 @@ HTML = r"""<!doctype html>
       return loadInkdropSettings(false, settingsAreaFromRouteParams());
     }
 
-    async function saveProviderSettings(card) {
+    async function saveProviderSettings(card, extraScope=null) {
+      const scopes = providerFieldScopes(card, extraScope);
       const id = card?.dataset?.providerId || "";
       const runtimeTemplateOnly = card?.dataset?.providerRuntimeOnly === "1";
-      const enabled = !!card?.querySelector?.("[data-provider-enabled]")?.checked;
-      const base = card?.querySelector?.("[data-provider-base-url]");
+      const enabled = !!providerFieldQuery(scopes, "[data-provider-enabled]")?.checked;
+      const base = providerFieldQuery(scopes, "[data-provider-base-url]");
       const patchSettings = {};
-      for (const input of card?.querySelectorAll?.("[data-provider-setting]") || []) {
+      for (const input of providerFieldQueryAll(scopes, "[data-provider-setting]")) {
         if (input.dataset.secretField && !String(input.value || "").trim()) continue;
         patchSettings[input.dataset.providerSetting] = readSettingInput(input);
       }
       if (runtimeTemplateOnly) {
-        const providerName = String(card?.querySelector?.(".settings-card-title h3")?.textContent || id || "Provider").trim();
+        const providerName = String(providerFieldQuery(scopes, ".settings-card-title h3")?.textContent || id || "Provider").trim();
         const ok = await openInkdropConfirmModal({
           title: "Claim Runtime Provider",
           actionTitle: "Create provider config",
@@ -32392,7 +32886,12 @@ HTML = r"""<!doctype html>
             const alias = document.createElement("button");
             alias.textContent = "Add Alias";
             alias.onclick = async () => {
-              const suggested = item.matched_title || sourceItem?.title || candidate.title || "";
+              // Never suggest the matched candidate/source item's own raw
+              // filename -- it carries release-tag noise (pack range, year
+              // range, format, group) that turns every future search for
+              // this series into a query nothing will ever match. Fall back
+              // to fields InkDrop already treats as clean titles instead.
+              const suggested = item.matched_title || item.matched_series || item.series || item.query || "";
               await addManualReviewAlias(item, suggested);
             };
             const bad = document.createElement("button");
@@ -32715,7 +33214,12 @@ HTML = r"""<!doctype html>
             const alias = document.createElement("button");
             alias.textContent = "Add Alias";
             alias.onclick = async () => {
-              const suggested = item.matched_title || candidate.title || "";
+              // Never suggest the matched candidate's own raw filename -- it
+              // carries release-tag noise (pack range, year range, format,
+              // group) that turns every future search for this series into
+              // a query nothing will ever match. Fall back to fields
+              // InkDrop already treats as clean titles instead.
+              const suggested = item.matched_title || item.matched_series || item.series || item.query || "";
               await addManualReviewAlias(item, suggested);
             };
             moreMenu.append(importMatched, ignore, alias, bad);
@@ -32742,7 +33246,12 @@ HTML = r"""<!doctype html>
             const alias = document.createElement("button");
             alias.textContent = "Add Alias";
             alias.onclick = async () => {
-              const suggested = item.matched_title || sourceItem?.title || candidate.title || "";
+              // Never suggest the matched candidate/source item's own raw
+              // filename -- it carries release-tag noise (pack range, year
+              // range, format, group) that turns every future search for
+              // this series into a query nothing will ever match. Fall back
+              // to fields InkDrop already treats as clean titles instead.
+              const suggested = item.matched_title || item.matched_series || item.series || item.query || "";
               await addManualReviewAlias(item, suggested);
             };
             moreMenu.append(ignore, alias, bad);
@@ -32765,7 +33274,13 @@ HTML = r"""<!doctype html>
               const alias = document.createElement("button");
               alias.textContent = "Add Alias";
               alias.onclick = async () => {
-                const suggested = item.matched_title || sourceItem?.title || candidate.title || "";
+                // Never suggest the matched candidate/source item's own raw
+                // filename -- it carries release-tag noise (pack range,
+                // year range, format, group) that turns every future
+                // search for this series into a query nothing will ever
+                // match. Fall back to fields InkDrop already treats as
+                // clean titles instead.
+                const suggested = item.matched_title || item.matched_series || item.series || item.query || "";
                 await addManualReviewAlias(item, suggested);
               };
               const bad = document.createElement("button");
@@ -38812,17 +39327,17 @@ def run_missing_acquire(fresh=False, hot=False, series=None, max_per_series=None
     if hot:
         default_per_series = 1
         default_total = 5
-        cooldown_hours = "1"
+        cooldown_hours = "0.5"
         fresh_days = "3"
     elif fresh:
         default_per_series = 1
         default_total = 10
-        cooldown_hours = "2"
+        cooldown_hours = "1"
         fresh_days = "21"
     else:
         default_per_series = 5
         default_total = 25
-        cooldown_hours = "24"
+        cooldown_hours = "4"
         fresh_days = None
     if cooldown_hours_override is not None:
         cooldown_hours = str(cooldown_hours_override)
@@ -40434,7 +40949,7 @@ def series_autopilot_worker_args(max_series, max_issues):
         "--missing-max-total",
         str(SERIES_AUTOPILOT_MISSING_MAX_TOTAL),
         "--no-result-cooldown-hours",
-        "1",
+        str(SERIES_AUTOPILOT_PROWLARR_NO_RESULT_COOLDOWN_HOURS),
         "--source-lock-wait-seconds",
         str(SERIES_AUTOPILOT_SOURCE_LOCK_WAIT_SECONDS),
         "--retry-seconds",
@@ -43119,25 +43634,34 @@ def source_health_summary(
     else:
         rss_label = rss_source_status
 
-    comicscodes_source_status = str(comicscodes_status.get("status") or "unknown")
+    comicscodes_enabled = bool((inkdrop_state.provider_config(INKDROP_STATE_DB, "comicscodes") or {}).get("enabled", True)) if inkdrop_state is not None else True
     backoff_sources = int(comicscodes_status.get("backoff_sources") or 0)
     blocked_sources = int(comicscodes_status.get("blocked_sources") or 0)
     source_errors = []
     for source in comicscodes_status.get("sources") or []:
         if isinstance(source, dict) and source.get("last_error"):
             source_errors.append(str(source.get("last_error")))
-    if backoff_sources:
-        comicscodes_detail = (
-            f"{backoff_sources} source{'s are' if backoff_sources != 1 else ' is'} backing off"
-        )
-        if source_errors:
-            comicscodes_detail += f": {', '.join(sorted(set(source_errors))[:2])}"
+    if not comicscodes_enabled:
+        # An operator turned it off; say that plainly instead of reusing
+        # stale backoff/candidate counts from before it was turned off,
+        # which read like it's still actively retrying.
+        comicscodes_source_status = "disabled"
+        comicscodes_detail = "Turned off in Settings."
+        backoff_sources = 0
     else:
-        found = int(comicscodes_status.get("candidates_found") or 0)
-        comicscodes_detail = (
-            f"{found} candidate{'s' if found != 1 else ''} found"
-            f", {blocked_sources} source{'s' if blocked_sources != 1 else ''} blocked"
-        )
+        comicscodes_source_status = str(comicscodes_status.get("status") or "unknown")
+        if backoff_sources:
+            comicscodes_detail = (
+                f"{backoff_sources} source{'s are' if backoff_sources != 1 else ' is'} backing off"
+            )
+            if source_errors:
+                comicscodes_detail += f": {', '.join(sorted(set(source_errors))[:2])}"
+        else:
+            found = int(comicscodes_status.get("candidates_found") or 0)
+            comicscodes_detail = (
+                f"{found} candidate{'s' if found != 1 else ''} found"
+                f", {blocked_sources} source{'s' if blocked_sources != 1 else ''} blocked"
+            )
 
     active = int(reconcile_status.get("active_downloads") or 0)
     ready = int(reconcile_status.get("ready_imports") or 0)
@@ -43316,11 +43840,17 @@ def completed_pack_manifest_cache_summary(limit=5):
     }
 
 
+def source_health_gate_stale(age_minutes):
+    return age_minutes is None or age_minutes >= SOURCE_HEALTH_GATE_RETRY_AFTER_MINUTES
+
+
 def source_health_provider_snapshot(source_health):
     source_health = source_health if isinstance(source_health, dict) else {}
     pack_roots = int(source_health.get("completed_pack_manifest_cache_roots") or 0)
     pack_archives = int(source_health.get("completed_pack_manifest_cache_archives") or 0)
     pack_cache_text = f"; pack cache {pack_roots} roots/{pack_archives} files" if (pack_roots or pack_archives) else ""
+    rss_gate_stale = source_health_gate_stale(source_health.get("rss_age_minutes"))
+    comicscodes_gate_stale = source_health_gate_stale(source_health.get("comicscodes_age_minutes"))
     return {
         "prowlarr": {
             "state": source_health.get("prowlarr_api_state") or ("healthy" if source_health.get("prowlarr_status") == "running" else "unavailable"),
@@ -43341,13 +43871,24 @@ def source_health_provider_snapshot(source_health):
             "torrentleech_coverage_detail": source_health.get("prowlarr_torrentleech_coverage_detail"),
         },
         "rss": {
-            "state": "healthy" if str(source_health.get("rss_status") or "").lower().startswith("ok") else "watch",
-            "label": source_health.get("rss_status") or "unknown",
+            "state": "unknown" if rss_gate_stale else (
+                "healthy" if str(source_health.get("rss_status") or "").lower().startswith("ok") else "watch"
+            ),
+            "label": "retrying; last check is over 16h old" if rss_gate_stale else (source_health.get("rss_status") or "unknown"),
             "detail": f"{source_health.get('rss_feed_status') or 'feed unknown'}; {int(source_health.get('rss_candidates_found') or 0)} candidates",
         },
         "comicscodes": {
-            "state": "backoff" if int(source_health.get("comicscodes_backoff_sources") or 0) else "healthy",
-            "label": "backoff" if int(source_health.get("comicscodes_backoff_sources") or 0) else (source_health.get("comicscodes_status") or "unknown"),
+            "state": (
+                "disabled" if source_health.get("comicscodes_status") == "disabled"
+                else "unknown" if comicscodes_gate_stale
+                else "backoff" if int(source_health.get("comicscodes_backoff_sources") or 0)
+                else "healthy"
+            ),
+            "label": (
+                source_health.get("comicscodes_status") if source_health.get("comicscodes_status") == "disabled"
+                else "retrying; last check is over 16h old" if comicscodes_gate_stale
+                else source_health.get("comicscodes_status") or "unknown"
+            ),
             "detail": source_health.get("comicscodes_detail") or "",
         },
         "slskd": {
@@ -44383,7 +44924,7 @@ def run_inkdrop_library_frontend_sync(payload):
     }
 
 
-def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None):
+def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None):
     started_at = time.perf_counter()
     try:
         view = str(view or "").strip().lower()
@@ -44457,6 +44998,7 @@ def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filte
             offset=offset,
             sort_key=sort_key,
             sort_direction=sort_direction,
+            history_search=history_search,
         )
         if isinstance(settlement, dict) and settlement.get("skipped"):
             payload["queue_settlement"] = settlement
@@ -45688,6 +46230,28 @@ def remove_inkdrop_series(payload):
     }
 
 
+def clear_inkdrop_source_attempts(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    series_id = str(payload.get("series_id") or payload.get("seriesId") or "").strip()
+    issue_id = str(payload.get("issue_id") or payload.get("issueId") or "").strip()
+    wanted_id = str(payload.get("wanted_id") or payload.get("wantedId") or "").strip()
+    queue_id = str(payload.get("queue_id") or payload.get("queueId") or "").strip()
+    source_attempt_id = str(payload.get("source_attempt_id") or payload.get("sourceAttemptId") or "").strip()
+    result = inkdrop_state.reset_source_attempts(
+        INKDROP_STATE_DB,
+        series_id=series_id or None,
+        issue_id=issue_id or None,
+        wanted_id=wanted_id or None,
+        queue_id=queue_id or None,
+        source_attempt_id=source_attempt_id or None,
+    )
+    watch_log(
+        "inkdrop_source_attempts_cleared",
+        {"scope": result.get("scope"), "deletedCount": result.get("deleted_count")},
+    )
+    return result
+
+
 def migrate_inkdrop_series_library(payload):
     payload = payload if isinstance(payload, dict) else {}
     series_id = str(payload.get("id") or payload.get("series_id") or payload.get("seriesId") or "").strip()
@@ -46645,6 +47209,8 @@ def runtime_provider_settings():
             "packs_allowed": True,
             "pack_auto_approve_min_missing": 1,
             "complete_pack_min_missing": 1,
+            "pack_size_limit_gb_comics": 0,
+            "pack_size_limit_gb_manga": 0,
             "editable_fields": [
                 "preferred_language",
                 "allow_non_english",
@@ -46654,6 +47220,8 @@ def runtime_provider_settings():
                 "packs_allowed",
                 "pack_auto_approve_min_missing",
                 "complete_pack_min_missing",
+                "pack_size_limit_gb_comics",
+                "pack_size_limit_gb_manga",
             ],
         },
     )
@@ -46973,6 +47541,14 @@ def runtime_provider_settings():
                 "source": "runtime",
             },
             {
+                "key": "quality.allow_raw_image_page_folders",
+                "scope": "quality",
+                "label": "Allow Raw Page-Image Folders",
+                "value": True,
+                "description": "Some Soulseek shares are page-by-page .jpg/.png scans with no archive at all. When on, InkDrop can grab one of these as a candidate and build a CBZ from the pages during import. Turn this off to leave archive-less scan folders alone.",
+                "source": "runtime",
+            },
+            {
                 "key": "quality.preferred_extensions",
                 "scope": "quality",
                 "label": "Preferred Extensions",
@@ -47274,7 +47850,7 @@ PROVIDER_SETTINGS_META = {
     "comicscodes": {
         "settings_group": "download_sources",
         "automation_role": "Direct download discovery",
-        "description": "Checks direct-download listing/feed sources with backoff protection.",
+        "description": "Checks comics.codes for direct-download releases, with backoff protection if it starts blocking requests.",
         "next_action": "Keep limits low when Cloudflare or host challenges appear.",
         "applied_by": ["Series Autopilot", "ComicsCodes discovery worker"],
         "ownership": "native",
@@ -47497,6 +48073,8 @@ COMMON_PROVIDER_FIELD_SCHEMA = {
     "packs_allowed": {"label": "Allow Packs", "kind": "boolean"},
     "pack_auto_approve_min_missing": {"label": "Pack Auto-Approve Missing Count", "kind": "number", "min": 1},
     "complete_pack_min_missing": {"label": "Complete Pack Missing Count", "kind": "number", "min": 1},
+    "pack_size_limit_gb_comics": {"label": "Pack Size Limit - Comics (GB)", "kind": "number", "min": 0},
+    "pack_size_limit_gb_manga": {"label": "Pack Size Limit - Manga (GB)", "kind": "number", "min": 0},
     "register_new_series": {"label": "Register New Series", "kind": "boolean"},
     "allow_adapter_backfill": {"label": "Allow Adapter Backfill", "kind": "boolean"},
     "allow_legacy_sync": {"label": "Allow Legacy Sync", "kind": "boolean"},
@@ -47589,6 +48167,8 @@ PROVIDER_FIELD_HELP = {
         "allow_non_english": "When off, language-looking release terms block automatic grabs.",
         "packs_allowed": "When on, high-confidence pack/range candidates can be auto-used.",
         "pdf_allowed": "When on, high-confidence PDF matches can be auto-used.",
+        "pack_size_limit_gb_comics": "Largest comic pack/torrent InkDrop will grab automatically. 0 means no limit -- a pack over the limit goes to Manual Review instead of being auto-grabbed or dropped.",
+        "pack_size_limit_gb_manga": "Largest manga pack/torrent InkDrop will grab automatically. 0 means no limit -- a pack over the limit goes to Manual Review instead of being auto-grabbed or dropped.",
     },
     "media_management": {
         "root_folder_strategy": "Use media type by default: comics land under the comic root and manga lands under the manga root.",
@@ -53926,6 +54506,20 @@ def add_alias_from_review(payload):
     series = item.get("series")
     if not series:
         raise ValueError("review item has no matched series")
+    # An "Add Alias" suggestion can fall back to a matched candidate's raw
+    # filename (release group, pack range, year range, format tag and all)
+    # when InkDrop has no cleaner title on hand. That's fine as a starting
+    # point for the user to edit, but saving it verbatim silently turns
+    # every future search for this series into a query no index will ever
+    # match -- reject rather than let release-tag noise into the alias
+    # store, the same test source_title_variants() uses to decide whether a
+    # stored alias is trustworthy as a literal query.
+    import inkdrop_slskd_source_probe as slskd_probe
+    cleaned_alias = slskd_probe.clean_alias_title(alias)
+    if cleaned_alias and slskd_probe.normalize(cleaned_alias) != slskd_probe.normalize(alias):
+        raise ValueError(
+            f"alias looks like a release filename, not a title -- try {cleaned_alias!r} instead"
+        )
     aliases = read_json_file(RSS_ALIASES_FILE, {}) or {}
     values = aliases.setdefault(series, [])
     if alias not in values:
@@ -58609,6 +59203,26 @@ class Handler(BaseHTTPRequestHandler):
             contract = inkdrop_state.series_library_contract(INKDROP_STATE_DB, series_id)
             status = 200 if contract.get("ok") else 404 if contract.get("reason") == "series_not_found" else 400
             self.send_json({"ok": bool(contract.get("ok")), "library": contract}, status=status)
+        elif path == "/api/inkdrop-state/series/library/preview":
+            series_id = str(
+                (query.get("id") or query.get("series_id") or query.get("seriesId") or [""])[0] or ""
+            ).strip()
+            destination_root = str(
+                (query.get("destination_root") or query.get("destinationRoot") or [""])[0] or ""
+            ).strip()
+            destination_path = str(
+                (query.get("destination_path") or query.get("destinationPath") or [""])[0] or ""
+            ).strip() or None
+            move_files = inkdrop_bool_value((query.get("move_files") or query.get("moveFiles") or ["0"])[0], False)
+            plan = inkdrop_state.preview_series_library_migration(
+                INKDROP_STATE_DB,
+                series_id,
+                destination_root,
+                destination_path=destination_path,
+                move_files=move_files,
+            )
+            status = 200 if plan.get("ok") else 404 if plan.get("reason") == "series_not_found" else 409
+            self.send_json({"ok": bool(plan.get("ok")), "preview": plan}, status=status)
         elif path == "/api/inkdrop-state/history/raw":
             query = parse_qs(parsed.query or "")
             payload = inkdrop_history_event_raw((query.get("id") or [None])[0])
@@ -58644,6 +59258,7 @@ class Handler(BaseHTTPRequestHandler):
                     offset=(query.get("offset") or [0])[0],
                     sort_key=(query.get("sort") or query.get("sort_key") or [None])[0],
                     sort_direction=(query.get("direction") or query.get("sort_direction") or [None])[0],
+                    history_search=(query.get("history_search") or query.get("historySearch") or [None])[0],
                 )
                 self.send_json({"ok": bool(payload.get("ok")), "view": payload}, status=200 if payload.get("ok") else 404)
             elif summary_mode in {"compact", "minimal", "sections"}:
@@ -58689,6 +59304,7 @@ class Handler(BaseHTTPRequestHandler):
                 offset=(query.get("offset") or [0])[0],
                 sort_key=(query.get("sort") or query.get("sort_key") or [None])[0],
                 sort_direction=(query.get("direction") or query.get("sort_direction") or [None])[0],
+                history_search=(query.get("history_search") or query.get("historySearch") or [None])[0],
             )
             self.send_json({"ok": bool(payload.get("ok")), "view": payload}, status=200 if payload.get("ok") else 404)
         elif path == "/api/inkdrop-settings":
@@ -58919,10 +59535,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "result": update_inkdrop_series_flags(data)})
             elif path == "/api/inkdrop-state/series/remove":
                 self.send_json({"ok": True, "result": remove_inkdrop_series(data)})
+            elif path == "/api/inkdrop-state/source-attempts/clear":
+                self.send_json({"ok": True, "result": clear_inkdrop_source_attempts(data)})
             elif path == "/api/inkdrop-state/series/library/migrate":
                 result = migrate_inkdrop_series_library(data)
                 self.send_json(
-                    {"ok": bool(result.get("ok")), "result": result},
+                    {"ok": bool(result.get("ok")), "result": result, "error": result.get("reason")},
                     status=200 if result.get("ok") else 409,
                 )
             elif path == "/api/inkdrop-state/wanted/run":

@@ -28,6 +28,12 @@ import sys
 import time
 
 import inkdrop_runtime_config
+import inkdrop_archive_conversion
+
+try:
+    import inkdrop_state
+except Exception:
+    inkdrop_state = None
 
 
 def extract_issue_number(filename):
@@ -73,6 +79,13 @@ STATE_DB = os.environ.get("INKDROP_STATE_DB") or str(
 PRIORITY_LOOKBACK_SECONDS = int(os.environ.get("INKDROP_SLSKD_SWEEP_PRIORITY_LOOKBACK_SECONDS", 7 * 24 * 3600))
 ARCHIVE_EXT = {".cbz", ".cbr", ".zip", ".pdf"}
 CHECKPOINT_MAX_AGE_SECONDS = int(os.environ.get("INKDROP_SLSKD_SWEEP_CHECKPOINT_MAX_AGE_SECONDS", 7 * 24 * 3600))
+# A folder of loose scan pages (no archive at all -- real example: a peer
+# sharing 43 numbered .png pages with no .cbz/.cbr anywhere) is invisible to
+# every check above; ARCHIVE_EXT never matches a bare .png/.jpg. Converting
+# it to a CBZ here, once, is what makes the existing archive pipeline above
+# able to see it on a later run -- nothing about matching or import changes.
+PAGE_DIRECTORY_TIMEOUT_SECONDS = int(os.environ.get("INKDROP_SLSKD_SWEEP_PAGE_DIRECTORY_TIMEOUT_SECONDS", 300))
+MAX_PAGE_DIRECTORY_CONVERSIONS = int(os.environ.get("INKDROP_SLSKD_SWEEP_MAX_PAGE_DIRECTORY_CONVERSIONS", 5))
 # Comics-kind files have no cheap live-existence check the way manga does
 # (find_existing_manga_unit_file scans the target folder directly; comics
 # falls through to the sha256 ledger, which requires hashing the whole
@@ -208,6 +221,61 @@ def enumerate_files(root):
     return files
 
 
+def raw_image_page_folders_setting_enabled():
+    """Whether Settings > Quality > Allow Raw Page-Image Folders is on.
+
+    Same source-of-truth pattern as the other quality.* toggles this sweep
+    doesn't otherwise read: an explicit user override wins, anything else
+    (unset, non-user source) falls back to the setting's documented default.
+    """
+    if inkdrop_state is None:
+        return True
+    try:
+        setting = inkdrop_state.app_setting(STATE_DB, "quality.allow_raw_image_page_folders")
+    except Exception:
+        return True
+    if not setting or setting.get("source") != "user":
+        return True
+    return bool(setting.get("value", True))
+
+
+def enumerate_page_directories(root):
+    """Directories holding only loose, sequential page images -- no archive,
+    no subfolders. Mirrors enumerate_files' shape so the checkpoint table
+    can track a directory the same way it tracks a real file."""
+    directories = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if not filenames:
+            continue
+        try:
+            inspection = inkdrop_archive_conversion.inspect_page_directory(dirpath)
+        except inkdrop_archive_conversion.ConversionRefused:
+            continue
+        if inspection["nested_archives"] or inspection["subdirectories"]:
+            continue
+        if inspection["image_count"] < inkdrop_archive_conversion.MIN_PAGE_DIRECTORY_IMAGES:
+            continue
+        try:
+            st = os.stat(dirpath)
+        except OSError:
+            continue
+        # image_count stands in for a file's size in the (path, size, mtime)
+        # checkpoint key -- it changes if pages are added/removed between
+        # runs, which is exactly when a directory should be looked at again.
+        directories.append((dirpath, inspection["image_count"], st.st_mtime))
+    return directories
+
+
+def process_one_page_directory(path):
+    try:
+        result = inkdrop_archive_conversion.convert_page_directory(path, dry_run=DRY_RUN)
+    except Exception as exc:
+        return {"decision": "error", "reason": f"{type(exc).__name__}: {exc}", "dest": None}
+    if result.get("converted") or (DRY_RUN and result.get("ok")):
+        return {"decision": "converted", "reason": None, "dest": result.get("dest")}
+    return {"decision": "skipped", "reason": result.get("reason") or "not_convertible", "dest": result.get("dest")}
+
+
 def load_checkpoints(con):
     rows = con.execute("select path, size, mtime, checked_at from slskd_staging_scan_checkpoint").fetchall()
     return {(r[0], r[1], r[2]): r[3] for r in rows}
@@ -334,6 +402,57 @@ def main():
     checkpoints = load_checkpoints(con)
     error_counts = load_error_counts(con)
 
+    page_directory_summary = {
+        "enabled": raw_image_page_folders_setting_enabled(),
+        "eligible_this_run": 0,
+        "converted_this_run": 0,
+        "skipped_this_run": 0,
+        "errors_this_run": 0,
+    }
+    if page_directory_summary["enabled"]:
+        page_directory_started = time.time()
+        eligible_directories = enumerate_page_directories(SLSKD_ROOT)
+        page_directory_summary["eligible_this_run"] = len(eligible_directories)
+        random.shuffle(eligible_directories)
+        conversions_done = 0
+        for path, image_count, mtime in eligible_directories:
+            if time.time() - page_directory_started > PAGE_DIRECTORY_TIMEOUT_SECONDS:
+                break
+            if conversions_done >= MAX_PAGE_DIRECTORY_CONVERSIONS:
+                break
+            key = (path, image_count, mtime)
+            checked_at = checkpoints.get(key)
+            if checked_at is not None and (time.time() - checked_at) < CHECKPOINT_MAX_AGE_SECONDS:
+                continue
+            err_count, last_error_at = error_counts.get(path, (0, None))
+            if err_count >= MAX_CONSECUTIVE_ERRORS and last_error_at is not None and (time.time() - last_error_at) < ERROR_COOLDOWN_SECONDS:
+                continue
+
+            result = process_one_page_directory(path)
+            if result["decision"] == "converted":
+                page_directory_summary["converted_this_run"] += 1
+                conversions_done += 1
+                clear_error_count(con, path)
+                # The directory itself no longer exists after a real (non-dry-run)
+                # conversion -- moved aside as the CBZ's kept original -- so there
+                # is nothing further to checkpoint here. enumerate_files() below
+                # picks up the new CBZ like any other archive on this same run.
+            elif result["decision"] == "error":
+                page_directory_summary["errors_this_run"] += 1
+                record_error(con, path, result["reason"])
+            else:
+                page_directory_summary["skipped_this_run"] += 1
+                clear_error_count(con, path)
+                con.execute(
+                    """
+                    insert or replace into slskd_staging_scan_checkpoint
+                        (path, size, mtime, decision, reason, dest, checked_at)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (path, image_count, mtime, result["decision"], result["reason"], result["dest"], time.time()),
+                )
+                con.commit()
+
     all_files = enumerate_files(SLSKD_ROOT)
     now = time.time()
     to_process = []
@@ -433,6 +552,7 @@ def main():
     if summary["stopped_reason"] is None:
         summary["stopped_reason"] = "all_candidates_processed"
 
+    summary["page_directories"] = page_directory_summary
     summary["elapsed_seconds"] = round(time.time() - started, 1)
     print(json.dumps(summary, indent=2))
     con.close()

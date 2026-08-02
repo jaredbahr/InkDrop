@@ -487,6 +487,41 @@ def resolve_command(command):
     return [resolve_script(part) if isinstance(part, str) and part.endswith((".py", ".sh")) else part for part in command]
 
 
+_ISOLATED_STATE_ENV = None
+
+
+def isolated_state_env_defaults():
+    """INKDROP_STATE_DIR and friends default to a real, persistent path when
+    unset. CI sets these explicitly via the workflow, but a local run of this
+    script -- by a developer or an agent verifying a fix -- would otherwise
+    run every check below against real application state. Lazily build one
+    isolated temp root (shared across the whole run here, same as CI's own
+    per-job $RUNNER_TEMP) and reuse it for every check_env() call in this
+    process; only fills in vars the caller hasn't already set.
+    """
+    global _ISOLATED_STATE_ENV
+    if _ISOLATED_STATE_ENV is None:
+        root = tempfile.mkdtemp(prefix="inkdrop-release-check-")
+        layout = {
+            "INKDROP_CONFIG_DIR": "config",
+            "INKDROP_STATE_DIR": "state",
+            "INKDROP_LOCK_DIR": "state/locks",
+            "INKDROP_LOG_DIR": "state/logs",
+            "INKDROP_CACHE_DIR": "state/cache",
+            "INKDROP_BACKUP_DIR": "state/backups",
+            "INKDROP_STAGING_DIR": "staging",
+            "INKDROP_MANUAL_INBOX_DIR": "manual-inbox",
+            "INKDROP_QUARANTINE_DIR": "state/quarantine",
+        }
+        defaults = {}
+        for var, rel in layout.items():
+            path = os.path.join(root, rel)
+            os.makedirs(path, exist_ok=True)
+            defaults[var] = path
+        _ISOLATED_STATE_ENV = defaults
+    return _ISOLATED_STATE_ENV
+
+
 def check_env(env=None):
     """Run child scripts with the repo root importable.
 
@@ -494,6 +529,8 @@ def check_env(env=None):
     test under tests/ cannot import the root modules it exercises without this.
     """
     resolved = dict(os.environ if env is None else env)
+    if "INKDROP_STATE_DIR" not in resolved:
+        resolved.update(isolated_state_env_defaults())
     existing = resolved.get("PYTHONPATH", "")
     root = str(ROOT)
     if root not in existing.split(os.pathsep):

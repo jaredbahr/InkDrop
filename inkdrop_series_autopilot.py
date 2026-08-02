@@ -15575,7 +15575,7 @@ def main():
     parser.add_argument("--prowlarr-provider-fetch-failure-threshold", type=int, default=None)
     parser.add_argument("--prowlarr-provider-fetch-failure-cooldown-seconds", type=int, default=None)
     parser.add_argument("--source-lock-wait-seconds", type=int, default=DEFAULT_SLSKD_SOURCE_LOCK_WAIT_SECONDS, help="seconds to wait for a busy source worker before retrying on the next queue pass")
-    parser.add_argument("--no-result-cooldown-hours", type=float, default=1)
+    parser.add_argument("--no-result-cooldown-hours", type=float, default=0.33)
     parser.add_argument("--skip-failed-retry", action="store_true")
     parser.add_argument("--failed-retry-max-total", type=int, default=3)
     parser.add_argument("--failed-retry-limit", type=int, default=50)

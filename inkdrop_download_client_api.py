@@ -12,6 +12,7 @@ import uuid
 import requests
 
 import inkdrop_download_client_config as config_store
+import inkdrop_download_client_routing
 import inkdrop_download_clients
 import inkdrop_operator_contracts
 import inkdrop_qbittorrent_auth
@@ -142,7 +143,40 @@ def storage_payload(payload):
 
 
 def list_payload(db_path):
-    return {"ok": True, "registry": implemented_registry(), **config_store.list_instances(db_path)}
+    payload = {"ok": True, "registry": implemented_registry(), **config_store.list_instances(db_path)}
+    instances = payload.get("instances") or []
+    if any(str(row.get("client_type") or "").lower() == "slskd" for row in instances):
+        # SLSKD is unique in this system: an instance row here doesn't just add a
+        # second connection, it can fully take over from the single SLSKD provider
+        # card once it satisfies slskd_source_instance()'s readiness check (enabled,
+        # base_url, api_key). Surface exactly which instance (if any) the routing
+        # layer actually picked, so the UI can show which config is live instead of
+        # guessing from "enabled" -- an instance can be enabled and still not be the
+        # one InkDrop is actually using.
+        routed = inkdrop_download_client_routing.slskd_source_instance(db_path)
+        routed_id = (routed or {}).get("download_client_instance_id")
+        for row in instances:
+            if str(row.get("client_type") or "").lower() == "slskd":
+                row["is_active_slskd_source"] = row.get("id") == routed_id
+    legacy_slskd = inkdrop_state.provider_config(db_path, "slskd")
+    if legacy_slskd:
+        # A brand-new SLSKD instance draft otherwise starts blank -- if a user
+        # finishes and enables it, thinking they're just adding a second
+        # connection, it silently takes over with whatever they typed instead of
+        # the tuned download_root/incomplete_root/probe settings already live on
+        # the provider card. Pre-filling from that card's current config means
+        # activating the new surface can't silently change where downloads land.
+        legacy_settings = legacy_slskd.get("settings") or {}
+        payload["legacy_slskd_defaults"] = {
+            "base_url": legacy_slskd.get("base_url") or "",
+            "download_path": legacy_settings.get("download_root") or "",
+            "settings": {
+                key: legacy_settings[key] for key in
+                ("wait_seconds", "max_queries", "auto_grab_max", "probe_budget_seconds", "cooldown_hours", "max_active_per_user")
+                if key in legacy_settings
+            },
+        }
+    return payload
 
 
 def get_payload(db_path, instance_id):

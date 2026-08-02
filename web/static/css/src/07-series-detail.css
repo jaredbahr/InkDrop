@@ -1354,7 +1354,8 @@
       letter-spacing: 0;
       text-transform: uppercase;
     }
-    .inkdrop-text-field input {
+    .inkdrop-text-field input,
+    .inkdrop-text-field select {
       width: 100%;
       min-height: 38px;
       border: 1px solid rgba(114, 210, 255, .28);
@@ -1366,7 +1367,8 @@
       font-weight: 800;
       line-height: 1.25;
     }
-    .inkdrop-text-field input:focus {
+    .inkdrop-text-field input:focus,
+    .inkdrop-text-field select:focus {
       outline: 1px solid rgba(66, 185, 229, .62);
       outline-offset: 1px;
       border-color: rgba(66, 185, 229, .7);

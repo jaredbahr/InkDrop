@@ -832,26 +832,49 @@ require(slskd.verdict_refresh_budget_seconds(10_000) <= 15, slskd.verdict_refres
 # A metadata title can be a bad Soulseek query while the shelf name is a good
 # one. Uploaders file "Naoki Urasawa's 20th Century Boys" under
 # Manga/URASAWA Naoki/20th Century Boys, so the canonical title matches almost
-# no filenames: live, it returns 1 file from 1 peer on every run, while
-# "20th Century Boys manga" returns 1,058 files from 19 peers -- and that query
-# was never generated at all. Only the alternate variant's later
-# "complete"/"collection" forms were reaching the plan.
+# no filenames: live, it returns 1 file from 1 peer on every run, while the
+# de-prefixed alternate title "20th Century Boys" was never being generated
+# at all. Only the alternate variant's later "complete"/"collection" forms
+# were reaching the plan.
+#
+# The de-prefixed alias getting a "manga"-qualified form too (PASS: manga
+# query priority, 2026-08-02) turned out to be a stale comparison once the
+# fix above landed: it was only ever measured against the badly-mismatched
+# canonical title (1 file), never against the bare alias itself. Once the
+# bare alias started being generated, live slskd data showed it strictly
+# beats its own qualified form -- 2,405+ files/180 peers bare vs. 982
+# files/20 peers qualified, zero peers unique to the qualified query -- the
+# same pattern real data confirmed for every other series checked (Monster,
+# Kingdom, On a Sunbeam, Deadman Wonderland). The qualified form is no
+# longer generated for an already-good title; it remains for the canonical
+# (still known-bad) title just below, which is a different case.
 authored = {"series": "Naoki Urasawa's 20th Century Boys", "issue": "6",
             "issue_title": "Volume 6", "media_type": "manga"}
 authored_queries = slskd.source_queries(authored)
 stripped = [q for q in authored_queries if "naoki" not in slskd.normalize(q)]
 require(any(slskd.normalize(q) == "20th century boys" for q in stripped),
         ("bare alternate title must be searchable", authored_queries[:12]))
-require(any(slskd.normalize(q) == "20th century boys manga" for q in stripped),
-        ("media-qualified alternate title must be searchable", authored_queries[:12]))
+require(
+    not any(slskd.normalize(q) == "20th century boys manga" for q in stripped),
+    ("an already-good promoted title must not waste a slot on the redundant qualifier", authored_queries[:12]),
+)
+require(
+    "Naoki Urasawa's 20th Century Boys manga" in authored_queries,
+    ("the known-bad canonical title keeps its qualified fallback", authored_queries[:12]),
+)
 # ...without pushing the wanted issue out of the front of the plan. A pass only
 # fires two queries, so finding the issue has to keep leading.
 require(any("6" in query for query in authored_queries[1:4]),
         ("a numbered query must stay near the front", authored_queries[:6]))
-# A series with a single title variant must be unchanged by any of this.
+# A series with a single title variant must be unchanged by any of this,
+# except that its guaranteed early slot goes to a numbered query instead of
+# the media qualifier -- real data shows a bare title beats its own
+# qualified form in every case tested, so that slot is worth more spent
+# elsewhere (PASS: manga query priority, 2026-08-02).
 plain = slskd.source_queries({"series": "Vagabond", "issue": "5",
                               "issue_title": "Volume 5", "media_type": "manga"})
-require(plain[0] == "Vagabond" and plain[1] == "Vagabond manga", plain[:4])
+require(plain[0] == "Vagabond", plain[:4])
+require("Vagabond manga" not in plain, plain)
 
 # An automatic pass must not re-ask Soulseek a question it asked an hour ago.
 # One series can hold ~100 wanted rows that all build the same broad series

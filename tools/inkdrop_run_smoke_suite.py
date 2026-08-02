@@ -12,7 +12,50 @@ passes is reported so it can be un-skipped.
 import os
 import subprocess
 import sys
+import tempfile
 import time
+
+# INKDROP_STATE_DIR and friends default to a real, persistent path
+# (inkdrop_runtime_config.state_dir()'s own fallback) when unset. CI always
+# sets these explicitly via the workflow, but a local run of this script --
+# by a developer or an agent verifying a fix, exactly the kind of run that
+# polluted the real state dir on a dev machine for over a week before this
+# fix -- would otherwise run all ~265 smoke tests against real application
+# state. Default to an isolated temp root unless the caller already set
+# INKDROP_STATE_DIR themselves (CI's explicit exports are left untouched).
+_STATE_ENV_VARS = (
+    "INKDROP_CONFIG_DIR",
+    "INKDROP_STATE_DIR",
+    "INKDROP_LOCK_DIR",
+    "INKDROP_LOG_DIR",
+    "INKDROP_CACHE_DIR",
+    "INKDROP_BACKUP_DIR",
+    "INKDROP_STAGING_DIR",
+    "INKDROP_MANUAL_INBOX_DIR",
+    "INKDROP_QUARANTINE_DIR",
+)
+
+
+def ensure_isolated_state_env():
+    if "INKDROP_STATE_DIR" in os.environ:
+        return
+    root = tempfile.mkdtemp(prefix="inkdrop-smoke-suite-")
+    layout = {
+        "INKDROP_CONFIG_DIR": "config",
+        "INKDROP_STATE_DIR": "state",
+        "INKDROP_LOCK_DIR": "state/locks",
+        "INKDROP_LOG_DIR": "state/logs",
+        "INKDROP_CACHE_DIR": "state/cache",
+        "INKDROP_BACKUP_DIR": "state/backups",
+        "INKDROP_STAGING_DIR": "staging",
+        "INKDROP_MANUAL_INBOX_DIR": "manual-inbox",
+        "INKDROP_QUARANTINE_DIR": "state/quarantine",
+    }
+    for var, rel in layout.items():
+        path = os.path.join(root, rel)
+        os.makedirs(path, exist_ok=True)
+        os.environ[var] = path
+
 
 # name -> reason. Keep this list SHORT and every entry justified.
 SKIP = {
@@ -44,6 +87,7 @@ def tracked_smokes():
 
 
 def main():
+    ensure_isolated_state_env()
     names = tracked_smokes()
     failures = []
     skipped_passing = []

@@ -141,7 +141,17 @@
       event.preventDefault();
       const type = new FormData(form).get("client_type");
       if (!type) return;
-      showEditor(state, {client_type: String(type), enabled: false, priority: 100}, trigger);
+      const draft = {client_type: String(type), enabled: false, priority: 100};
+      // A new SLSKD instance otherwise starts blank -- pre-fill it from the single
+      // SLSKD provider card's current config so finishing and enabling it can't
+      // silently point downloads at a different, untested path.
+      const legacy = String(type) === "slskd" ? state.payload?.legacy_slskd_defaults : null;
+      if (legacy) {
+        if (legacy.base_url) draft.base_url = legacy.base_url;
+        if (legacy.download_path) draft.download_path = legacy.download_path;
+        if (legacy.settings && Object.keys(legacy.settings).length) draft.settings = {...legacy.settings};
+      }
+      showEditor(state, draft, trigger, {prefilledFromLegacy: !!legacy});
     });
     for (const group of GROUPS) {
       const rows = group.types.map(type => available.get(type)).filter(Boolean);
@@ -317,7 +327,7 @@
     return true;
   }
 
-  function showEditor(state, instance, trigger) {
+  function showEditor(state, instance, trigger, options) {
     const editing = !!instance?.id;
     const type = String(instance.client_type || "").toLowerCase();
     const registry = registryRow(state, type);
@@ -326,6 +336,9 @@
     const form = el("form", "download-client-editor");
     form.noValidate = true;
     const error = el("div", "download-client-inline-error wide"); error.hidden = true; error.setAttribute("role", "alert"); form.append(error);
+    if (options?.prefilledFromLegacy) {
+      form.append(el("p", "download-client-inline-note wide", "Pre-filled from your existing SLSKD card below. These values don't take effect until this instance is enabled and saved — change them if this should point somewhere else."));
+    }
     if (editing) field(form, "Instance ID", "instance_id", {value: instance.id, readonly: true, help: "Immutable identity used by queue and history records."});
     field(form, "Instance name", "name", {value: instance.name || `${clientLabel(type, registry)}`, required: true, help: "A unique name, such as qBittorrent Main or NZBGet Comics."});
     checkbox(form, "Enabled", "enabled", !!instance.enabled, "Disabled clients keep their settings but are skipped by routing and Test All.");
@@ -478,6 +491,11 @@
       }
       const status = statusText(state.statuses.get(instance.id));
       const statusWrap = el("div", ""); statusWrap.append(el("dt", "", "Health"), el("dd", `download-client-health ${status.tone}`, status.text)); facts.append(statusWrap); card.append(facts);
+      if (String(instance.client_type || "").toLowerCase() === "slskd") {
+        card.append(instance.is_active_slskd_source
+          ? el("p", "download-client-instance-note good", "Active — InkDrop is using this instance for SLSKD search and downloads. The single SLSKD card below is disabled while this is active.")
+          : el("p", "download-client-instance-note warn", "Not active yet — InkDrop is still using the single SLSKD card below. This instance takes over automatically once it's enabled with a URL and API key."));
+      }
       if ((instance.path_mappings || []).length) card.append(el("p", "download-client-instance-note", `${instance.path_mappings.length} remote path mapping${instance.path_mappings.length === 1 ? "" : "s"}`));
       const actions = el("div", "download-client-instance-actions");
       const edit = el("button", "", "Edit"); edit.type = "button"; edit.addEventListener("click", () => showEditor(state, instance, edit));
@@ -490,7 +508,15 @@
   }
 
   function hideMigratedLegacyCards(state) {
-    const types = new Set(state.instances.map(item => String(item.client_type || "").toLowerCase()));
+    // For most client types, adding any instance means "use this instead of the
+    // legacy single card." SLSKD is different: an instance row only takes over once
+    // it's actually ready (is_active_slskd_source, computed server-side from the same
+    // check the SLSKD search worker uses) -- an enabled-looking-but-incomplete SLSKD
+    // instance must NOT hide the legacy card, or neither card would show the config
+    // InkDrop is really using.
+    const types = new Set(state.instances
+      .filter(item => String(item.client_type || "").toLowerCase() !== "slskd" || item.is_active_slskd_source)
+      .map(item => String(item.client_type || "").toLowerCase()));
     const group = state.root.closest(".settings-group-body") || state.root.parentElement;
     group?.querySelectorAll?.(".settings-card[data-provider-id]").forEach(card => {
       const migrated = types.has(String(card.dataset.providerId || "").toLowerCase());
@@ -574,5 +600,33 @@
     return root;
   }
 
-  global.InkDropDownloadClients = {mount, _test: {GROUPS, LABELS, editorPayload, validateEditor}};
+  function mountedState(parent) {
+    const root = parent?.querySelector?.(":scope > [data-download-client-manager]");
+    return root ? stateByRoot.get(root) : null;
+  }
+
+  // Reuses the same <dialog> (focus trap, Escape, backdrop-click-to-close already
+  // wired in mount()) to edit the qBittorrent/SABnzbd/SLSKD provider cards, so every
+  // download-client editor -- the single built-in cards and the additional-instance
+  // ones -- opens the same way instead of the inline expand/collapse accordion.
+  function openProviderCardModal(parent, titleText, copyText, bodyNode, trigger) {
+    const state = mountedState(parent);
+    if (!state || !bodyNode) return;
+    const wrapper = shell(titleText, copyText || "Review and update this download client's settings.");
+    bodyNode.classList.add("settings-card-modal-body");
+    wrapper.append(bodyNode);
+    wrapper.querySelectorAll("[data-dialog-close]").forEach(button => button.addEventListener("click", () => closeDialog(state)));
+    state.dialog.setAttribute("aria-labelledby", wrapper.dataset.titleId);
+    openDialog(state, wrapper, trigger);
+  }
+
+  function closeProviderCardModal(parent) {
+    const state = mountedState(parent);
+    if (state) closeDialog(state);
+  }
+
+  global.InkDropDownloadClients = {
+    mount, openProviderCardModal, closeProviderCardModal,
+    _test: {GROUPS, LABELS, editorPayload, validateEditor},
+  };
 })(window);

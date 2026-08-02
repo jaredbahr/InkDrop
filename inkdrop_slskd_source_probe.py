@@ -377,6 +377,7 @@ def inkdrop_quality_app_settings():
         "allow_non_english": inkdrop_user_app_setting_value("quality.allow_non_english", None),
         "allow_pdfs": inkdrop_user_app_setting_value("quality.allow_pdfs", None),
         "allow_packs": inkdrop_user_app_setting_value("quality.allow_packs", None),
+        "allow_raw_image_page_folders": inkdrop_user_app_setting_value("quality.allow_raw_image_page_folders", None),
         "preferred_extensions": inkdrop_user_app_setting_value("quality.preferred_extensions", []) or [],
         "blocked_release_terms": inkdrop_user_app_setting_value("quality.blocked_release_terms", []) or [],
     }
@@ -456,6 +457,7 @@ def load_quality_language_rules():
         "preferred_language": str(settings.get("preferred_language") or "english").strip().lower() or "english",
         "pdf_allowed": bool_setting(settings, "pdf_allowed", True),
         "packs_allowed": bool_setting(settings, "packs_allowed", True),
+        "raw_image_page_folders_allowed": bool_setting(settings, "raw_image_page_folders_allowed", True),
         "allowed_extensions": normalized_extensions(settings.get("allowed_manual_extensions") or [".cbz", ".cbr", ".pdf"]),
         "blocked_release_terms": list(QUALITY_LANGUAGE_RULES.get("blocked_release_terms") or []),
     }
@@ -487,6 +489,11 @@ def load_quality_language_rules():
         rules["source"] = "inkdrop_app_settings"
     if app_settings.get("allow_packs") is not None:
         rules["packs_allowed"] = boolish_value(app_settings.get("allow_packs"), rules["packs_allowed"])
+        rules["source"] = "inkdrop_app_settings"
+    if app_settings.get("allow_raw_image_page_folders") is not None:
+        rules["raw_image_page_folders_allowed"] = boolish_value(
+            app_settings.get("allow_raw_image_page_folders"), rules["raw_image_page_folders_allowed"]
+        )
         rules["source"] = "inkdrop_app_settings"
     preferred_extensions = normalized_extensions(app_settings.get("preferred_extensions") or [])
     if preferred_extensions:
@@ -617,10 +624,18 @@ COMIC_EXTENSIONS = {".cbz", ".cbr", ".pdf", ".zip", ".rar", ".7z"}
 AUTO_GRAB_EXTENSIONS = {".cbz", ".cbr", ".pdf"}
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 AUTO_GRAB_EXACT_ARCHIVE_EXTENSIONS = {".zip"}
+# Kept separate from COMIC_EXTENSIONS itself, not merged in: a page image's
+# extension alone doesn't make it a candidate the way an archive's does (any
+# stray cover thumbnail or preview .jpg in a share would otherwise pass every
+# COMIC_EXTENSIONS gate as a one-file candidate). Membership here only feeds
+# the raw-page-folder grouping step, which requires several sequential images
+# from the same directory before anything is treated as a candidate at all.
+RAW_PAGE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 def apply_quality_language_rules():
     global QUALITY_LANGUAGE_RULES, COMIC_EXTENSIONS, AUTO_GRAB_EXTENSIONS, ARCHIVE_EXTENSIONS, AUTO_GRAB_EXACT_ARCHIVE_EXTENSIONS
+    global RAW_PAGE_IMAGE_EXTENSIONS
     rules = load_quality_language_rules()
     pack_exts = {".zip", ".rar", ".7z"} if rules.get("packs_allowed", True) else set()
     single_exts = {".cbz", ".cbr"}
@@ -633,6 +648,7 @@ def apply_quality_language_rules():
     AUTO_GRAB_EXTENSIONS = single_exts
     ARCHIVE_EXTENSIONS = pack_exts
     AUTO_GRAB_EXACT_ARCHIVE_EXTENSIONS = {".zip"} if rules.get("packs_allowed", True) else set()
+    RAW_PAGE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"} if rules.get("raw_image_page_folders_allowed", True) else set()
     rules["allowed_extensions"] = allowed_exts
     QUALITY_LANGUAGE_RULES = rules
     return rules
@@ -3344,7 +3360,14 @@ def source_title_variants(item):
             values.extend(title_variants(cleaned))
             for variant in title_variants(cleaned):
                 values.extend(creator_possessive_title_variants(variant))
-        values.append(alias)
+        # A stored alias that clean_alias_title had to materially change
+        # carries the exact release-tag noise (pack range, year range,
+        # format, group) it exists to strip -- appending it verbatim as a
+        # search query is structurally guaranteed to return nothing.  Only
+        # trust the raw alias when cleaning it was a no-op, i.e. it was
+        # already just a title.
+        if not cleaned or normalize(cleaned) == normalize(alias):
+            values.append(alias)
         values.extend(creator_possessive_title_variants(alias))
     values.extend(title_variants(raw_series))
     values.extend(title_variants(series))
@@ -3550,17 +3573,20 @@ def broad_series_query_variants(title, qualifier="comics"):
         return []
     words = important_words(clean)
     short_title = len(" ".join(words)) <= 3
+    qualifier = normalize(qualifier) or "comics"
     out = []
     # Automatic discovery must see the provider's broad series/folder cohort
     # before spending its small query budget on one exact issue spelling.
     out.append(clean)
-    qualifier = normalize(qualifier) or "comics"
     out.append(f"{clean} {qualifier}")
-    if short_title:
-        out.extend([f"{clean} comics", f"{clean} manga", f"{clean} comic", f"{clean} cbz", f"{clean} cbr"])
-    else:
-        if len(words) <= 2:
-            out.extend([f"{clean} comics", f"{clean} manga", f"{clean} cbz", f"{clean} cbr"])
+    if short_title or len(words) <= 2:
+        # Previously hardcoded both "comics" and "manga" here regardless of
+        # the series' actual classification -- "Tongues", a real western
+        # comic, got tagged "manga" this way (real slskd history: 6069
+        # results for the plain title, 6 for "Tongues manga"). The correct
+        # qualifier is already appended above; only add format-extension
+        # variants here, not a second, possibly-wrong genre guess.
+        out.extend([f"{clean} cbz", f"{clean} cbr"])
     out.extend([
         f"{clean} complete",
         f"{clean} collection",
@@ -3605,7 +3631,14 @@ def source_queries(item):
     compact_volume_suffixes = volume_query_suffixes(issue_titles, issue)
     graphic_suffixes = graphic_novel_query_suffixes(issue) if issue_titles else []
     for alias in aliases_for_series(series):
-        if alias_mentions_issue(alias, issue):
+        # alias_mentions_issue() reads any "N-M" span in the alias as a
+        # coverage range proving it covers the wanted issue -- true for a
+        # legitimate alias like "Batman 1-50", but a release-tag noise
+        # block like "(001-019+)" matches the exact same shape. Only trust
+        # the raw alias here when clean_alias_title() finds nothing to
+        # clean, i.e. it was already just a title, not a filename.
+        cleaned = clean_alias_title(alias)
+        if (not cleaned or normalize(cleaned) == normalize(alias)) and alias_mentions_issue(alias, issue):
             queries.append(alias)
     preferred_titles = variants[:6]
     first_suffix = suffixes[0] if suffixes else ""
@@ -3620,7 +3653,22 @@ def source_queries(item):
     for title in preferred_titles[:1]:
         if alias_mentions_issue(title, issue) or title_has_numbering(title):
             continue
-        queries.extend(broad_series_query_variants(title, media_query_qualifier)[:2])
+        # Only the bare title gets the guaranteed early slot here (this is
+        # also where slskd_query_priority_titles() puts an already-promoted
+        # alternate title, e.g. the de-prefixed form of a creator-credited
+        # series). Real slskd search history shows the media-qualified form
+        # ("<title> manga"/"<title> comics") of a title uploaders already
+        # file things under consistently underperforms the plain title
+        # badly and adds ~no unique coverage -- Monster 6622 vs 1705,
+        # Kingdom 8477 vs 1951, On a Sunbeam 1124 vs 0, Deadman Wonderland
+        # 1582 vs 197 (its one uniquely-found peer a duplicate of an
+        # already-found match), and even the exact "20th Century Boys"
+        # case that motivated the alternate-title loop below: 2,405+ files
+        # bare vs. 982 qualified, zero peers unique to the qualified form.
+        # The canonical (still-known-mismatched) title just below keeps its
+        # qualified fallback untouched -- that's a genuinely different,
+        # unverified case left alone rather than guessed at.
+        queries.append(title)
     if canonical_title and compact_volume_suffixes and not alias_mentions_issue(canonical_title, issue) and not title_has_numbering(canonical_title):
         for suffix in compact_volume_suffixes[:3]:
             queries.append(f"{canonical_title} {suffix}")
@@ -6147,12 +6195,13 @@ def title_prefix_subseries_conflict(filename, item, title_details):
     return ""
 
 
-def item_match_details(filename, item):
+def item_match_details(filename, item, candidate=None):
     ext = extension_for(filename)
     reasons = []
     penalties = []
     score_reasons = []
-    if not ext or ext not in COMIC_EXTENSIONS:
+    is_raw_page_images = bool(isinstance(candidate, dict) and candidate.get("content_type") == "raw_page_images")
+    if not is_raw_page_images and (not ext or ext not in COMIC_EXTENSIONS):
         label = ext or "no extension"
         return {"matched": False, "score": -100, "reasons": reasons, "penalties": [f"unsupported extension {label}"]}
     if has_non_comic_context(filename) and not has_comic_context(filename):
@@ -6409,7 +6458,12 @@ def candidate_identity_compatibility(candidate, filename, item):
 def shared_candidate_match_details(filename, item, candidate=None):
     """Normalize a candidate through the same authoritative identity contract."""
 
-    details = item_match_details(filename, item)
+    is_raw_page_images = bool(isinstance(candidate, dict) and candidate.get("content_type") == "raw_page_images")
+    # item_match_details is patched by name in several existing tests with a
+    # strict-signature stub (filename, item) -- only ever pass the extra
+    # kwarg for the one content type that actually needs it, so every other
+    # candidate's call shape is untouched.
+    details = item_match_details(filename, item, candidate=candidate) if is_raw_page_images else item_match_details(filename, item)
     if not inkdrop_candidate_matching:
         return details
     if not (
@@ -6417,7 +6471,7 @@ def shared_candidate_match_details(filename, item, candidate=None):
         or (item or {}).get("collected_singleton_proof")
     ):
         return details
-    if extension_for(filename) not in COMIC_EXTENSIONS:
+    if not is_raw_page_images and extension_for(filename) not in COMIC_EXTENSIONS:
         return details
     if has_non_comic_context(filename) and not has_comic_context(filename):
         return details
@@ -9278,15 +9332,28 @@ def compact_enqueue_transfer_rows(rows, limit=5):
 def slskd_enqueue_candidate(candidate, dry_run):
     username = str(candidate.get("username") or "").strip()
     filename = str(candidate.get("filename") or "").strip()
-    try:
-        size = int(candidate.get("size") or 0)
-    except (TypeError, ValueError):
-        size = 0
     if not username:
         raise RuntimeError("candidate has no SLSKD username")
-    if not filename:
-        raise RuntimeError("candidate has no filename")
-    files = [{"filename": filename, "size": size}]
+    if candidate.get("content_type") == "raw_page_images":
+        # This candidate's "filename" is the shared directory, not a real
+        # download target -- every page under it has to be requested
+        # individually or the peer has nothing to send.
+        raw_page_files = candidate.get("raw_page_files") or []
+        files = [
+            {"filename": str(member.get("filename") or "").strip(), "size": int(member.get("size") or 0)}
+            for member in raw_page_files
+            if str(member.get("filename") or "").strip()
+        ]
+        if not files:
+            raise RuntimeError("raw page image candidate has no page files")
+    else:
+        try:
+            size = int(candidate.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if not filename:
+            raise RuntimeError("candidate has no filename")
+        files = [{"filename": filename, "size": size}]
     if dry_run:
         return {"dry_run": True, "endpoint": f"/transfers/downloads/{username}", "files": files}
     return slskd_post(f"/transfers/downloads/{quote(username, safe='')}", files, timeout=30)
@@ -10671,6 +10738,76 @@ def summarize_rejections(rejections, checked_file_count, response_count):
     }
 
 
+# Mirrors inkdrop_archive_conversion.MIN_PAGE_DIRECTORY_IMAGES: below this
+# count a folder is a stray cover or thumbnail dump, not a real issue's pages,
+# and the converter would refuse it anyway once downloaded.
+MIN_RAW_PAGE_IMAGES = 3
+
+
+def raw_page_image_pack_candidates(response):
+    """Group one peer's loose page images into one candidate per directory.
+
+    Some uploaders share a comic as raw scans -- one folder per issue,
+    page-by-page .jpg/.png, no archive anywhere (real example: a peer sharing
+    ``shared\\Temp\\scans convert\\Vol.1\\Comic\\01.png`` through ``43.png``).
+    Nothing downstream can act on that today because every page's extension
+    fails the COMIC_EXTENSIONS gate before a candidate is ever built. This
+    says nothing about *which* series or issue the folder holds -- same as
+    inkdrop_archive_conversion.convert_page_directory, identity stays with
+    the existing title/issue matching this candidate is handed to below.
+    """
+    if not RAW_PAGE_IMAGE_EXTENSIONS:
+        return []
+    username = str(response_get(response, "username") or "")
+    upload_speed = int(response_get(response, "uploadSpeed", response_get(response, "UploadSpeed", 0)) or 0)
+    queue_length = int(response_get(response, "queueLength", response_get(response, "QueueLength", 0)) or 0)
+    free_slot = bool(response_get(response, "hasFreeUploadSlot", response_get(response, "HasFreeUploadSlot", False)))
+    grouped = {}
+    for raw_row in response_get(response, "files", response_get(response, "Files", [])) or []:
+        if not isinstance(raw_row, dict) or file_get(raw_row, "isLocked", False):
+            continue
+        filename = str(file_get(raw_row, "filename") or "").strip()
+        if not filename or extension_for(filename) not in RAW_PAGE_IMAGE_EXTENSIONS:
+            continue
+        segments = path_segments(filename)
+        if len(segments) < 2:
+            # No parent directory at all -- a lone image dropped at share
+            # root is never a page folder, and grouping it under "" would
+            # wrongly merge it with every other rootless image this peer has.
+            continue
+        separator = "\\" if "\\" in filename else "/"
+        directory = separator.join(segments[:-1])
+        member = {"filename": filename, "size": int(file_get(raw_row, "size", 0) or 0)}
+        grouped.setdefault(directory, []).append(member)
+
+    candidates = []
+    for directory, members in grouped.items():
+        deduped = []
+        seen = set()
+        for member in members:
+            key = normalize(member["filename"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(member)
+        if len(deduped) < MIN_RAW_PAGE_IMAGES:
+            continue
+        deduped.sort(key=lambda member: member["filename"])
+        candidates.append({
+            "filename": directory,
+            "size": sum(member["size"] for member in deduped),
+            "extension": "",
+            "username": username,
+            "upload_speed": upload_speed,
+            "queue_length": queue_length,
+            "has_free_upload_slot": free_slot,
+            "locked": False,
+            "content_type": "raw_page_images",
+            "raw_page_files": deduped,
+        })
+    return candidates
+
+
 def candidates_from_responses(responses, item, *, deadline=None, max_files=None, candidate_limit=None, annotate_auto_grab=True):
     out = []
     rejections = []
@@ -10754,6 +10891,24 @@ def candidates_from_responses(responses, item, *, deadline=None, max_files=None,
                     del out[result_cap:]
             if processing_timed_out or processing_file_cap_reached:
                 break
+        if not processing_timed_out and not processing_file_cap_reached:
+            for candidate in raw_page_image_pack_candidates(response):
+                if deadline is not None and seconds_remaining(deadline) <= 0:
+                    processing_timed_out = True
+                    break
+                if file_cap is not None and checked_file_count >= file_cap:
+                    processing_file_cap_reached = True
+                    break
+                checked_file_count += 1
+                details = shared_candidate_match_details(candidate["filename"], item, candidate=candidate)
+                if not details.get("matched"):
+                    if len(rejections) < 2000:
+                        rejections.append((candidate["filename"], details))
+                    continue
+                out.append(attach_match_explanation(candidate, item))
+                if result_cap is not None and len(out) > result_cap:
+                    out.sort(key=lambda value: (value.get("score", 0), value.get("has_free_upload_slot", False), value.get("upload_speed", 0)), reverse=True)
+                    del out[result_cap:]
         if processing_timed_out or processing_file_cap_reached:
             break
     out.sort(key=lambda row: (row.get("score", 0), row.get("has_free_upload_slot", False), row.get("upload_speed", 0)), reverse=True)

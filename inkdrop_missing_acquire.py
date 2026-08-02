@@ -67,6 +67,7 @@ PACK_REVIEWABLE_BLOCK_REASONS = {
     "english_not_confirmed",
     "pack_requires_review",
     "special_or_issue_zero_requires_review",
+    "pack_exceeds_size_limit",
 }
 PACK_IN_FLIGHT_STALE_SECONDS = 12 * 3600
 PACK_BAD_ARCHIVE_AUTO_BLOCK_MIN = 3
@@ -88,6 +89,8 @@ DEFAULT_QUALITY_LANGUAGE_RULES = {
     "packs_allowed": True,
     "pack_auto_approve_min_missing": 1,
     "complete_pack_min_missing": 1,
+    "pack_size_limit_gb_comics": 0,
+    "pack_size_limit_gb_manga": 0,
     "allowed_extensions": {".cbz", ".cbr", ".pdf", ".epub", ".zip", ".rar", ".7z"},
     "blocked_release_terms": [
         "spanish",
@@ -527,6 +530,24 @@ def quality_language_rules(refresh=False):
                 rules["complete_pack_min_missing"],
                 1,
                 999,
+            )
+            # 0 means unlimited -- most InkDrop users don't mind large files,
+            # so the floor is 0 (off), not 1, and nothing here should ever
+            # coerce 0 into a 1GB minimum the way pack_auto_approve_min_missing
+            # does for its own floor.
+            rules["pack_size_limit_gb_comics"] = int_setting(
+                settings,
+                "pack_size_limit_gb_comics",
+                rules["pack_size_limit_gb_comics"],
+                0,
+                100000,
+            )
+            rules["pack_size_limit_gb_manga"] = int_setting(
+                settings,
+                "pack_size_limit_gb_manga",
+                rules["pack_size_limit_gb_manga"],
+                0,
+                100000,
             )
             allowed = normalized_extensions(settings.get("allowed_manual_extensions") or [])
             if allowed:
@@ -5544,6 +5565,25 @@ def send(acquire, chosen, query, dry_run):
     return outcome
 
 
+def pack_size_limit_bytes_for_item(item, quality_rules):
+    """0 (the default) means unlimited -- most InkDrop users don't mind
+    large files, so an unset or zero limit must never reject a pack."""
+    item = item if isinstance(item, dict) else {}
+    is_manga = row_is_manga({
+        "media_type": item.get("media_type") or item.get("mediaType"),
+        "title": item.get("series") or item.get("title"),
+        "publisher": item.get("publisher"),
+    })
+    limit_gb = quality_rules.get(
+        "pack_size_limit_gb_manga" if is_manga else "pack_size_limit_gb_comics"
+    )
+    try:
+        limit_gb = int(limit_gb or 0)
+    except (TypeError, ValueError):
+        limit_gb = 0
+    return limit_gb * 1024 * 1024 * 1024 if limit_gb > 0 else 0
+
+
 def pack_auto_approve_reason(item, quality_rules=None):
     quality_rules = quality_rules or quality_language_rules()
     decision = item.get("pack_decision") or {}
@@ -5586,6 +5626,9 @@ def pack_auto_approve_reason(item, quality_rules=None):
         return "collected_edition_not_trigger_match"
     if int(pack_match.get("unknown_unmatched_count") or 0) != 0:
         return "unknown_pack_contents"
+    size_limit_bytes = pack_size_limit_bytes_for_item(item, quality_rules)
+    if size_limit_bytes and int(candidate.get("size") or 0) > size_limit_bytes:
+        return "pack_exceeds_size_limit"
     if pack_match.get("coverage_source") == "complete_keyword" and useful_missing_count < complete_min_missing:
         return "complete_pack_too_small_for_auto_approval"
     if english.get("status") not in {"confirmed_english", "likely_english"}:

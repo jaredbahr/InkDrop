@@ -1096,6 +1096,19 @@ body[data-inkdrop-view="manual_review"] .manual-review-inline-decision {
     details.settings-card[open] > summary.settings-card-head {
       border-bottom: 1px solid rgba(39, 54, 77, .55);
     }
+    /* Download-client cards (qBittorrent/SABnzbd/SLSKD) open an edit modal instead of
+       expanding inline, so the card itself is a plain clickable tile, not <details>. */
+    .settings-card.settings-card-modal-trigger {
+      cursor: pointer;
+      transition: border-color .12s ease;
+    }
+    .settings-card.settings-card-modal-trigger:hover,
+    .settings-card.settings-card-modal-trigger:focus-within {
+      border-color: rgba(54, 169, 214, .55);
+    }
+    .settings-card.settings-card-modal-trigger > .settings-card-head {
+      cursor: pointer;
+    }
     .settings-provider-grid > .settings-group-body {
       grid-template-columns: repeat(auto-fill, minmax(218px, 1fr));
       gap: 16px;

@@ -159,6 +159,7 @@ _add("POST", {
     "/api/inkdrop-state/readiness-repair/apply", "/api/inkdrop-state/readiness_repair/apply",
     "/api/inkdrop-state/series-shadow-ref-merge/apply", "/api/inkdrop-state/series_shadow_ref_merge/apply",
     "/api/inkdrop-state/series-shadow-retire/apply", "/api/inkdrop-state/series_shadow_retire/apply",
+    "/api/inkdrop-state/source-attempts/clear",
 }, "destructive_maintenance", "admin", admin=True, destructive=True, high_impact=True)
 
 _add("POST", {

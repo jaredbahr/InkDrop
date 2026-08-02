@@ -49,18 +49,20 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.04",
-      slug: "v0-1-04",
+      version: "v0.1.05",
+      slug: "v0-1-05",
       released_at: "2026-08-02",
-      title: "SLSKD stops crying wolf, and a wrong print-run stops auto-grabbing",
-      summary: "\"SLSKD is not working\" reports traced to a pipe deadlock giving false timeouts on searches that had already finished. A wrong-volume auto-grab bug and a queue tiebreak that permanently excluded 149 series from search are fixed too.",
+      title: "Comic one-shots stop getting rejected, and series can move library folders",
+      summary: "A large batch of acquisition and UI fixes. Comic one-shots and graphic novels no longer get rejected at import, oversized packs go to Manual Review instead of auto-grabbing, and a series content type and library folder can now be changed after creation.",
       highlights: [
-        "SLSKD probes that had already finished were being logged and retried as timeouts — 374 times in a single day. Fixed.",
-        "A candidate with the wrong volume or print run (e.g. \"v2 #19\" when you wanted \"v1 #19\") could be auto-grabbed as a safe match. It's now blocked or sent to Manual Review instead.",
-        "149 series, including every League of Extraordinary Gentlemen issue, were never being searched via SLSKD at all — a broken staleness tiebreak locked them out of the rotation permanently.",
-        "RSS discovery had been silently stalled for about three weeks by a slow database query, not the feed or the matcher.",
-        "SLSKD, Prowlarr, Torznab, and Newznab searches all try a few more query variants on a genuine zero-result search instead of waiting on a future pass.",
-        "Manual Review was hiding real \"needs you\" decisions imported from the legacy review feed — they're visible again, with a new bulk-ignore action."
+        "Packs over a configurable size limit now go to Manual Review instead of being auto-grabbed.",
+        "Fixed comic one-shots and graphic novels getting permanently rejected at import.",
+        "Fixed a ComicsCodes health-check bug that could get the source stuck instead of simply marking it unhealthy.",
+        "You can now change a series' content type and library root folder after it's created.",
+        "SLSKD searches no longer waste early attempts on a redundant qualifier, and no longer leak filename text into queries through series aliases.",
+        "SLSKD can now recognize and convert raw page-image folders into a CBZ during import.",
+        "The History page supports searching by series title and no longer repeats duplicate entries.",
+        "Recover Missing, Attempts, and the SLSKD/download-client Settings cards all got clarity and usability fixes this build."
       ]
     })
   ]);

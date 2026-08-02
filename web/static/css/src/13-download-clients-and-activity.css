@@ -592,6 +592,8 @@
 .download-client-health.warn { color: var(--warn); }
 .download-client-health.bad { color: var(--bad); }
 .download-client-instance-note { color: var(--muted); font-size: 12px; }
+.download-client-instance-note.warn { color: var(--warn); }
+.download-client-instance-note.good { color: var(--good); }
 
 .download-client-dialog {
   width: min(980px, calc(100vw - 32px));
@@ -638,6 +640,15 @@
 
 .download-client-editor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .download-client-editor > .wide { grid-column: 1 / -1; }
+
+/* The qBittorrent/SABnzbd/SLSKD provider card body, moved into this same dialog
+   shell by openProviderCardModal() instead of expanding inline in the page. */
+.settings-card-modal-body {
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px 16px;
+  overflow: auto;
+}
 
 .download-client-choice-group,
 .download-client-routing,
@@ -748,6 +759,13 @@
 }
 
 .download-client-delete-warning { margin: 14px 16px; color: var(--text); }
+
+.download-client-inline-note {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel-2));
+  color: var(--text);
+}
 
 @media (max-width: 760px) {
   .download-client-manager { padding: 10px; }
@@ -1174,12 +1192,58 @@
 .missing-recovery-metric.good .missing-recovery-metric-value { color: var(--good); }
 .missing-recovery-metric.bad .missing-recovery-metric-value { color: var(--bad); }
 
+button.missing-recovery-metric {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+button.missing-recovery-metric:hover,
+button.missing-recovery-metric:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--panel-2) 85%, var(--accent) 15%);
+}
+
 .missing-recovery-categories,
 .missing-recovery-progress,
 .missing-recovery-result {
   display: grid;
   gap: 8px;
 }
+
+.missing-recovery-advanced {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 12px 12px;
+}
+.missing-recovery-advanced > summary {
+  cursor: pointer;
+  padding: 8px 0;
+  color: var(--muted);
+  font-size: 13px;
+  user-select: none;
+}
+.missing-recovery-advanced[open] > summary { color: var(--text); }
+
+.missing-recovery-stage-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 999px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.missing-recovery-stage-filter button {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+.missing-recovery-stage-filter button:hover { color: var(--text); }
 
 .missing-recovery-category-list,
 .missing-recovery-actions {

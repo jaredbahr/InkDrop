@@ -15,6 +15,21 @@
     complete: "Complete",
     needs_attention: "Needs attention",
   });
+  // Each stage maps to the row status label(s) InkDrop already shows on the
+  // Wanted table itself (coreStateLabel in the main app script) -- clicking a
+  // tile reuses that same vocabulary rather than inventing a parallel one.
+  const progressStageStatusTargets = Object.freeze({
+    waiting_to_search: ["Waiting"],
+    searching: ["Searching"],
+    results_found: ["Searching"],
+    downloading: ["Downloading"],
+    checking_download: ["Downloading"],
+    ready_to_import: ["Importing"],
+    importing: ["Importing"],
+    waiting_for_library_scan: ["Waiting"],
+    complete: ["Complete"],
+    needs_attention: ["Needs Review", "Failed", "Blocked"],
+  });
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -27,12 +42,22 @@
     return document.getElementById("inkdropMissingRecovery");
   }
 
-  function metric(label, value, detail, tone="") {
-    const card = element("div", `missing-recovery-metric ${tone}`.trim());
+  function metric(label, value, detail, tone="", onClick=null) {
+    const card = element(onClick ? "button" : "div", `missing-recovery-metric ${tone}`.trim());
+    if (onClick) {
+      card.type = "button";
+      card.addEventListener("click", onClick);
+    }
     card.append(element("span", "missing-recovery-metric-label", label));
     card.append(element("strong", "missing-recovery-metric-value", value));
     if (detail) card.append(element("span", "missing-recovery-metric-detail", detail));
     return card;
+  }
+
+  function openWantedStage(stageKey, label) {
+    const nav = window.InkDropWantedNav;
+    if (!nav || typeof nav.openStage !== "function") return;
+    nav.openStage(stageKey, label);
   }
 
   function renderMessage(host, message, tone="") {
@@ -96,6 +121,26 @@
       host.append(failure);
     }
 
+    const progress = element("div", "missing-recovery-progress");
+    progress.append(element("strong", "missing-recovery-subtitle", "Where the missing issues are now"));
+    const progressGrid = element("div", "missing-recovery-progress-grid");
+    for (const [key, label] of Object.entries(progressLabels)) {
+      const value = payload.status_available ? Number(payload.progress?.[key] || 0) : "—";
+      const tone = key === "needs_attention" && Number(value) ? "bad" : key === "complete" && Number(value) ? "good" : "";
+      const clickable = payload.status_available && Number(value) > 0;
+      progressGrid.append(metric(
+        label,
+        value,
+        clickable ? "View in Wanted" : "",
+        tone,
+        clickable ? () => openWantedStage(key, label) : null,
+      ));
+    }
+    progress.append(progressGrid);
+    host.append(progress);
+
+    const advanced = element("details", "missing-recovery-advanced");
+    advanced.append(element("summary", "", "Advanced: next-pass planning and admission limits"));
     const selection = element("div", "missing-recovery-metrics");
     selection.append(
       metric("Next-pass selection", payload.status_available ? Number(payload.selected_count || 0) : "Unknown", payload.status_available ? `${payload.selection_estimated ? "Estimate · " : ""}${Number(payload.eligible_count || 0)} look eligible right now. InkDrop picks the final list when the pass actually starts` : "Selection data unavailable"),
@@ -106,7 +151,7 @@
       metric("Failure pause", payload.failure_pause?.label || "Unknown", payload.failure_pause?.detail || "Failure policy unknown"),
       metric("Quiet hours", payload.quiet_hours?.label || "Unknown", payload.quiet_hours?.detail || "Quiet-hours policy unknown"),
     );
-    host.append(selection);
+    advanced.append(selection);
 
     const categories = element("div", "missing-recovery-categories");
     categories.append(element("strong", "", "Selection mix"));
@@ -122,17 +167,8 @@
       categoryList.append(element("span", "mini", payload.status_available ? "Nothing is picked for the next pass yet." : "Selection categories are unknown."));
     }
     categories.append(categoryList);
-    host.append(categories);
-
-    const progress = element("div", "missing-recovery-progress");
-    progress.append(element("strong", "missing-recovery-subtitle", "Where the missing issues are now"));
-    const progressGrid = element("div", "missing-recovery-progress-grid");
-    for (const [key, label] of Object.entries(progressLabels)) {
-      const value = payload.status_available ? Number(payload.progress?.[key] || 0) : "—";
-      progressGrid.append(metric(label, value, "", key === "needs_attention" && Number(value) ? "bad" : key === "complete" && Number(value) ? "good" : ""));
-    }
-    progress.append(progressGrid);
-    host.append(progress);
+    advanced.append(categories);
+    host.append(advanced);
 
     const footer = element("div", "missing-recovery-footer");
     const result = element("div", "missing-recovery-result");
