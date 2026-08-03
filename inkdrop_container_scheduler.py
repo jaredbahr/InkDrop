@@ -294,6 +294,24 @@ def build_jobs() -> list[ScheduledJob]:
             critical=False,
         ),
         ScheduledJob(
+            "notification-dispatch",
+            int_env("INKDROP_SCHEDULER_NOTIFICATION_DISPATCH_INTERVAL_SECONDS", 180),
+            (py, "-B", "inkdrop_internal_jobs.py", "notification-dispatch"),
+            initial_delay_seconds=30,
+            # 90s default: the pass is a handful of bounded SQLite queries plus
+            # up to six health checks with their own short per-provider timeouts
+            # (2.5-8s each), so a normal run finishes in low single-digit
+            # seconds. The floor still lets an operator dial it down; the
+            # ceiling stops one wedged health check from hanging the whole job.
+            timeout_seconds=bounded_int_env(
+                "INKDROP_SCHEDULER_NOTIFICATION_DISPATCH_TIMEOUT_SECONDS",
+                90,
+                30,
+                600,
+            ),
+            critical=False,
+        ),
+        ScheduledJob(
             "completed-import-comics",
             int_env("INKDROP_SCHEDULER_COMPLETED_IMPORT_COMICS_INTERVAL_SECONDS", 900),
             (

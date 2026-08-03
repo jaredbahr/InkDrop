@@ -1114,6 +1114,8 @@ def init_schema_uncached(con):
         create index if not exists idx_source_attempts_provider_recent on source_attempts(lower(coalesce(provider, '')), coalesce(completed_at, started_at, 0) desc, id desc);
         create index if not exists idx_source_attempts_client_recent on source_attempts(lower(coalesce(download_client, '')), coalesce(completed_at, started_at, 0) desc, id desc);
         create index if not exists idx_source_attempts_provider_id_recent on source_attempts(lower(coalesce(provider_id, '')), coalesce(completed_at, started_at, 0) desc, id desc);
+        create index if not exists idx_source_attempts_provider_fallback_recent on source_attempts(lower(coalesce(provider_id, provider, source, '')), coalesce(completed_at, started_at, 0) desc, id desc);
+        create index if not exists idx_source_attempts_provider_fallback_nullif_recent on source_attempts(lower(coalesce(nullif(provider_id, ''), nullif(provider, ''), nullif(source, ''), '')), coalesce(completed_at, started_at, 0) desc);
         create index if not exists idx_source_attempts_filter_rollup on source_attempts(
             lower(coalesce(source, '')),
             lower(coalesce(provider, '')),
@@ -1715,6 +1717,16 @@ SLSKD_LOCAL_EVIDENCE_PATH_KEYS = {
     "local_path", "localpath", "destination_path", "destinationpath", "dest_path",
     "save_path", "staging_path", "managed_path", "import_path",
 }
+# Human-authored explanation text, never a reusable remote locator -- but several
+# real gate messages legitimately contain a bare "/" (e.g. "missing issue/part,
+# volume, or issue-title evidence"), which used to satisfy the path heuristic
+# below and get irreversibly hashed away. Confirmed live: a Berserk v34
+# quality_rejected event's "reason" was replaced with a sha256 digest, making
+# the actual rejection cause unrecoverable after the fact. These keys skip the
+# path/remote-locator check entirely regardless of their content.
+SLSKD_DIAGNOSTIC_TEXT_KEYS = {
+    "reason", "detail", "failure_reason", "cleanup_reason", "quality_reason",
+}
 
 
 def slskd_private_evidence_payload(value, key=""):
@@ -1739,6 +1751,8 @@ def slskd_private_evidence_payload(value, key=""):
         return "[redacted]"
     if key_text == "provider" and text.lower() not in {"slskd", "soulseek"}:
         return "[redacted]"
+    if key_text in SLSKD_DIAGNOSTIC_TEXT_KEYS:
+        return scrub_credential_query_params(value)
     url_or_magnet = text.lower().startswith(("http://", "https://", "magnet:?"))
     directory_qualified = bool(
         text.startswith(("\\\\", "//"))
@@ -17635,7 +17649,7 @@ def cleanup_superseded_sent_download_tasks(con, now):
                dt.source_attempt_id, dt.source, dt.provider, dt.protocol,
                dt.download_client, dt.external_id, dt.title, dt.status, dt.state,
                dt.category, dt.save_path, dt.local_path, dt.size_bytes, dt.progress,
-               dt.started_at, dt.updated_at, dt.completed_at, dt.raw_json,
+               dt.started_at, dt.updated_at, dt.completed_at, dt.raw_json, dt.lifecycle_phase,
                q.active as queue_active, q.state as queue_state,
                q.current_source as queue_current_source, q.last_event as queue_last_event,
                q.updated_at as queue_updated_at, q.raw_json as queue_raw_json
@@ -17669,11 +17683,38 @@ def cleanup_superseded_sent_download_tasks(con, now):
             safe_float(task.get("completed_at"), 0) or 0,
         )
         raw_payload = stale_active_download_task_payload(task, task, now)
-        raw_payload["cleanup_reason"] = "non-concrete sent download task superseded by later queue retry state"
+        # A task can reach this state-only match (state='queued'/'downloading'/etc.)
+        # without ever being dispatched to a download client at all -- e.g. a
+        # provider-health backoff (Cloudflare block, rate limit) that skipped
+        # sending anything. That's not a stale transfer; nothing was ever sent
+        # for a file to go missing from. Labeling it "stale_no_local_file"
+        # falsely implies a completed-or-attempted transfer, and that label
+        # then durably poisons bad_source_candidates for a source that was
+        # simply rate-limited and never actually tried.
+        task_status = str(task.get("status") or "").strip().lower()
+        task_state_value = str(task.get("state") or "").strip().lower()
+        task_lifecycle = str(task.get("lifecycle_phase") or "").strip().lower()
+        never_dispatched = (
+            (
+                task_status in {"provider_wait", "provider_unavailable"}
+                or task_state_value in {"provider_wait", "provider_unavailable"}
+                or task_lifecycle == "provider_wait"
+            )
+            and not download_task_has_trackable_handoff(task)
+        )
+        if never_dispatched:
+            retire_status = "provider_wait_superseded"
+            raw_payload["cleanup_reason"] = (
+                "non-concrete queued task superseded by later queue retry state; "
+                "never dispatched to a download client (provider health backoff), not a stale transfer"
+            )
+        else:
+            retire_status = "stale_no_local_file"
+            raw_payload["cleanup_reason"] = "non-concrete sent download task superseded by later queue retry state"
         retire_download_task(
             con,
             task,
-            status="stale_no_local_file",
+            status=retire_status,
             state="failed",
             ts=ts,
             raw_payload=raw_payload,
@@ -18596,6 +18637,7 @@ def sync_stale_download_task_bad_candidates(con, now=None, limit=5000):
     if not con:
         return 0
     now = float(now or time.time())
+    import inkdrop_manual_source_autoresolve as manual_source_autoresolve
     rows = con.execute(
         """
         select dt.id as task_id, dt.queue_id, dt.wanted_id, dt.series_id, dt.issue_id,
@@ -18665,6 +18707,18 @@ def sync_stale_download_task_bad_candidates(con, now=None, limit=5000):
             or raw.get("cleanup_reason")
             or "download handoff went stale without a local file"
         )
+        # A stale/missing-local-file task can be the terminal record of a
+        # genuinely transient provider hiccup (a health backoff, a read
+        # timeout) rather than proof the candidate itself is bad -- the rest
+        # of the pipeline already draws this line via
+        # classify_candidate_failure() (kind == "transient"). Without it here,
+        # a single ComicsCodes read-timeout gets permanently blocklisted the
+        # same as a genuinely corrupt or wrong-series file (confirmed live:
+        # this is exactly what happened to Deadman Wonderland #5/#7, Fairy
+        # Tail #30, and partially 5 Worlds #5).
+        failure_classification = manual_source_autoresolve.classify_candidate_failure(failure_reason)
+        if failure_classification.get("kind") == "transient":
+            continue
         payload = download_client_bad_candidate_payload(
             record,
             task_payload,
@@ -46840,17 +46894,35 @@ def queue_row_from_record(row, provider_health=None, db_path=None, media_managem
         and not task_problem
     )
     if str(out.get("state") or "").strip().lower() == "downloading" and not task_true_transfer:
-        out["display_queue_state"] = "source_wait"
-        out["display_state"] = "source_wait"
-        out["display_state_label"] = "Source Wait"
-        out["transfer_lens"] = {
-            "state": "source_wait",
-            "reason": "no_confirmed_active_transfer",
-            "download_task_id": download_task.get("id"),
-            "download_task_state": download_task.get("state"),
-            "download_task_status": download_task.get("status"),
-            "download_task_display_phase": download_task.get("display_phase"),
-        }
+        if task_status == "transfer_succeeded_missing_stage":
+            # The source already delivered the file; InkDrop just hasn't
+            # located/staged it yet and is retrying that lookup. That's not a
+            # source-health/cooldown wait, so don't show "Source Wait" here -
+            # mirror the "importing" bucket the completed-transfer recovery
+            # path (recover_completed_slskd_candidate_task) already uses for
+            # this same condition.
+            out["display_queue_state"] = "importing"
+            out["display_state"] = "importing"
+            out["transfer_lens"] = {
+                "state": "importing",
+                "reason": "transfer_succeeded_awaiting_stage",
+                "download_task_id": download_task.get("id"),
+                "download_task_state": download_task.get("state"),
+                "download_task_status": download_task.get("status"),
+                "download_task_display_phase": download_task.get("display_phase"),
+            }
+        else:
+            out["display_queue_state"] = "source_wait"
+            out["display_state"] = "source_wait"
+            out["display_state_label"] = "Source Wait"
+            out["transfer_lens"] = {
+                "state": "source_wait",
+                "reason": "no_confirmed_active_transfer",
+                "download_task_id": download_task.get("id"),
+                "download_task_state": download_task.get("state"),
+                "download_task_status": download_task.get("status"),
+                "download_task_display_phase": download_task.get("display_phase"),
+            }
     if download_task and row_provider_health_problem(out):
         task_problem = download_task_problem_info(
             {

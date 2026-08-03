@@ -18890,6 +18890,81 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   overflow-wrap: anywhere;
 }
 
+.notifications-settings-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 18px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 14px;
+  background: rgba(15, 21, 28, .45);
+}
+
+.notifications-matrix,
+.notifications-history-table {
+  grid-column: 1 / -1;
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.notifications-matrix th,
+.notifications-matrix td,
+.notifications-history-table th,
+.notifications-history-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+  color: var(--text);
+}
+
+.notifications-matrix th,
+.notifications-history-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+
+.notifications-matrix td:not(:first-child) {
+  text-align: center;
+}
+
+.notifications-history-table td {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.notifications-filter-channel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.notifications-filter-channel:first-of-type {
+  border-top: 0;
+}
+
+.notifications-series-picker {
+  display: grid;
+  gap: 8px;
+  max-width: 480px;
+}
+
+.notifications-series-list {
+  display: grid;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+}
+
 .inkdrop-one-time-key output {
   display: block;
   border: 1px solid rgba(247, 201, 111, .45);
@@ -20084,7 +20159,13 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
 .missing-recovery-metric.good .missing-recovery-metric-value { color: var(--good); }
 .missing-recovery-metric.bad .missing-recovery-metric-value { color: var(--bad); }
 
+/* The sitewide `input, select, button { height: 38px }` baseline (see
+   06-settings-forms.css) clips these to one line's worth of height -- these
+   tiles are three lines (label + value + detail), so without this override
+   the text overflows the fixed height with nothing clipping it, spilling
+   down into the tile below. */
 button.missing-recovery-metric {
+  height: auto;
   font: inherit;
   color: inherit;
   text-align: left;

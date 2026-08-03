@@ -34,6 +34,7 @@ import inkdrop_process_lifecycle
 import inkdrop_library_adoption
 import inkdrop_archive_conversion
 import inkdrop_notifications
+import inkdrop_notification_store
 import inkdrop_release_calendar
 from inkdrop_transfer import normalize_transfer_status
 import json
@@ -6767,6 +6768,8 @@ HTML = r"""<!doctype html>
         "/api/inkdrop-settings/provider/delete": "Deleting indexer",
         "/api/inkdrop-settings/provider/recommendation/apply": "Applying provider recommendation",
         "/api/inkdrop-settings/provider/test": "Testing provider",
+        "/api/notifications/channel/save": "Saving notification channel",
+        "/api/notifications/settings/save": "Saving notification settings",
         "/api/inkdrop-settings/app/update": "Saving app setting",
         "/api/inkdrop-settings/backup/export": "Exporting portable settings",
         "/api/inkdrop-settings/portability/export": "Exporting settings and series list",
@@ -13704,7 +13707,7 @@ HTML = r"""<!doctype html>
       // word -- Queue and Blocklist were drawing both at once, about 170px
       // apart. One reload control per page, always in the same corner.
       if (key === "wanted") {
-        appendArrTableButton(left, "Search All", "Search every Wanted issue in the library, not just this filtered view, in priority order", () => runWantedSearchAll());
+        appendArrTableButton(left, "Search All", "Search every Wanted issue in the library right now, not just this filtered view. Unlike Recover Missing's guarded pass above, this ignores today's data cap and quiet hours", () => runWantedSearchAll());
         appendArrTableButton(left, "Search Selected", "Queue searches for selected visible Wanted rows", () => runSelectedWantedSearches(), {requiresSelection: true});
         appendArrTableButton(left, "Manual Search", "Search providers for the single selected Wanted row", () => {
           const selectedRows = selectedInkdropTableSourceRows("wanted");
@@ -25754,6 +25757,653 @@ HTML = r"""<!doctype html>
       parent.appendChild(panel);
     }
 
+    const NOTIFICATION_STATUS_TONE = {
+      sent: "good",
+      failed: "bad",
+      queued: "warn",
+      deduped: "warn",
+      filtered: "warn",
+      disabled: "warn",
+    };
+
+    const NOTIFICATION_QUEUE_REASON_LABEL = {
+      quiet_hours: "waiting for quiet hours to end",
+      retry: "retrying after a failed send",
+      rate_limit: "waiting for send-rate limit to free up",
+    };
+
+    function notificationStatusBadge(row) {
+      const badge = document.createElement("span");
+      const tone = NOTIFICATION_STATUS_TONE[row.status] || "warn";
+      badge.className = `status-badge ${tone}`;
+      let label = row.status;
+      if (row.status === "queued" && row.queue_reason) {
+        label = NOTIFICATION_QUEUE_REASON_LABEL[row.queue_reason] || "queued";
+      }
+      badge.textContent = label;
+      return badge;
+    }
+
+    function notificationChannelLabel(channelId) {
+      return channelId === "discord" ? "Discord" : channelId === "pushover" ? "Pushover" : channelId;
+    }
+
+    function appendNotificationsEventMatrix(parent, config, onSaved) {
+      appendSettingsFormSectionTitle(parent, "Event triggers");
+      const intro = document.createElement("p");
+      intro.className = "setting-description";
+      intro.textContent = "Choose which events each channel should notify on. A channel with no events checked stays completely silent, even if it's enabled and configured above.";
+      parent.appendChild(intro);
+
+      const channelsById = Object.fromEntries((config.channels || []).map((c) => [c.id, c]));
+      const table = document.createElement("table");
+      table.className = "notifications-matrix";
+      const thead = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      headRow.appendChild(document.createElement("th"));
+      for (const channel of config.channels || []) {
+        const th = document.createElement("th");
+        th.textContent = notificationChannelLabel(channel.id);
+        if (!channel.enabled) {
+          const note = document.createElement("div");
+          note.className = "setting-description";
+          note.textContent = "Not enabled above";
+          th.appendChild(note);
+        }
+        headRow.appendChild(th);
+      }
+      thead.appendChild(headRow);
+      const tbody = document.createElement("tbody");
+      const checkboxes = {};
+      for (const eventType of config.event_types || []) {
+        const row = document.createElement("tr");
+        const labelCell = document.createElement("td");
+        labelCell.textContent = eventType.label;
+        row.appendChild(labelCell);
+        for (const channel of config.channels || []) {
+          const cell = document.createElement("td");
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.checked = (channel.events || []).includes(eventType.id);
+          cell.appendChild(input);
+          row.appendChild(cell);
+          checkboxes[`${channel.id}:${eventType.id}`] = input;
+        }
+        tbody.appendChild(row);
+      }
+      table.append(thead, tbody);
+      parent.appendChild(table);
+
+      const saveRow = document.createElement("div");
+      saveRow.className = "settings-form-row";
+      const saveButton = document.createElement("button");
+      saveButton.type = "button";
+      saveButton.className = "primary";
+      saveButton.textContent = "Save event triggers";
+      saveRow.appendChild(saveButton);
+      parent.appendChild(saveRow);
+
+      saveButton.onclick = async () => {
+        saveButton.disabled = true;
+        saveButton.textContent = "Saving…";
+        try {
+          for (const channel of config.channels || []) {
+            const events = (config.event_types || [])
+              .map((e) => e.id)
+              .filter((eventId) => checkboxes[`${channel.id}:${eventId}`]?.checked);
+            await api("/api/notifications/channel/save", {id: channel.id, events});
+          }
+          toast("Event triggers saved.", true, "inkdropSettings");
+          if (onSaved) await onSaved();
+        } catch (error) {
+          toast(error?.message || "Could not save event triggers.", false, "inkdropSettings");
+        } finally {
+          saveButton.disabled = false;
+          saveButton.textContent = "Save event triggers";
+        }
+      };
+    }
+
+    function appendNotificationsSeriesFilter(parent, config, onSaved) {
+      appendSettingsFormSectionTitle(parent, "Series filter");
+      const intro = document.createElement("p");
+      intro.className = "setting-description";
+      intro.textContent = "By default every channel gets events for every series. Scope a channel to specific series if you only want alerts for part of your library on that channel.";
+      parent.appendChild(intro);
+
+      const seriesOptions = config.series_options || [];
+      for (const channel of config.channels || []) {
+        const wrap = document.createElement("div");
+        wrap.className = "notifications-filter-channel";
+        const heading = document.createElement("strong");
+        heading.textContent = notificationChannelLabel(channel.id);
+        wrap.appendChild(heading);
+
+        const scopeRow = document.createElement("div");
+        scopeRow.className = "settings-form-row";
+        const allLabel = document.createElement("label");
+        allLabel.className = "checkline";
+        const allRadio = document.createElement("input");
+        allRadio.type = "radio";
+        allRadio.name = `notif-scope-${channel.id}`;
+        allRadio.checked = !(channel.series_filter || []).length;
+        allLabel.append(allRadio, document.createTextNode(" All series"));
+        const specificLabel = document.createElement("label");
+        specificLabel.className = "checkline";
+        const specificRadio = document.createElement("input");
+        specificRadio.type = "radio";
+        specificRadio.name = `notif-scope-${channel.id}`;
+        specificRadio.checked = !!(channel.series_filter || []).length;
+        specificLabel.append(specificRadio, document.createTextNode(" Specific series"));
+        scopeRow.append(allLabel, specificLabel);
+        wrap.appendChild(scopeRow);
+
+        const pickerWrap = document.createElement("div");
+        pickerWrap.className = "notifications-series-picker";
+        pickerWrap.hidden = !specificRadio.checked;
+        const search = document.createElement("input");
+        search.type = "search";
+        search.placeholder = "Search series…";
+        const list = document.createElement("div");
+        list.className = "notifications-series-list";
+        const selected = new Set(channel.series_filter || []);
+        const optionRows = [];
+        for (const series of seriesOptions) {
+          const row = document.createElement("label");
+          row.className = "checkline";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.checked = selected.has(series.id);
+          input.onchange = () => {
+            if (input.checked) selected.add(series.id);
+            else selected.delete(series.id);
+          };
+          row.append(input, document.createTextNode(` ${series.title}`));
+          list.appendChild(row);
+          optionRows.push({title: series.title.toLowerCase(), row});
+        }
+        search.oninput = () => {
+          const q = search.value.trim().toLowerCase();
+          for (const {title, row} of optionRows) {
+            row.style.display = !q || title.includes(q) ? "" : "none";
+          }
+        };
+        pickerWrap.append(search, list);
+        wrap.appendChild(pickerWrap);
+        allRadio.onchange = () => { pickerWrap.hidden = true; };
+        specificRadio.onchange = () => { pickerWrap.hidden = false; };
+
+        const saveButton = document.createElement("button");
+        saveButton.type = "button";
+        saveButton.textContent = `Save ${notificationChannelLabel(channel.id)} filter`;
+        saveButton.onclick = async () => {
+          saveButton.disabled = true;
+          try {
+            const seriesFilter = allRadio.checked ? [] : Array.from(selected);
+            await api("/api/notifications/channel/save", {id: channel.id, series_filter: seriesFilter});
+            toast(`${notificationChannelLabel(channel.id)} filter saved.`, true, "inkdropSettings");
+            if (onSaved) await onSaved();
+          } catch (error) {
+            toast(error?.message || "Could not save series filter.", false, "inkdropSettings");
+          } finally {
+            saveButton.disabled = false;
+          }
+        };
+        wrap.appendChild(saveButton);
+        parent.appendChild(wrap);
+      }
+    }
+
+    function appendNotificationsQuietHours(parent, config, onSaved) {
+      appendSettingsFormSectionTitle(parent, "Quiet hours");
+      const settings = config.settings || {};
+      const intro = document.createElement("p");
+      intro.className = "setting-description";
+      intro.textContent = "During this window, non-urgent notifications wait instead of firing immediately. Events you mark below as always-notify (health issues, by default) still go out right away.";
+      parent.appendChild(intro);
+
+      const enabledInput = document.createElement("input");
+      enabledInput.type = "checkbox";
+      enabledInput.checked = !!settings.quiet_hours_enabled;
+      appendProviderSettingRow(parent, "Enable quiet hours", enabledInput, {toggleText: "Enabled"});
+
+      const startInput = document.createElement("input");
+      startInput.type = "time";
+      startInput.value = settings.quiet_hours_start || "22:00";
+      appendProviderSettingRow(parent, "Starts", startInput, {description: "Local server time."});
+
+      const endInput = document.createElement("input");
+      endInput.type = "time";
+      endInput.value = settings.quiet_hours_end || "07:00";
+      appendProviderSettingRow(parent, "Ends", endInput, {description: "Can be earlier than the start time -- that just means the window crosses midnight."});
+
+      const daysWrap = document.createElement("div");
+      daysWrap.className = "settings-form-row";
+      const DAY_LABELS = [["mon", "Mon"], ["tue", "Tue"], ["wed", "Wed"], ["thu", "Thu"], ["fri", "Fri"], ["sat", "Sat"], ["sun", "Sun"]];
+      const dayInputs = {};
+      const activeDays = new Set(settings.quiet_hours_days || []);
+      for (const [value, label] of DAY_LABELS) {
+        const dayLabel = document.createElement("label");
+        dayLabel.className = "checkline";
+        const dayInput = document.createElement("input");
+        dayInput.type = "checkbox";
+        dayInput.checked = !activeDays.size || activeDays.has(value);
+        dayLabel.append(dayInput, document.createTextNode(` ${label}`));
+        daysWrap.appendChild(dayLabel);
+        dayInputs[value] = dayInput;
+      }
+      appendProviderSettingRow(parent, "Days", daysWrap, {description: "Leave every day checked to apply quiet hours every day."});
+
+      const urgentWrap = document.createElement("div");
+      urgentWrap.className = "settings-form-row";
+      const urgentInputs = {};
+      const urgentSet = new Set(settings.quiet_hours_urgent_events || []);
+      for (const eventType of config.event_types || []) {
+        const urgentLabel = document.createElement("label");
+        urgentLabel.className = "checkline";
+        const urgentInput = document.createElement("input");
+        urgentInput.type = "checkbox";
+        urgentInput.checked = urgentSet.has(eventType.id);
+        urgentLabel.append(urgentInput, document.createTextNode(` ${eventType.label}`));
+        urgentWrap.appendChild(urgentLabel);
+        urgentInputs[eventType.id] = urgentInput;
+      }
+      appendProviderSettingRow(parent, "Always notify for", urgentWrap, {description: "These events fire immediately even during quiet hours."});
+
+      appendSettingsFormSectionTitle(parent, "Delivery limits");
+      const rateInput = document.createElement("input");
+      rateInput.type = "number";
+      rateInput.min = "1";
+      rateInput.max = "1000";
+      rateInput.value = settings.rate_limit_max_per_hour ?? 20;
+      appendProviderSettingRow(parent, "Max per channel per hour", rateInput, {description: "Once a channel hits this many sends in a rolling hour, further notifications wait until it has room again."});
+
+      const dedupInput = document.createElement("input");
+      dedupInput.type = "number";
+      dedupInput.min = "0";
+      dedupInput.max = "86400";
+      dedupInput.value = settings.dedup_window_seconds ?? 3600;
+      appendProviderSettingRow(parent, "Dedup window (seconds)", dedupInput, {description: "The same event for the same item won't notify twice within this window."});
+
+      const retryAttemptsInput = document.createElement("input");
+      retryAttemptsInput.type = "number";
+      retryAttemptsInput.min = "0";
+      retryAttemptsInput.max = "20";
+      retryAttemptsInput.value = settings.retry_max_attempts ?? 5;
+      appendProviderSettingRow(parent, "Max retry attempts", retryAttemptsInput, {description: "How many times to retry a send that failed for a transient reason (timeout, 5xx, rate limited by the provider)."});
+
+      const retryBackoffInput = document.createElement("input");
+      retryBackoffInput.type = "number";
+      retryBackoffInput.min = "30";
+      retryBackoffInput.max = "3600";
+      retryBackoffInput.value = settings.retry_backoff_seconds ?? 300;
+      appendProviderSettingRow(parent, "Retry backoff (seconds)", retryBackoffInput, {description: "Wait time before the first retry; it doubles after each further attempt."});
+
+      const retentionInput = document.createElement("input");
+      retentionInput.type = "number";
+      retentionInput.min = "1";
+      retentionInput.max = "365";
+      retentionInput.value = settings.history_retention_days ?? 30;
+      appendProviderSettingRow(parent, "History retention (days)", retentionInput, {description: "Delivery history older than this is cleared out automatically."});
+
+      const saveRow = document.createElement("div");
+      saveRow.className = "settings-form-row";
+      const saveButton = document.createElement("button");
+      saveButton.type = "button";
+      saveButton.className = "primary";
+      saveButton.textContent = "Save quiet hours & limits";
+      saveRow.appendChild(saveButton);
+      parent.appendChild(saveRow);
+
+      saveButton.onclick = async () => {
+        saveButton.disabled = true;
+        saveButton.textContent = "Saving…";
+        try {
+          const days = Object.entries(dayInputs).filter(([, input]) => input.checked).map(([value]) => value);
+          await api("/api/notifications/settings/save", {
+            quiet_hours_enabled: enabledInput.checked,
+            quiet_hours_start: startInput.value || "22:00",
+            quiet_hours_end: endInput.value || "07:00",
+            quiet_hours_days: days.length === 7 ? [] : days,
+            quiet_hours_urgent_events: Object.entries(urgentInputs).filter(([, input]) => input.checked).map(([id]) => id),
+            rate_limit_max_per_hour: Number(rateInput.value) || 20,
+            dedup_window_seconds: Number(dedupInput.value) || 0,
+            retry_max_attempts: Number(retryAttemptsInput.value) || 0,
+            retry_backoff_seconds: Number(retryBackoffInput.value) || 300,
+            history_retention_days: Number(retentionInput.value) || 30,
+          });
+          toast("Quiet hours and limits saved.", true, "inkdropSettings");
+          if (onSaved) await onSaved();
+        } catch (error) {
+          toast(error?.message || "Could not save quiet hours.", false, "inkdropSettings");
+        } finally {
+          saveButton.disabled = false;
+          saveButton.textContent = "Save quiet hours & limits";
+        }
+      };
+    }
+
+    function appendNotificationsHistory(parent) {
+      appendSettingsFormSectionTitle(parent, "Delivery history");
+      const status = document.createElement("p");
+      status.className = "setting-description";
+      status.setAttribute("role", "status");
+      status.textContent = "Loading…";
+      parent.appendChild(status);
+      const table = document.createElement("table");
+      table.className = "notifications-history-table";
+      const thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th>When</th><th>Event</th><th>Channel</th><th>Subject</th><th>Status</th><th>Detail</th></tr>";
+      const tbody = document.createElement("tbody");
+      table.append(thead, tbody);
+      table.hidden = true;
+      parent.appendChild(table);
+      const loadMoreRow = document.createElement("div");
+      loadMoreRow.className = "settings-form-row";
+      const loadMoreButton = document.createElement("button");
+      loadMoreButton.type = "button";
+      loadMoreButton.textContent = "Load more";
+      loadMoreButton.hidden = true;
+      loadMoreRow.appendChild(loadMoreButton);
+      parent.appendChild(loadMoreRow);
+
+      let oldestSeen = null;
+      const loadPage = async () => {
+        loadMoreButton.disabled = true;
+        try {
+          const query = oldestSeen ? `?limit=25&before=${oldestSeen}` : "?limit=25";
+          const data = await getJsonWithTimeout(`/api/notifications/deliveries${query}`, 12000, "Loading delivery history");
+          const rows = data?.deliveries || [];
+          if (!rows.length && !oldestSeen) {
+            status.textContent = "No notifications have been sent yet.";
+            return;
+          }
+          status.textContent = "";
+          table.hidden = false;
+          for (const row of rows) {
+            const tr = document.createElement("tr");
+            const when = document.createElement("td");
+            when.textContent = row.created_at ? new Date(row.created_at * 1000).toLocaleString() : "";
+            const eventCell = document.createElement("td");
+            eventCell.textContent = row.event_type;
+            const channelCell = document.createElement("td");
+            channelCell.textContent = notificationChannelLabel(row.channel_id);
+            const subjectCell = document.createElement("td");
+            subjectCell.textContent = row.subject || "";
+            const statusCell = document.createElement("td");
+            statusCell.appendChild(notificationStatusBadge(row));
+            const detailCell = document.createElement("td");
+            detailCell.textContent = row.error_detail || "";
+            tr.append(when, eventCell, channelCell, subjectCell, statusCell, detailCell);
+            tbody.appendChild(tr);
+            oldestSeen = row.created_at;
+          }
+          loadMoreButton.hidden = rows.length < 25;
+        } catch (error) {
+          status.textContent = `Could not load delivery history: ${error?.message || error}`;
+        } finally {
+          loadMoreButton.disabled = false;
+        }
+      };
+      loadMoreButton.onclick = loadPage;
+      loadPage();
+    }
+
+    async function appendNotificationsSettingsPanel(parent) {
+      appendSettingsFormSectionTitle(parent, "Notifications");
+      const intro = document.createElement("p");
+      intro.textContent = "Fine-tune what Discord and Pushover actually notify you about. Turn a channel on/off and set its webhook or token on the Notifications card in this Connect section -- everything here controls what that channel does once it's on.";
+      parent.appendChild(intro);
+
+      const status = document.createElement("p");
+      status.className = "setting-description";
+      status.textContent = "Loading…";
+      parent.appendChild(status);
+
+      const body = document.createElement("div");
+      body.className = "notifications-settings-panel";
+      parent.appendChild(body);
+
+      const render = async () => {
+        let data;
+        try {
+          data = await getJsonWithTimeout("/api/notifications/config", 12000, "Loading notification settings");
+        } catch (error) {
+          status.textContent = `Could not load notification settings: ${error?.message || error}`;
+          return;
+        }
+        status.remove();
+        body.replaceChildren();
+        const config = data.config || {};
+        appendNotificationsEventMatrix(body, config, render);
+        appendNotificationsSeriesFilter(body, config, render);
+        appendNotificationsQuietHours(body, config, render);
+        appendNotificationsHistory(body);
+      };
+      await render();
+    }
+
+    function archiveConversionBaseName(path) {
+      const text = String(path || "");
+      if (!text) return "";
+      const parts = text.split(/[\\/]/).filter(Boolean);
+      return parts[parts.length - 1] || text;
+    }
+
+    // Builds one normalized view of a poll response, whether it's a plan
+    // (scan only) or apply (scan, then convert) task, so the inline bar and
+    // the modal can share the same formatting instead of drifting apart.
+    function archiveConversionProgressView(task={}, kind) {
+      const phase = kind === "plan" ? "scanning" : (task.phase || "scanning");
+      const updatedAtMs = Number(task.updated_at || task.started_at || 0) * 1000;
+      const idleSeconds = updatedAtMs ? Math.max(0, Math.round((Date.now() - updatedAtMs) / 1000)) : 0;
+      const stalled = idleSeconds >= 30;
+      if (phase === "scanning") {
+        const scanned = Number(task.scanned || 0);
+        const total = Number(task.scan_total || 0);
+        const found = Number(task.candidates_found || 0);
+        const percent = total > 0 ? Math.min(100, Math.round((scanned / total) * 100)) : null;
+        const currentName = archiveConversionBaseName(task.current_path);
+        return {
+          label: kind === "plan" ? "Checking your library" : "Re-checking your library before converting",
+          statusText: percent !== null ? `${percent}%` : "Scanning",
+          percent,
+          determinate: percent !== null,
+          stalled,
+          meta: [
+            percent !== null
+              ? `${scanned.toLocaleString()} of ${total.toLocaleString()} files checked`
+              : (scanned > 0 ? `${scanned.toLocaleString()} files checked` : "Starting…"),
+            `${found.toLocaleString()} CBR${found === 1 ? "" : "s"} found so far`,
+            currentName ? `Now checking: ${currentName}` : "",
+            stalled ? `No update in ${idleSeconds}s -- large folders can take a moment` : "",
+          ].filter(Boolean).join(" · "),
+        };
+      }
+      const attempted = Number(task.attempted || 0);
+      const total = Number(task.convertible_total || 0);
+      const converted = Number(task.converted || 0);
+      const failed = Number(task.failed || 0);
+      const percent = total > 0 ? Math.min(100, Math.round((attempted / total) * 100)) : null;
+      const currentName = archiveConversionBaseName(task.current_path);
+      return {
+        label: "Converting to CBZ",
+        statusText: percent !== null ? `${percent}%` : "Converting",
+        percent,
+        determinate: percent !== null,
+        stalled,
+        meta: [
+          percent !== null
+            ? `${attempted.toLocaleString()} of ${total.toLocaleString()} processed`
+            : (attempted > 0 ? `${attempted.toLocaleString()} processed` : "Starting…"),
+          `${converted.toLocaleString()} converted, ${failed.toLocaleString()} failed`,
+          currentName ? `Now converting: ${currentName}` : "",
+          stalled ? `No update in ${idleSeconds}s -- a large or RAR file can take a while to extract` : "",
+        ].filter(Boolean).join(" · "),
+      };
+    }
+
+    // Reuses the queue row's own progress-bar chrome (percent fill, stalled
+    // tone, indeterminate slide) so this doesn't invent a second visual
+    // language for "something is running" in the same app.
+    function renderArchiveConversionProgressBar(container, view, options={}) {
+      if (!container) return;
+      container.replaceChildren();
+      const box = document.createElement("div");
+      box.className = `queue-row-progress${view.determinate ? "" : " indeterminate"}${options.compact ? " compact" : ""}${view.stalled ? " stalled" : ""}`;
+      box.setAttribute("aria-label", view.label);
+      if (view.determinate) {
+        box.setAttribute("role", "progressbar");
+        box.setAttribute("aria-valuemin", "0");
+        box.setAttribute("aria-valuemax", "100");
+        box.setAttribute("aria-valuenow", String(view.percent));
+      } else {
+        box.setAttribute("role", "status");
+        box.setAttribute("aria-live", "polite");
+      }
+      const head = document.createElement("div");
+      head.className = "queue-row-progress-head";
+      const label = document.createElement("span");
+      label.textContent = view.label;
+      const value = document.createElement("strong");
+      value.textContent = view.statusText;
+      head.append(label, value);
+      box.appendChild(head);
+      if (view.determinate) {
+        const track = document.createElement("div");
+        track.className = "queue-row-progress-track";
+        const fill = document.createElement("div");
+        fill.className = "queue-row-progress-fill";
+        fill.style.setProperty("--queue-row-progress", `${view.percent}%`);
+        track.appendChild(fill);
+        box.appendChild(track);
+      }
+      if (view.meta) {
+        const meta = document.createElement("div");
+        meta.className = "queue-row-progress-meta";
+        meta.textContent = view.meta;
+        box.appendChild(meta);
+      }
+      container.appendChild(box);
+    }
+
+    function ensureArchiveConversionProgressModal() {
+      let modal = $("archiveConversionProgressModal");
+      if (modal) return modal;
+      modal = document.createElement("section");
+      modal.id = "archiveConversionProgressModal";
+      modal.className = "series-remove-modal archive-conversion-progress-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-labelledby", "archiveConversionProgressTitle");
+      modal.hidden = true;
+      const dialog = document.createElement("div");
+      dialog.className = "series-remove-dialog";
+      const head = document.createElement("div");
+      head.className = "series-remove-head";
+      const title = document.createElement("h3");
+      title.id = "archiveConversionProgressTitle";
+      title.textContent = "Checking your library";
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "series-remove-close";
+      closeButton.setAttribute("aria-label", "Close progress dialog");
+      closeButton.textContent = "×";
+      closeButton.onclick = () => closeArchiveConversionProgressModal();
+      head.append(title, closeButton);
+      const body = document.createElement("div");
+      body.className = "series-remove-body";
+      const barWrap = document.createElement("div");
+      barWrap.id = "archiveConversionProgressBarWrap";
+      const note = document.createElement("span");
+      note.className = "series-remove-copy";
+      note.textContent = "This keeps running in the background if you close this window -- reopen it any time from the panel below.";
+      body.append(barWrap, note);
+      const foot = document.createElement("div");
+      foot.className = "series-remove-foot";
+      const footClose = document.createElement("button");
+      footClose.type = "button";
+      footClose.textContent = "Close";
+      footClose.onclick = () => closeArchiveConversionProgressModal();
+      foot.appendChild(footClose);
+      dialog.append(head, body, foot);
+      modal.appendChild(dialog);
+      modal.onclick = event => {
+        if (event.target === modal) closeArchiveConversionProgressModal();
+      };
+      document.body.appendChild(modal);
+      return modal;
+    }
+
+    function openArchiveConversionProgressModal() {
+      const modal = ensureArchiveConversionProgressModal();
+      modal.hidden = false;
+      document.body.dataset.archiveConversionProgressModalOpen = "true";
+      if (!modal._escHandler) {
+        modal._escHandler = event => {
+          if (event.key === "Escape") closeArchiveConversionProgressModal();
+        };
+        document.addEventListener("keydown", modal._escHandler);
+      }
+    }
+
+    function closeArchiveConversionProgressModal() {
+      const modal = $("archiveConversionProgressModal");
+      if (!modal) return;
+      modal.hidden = true;
+      document.body.dataset.archiveConversionProgressModalOpen = "false";
+    }
+
+    function updateArchiveConversionProgressModal(task, kind) {
+      const modal = $("archiveConversionProgressModal");
+      if (!modal || modal.hidden) return;
+      const view = archiveConversionProgressView(task, kind);
+      const title = $("archiveConversionProgressTitle");
+      if (title) title.textContent = view.label;
+      renderArchiveConversionProgressBar($("archiveConversionProgressBarWrap"), view, {compact: false});
+    }
+
+    // Without this, a modal left open past completion freezes on its last
+    // "running" snapshot forever -- the exact "is it still working or stuck"
+    // confusion this whole feature exists to fix, just relocated into the popup.
+    function finishArchiveConversionProgressModal(titleText, message) {
+      const modal = $("archiveConversionProgressModal");
+      if (!modal) return;
+      const title = $("archiveConversionProgressTitle");
+      if (title) title.textContent = titleText;
+      const barWrap = $("archiveConversionProgressBarWrap");
+      if (barWrap) {
+        barWrap.replaceChildren();
+        const done = document.createElement("p");
+        done.className = "series-remove-copy";
+        done.textContent = message;
+        barWrap.appendChild(done);
+      }
+    }
+
+    const ARCHIVE_CONVERSION_ACTIVE_TASK_KEY = "inkdrop.archiveConversion.activeTask";
+
+    function rememberArchiveConversionActiveTask(taskId, kind) {
+      try {
+        window.localStorage.setItem(ARCHIVE_CONVERSION_ACTIVE_TASK_KEY, JSON.stringify({taskId, kind}));
+      } catch (error) { /* storage unavailable -- progress still works, just won't resume across a reload */ }
+    }
+
+    function forgetArchiveConversionActiveTask() {
+      try {
+        window.localStorage.removeItem(ARCHIVE_CONVERSION_ACTIVE_TASK_KEY);
+      } catch (error) { /* ignore */ }
+    }
+
+    function readArchiveConversionActiveTask() {
+      try {
+        const raw = window.localStorage.getItem(ARCHIVE_CONVERSION_ACTIVE_TASK_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
     function appendArchiveConversionPanel(parent) {
       appendSettingsFormSectionTitle(parent, "Convert comics to CBZ");
       const panel = document.createElement("section");
@@ -25791,6 +26441,13 @@ HTML = r"""<!doctype html>
       status.setAttribute("role", "status");
       status.setAttribute("aria-live", "polite");
       status.textContent = "Not checked yet.";
+      const inlineProgress = document.createElement("div");
+      inlineProgress.className = "archive-conversion-inline-progress";
+      const viewProgressButton = document.createElement("button");
+      viewProgressButton.type = "button";
+      viewProgressButton.textContent = "View progress";
+      viewProgressButton.hidden = true;
+      viewProgressButton.onclick = () => openArchiveConversionProgressModal();
       const resultsWrap = document.createElement("div");
       resultsWrap.className = "archive-conversion-results";
       let lastPlan = null;
@@ -25799,18 +26456,21 @@ HTML = r"""<!doctype html>
         api("/api/inkdrop-library/convert-archives/status", {taskId}, {timeoutMs: 30000}).then(data => {
           const task = data?.task || {};
           if (task.state === "running") {
-            const scanned = task.scanned || 0;
-            const found = task.candidates_found || 0;
-            status.textContent = scanned > 0
-              ? `Checking your library… ${scanned.toLocaleString()} files scanned, ${found.toLocaleString()} found so far.`
-              : "Checking your library…";
+            const view = archiveConversionProgressView(task, "plan");
+            status.textContent = `${view.label}… ${view.meta}`;
+            renderArchiveConversionProgressBar(inlineProgress, view, {compact: true});
+            updateArchiveConversionProgressModal(task, "plan");
             setTimeout(() => pollArchiveConversionPlanTask(taskId), 1000);
             return;
           }
+          forgetArchiveConversionActiveTask();
           checkButton.disabled = false;
           checkButton.textContent = checkButton.dataset.originalText || "Check my library";
+          viewProgressButton.hidden = true;
           if (task.state === "failed") {
             status.textContent = `Check failed: ${task.error || "unknown error"}`;
+            inlineProgress.replaceChildren();
+            finishArchiveConversionProgressModal("Check failed", status.textContent);
             return;
           }
           lastPlan = task.plan || {};
@@ -25823,6 +26483,8 @@ HTML = r"""<!doctype html>
               : ` ${needsRar} need unrar, which is not installed on this server, so those cannot be converted yet.`;
           }
           status.textContent = `${lastPlan.convertible_count || 0} comics to convert.${toolingNote}`;
+          inlineProgress.replaceChildren();
+          finishArchiveConversionProgressModal("Check complete", status.textContent);
           resultsWrap.replaceChildren();
           // A misconfigured or unmounted library root reports back as "0 comics
           // to convert" same as a genuinely clean library -- without surfacing
@@ -25846,6 +26508,7 @@ HTML = r"""<!doctype html>
           checkButton.disabled = false;
           checkButton.textContent = checkButton.dataset.originalText || "Check my library";
           status.textContent = `Lost track of the check run: ${error?.message || error}`;
+          finishArchiveConversionProgressModal("Lost track of the check run", status.textContent);
         });
       }
 
@@ -25853,18 +26516,28 @@ HTML = r"""<!doctype html>
         api("/api/inkdrop-library/convert-archives/status", {taskId}, {timeoutMs: 30000}).then(data => {
           const task = data?.task || {};
           if (task.state === "running") {
-            status.textContent = `Converting… ${task.converted || 0} converted, ${task.failed || 0} failed, ${task.attempted || 0} attempted so far.`;
-            setTimeout(() => pollArchiveConversionTask(taskId), 2000);
+            const view = archiveConversionProgressView(task, "apply");
+            status.textContent = `${view.label}… ${view.meta}`;
+            renderArchiveConversionProgressBar(inlineProgress, view, {compact: true});
+            updateArchiveConversionProgressModal(task, "apply");
+            setTimeout(() => pollArchiveConversionTask(taskId), 1500);
             return;
           }
+          forgetArchiveConversionActiveTask();
           convertButton.disabled = false;
           convertButton.textContent = "Convert them";
+          checkButton.disabled = false;
+          viewProgressButton.hidden = true;
           const summary = task.summary || {};
           if (task.state === "failed" && summary.reason) {
             status.textContent = `Conversion stopped: ${summary.reason === "rar_tooling_missing" ? "unrar/7z is not installed on this server." : summary.reason}`;
+            inlineProgress.replaceChildren();
+            finishArchiveConversionProgressModal("Conversion stopped", status.textContent);
             return;
           }
           status.textContent = `Done: ${summary.converted || 0} converted, ${summary.failed || 0} failed, ${summary.skipped || 0} skipped.`;
+          inlineProgress.replaceChildren();
+          finishArchiveConversionProgressModal("Conversion complete", status.textContent);
           resultsWrap.replaceChildren();
           const failures = (summary.results || []).filter(r => !r.converted && r.reason && r.reason !== "unsupported_container" && r.reason !== "rar_named_cbz" && r.reason !== "zip_named_cbr");
           if (failures.length) {
@@ -25878,6 +26551,7 @@ HTML = r"""<!doctype html>
           }
         }).catch(error => {
           status.textContent = `Lost track of the conversion run: ${error?.message || error}`;
+          finishArchiveConversionProgressModal("Lost track of the conversion run", status.textContent);
         });
       }
 
@@ -25886,9 +26560,15 @@ HTML = r"""<!doctype html>
         checkButton.dataset.originalText = checkButton.dataset.originalText || checkButton.textContent;
         checkButton.textContent = "Checking…";
         status.textContent = "Checking your library…";
+        inlineProgress.replaceChildren();
         resultsWrap.replaceChildren();
         try {
-          const data = await api("/api/inkdrop-library/convert-archives/plan", {}, {timeoutMs: 30000});
+          const data = await api("/api/inkdrop-library/convert-archives/plan", {
+            includeMislabeledCbz: mislabeledInput.checked,
+          }, {timeoutMs: 30000});
+          rememberArchiveConversionActiveTask(data.taskId, "plan");
+          viewProgressButton.hidden = false;
+          openArchiveConversionProgressModal();
           pollArchiveConversionPlanTask(data.taskId);
         } catch (error) {
           checkButton.disabled = false;
@@ -25911,6 +26591,9 @@ HTML = r"""<!doctype html>
             includeMislabeledCbz: mislabeledInput.checked,
           }, {timeoutMs: 30000});
           checkButton.disabled = false;
+          rememberArchiveConversionActiveTask(data.taskId, "apply");
+          viewProgressButton.hidden = false;
+          openArchiveConversionProgressModal();
           if (data?.already_running) {
             status.textContent = "A conversion run is already in progress.";
             pollArchiveConversionTask(data.taskId);
@@ -25925,8 +26608,30 @@ HTML = r"""<!doctype html>
         }
       };
 
-      panel.append(intro, checkButton, convertButton, optionsWrap, status, resultsWrap);
+      panel.append(intro, checkButton, convertButton, viewProgressButton, optionsWrap, status, inlineProgress, resultsWrap);
       parent.appendChild(panel);
+
+      // A page reload or Settings re-render loses the taskId that was live in
+      // this closure, but the background thread keeps running on the server.
+      // Without this, "is it stuck?" becomes unanswerable until the run
+      // finishes on its own -- resume polling instead of showing "Not
+      // checked yet." over a run that never stopped.
+      const activeTask = readArchiveConversionActiveTask();
+      if (activeTask?.taskId && activeTask.kind === "plan") {
+        checkButton.disabled = true;
+        checkButton.dataset.originalText = checkButton.dataset.originalText || checkButton.textContent;
+        checkButton.textContent = "Checking…";
+        status.textContent = "Resuming an in-progress check…";
+        viewProgressButton.hidden = false;
+        pollArchiveConversionPlanTask(activeTask.taskId);
+      } else if (activeTask?.taskId && activeTask.kind === "apply") {
+        convertButton.disabled = true;
+        checkButton.disabled = true;
+        convertButton.textContent = "Converting…";
+        status.textContent = "Resuming an in-progress conversion…";
+        viewProgressButton.hidden = false;
+        pollArchiveConversionTask(activeTask.taskId);
+      }
     }
 
     function appendSettingsBackupRestore(parent) {
@@ -26965,6 +27670,7 @@ HTML = r"""<!doctype html>
         }
         if (group.key === "libraries") {
           appendLibraryAdaptersLens(providerTarget, visibleProviders, appSettings);
+          appendNotificationsSettingsPanel(providerTarget);
         }
         if (group.key === "comicvine") {
           appendSettingsPluginGrid(providerTarget, "Metadata Files", [
@@ -27248,6 +27954,13 @@ HTML = r"""<!doctype html>
             input.type = "password";
             input.placeholder = schema.placeholder || (savedSecrets[key] ? "Saved; leave blank to keep" : "Not set");
             input.dataset.secretField = "1";
+            // Distinct name/autocomplete per field: two bare, unnamed password
+            // inputs sitting next to each other (e.g. Pushover's token + user
+            // key) get pattern-matched by Chromium's password manager as a
+            // "new password + confirm password" pair, which can autofill or
+            // clear one of them before the click handler ever reads .value.
+            input.name = `provider-secret-${provider.id || provider.provider_id || "provider"}-${key}`;
+            input.autocomplete = "off";
             if (schema.help) input.title = schema.help;
           } else {
             input = settingInputControl(value, schema);
@@ -37151,6 +37864,20 @@ def load_kavita_settings():
     }
 
 
+_SECRET_URL_PARAM_RE = re.compile(r"(?i)\b(api[_-]?key|password|passwd|token|secret)=[^&\s]+")
+
+
+def redact_secret_url_params(value):
+    """Strip secret-shaped query values from request-exception text.
+
+    A handful of provider health checks (Kavita, SABnzbd) send their API key
+    as a URL query parameter. `requests` connection/HTTP-error messages embed
+    the full request URL, so an unredacted `str(exc)` here would put the
+    plaintext key straight into a Test Provider response or a log line.
+    """
+    return _SECRET_URL_PARAM_RE.sub(lambda m: f"{m.group(1)}=<redacted>", str(value or ""))
+
+
 def kavita_api_health():
     started = time.time()
     try:
@@ -37173,7 +37900,7 @@ def kavita_api_health():
         return {
             "state": "unavailable",
             "label": "API unavailable",
-            "detail": str(exc),
+            "detail": redact_secret_url_params(exc),
         }
 
 
@@ -43166,7 +43893,7 @@ def sabnzbd_api_health(timeout=4.0):
         return {
             "state": "unavailable",
             "label": "unavailable",
-            "detail": f"{type(exc).__name__}: {exc}",
+            "detail": f"{type(exc).__name__}: {redact_secret_url_params(exc)}",
             "api_reachable": False,
         }
 
@@ -43249,7 +43976,7 @@ def qbittorrent_transfer_snapshots(timeout=4.0):
             )
         return {"ok": True, "client": "qbittorrent", "available": True, "snapshots": snapshots, "count": len(snapshots)}
     except Exception as exc:
-        message = re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", str(exc))
+        message = redact_secret_url_params(exc)
         return {"ok": False, "client": "qbittorrent", "available": False, "error": f"{type(exc).__name__}: {message}"}
 
 
@@ -43366,7 +44093,7 @@ def sabnzbd_transfer_snapshots(timeout=4.0, history_limit=200):
             "category_summary": sorted({str(item.get("category") or "").strip() for item in snapshots if str(item.get("category") or "").strip()}),
         }
     except Exception as exc:
-        message = re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", str(exc))
+        message = redact_secret_url_params(exc)
         return {"ok": False, "client": "sabnzbd", "available": False, "error": f"{type(exc).__name__}: {message}"}
 
 
@@ -43516,7 +44243,7 @@ def inkdrop_reconcile_download_clients_best_effort():
             busy_timeout_ms=1500,
         )
     except Exception as exc:
-        message = re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", str(exc))
+        message = redact_secret_url_params(exc)
         return {
             "ok": False,
             "skipped": True,
@@ -45851,17 +46578,22 @@ def run_library_adoption_apply(payload):
     return result
 
 
-def _run_archive_conversion_plan_task(task_id):
-    def scan_progress(scanned, candidates_found):
+def _run_archive_conversion_plan_task(task_id, *, include_mislabeled_cbz):
+    def scan_progress(scanned, total, candidates_found, current_path):
         with ARCHIVE_CONVERSION_TASKS_LOCK:
             task = ARCHIVE_CONVERSION_TASKS.get(task_id)
             if not task:
                 return
             task["scanned"] = scanned
+            task["scan_total"] = total
             task["candidates_found"] = candidates_found
+            task["current_path"] = current_path
+            task["updated_at"] = time.time()
 
     try:
-        plan = inkdrop_archive_conversion.convert_library(dry_run=True, scan_progress=scan_progress)
+        plan = inkdrop_archive_conversion.convert_library(
+            dry_run=True, include_mislabeled_cbz=include_mislabeled_cbz, scan_progress=scan_progress
+        )
         with ARCHIVE_CONVERSION_TASKS_LOCK:
             task = ARCHIVE_CONVERSION_TASKS.get(task_id)
             if task:
@@ -45887,7 +46619,9 @@ def _run_archive_conversion_plan_task(task_id):
         print(f"archive conversion plan task failed task_id={task_id} error={exc}", file=sys.stderr)
 
 
-def run_archive_conversion_plan_start():
+def run_archive_conversion_plan_start(payload=None):
+    payload = payload or {}
+    include_mislabeled_cbz = inkdrop_bool_value(payload.get("includeMislabeledCbz") or payload.get("include_mislabeled_cbz"), False)
     with ARCHIVE_CONVERSION_TASKS_LOCK:
         for existing_id, existing_task in ARCHIVE_CONVERSION_TASKS.items():
             if existing_task.get("kind") == "plan" and existing_task.get("state") == "running":
@@ -45898,15 +46632,19 @@ def run_archive_conversion_plan_start():
             "kind": "plan",
             "state": "running",
             "started_at": time.time(),
+            "updated_at": time.time(),
             "finished_at": None,
             "scanned": 0,
+            "scan_total": 0,
             "candidates_found": 0,
+            "current_path": None,
             "plan": None,
             "error": None,
         }
     thread = threading.Thread(
         target=_run_archive_conversion_plan_task,
         args=(task_id,),
+        kwargs={"include_mislabeled_cbz": include_mislabeled_cbz},
         name=f"archive-conversion-plan-{task_id[-8:]}",
         daemon=True,
     )
@@ -45915,17 +46653,34 @@ def run_archive_conversion_plan_start():
 
 
 def _run_archive_conversion_task(task_id, *, limit, keep_original, include_mislabeled_cbz):
-    def progress(result):
+    def scan_progress(scanned, total, candidates_found, current_path):
         with ARCHIVE_CONVERSION_TASKS_LOCK:
             task = ARCHIVE_CONVERSION_TASKS.get(task_id)
             if not task:
                 return
-            task["attempted"] += 1
-            if result.get("converted"):
-                task["converted"] += 1
-            elif not result.get("ok"):
-                task["failed"] += 1
-            task["last_result"] = {"source": result.get("source"), "converted": bool(result.get("converted")), "reason": result.get("reason")}
+            task["phase"] = "scanning"
+            task["scanned"] = scanned
+            task["scan_total"] = total
+            task["candidates_found"] = candidates_found
+            task["current_path"] = current_path
+            task["updated_at"] = time.time()
+
+    def progress(event):
+        with ARCHIVE_CONVERSION_TASKS_LOCK:
+            task = ARCHIVE_CONVERSION_TASKS.get(task_id)
+            if not task:
+                return
+            task["phase"] = "converting"
+            task["convertible_total"] = event.get("convertible_total") or 0
+            task["attempted"] = event.get("attempted") or task.get("attempted", 0)
+            task["current_path"] = event.get("source")
+            task["updated_at"] = time.time()
+            if event.get("event") == "done":
+                if event.get("converted"):
+                    task["converted"] += 1
+                elif not event.get("ok"):
+                    task["failed"] += 1
+                task["last_result"] = {"source": event.get("source"), "converted": bool(event.get("converted")), "reason": event.get("reason")}
 
     try:
         summary = inkdrop_archive_conversion.convert_library(
@@ -45934,6 +46689,7 @@ def _run_archive_conversion_task(task_id, *, limit, keep_original, include_misla
             keep_original=keep_original,
             include_mislabeled_cbz=include_mislabeled_cbz,
             progress=progress,
+            scan_progress=scan_progress,
         )
         with ARCHIVE_CONVERSION_TASKS_LOCK:
             task = ARCHIVE_CONVERSION_TASKS.get(task_id)
@@ -45970,9 +46726,17 @@ def run_archive_conversion_apply_start(payload):
         task_id = uuid.uuid4().hex
         ARCHIVE_CONVERSION_TASKS[task_id] = {
             "task_id": task_id,
+            "kind": "apply",
             "state": "running",
+            "phase": "scanning",
             "started_at": time.time(),
+            "updated_at": time.time(),
             "finished_at": None,
+            "scanned": 0,
+            "scan_total": 0,
+            "candidates_found": 0,
+            "current_path": None,
+            "convertible_total": 0,
             "attempted": 0,
             "converted": 0,
             "failed": 0,
@@ -47016,7 +47780,7 @@ def runtime_provider_settings():
             "auto_grab_max": SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX,
             "probe_budget_seconds": SERIES_AUTOPILOT_SLSKD_PROBE_BUDGET_SECONDS,
             "cooldown_hours": SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS,
-            "max_active_per_user": 4,
+            "max_active_per_user": 8,
             "delete_search_history": False,
             "search_history_keep": 100,
             "search_history_max_delete": 5000,
@@ -48145,7 +48909,7 @@ PROVIDER_FIELD_HELP = {
     },
     "slskd": {
         "auto_grab_max": "Maximum safe SLSKD candidates InkDrop can start in one probe pass.",
-        "max_active_per_user": "Per-user transfer cap to avoid piling all jobs onto one Soulseek user.",
+        "max_active_per_user": "How many transfers InkDrop will have active or queued from one Soulseek user at once. A well-stocked comics/manga peer often has dozens of matching files, but this doesn't limit how many InkDrop finds or considers -- it only paces how many it pulls from that one peer concurrently, so a single user can't hog the whole auto-grab pass. Default 8, up to 20.",
         "delete_search_history": "When enabled, InkDrop periodically deletes old completed SLSKD search-history rows through the SLSKD API. Active searches are left alone.",
         "search_history_keep": "Newest completed SLSKD search rows to keep when history cleanup is enabled.",
         "search_history_max_delete": "Maximum completed SLSKD search rows InkDrop may delete in one cleanup pass.",
@@ -49877,6 +50641,76 @@ def test_inkdrop_provider(payload):
         },
         "message": health.get("detail") or health.get("label") or activity.get("last_status") or state,
     }
+
+
+def notification_series_options(limit=1000):
+    with inkdrop_state.connect_read(INKDROP_STATE_DB) as con:
+        rows = con.execute(
+            "select id, title from series order by title collate nocase limit ?",
+            (int(limit),),
+        ).fetchall()
+        return [{"id": row["id"], "title": row["title"]} for row in rows]
+
+
+def notifications_config_public():
+    return {
+        "channels": inkdrop_notifications.public_channel_status(INKDROP_STATE_DB),
+        "settings": inkdrop_notification_store.get_settings(INKDROP_STATE_DB),
+        "event_types": [
+            {"id": event_id, "label": inkdrop_notifications.EVENT_LABELS.get(event_id, event_id)}
+            for event_id in inkdrop_notifications.EVENT_TYPES
+        ],
+        "series_options": notification_series_options(),
+    }
+
+
+def save_notification_channel(payload):
+    """Event-trigger toggles and series filter only -- enabled state and
+    secrets are owned by the existing generic provider card and saved
+    through /api/inkdrop-settings/provider/update instead."""
+    payload = payload or {}
+    channel_id = str(payload.get("id") or "").strip().lower()
+    if not channel_id:
+        raise ValueError("channel id is required")
+    kwargs = {}
+    if isinstance(payload.get("events"), list):
+        kwargs["events"] = payload["events"]
+    if isinstance(payload.get("series_filter"), list):
+        kwargs["series_filter"] = payload["series_filter"]
+    inkdrop_notification_store.save_channel_prefs(INKDROP_STATE_DB, channel_id, **kwargs)
+    return notifications_config_public()
+
+
+def save_notification_settings(payload):
+    inkdrop_notification_store.save_settings(INKDROP_STATE_DB, payload or {})
+    return notifications_config_public()
+
+
+def notification_deliveries_public(query):
+    query = query or {}
+
+    def _param(name, default=None):
+        values = query.get(name)
+        return values[0] if values else default
+
+    try:
+        limit = max(1, min(500, int(_param("limit", 100))))
+    except (TypeError, ValueError):
+        limit = 100
+    before = _param("before")
+    try:
+        before = float(before) if before else None
+    except (TypeError, ValueError):
+        before = None
+    deliveries = inkdrop_notification_store.list_deliveries(
+        INKDROP_STATE_DB,
+        limit=limit,
+        before=before,
+        event_type=_param("event_type") or None,
+        channel_id=_param("channel_id") or None,
+        status=_param("status") or None,
+    )
+    return {"ok": True, "deliveries": deliveries}
 
 
 def update_inkdrop_app_setting(payload):
@@ -53528,7 +54362,7 @@ def sab_pack_state(record):
         queue_slots = queue.get("slots") if isinstance(queue, dict) else []
         history_slots = sab.history_slots()
     except Exception as exc:
-        message = re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", str(exc))
+        message = redact_secret_url_params(exc)
         return {"client": "sab", "state": "client_unavailable", "reason": f"{type(exc).__name__}: {message}"}
     for slot in queue_slots or []:
         if str(slot.get("nzo_id") or slot.get("nzoid") or "") in nzo_ids:
@@ -53554,7 +54388,7 @@ def qbit_pack_state(record, title):
         inkdrop_qbittorrent_auth.authenticate_settings(session, qbit, timeout=3)
         torrents = session.get(base + "/api/v2/torrents/info", timeout=5).json()
     except Exception as exc:
-        message = re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", str(exc))
+        message = redact_secret_url_params(exc)
         return {"client": "qbit", "state": "client_unavailable", "reason": f"{type(exc).__name__}: {message}"}
 
     title_norm = normalize_key(title)
@@ -59089,6 +59923,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": bool(audit.get("ok", True)), "audit": audit},
                 status=200 if audit.get("ok", True) else 500,
             )
+        elif path == "/api/notifications/config":
+            self.send_json({"ok": True, "config": notifications_config_public()})
+        elif path == "/api/notifications/deliveries":
+            query = parse_qs(parsed.query or "")
+            self.send_json(notification_deliveries_public(query))
         elif path in {"/api/inkdrop-diagnostics/managed-library-audit", "/api/inkdrop-diagnostics/managed_library_audit"}:
             # Read-only: report the cached last scan. The scan itself only runs
             # when someone posts to .../managed-library-audit/run, so opening
@@ -59636,6 +60475,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = test_inkdrop_provider(data)
                 result["history"] = inkdrop_state.record_provider_test(INKDROP_STATE_DB, result)
                 self.send_json({"ok": True, "result": result})
+            elif path == "/api/notifications/channel/save":
+                self.send_json({"ok": True, "config": save_notification_channel(data)})
+            elif path == "/api/notifications/settings/save":
+                self.send_json({"ok": True, "config": save_notification_settings(data)})
             elif path == "/api/inkdrop-settings/app/update":
                 self.send_json({"ok": True, "settings": update_inkdrop_app_setting(data)})
             elif path == "/api/inkdrop-settings/backup/export":
@@ -59670,7 +60513,7 @@ class Handler(BaseHTTPRequestHandler):
                 except inkdrop_library_adoption.AdoptionAlreadyImported as exc:
                     self.send_json({"ok": False, "error": str(exc), "code": "already_imported"}, status=409, headers={"Cache-Control": "no-store"})
             elif path == "/api/inkdrop-library/convert-archives/plan":
-                self.send_json({"ok": True, **run_archive_conversion_plan_start()}, headers={"Cache-Control": "no-store"})
+                self.send_json({"ok": True, **run_archive_conversion_plan_start(data)}, headers={"Cache-Control": "no-store"})
             elif path == "/api/inkdrop-library/convert-archives/apply":
                 self.send_json({"ok": True, **run_archive_conversion_apply_start(data)}, headers={"Cache-Control": "no-store"})
             elif path == "/api/inkdrop-library/convert-archives/status":

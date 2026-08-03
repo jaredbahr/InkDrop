@@ -5075,6 +5075,19 @@ def connect():
     return conn
 
 
+# A rejection verdict recorded here used to block the exact same content
+# forever, with no re-check -- one bad classification (or a genuine
+# misclassification, e.g. a correctly-named single issue misread as a
+# collected volume) permanently prevented that file from ever being
+# imported again, even once offered against a different/correct target.
+# Give it a bounded lifetime instead: past this window, the caller runs a
+# real re-evaluation (the normal archive_check + artifact_acceptance_decision
+# path) rather than trusting the cached verdict, and record_artifact_bad_content_memory
+# refreshes last_seen_at on every re-check, so a genuinely-still-bad file
+# just gets a fresh TTL window instead of being retried every cycle.
+ARTIFACT_BAD_CONTENT_MEMORY_TTL_SECONDS = 7 * 24 * 3600
+
+
 def ensure_artifact_bad_content_memory_schema(conn):
     conn.execute(
         """
@@ -5652,13 +5665,22 @@ def safe_filename_part(value):
 
 def extract_issue_number(path):
     text = " ".join([Path(path).stem, Path(path).parent.name])
+    # The number group's trailing boundary used to be a plain `\b`, which
+    # treats `_` as a word character -- filenames that use an underscore as
+    # the delimiter right after the issue number (e.g. "Moebius 7_ The
+    # Goddess - Moebius.cbr") never matched anything, because Python regex
+    # sees no boundary between the digit and the underscore. Replaced with a
+    # lookahead that only blocks a genuine alphanumeric continuation (so
+    # "720p" style tokens are still rejected) while accepting `_` as a
+    # delimiter like the other punctuation these patterns already allow.
+    no_alnum_after = r"(?![A-Za-z0-9])"
     patterns = [
-        r"(?:^|[\s._\-\(\[])#\s*(\d{1,5}(?:\.\d+)?)\b",
-        r"\bissue[\s._-]*(\d{1,5}(?:\.\d+)?)\b",
-        r"\b(?:volume|vol|v)[\s._-]*0*1[\s._-]*issue[\s._-]*(\d{1,5}(?:\.\d+)?)\b",
-        r"\b(?:volume|vol|v)[\s._-]*(?:19|20)\d{2}[\s._-]+0*(\d{1,3}(?:\.\d+)?)\b",
-        r"\b(?:volume|vol|v)[\s._-]*(?!(?:19|20)\d{2}\b)(\d{1,5}(?:\.\d+)?)\b",
-        r"(?:^|[\s._-])0*(\d{1,5}(?:\.\d+)?)\b",
+        rf"(?:^|[\s._\-\(\[])#\s*(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
+        rf"\bissue[\s._-]*(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
+        rf"\b(?:volume|vol|v)[\s._-]*0*1[\s._-]*issue[\s._-]*(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
+        rf"\b(?:volume|vol|v)[\s._-]*(?:19|20)\d{{2}}[\s._-]+0*(\d{{1,3}}(?:\.\d+)?){no_alnum_after}",
+        rf"\b(?:volume|vol|v)[\s._-]*(?!(?:19|20)\d{{2}}\b)(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
+        rf"(?:^|[\s._-])0*(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.I)
@@ -8117,10 +8139,17 @@ def find_artifact_bad_content_memory(conn, path, file_sha256=None, decision=None
     if not clauses:
         return None
     row = conn.execute(
-        f"select identity, decision, reason_codes from artifact_bad_content_memory where {' or '.join(clauses)} order by last_seen_at desc limit 1",
+        f"select identity, decision, reason_codes, last_seen_at from artifact_bad_content_memory where {' or '.join(clauses)} order by last_seen_at desc limit 1",
         params,
     ).fetchone()
     if not row:
+        return None
+    last_seen_at = row[3]
+    try:
+        expired = last_seen_at is None or (time.time() - float(last_seen_at)) > ARTIFACT_BAD_CONTENT_MEMORY_TTL_SECONDS
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
         return None
     return {
         "blocked": True,

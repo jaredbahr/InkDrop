@@ -49,20 +49,20 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.05",
-      slug: "v0-1-05",
+      version: "v0.1.06",
+      slug: "v0-1-06",
       released_at: "2026-08-02",
-      title: "Comic one-shots stop getting rejected, and series can move library folders",
-      summary: "A large batch of acquisition and UI fixes. Comic one-shots and graphic novels no longer get rejected at import, oversized packs go to Manual Review instead of auto-grabbing, and a series content type and library folder can now be changed after creation.",
+      title: "Notifications become a real system, and SLSKD gets smarter searches",
+      summary: "Notifications now support per-channel event triggers, series scoping, quiet hours, and delivery history. SLSKD searches use better terms and more patience, several stuck-download patterns are fixed, and provider secrets no longer leak into diagnostics.",
       highlights: [
-        "Packs over a configurable size limit now go to Manual Review instead of being auto-grabbed.",
-        "Fixed comic one-shots and graphic novels getting permanently rejected at import.",
-        "Fixed a ComicsCodes health-check bug that could get the source stuck instead of simply marking it unhealthy.",
-        "You can now change a series' content type and library root folder after it's created.",
-        "SLSKD searches no longer waste early attempts on a redundant qualifier, and no longer leak filename text into queries through series aliases.",
-        "SLSKD can now recognize and convert raw page-image folders into a CBZ during import.",
-        "The History page supports searching by series title and no longer repeats duplicate entries.",
-        "Recover Missing, Attempts, and the SLSKD/download-client Settings cards all got clarity and usability fixes this build."
+        "Notifications are a real system now: per-channel event triggers, series scoping, quiet hours, delivery history, and test buttons for Discord and Pushover.",
+        "SLSKD searches no longer waste queries on literal \"cbz\"/\"cbr\" keywords or miss singular/plural title variants, and get more time before assuming a timeout.",
+        "Fixed several stuck-download patterns: repeat-reject loops, permanent single-timeout blocks, and dead-end searches that only turn up already-rejected results.",
+        "Fixed downloads that were grabbed but never finished landing in your library.",
+        "Rate-limited or temporarily unavailable sources no longer get mislabeled as failed transfers.",
+        "The \"item imported\" notification no longer repeats for the same file on every re-check.",
+        "Provider API keys and webhook tokens no longer show up in error messages or diagnostic output.",
+        "Recover Missing's tiles no longer overlap, Search All's scope is clearer, and SLSKD's default per-user transfer cap was raised."
       ]
     })
   ]);

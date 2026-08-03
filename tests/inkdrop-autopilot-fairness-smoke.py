@@ -939,7 +939,7 @@ stale_row.update(
         "state": "searching",
         "current_source": "slskd",
         "last_source_started_source": "slskd",
-        "last_source_started_at": NOW - autopilot.STALE_SEARCH_SOURCE_MARKER_SECONDS - 1,
+        "last_source_started_at": NOW - autopilot.STALE_SLSKD_SOURCE_MARKER_SECONDS - 1,
     }
 )
 stale_queue = {"items": {"stale-provider-start": stale_row}, "history": []}

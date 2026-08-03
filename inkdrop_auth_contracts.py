@@ -53,6 +53,7 @@ _add("POST", {
     "/api/inkdrop-settings/provider/add", "/api/inkdrop-settings/provider/claim",
     "/api/inkdrop-settings/provider/update", "/api/inkdrop-settings/provider/test",
     "/api/inkdrop-settings/provider/recommendation/apply",
+    "/api/notifications/channel/save", "/api/notifications/settings/save",
 }, "settings_update", "settings")
 _add("POST", {
     "/api/download-clients", "/api/download-clients/test", "/api/download-clients/test-all",

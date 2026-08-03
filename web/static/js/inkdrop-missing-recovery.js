@@ -93,6 +93,7 @@
     copy.append(element("span", "section-eyebrow", "Wanted"));
     copy.append(element("h3", "", "Recover Missing"));
     copy.append(element("p", "mini", "Make one limited pass over the gaps InkDrop has been leaving behind: old misses, downloads that stalled part-way, and imports that never finished."));
+    copy.append(element("p", "mini", "Stays inside today's data cap, staging space, and quiet hours. For an immediate sweep of every Wanted issue instead, use Search All in the table below."));
     const mode = stateLabel(payload);
     heading.append(copy, element("span", `missing-recovery-state ${mode.tone}`.trim(), mode.label));
     host.append(heading);

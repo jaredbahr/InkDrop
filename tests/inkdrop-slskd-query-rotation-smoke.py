@@ -23,9 +23,15 @@ def require(condition, message):
 # of a match the plain query already had), so it no longer spends one of
 # the first two guaranteed query slots; exact unit variants still remain
 # available when the broad searches do not settle the row.
+# "<title> cbz"/"<title> cbr" are gone from the variant pool entirely
+# (2026-08-03) -- each one only matches its own archive format, so real
+# releases shared in the other format never show up, and "cbr" collides
+# with the "Constant Bit Rate" MP3 tag and pulls in unrelated music shares.
+# The singular "<title> comic" took the freed slot (same date) -- live
+# spot checks found it turns up genuine releases plural sometimes misses.
 descender = {"series": "Descender", "issue": "15", "year": "2016"}
 queries = probe.source_queries(descender)
-require(queries[:4] == ["Descender", "Descender 15", "Descender cbz", "Descender cbr"], queries[:8])
+require(queries[:4] == ["Descender", "Descender 15", "Descender comic", "Descender complete"], queries[:8])
 initial = probe.rotated_query_batch(queries, max_queries=2, offset=0)
 require(initial == queries[:2], initial)
 
@@ -327,14 +333,19 @@ def annotate_blocked_first_query(rows, _review_id):
 
 
 with (
-    mock.patch.object(probe, "slskd_search", side_effect=[[{"id": "broad"}], [{"id": "qualified"}]]) as search,
-    mock.patch.object(probe, "candidates_from_responses", side_effect=[([safe_candidate], {}), ([], {})]),
+    mock.patch.object(probe, "slskd_search", side_effect=[[{"id": "broad"}], [{"id": "qualified"}], [], []]) as search,
+    mock.patch.object(probe, "candidates_from_responses", side_effect=[([safe_candidate], {}), ([], {}), ([], {}), ([], {})]),
     mock.patch.object(probe, "annotate_bad_candidate_verdicts", side_effect=annotate_blocked_first_query),
     mock.patch.object(probe, "detected_staged_files", return_value=[]),
 ):
     blocked_entry = probe.probe_item(descender, max_queries=2)
-require(search.call_count == 2, search.call_args_list)
 require(not blocked_entry["attempts"][0].get("search_stop_reason"), blocked_entry)
+# A blocked/rejected candidate is not a safe result either -- the planned
+# batch alone never clears the auto-grab gate, so same-pass expansion must
+# keep searching instead of parking on the blocked candidate forever (this is
+# the exact From Hell #4 shape: a raw hit that never clears the gate).
+require(search.call_count == 4, search.call_args_list)
+require(blocked_entry["query_expansion_count"] == 2, blocked_entry)
 
 review_candidate = {
     "filename": "Descender collection.cbz",

@@ -828,6 +828,19 @@ def download_client_handoff_tasks_for_queue(db_path, queue_id, *, source_attempt
             "download_started", "downloading", "completed", "download_completed", "imported", "staged_file_ready"
         }:
             completed_families.update(families)
+    # A family whose latest sibling attempt failed terminally with
+    # retry_eligible=False is dead -- an older "sent" row for that same
+    # candidate must not keep being treated as an active handoff still worth
+    # completing. Without this, a stale "sent" row that never got its own
+    # state updated (confirmed live: Court of Owls #1's TorrentLeech candidate,
+    # candidate_identity 82a99a30d456ab1aa82cb9b4) keeps resurrecting the exact
+    # same permanently-invalid torrent every pass, ignoring the retry_eligible
+    # already recorded on its own sibling failure.
+    dead_families = set()
+    for task in tasks:
+        status = str(task.get("status") or "").strip().lower()
+        if status in FAILED_HANDOFF_RETRY_STATUSES and not bool(task.get("retry_eligible")):
+            dead_families.update(_task_handoff_family_tokens(task))
     active_families = set()
     for task in tasks:
         families = _task_handoff_family_tokens(task)
@@ -836,7 +849,7 @@ def download_client_handoff_tasks_for_queue(db_path, queue_id, *, source_attempt
         if (
             state in {"queued", "source_wait"}
             and status in {"sent", "download_resolved"}
-            and not families & (completed_families | active_families)
+            and not families & (completed_families | active_families | dead_families)
         ):
             active.append(task)
             active_families.update(families)

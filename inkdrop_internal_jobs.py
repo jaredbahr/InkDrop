@@ -7,7 +7,25 @@ import argparse
 import json
 
 
-JOB_NAMES = ("comicvine-scan", "manual-review-noop-resolve")
+JOB_NAMES = ("comicvine-scan", "manual-review-noop-resolve", "notification-dispatch")
+
+
+def run_notification_dispatch() -> dict:
+    """Process due quiet-hours/rate-limit/retry queued deliveries, then run
+    the read-only diff scanners that turn download-task/health/update state
+    into grabbed/download_failed/health_issue/health_restored/
+    application_update events."""
+
+    import inkdrop_notification_events
+    import inkdrop_notification_store
+    import inkdrop_notifications
+    import inkdrop_runtime_config
+
+    db_path = inkdrop_runtime_config.state_db_path()
+    retries = inkdrop_notifications.process_due_retries(db_path)
+    scan = inkdrop_notification_events.run_scan(db_path)
+    pruned = inkdrop_notification_store.prune_history(db_path)
+    return {"retries": retries, "scan": scan, "pruned": pruned}
 
 
 def run_manual_source_import(payload: dict) -> dict:
@@ -54,6 +72,10 @@ def run_pack_review_state() -> dict:
 
 
 def run_job(name: str) -> tuple[int, dict]:
+    if name == "notification-dispatch":
+        result = run_notification_dispatch()
+        return 0, result
+
     import inkdrop_web
 
     if name == "comicvine-scan":

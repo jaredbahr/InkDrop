@@ -236,7 +236,7 @@ AUTO_GRAB_MAX_RECOVERY_ATTEMPTS_PER_REVIEW = max(
 )
 AUTO_GRAB_MAX_ATTEMPTS_PER_CANDIDATE = 1
 AUTO_GRAB_CANDIDATE_LIMIT = 25
-AUTO_GRAB_MAX_ACTIVE_PER_USER = max(1, min(env_int("INKDROP_SLSKD_MAX_ACTIVE_PER_USER", 4), 8))
+AUTO_GRAB_MAX_ACTIVE_PER_USER = max(1, min(env_int("INKDROP_SLSKD_MAX_ACTIVE_PER_USER", 8), 20))
 SERIES_RUN_MAX_ISSUES = max(1, min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_ISSUES", 8), 25))
 SERIES_RUN_MAX_BYTES = max(
     50 * 1024 * 1024,
@@ -540,7 +540,7 @@ def load_slskd_provider_settings():
                 256 * 1024,
                 64 * 1024 * 1024,
             ),
-            "max_active_per_user": int_setting(runtime, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, 8),
+            "max_active_per_user": int_setting(runtime, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, 20),
             "series_run_max_issues": int_setting(runtime, "series_run_max_issues", SERIES_RUN_MAX_ISSUES, 1, 25),
             "series_run_max_bytes": int_setting(runtime, "series_run_max_bytes", SERIES_RUN_MAX_BYTES, 50 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
             "series_run_max_observed_files": int_setting(runtime, "series_run_max_observed_files", SERIES_RUN_MAX_OBSERVED_FILES, 16, 500),
@@ -571,7 +571,7 @@ def load_slskd_provider_settings():
             256 * 1024,
             64 * 1024 * 1024,
         ),
-        "max_active_per_user": int_setting(settings, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, 8),
+        "max_active_per_user": int_setting(settings, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, 20),
         "series_run_max_issues": int_setting(settings, "series_run_max_issues", SERIES_RUN_MAX_ISSUES, 1, 25),
         "series_run_max_bytes": int_setting(settings, "series_run_max_bytes", SERIES_RUN_MAX_BYTES, 50 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
         "series_run_max_observed_files": int_setting(settings, "series_run_max_observed_files", SERIES_RUN_MAX_OBSERVED_FILES, 16, 500),
@@ -3571,22 +3571,26 @@ def broad_series_query_variants(title, qualifier="comics"):
     clean = display_clean(title)
     if not clean or title_has_numbering(clean):
         return []
-    words = important_words(clean)
-    short_title = len(" ".join(words)) <= 3
     qualifier = normalize(qualifier) or "comics"
     out = []
     # Automatic discovery must see the provider's broad series/folder cohort
     # before spending its small query budget on one exact issue spelling.
     out.append(clean)
     out.append(f"{clean} {qualifier}")
-    if short_title or len(words) <= 2:
-        # Previously hardcoded both "comics" and "manga" here regardless of
-        # the series' actual classification -- "Tongues", a real western
-        # comic, got tagged "manga" this way (real slskd history: 6069
-        # results for the plain title, 6 for "Tongues manga"). The correct
-        # qualifier is already appended above; only add format-extension
-        # variants here, not a second, possibly-wrong genre guess.
-        out.extend([f"{clean} cbz", f"{clean} cbr"])
+    if qualifier == "comics":
+        # Neither form alone covers everyone's folder-naming convention:
+        # real slskd history has plural winning big for some titles
+        # ("Ultimate Spider Man comics" 7247 files vs "... comic" 803) and
+        # singular winning for others ("Love and Rockets comic" 107 files
+        # vs "... comics" near zero). "manga" has no separate singular form.
+        out.append(f"{clean} comic")
+    # No literal "cbz"/"cbr" variant: each one only matches its own archive
+    # format, so it blinds that query slot to whichever format the release
+    # actually shares in, and "cbr" also collides with the "Constant Bit
+    # Rate" MP3 tag, pulling in unrelated audio shares (confirmed live: a
+    # "300 cbr" search matched an MP3 release tagged "CBR"). A single
+    # "300 comic" query found both the .cbr and .cbz copies of the real
+    # release instead.
     out.extend([
         f"{clean} complete",
         f"{clean} collection",
@@ -3896,7 +3900,19 @@ def query_attempt_completed_clean_zero(attempt):
     candidate_count = attempt.get("candidate_count")
     if type(response_count) is not int or type(candidate_count) is not int:
         return False
-    return response_count >= 0 and candidate_count == 0
+    if response_count < 0:
+        return False
+    if candidate_count == 0:
+        return True
+    # Candidates that all failed the auto-grab safety gate are just as
+    # unproductive for rotation purposes as a literal zero. Treating any
+    # raw hit as "found" pins rotation on that one query forever -- confirmed
+    # live on From Hell #4: the original-print-year query ("From Hell 4
+    # 1994") kept surfacing candidates that never cleared the gate every
+    # pass, while the plain "From Hell 4" query two slots earlier in the
+    # same plan found the real (2019 reissue) release the whole time.
+    auto_grab_safe_count = attempt.get("auto_grab_safe_count")
+    return type(auto_grab_safe_count) is int and auto_grab_safe_count == 0
 
 
 def query_rotation_evidence(queries, attempts):
@@ -3921,10 +3937,24 @@ def query_rotation_evidence(queries, attempts):
     }
 
 
+def cache_entry_found_no_safe_candidate(cache_entry):
+    """True when a cached probe's status alone doesn't rule out "nothing worth
+    parking the search on" -- an "available" status only means *a* raw
+    candidate was parsed, not that anything cleared the auto-grab safety gate
+    (confirmed live on From Hell #4, permanently pinned on a query that kept
+    surfacing already-rejected candidates every pass)."""
+    cache_entry = cache_entry if isinstance(cache_entry, dict) else {}
+    if str(cache_entry.get("status") or "") != "available":
+        return False
+    auto_grab_safe_count = cache_entry.get("auto_grab_safe_count")
+    return type(auto_grab_safe_count) is int and auto_grab_safe_count == 0
+
+
 def retry_rotates_without_anchor(queries, cache_entry, refresh_reason="", force=False):
     if force or refresh_reason or not queries or not isinstance(cache_entry, dict):
         return False
-    if str(cache_entry.get("status") or "") != "searched_no_candidates":
+    status = str(cache_entry.get("status") or "")
+    if status != "searched_no_candidates" and not cache_entry_found_no_safe_candidate(cache_entry):
         return False
     signature = query_signature(queries)
     if cache_entry.get("query_signature") != signature:
@@ -3968,7 +3998,8 @@ def derive_query_offset(queries, cache_entry, refresh_reason="", force=False):
     # and never rotated through the rest of the query list.
     if refresh_reason == "query_plan_changed":
         return 0
-    if str(cache_entry.get("status") or "") not in {"searched_no_candidates", "no_query"}:
+    status = str(cache_entry.get("status") or "")
+    if status not in {"searched_no_candidates", "no_query"} and not cache_entry_found_no_safe_candidate(cache_entry):
         return 0
     if cache_entry.get("query_signature") == query_signature(queries):
         try:
@@ -12155,20 +12186,29 @@ def probe_item(
             break
 
     # Zero-result expansion: a cycle that cleanly exhausts its planned batch
-    # (no candidates, no errors/skips/provider-waits -- query_attempt_completed_
-    # clean_zero is the same "genuine zero" test the cross-cycle rotation
-    # evidence above already relies on) still has untried variants sitting in
-    # the query pool that the cross-cycle rotation wouldn't reach until a
-    # future scheduled pass. Try a couple of them now instead of waiting.
-    # Bounded by SEARCH_EXPANSION_MAX_QUERIES, and each extra query still goes
-    # through run_query -> slskd_search -> enforce_slskd_search_pacing and the
-    # same per-query deadline check above, so an already-rate-limited or
+    # (no safe candidate, no errors/skips/provider-waits -- query_attempt_completed_
+    # clean_zero is the same "nothing worth stopping for" test the cross-cycle
+    # rotation evidence above already relies on) still has untried variants
+    # sitting in the query pool that the cross-cycle rotation wouldn't reach
+    # until a future scheduled pass. Try a couple of them now instead of
+    # waiting. Bounded by SEARCH_EXPANSION_MAX_QUERIES, and each extra query
+    # still goes through run_query -> slskd_search -> enforce_slskd_search_pacing
+    # and the same per-query deadline check above, so an already-rate-limited or
     # budget-exhausted provider gets provider_unavailable/probe_budget_exhausted
     # handling exactly like the planned batch, never a bypass of it.
+    #
+    # This checks for a *safe* candidate, not merely a raw one. A query that
+    # only turns up candidates none of which clear the auto-grab gate is not
+    # "found" for expansion purposes -- confirmed live on From Hell #4, whose
+    # original-print-year query kept surfacing already-rejected candidates
+    # every pass and never triggered expansion into the query that actually
+    # had the real release.
     expansion_queries = []
-    if early_stop_reason is None and not merge_query_candidates(candidate_groups, item):
+    if early_stop_reason is None:
+        merged_so_far = annotate_bad_candidate_verdicts(merge_query_candidates(candidate_groups, item), item.get("review_id"))
+        safe_so_far = auto_grab_counts(merged_so_far)["auto_grab_safe"]
         executed_attempts = [attempt for attempt in attempts if not attempt.get("skipped")]
-        if executed_attempts and all(query_attempt_completed_clean_zero(attempt) for attempt in executed_attempts):
+        if not safe_so_far and executed_attempts and all(query_attempt_completed_clean_zero(attempt) for attempt in executed_attempts):
             already_planned = {normalize(planned_query) for planned_query in planned_queries}
             expansion_queries = [
                 candidate_query for candidate_query in queries

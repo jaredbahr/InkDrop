@@ -765,9 +765,25 @@ def convert_archive(source, *, root=None, originals_dir=None, keep_original=True
     return result
 
 
+def _count_scan_candidates(roots):
+    """Fast pass over the library for a progress denominator: filenames only, no archive header reads."""
+    total = 0
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not (d.startswith("_") or d in INTERNAL_DIR_NAMES)]
+            for name in filenames:
+                suffix = Path(name).suffix.lower()
+                if suffix in CONVERTIBLE_SUFFIXES or suffix in MISLABELED_SUFFIXES:
+                    total += 1
+    return total
+
+
 def scan_library(roots=None, *, include_mislabeled_cbz=False, progress=None):
     """Find every archive in the library that a CBZ-only reader would struggle with."""
     roots = [Path(root) for root in (roots or default_library_roots())]
+    total = _count_scan_candidates(roots) if progress else 0
     candidates = []
     skipped_roots = []
     scanned = 0
@@ -784,8 +800,8 @@ def scan_library(roots=None, *, include_mislabeled_cbz=False, progress=None):
             if suffix not in CONVERTIBLE_SUFFIXES and suffix not in MISLABELED_SUFFIXES:
                 continue
             scanned += 1
-            if progress and scanned % 25 == 0:
-                progress(scanned, len(candidates))
+            if progress:
+                progress(scanned, total, len(candidates), str(path))
             container = archive_container_format(path)
             if suffix in CONVERTIBLE_SUFFIXES:
                 if container == "zip":
@@ -813,7 +829,7 @@ def scan_library(roots=None, *, include_mislabeled_cbz=False, progress=None):
                     }
                 )
     if progress:
-        progress(scanned, len(candidates))
+        progress(scanned, total, len(candidates), None)
     tools = rar_tooling()
     needs_rar = [item for item in candidates if item["container"] == "rar" and item["convertible"]]
     return {
@@ -852,6 +868,7 @@ def convert_library(
         "candidate_count": len(scan["candidates"]),
         "convertible_count": scan["convertible_count"],
         "needs_rar_tooling": scan["needs_rar_tooling"],
+        "blocked_on_rar_tooling": scan["blocked_on_rar_tooling"],
         "keep_original": bool(keep_original),
         "originals_dir": str(originals_dir) if keep_original else None,
         "results": [],
@@ -879,6 +896,7 @@ def convert_library(
             summary["ok"] = False
             return summary
 
+    convertible_total = scan["convertible_count"]
     attempted = 0
     for candidate in scan["candidates"]:
         if not candidate["convertible"]:
@@ -892,6 +910,10 @@ def convert_library(
             summary["results"].append({"source": candidate["path"], "converted": False, "reason": "limit_reached"})
             continue
         attempted += 1
+        if progress:
+            # Fired before the (potentially slow, RAR-extracting) conversion call so a
+            # live viewer can show which file it's on rather than only post-hoc counts.
+            progress({"event": "start", "source": candidate["path"], "attempted": attempted, "convertible_total": convertible_total})
         result = convert_archive(
             candidate["path"],
             root=candidate["root"],
@@ -908,7 +930,7 @@ def convert_library(
         else:
             summary["failed"] += 1
         if progress:
-            progress(result)
+            progress({"event": "done", "attempted": attempted, "convertible_total": convertible_total, **result})
 
     summary["attempted"] = attempted
     summary["ok"] = summary["failed"] == 0

@@ -151,6 +151,15 @@ STALE_SLSKD_IMPORT_SIGNAL_SECONDS = 45 * 60
 STALE_SLSKD_DETECTED_FILE_SECONDS = 24 * 3600
 STALE_DOWNLOADER_SEND_SECONDS = 10 * 60
 STALE_SEARCH_SOURCE_MARKER_SECONDS = 45 * 60
+# The generic 45-minute marker assumes a source reports back (or a later pass
+# reconciles its result, see source_already_reported_result_since) well within
+# that window. Measured live 2026-08-02 under the current SLSKD backlog: the
+# real gap between a search starting and SLSKD's own result landing on the
+# item has a median of ~190 minutes, more than 4x the generic marker -- so the
+# 45-minute default was firing on the *typical* case, not just genuine
+# timeouts, discarding current_source and rescheduling a fresh search before
+# the original one had a realistic chance to report back.
+STALE_SLSKD_SOURCE_MARKER_SECONDS = 4 * 60 * 60
 STALE_DOWNLOADER_SEND_EVENT = "stale downloader send cleared; no client or import evidence found"
 STALE_DOWNLOADER_CONTINUE_EVENT = "downloader candidate vanished; continuing source ladder"
 STALE_DOWNLOADER_OUTCOME_REASON = "stale_downloader_send_no_client"
@@ -3552,7 +3561,34 @@ def source_started_stale_seconds(source, default_seconds=STALE_SEARCH_SOURCE_MAR
     }
     if source in provider_thresholds:
         return min(default_seconds, provider_thresholds[source])
+    if source == "slskd":
+        return max(default_seconds, STALE_SLSKD_SOURCE_MARKER_SECONDS)
     return default_seconds
+
+
+def source_already_reported_result_since(item, source, started_at):
+    """True when the source has already checked in with a real result for this attempt.
+
+    STALE_SEARCH_SOURCE_MARKER_SECONDS assumes "no result within N minutes"
+    means the source went silent. Under a large SLSKD backlog the probe
+    reconciliation pass that reads a result back onto the item can lag past
+    that window (measured real-world case: search started, marked stale at
+    +46min, SLSKD's own result -- including a safe auto-grab candidate --
+    landed at +95min). When that later result is already on the item,
+    treating this as a silent timeout is wrong: it discards a result that in
+    fact arrived and blanks current_source right as the item became
+    actionable. Only the source's own check-in timestamp can tell the two
+    cases apart, since wall-clock elapsed time alone can't.
+    """
+    if source != "slskd":
+        return False
+    try:
+        checked_at = float(item.get("last_slskd_at") or 0)
+    except (TypeError, ValueError):
+        checked_at = 0
+    if checked_at <= 0 or checked_at < started_at:
+        return False
+    return bool(item.get("last_slskd_status"))
 
 
 def normalize_stale_source_started_attempts(queue, now=None, stale_seconds=STALE_SEARCH_SOURCE_MARKER_SECONDS):
@@ -3578,6 +3614,9 @@ def normalize_stale_source_started_attempts(queue, now=None, stale_seconds=STALE
             continue
         threshold_seconds = source_started_stale_seconds(source, stale_seconds)
         if started_at > now - threshold_seconds:
+            continue
+        if source_already_reported_result_since(item, source, started_at):
+            clear_source_started_marker(item, source)
             continue
         if source_started_timeout_attempt_recorded(item, source, started_at):
             if item.get("current_source") == source:

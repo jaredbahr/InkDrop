@@ -2737,6 +2737,97 @@ def recovery_failure_reason(row):
     return ""
 
 
+def waiting_candidate_known_bad(probe, review_id, detected):
+    """Has this exact staged file already been marked bad for this review?
+
+    A rejected candidate is recorded via mark_manual_source_candidate_bad, but
+    nothing re-checked that record before this file was detected again -- the
+    same physical file sitting in the SLSKD downloads folder kept being
+    re-evaluated and re-deferred every pass, forever, because the deferred
+    recovery path never runs a real replacement search and nothing else clears
+    the stale download task. Reuse the probe's own bad-candidate lookup (the
+    same one auto-grab consults) so a proven-bad file is recognized instead of
+    re-scored from scratch on every pass.
+    """
+    bad_match = getattr(probe, "bad_candidate_match", None)
+    if not callable(bad_match):
+        return None
+    try:
+        return bad_match(review_id, detected)
+    except Exception:
+        return None
+
+
+REPEAT_BAD_CANDIDATE_PARK_FAILURE_THRESHOLD = 12
+REPEAT_BAD_CANDIDATE_PARK_AGE_SECONDS = 6 * 3600
+
+
+def repeat_bad_candidate_park_reason(known_bad):
+    """Has this exact candidate been durably re-confirmed bad often or long
+    enough that re-detecting and re-skipping it every pass, forever, stops
+    being useful and should instead surface for a human decision?
+
+    `known_bad` is durable bad-source-candidate memory (failure_count/
+    first_seen_at persist across passes in bad_source_candidates), not the
+    short-lived in-process runtime cache, so these numbers reflect real
+    history, not one pass's noise.
+    """
+    if not isinstance(known_bad, dict):
+        return None
+    try:
+        failure_count = int(known_bad.get("failure_count") or 0)
+    except (TypeError, ValueError):
+        failure_count = 0
+    try:
+        first_seen_at = float(known_bad.get("first_seen_at") or 0)
+    except (TypeError, ValueError):
+        first_seen_at = 0
+    if failure_count <= 0 and first_seen_at <= 0:
+        return None
+    if failure_count >= REPEAT_BAD_CANDIDATE_PARK_FAILURE_THRESHOLD:
+        return f"been found and rejected {failure_count} times"
+    age_seconds = (now() - first_seen_at) if first_seen_at > 0 else 0
+    if age_seconds >= REPEAT_BAD_CANDIDATE_PARK_AGE_SECONDS:
+        return f"been rejected every time for {int(age_seconds // 3600)}h straight with no other candidate found"
+    return None
+
+
+def repeat_bad_candidate_review_row(db_path, review_id, record, known_bad, park_reason):
+    row = {
+        "review_id": f"repeat_bad_candidate:{review_id}",
+        "series": record.get("series"),
+        "issue_number": record.get("issue"),
+        "source": "slskd",
+        "state": "needs_you",
+        "manual_review_actionable": True,
+        "reason": "repeat_bad_slskd_candidate",
+        "review_reason": (
+            f"This SLSKD candidate has {park_reason}. "
+            "It's stopped auto-retrying and needs a decision from you."
+        ),
+        "next_action": "Review the SLSKD candidate and either supply a different source or clear/ignore this one.",
+        "activity_summary": known_bad.get("detail") or known_bad.get("reason"),
+        "candidate_reason": known_bad.get("reason"),
+        "failure_count": known_bad.get("failure_count"),
+        "first_seen_at": known_bad.get("first_seen_at"),
+        "last_seen_at": known_bad.get("last_seen_at"),
+    }
+    queue_id = first_text(record.get("autopilot_queue_key"), record.get("queue_key"))
+    if queue_id and inkdrop_state is not None and db_path.exists():
+        try:
+            with inkdrop_state.connect_read(db_path) as con:
+                queue_row = con.execute(
+                    "select series_id, issue_id from queue_items where id=? limit 1",
+                    (queue_id,),
+                ).fetchone()
+            if queue_row:
+                row["series_id"] = queue_row["series_id"]
+                row["issue_id"] = queue_row["issue_id"]
+        except Exception:
+            pass
+    return row
+
+
 def recover_failed_waiting_candidate(args, result, review_id, record, detected, reason, transfer=None):
     if not args.live:
         return None
@@ -5277,6 +5368,7 @@ def run(args):
     )
     refreshed, _probe_status = refresh_probe_rows(probe, records)
     eligible = []
+    circuit_breaker_rows = []
     for entry in refreshed:
         review_id = str(entry.get("review_id") or "")
         source = "waiting" if review_id in waiting else str(entry.get("autoresolve_source") or "ready_detected")
@@ -5537,6 +5629,41 @@ def run(args):
                                 ignored_detected_count=len(filename_rejections),
                             ))
                         continue
+                else:
+                    # No transfer info at all for the marked candidate -- the
+                    # same staleness test the sibling "no detected staged
+                    # file" branch above already applies, so a genuinely dead
+                    # waiting record gets retired instead of gating every
+                    # fresh detection against its stale filename forever.
+                    # Confirmed live: Court of Owls #1 held a waiting record
+                    # for a candidate whose transfer had disappeared, silently
+                    # rejecting SLSKD's fresh, safe candidate as
+                    # staged_filename_mismatch for 43+ hours because this
+                    # branch never checked whether the marked candidate was
+                    # still alive.
+                    stale_reason = stale_waiting_failure_reason(record, None, stall_policy)
+                    if stale_reason:
+                        record_slskd_learning(record, None, False, stale_reason, review_id)
+                        skip = waiting_status_row(
+                            review_id,
+                            record,
+                            stale_reason,
+                            source=source,
+                            status="transfer_missing_stale",
+                            rejections=filename_rejections[:5],
+                        )
+                        recovery = recover_failed_waiting_candidate(
+                            args,
+                            result,
+                            review_id,
+                            record,
+                            None,
+                            stale_reason,
+                        )
+                        if recovery:
+                            skip["recovery"] = recovery
+                        result["skipped"].append(skip)
+                        continue
                 record_slskd_learning(record, None, False, "staged file did not match waiting candidate", review_id)
                 result["skipped"].append(waiting_status_row(
                     review_id,
@@ -5562,6 +5689,23 @@ def run(args):
                 path=(chosen or {}).get("path"),
             ))
             continue
+        known_bad = waiting_candidate_known_bad(probe, review_id, chosen)
+        if known_bad:
+            result["skipped"].append(waiting_status_row(
+                review_id,
+                record,
+                known_bad.get("detail") or known_bad.get("reason") or "candidate already marked bad",
+                source=source,
+                status="known_bad_candidate_skipped",
+                detected=chosen,
+                path=(chosen or {}).get("path"),
+            ))
+            park_reason = repeat_bad_candidate_park_reason(known_bad)
+            if park_reason:
+                circuit_breaker_rows.append(
+                    repeat_bad_candidate_review_row(INKDROP_STATE_DB, review_id, record, known_bad, park_reason)
+                )
+            continue
         quality_ok, quality_reason = auto_import_quality(chosen, source, item=record, probe_module=probe)
         if not quality_ok:
             record_slskd_learning(record, chosen, False, quality_reason, review_id)
@@ -5580,6 +5724,25 @@ def run(args):
             result["skipped"].append(skip)
             continue
         eligible.append((review_id, chosen, source, quality_reason, record))
+
+    result["repeat_bad_candidate_parked_count"] = len(circuit_breaker_rows)
+    if circuit_breaker_rows and args.live and inkdrop_state is not None:
+        try:
+            sync_summary = inkdrop_state.sync_review_exceptions(
+                INKDROP_STATE_DB, circuit_breaker_rows, origin="slskd_repeat_bad_candidate"
+            )
+            result["repeat_bad_candidate_sync"] = sync_summary
+            log(
+                "manual_source_repeat_bad_candidate_parked",
+                parked_count=len(circuit_breaker_rows),
+                review_ids=[row.get("review_id") for row in circuit_breaker_rows],
+            )
+        except Exception as exc:
+            result["repeat_bad_candidate_sync"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            log(
+                "manual_source_repeat_bad_candidate_parked_failed",
+                error=result["repeat_bad_candidate_sync"]["error"],
+            )
 
     result["eligible_count"] = len(eligible)
     publish_progress(

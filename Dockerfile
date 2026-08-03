@@ -98,6 +98,8 @@ COPY \
     inkdrop_missing_acquire.py \
     inkdrop_missing_recovery_policy.py \
     inkdrop_notifications.py \
+    inkdrop_notification_events.py \
+    inkdrop_notification_store.py \
     inkdrop_nfo_parser.py \
     inkdrop_pack_import.py \
     inkdrop_page_pack_downloader.py \
