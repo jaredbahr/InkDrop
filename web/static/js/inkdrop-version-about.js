@@ -307,7 +307,12 @@
     button.textContent = "Copy";
     button.setAttribute("aria-label", "Copy " + label.toLowerCase());
     button.addEventListener("click", function () {
-      if (global.navigator?.clipboard?.writeText) global.navigator.clipboard.writeText(String(value));
+      if (global.navigator?.clipboard?.writeText) {
+        global.navigator.clipboard.writeText(String(value));
+        const originalText = button.textContent;
+        button.textContent = 'Copied!';
+        setTimeout(() => { button.textContent = originalText; }, 2000);
+      }
     });
     content.after(button);
     return item;

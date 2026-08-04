@@ -109,6 +109,7 @@
         state.sort = item.key;
         invokeSort();
         sortMenu.root.open = false;
+        sortMenu.root.querySelector('summary')?.focus();
         refresh();
       }));
     });
@@ -117,6 +118,7 @@
         state.direction = direction;
         invokeSort();
         sortMenu.root.open = false;
+        sortMenu.root.querySelector('summary')?.focus();
         refresh();
       }));
     });
@@ -127,6 +129,7 @@
       filterMenu.panel.append(choice(item.label, state.filters[item.key] === true, item.supported === false, item.reason || "", function () {
         state.filters[item.key] = state.filters[item.key] !== true;
         invokeFilters();
+        filterMenu.root.querySelector('summary')?.focus();
         refresh();
       }));
     });
@@ -136,6 +139,7 @@
       state.filters = Object.assign({}, config.defaultFilters || {});
       invokeFilters();
       filterMenu.root.open = false;
+      filterMenu.root.querySelector('summary')?.focus();
       refresh();
     };
     filterMenu.panel.append(clear);

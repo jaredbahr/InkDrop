@@ -227,7 +227,11 @@
     const dialog = accountDialog();
     dialog.querySelector("[data-auth-mode]").textContent = `Mode: ${(state.status?.mode || "unknown").replaceAll("_", " ")}`;
     renderAccountPanel("account");
-    dialog.showModal();
+    try {
+      dialog.showModal();
+    } catch (e) {
+      // Dialog may already be open; ignore
+    }
   }
 
   function closeAccountDialog() {
@@ -266,7 +270,15 @@
   }
 
   async function logout() {
-    try { await request("/api/auth/logout", {method: "POST", body: {}}); } catch (_error) {}
+    window.__inkdropAuthLoggedOut = true;
+    if (window.__inkdropSessionPollTimer) {
+      window.clearInterval(window.__inkdropSessionPollTimer);
+      window.__inkdropSessionPollTimer = null;
+    }
+    try { await request("/api/auth/logout", {method: "POST", body: {}}); } catch (error) {
+      console.error('Logout failed:', error);
+      // Still clear client state since the user intended to log out
+    }
     state.principal = null;
     publishAuthorizationState();
     closeAccountDialog();
@@ -358,8 +370,8 @@
     renderLogin("Your session expired. Sign in again, then retry what you were doing.");
   });
   document.addEventListener("DOMContentLoaded", start, {once: true});
-  window.setInterval(() => {
-    if (!window.__inkdropAuthReady || document.hidden || state.status?.required === false) return;
+  window.__inkdropSessionPollTimer = window.setInterval(() => {
+    if (!window.__inkdropAuthReady || document.hidden || state.status?.required === false || window.__inkdropAuthLoggedOut) return;
     request("/api/auth/session").catch(error => {
       if (error.status !== 401) return;
       state.principal = null;

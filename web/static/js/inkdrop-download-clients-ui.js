@@ -87,7 +87,9 @@
     const dialog = state.dialog;
     dialog.replaceChildren(content);
     state.returnFocus = returnFocus || document.activeElement;
-    if (typeof dialog.showModal === "function") dialog.showModal();
+    if (typeof dialog.showModal === "function") {
+      try { dialog.showModal(); } catch (e) { /* Dialog may already be open; ignore */ }
+    }
     else dialog.setAttribute("open", "");
     requestAnimationFrame(() => focusable(dialog)[0]?.focus());
   }
@@ -122,7 +124,7 @@
     const root = el("div", "download-client-dialog-shell");
     const head = el("div", "download-client-dialog-head");
     const titleNode = el("h2", "", title);
-    titleNode.id = `downloadClientDialogTitle-${Math.random().toString(36).slice(2)}`;
+    titleNode.id = `downloadClientDialogTitle-${title.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() || "dialog"}`;
     const close = el("button", "download-client-dialog-close", "Close");
     close.type = "button";
     close.dataset.dialogClose = "1";
@@ -182,7 +184,7 @@
 
   function field(form, labelText, name, options) {
     const row = el("div", `download-client-field ${options?.wide ? "wide" : ""}`.trim());
-    const id = `dc-${name}-${Math.random().toString(36).slice(2)}`;
+    const id = `dc-field-${name || "input"}`;
     const label = el("label", "", labelText); label.htmlFor = id;
     const input = document.createElement(options?.multiline ? "textarea" : "input");
     input.id = id; input.name = name;
@@ -370,7 +372,7 @@
     const draftTest = el("button", "secondary", "Test Draft"); draftTest.type = "button";
     draftTest.addEventListener("click", async () => {
       if (!validateEditor(form) || draftTest.disabled) return;
-      draftTest.disabled = true; error.hidden = true;
+      draftTest.disabled = true; draftTest.setAttribute('aria-busy', 'true'); error.hidden = true;
       try {
         const result = await api("/api/download-clients/test", {method: "POST", body: editorPayload(form, instance, type)});
         const tested = result.result || {};
@@ -378,20 +380,20 @@
         error.textContent = tested.ok ? "Draft connection succeeded." : `Draft test failed: ${tested.reason || tested.error_type || "connection unavailable"}.`;
       } catch (err) {
         error.hidden = false; error.dataset.tone = "bad"; error.textContent = errorText(err, "Draft test failed.");
-      } finally { draftTest.disabled = false; }
+      } finally { draftTest.disabled = false; draftTest.removeAttribute('aria-busy'); }
     });
     footer.append(cancel, draftTest);
     if (editing) {
       const savedTest = el("button", "secondary", "Test Saved"); savedTest.type = "button";
       savedTest.addEventListener("click", async () => {
-        savedTest.disabled = true;
+        savedTest.disabled = true; savedTest.setAttribute('aria-busy', 'true');
         try {
           const result = await api(`/api/download-clients/${encodeURIComponent(instance.id)}/test`, {method: "POST", body: {}});
           const tested = result.status?.result || {};
           error.hidden = false; error.dataset.tone = tested.ok ? "good" : (tested.skipped ? "warn" : "bad");
           error.textContent = tested.skipped ? "Saved test skipped because this instance is disabled." : (tested.ok ? "Saved connection succeeded." : `Saved test failed: ${tested.reason || tested.error_type || "connection unavailable"}.`);
         } catch (err) { error.hidden = false; error.dataset.tone = "bad"; error.textContent = errorText(err, "Saved test failed."); }
-        finally { savedTest.disabled = false; }
+        finally { savedTest.disabled = false; savedTest.removeAttribute('aria-busy'); }
       });
       footer.append(savedTest);
     }
@@ -428,14 +430,14 @@
 
   async function testSaved(state, instance, button) {
     if (state.testing.has(instance.id)) return;
-    state.testing.add(instance.id); button.disabled = true; button.textContent = "Testing…";
+    state.testing.add(instance.id); button.disabled = true; button.setAttribute('aria-busy', 'true'); button.textContent = "Testing…";
     try {
       const payload = await api(`/api/download-clients/${encodeURIComponent(instance.id)}/test`, {method: "POST", body: {}});
       state.statuses.set(instance.id, payload.status || {}); renderCards(state);
       const result = payload.status?.result || {};
       setLive(state, result.skipped ? `${instance.name} skipped: ${result.reason || "not ready"}.` : (result.ok ? `${instance.name} connected.` : `${instance.name} failed: ${result.reason || result.error_type || "connection unavailable"}.`), result.ok ? "good" : (result.skipped ? "warn" : "bad"));
     } catch (err) { setLive(state, errorText(err, `Could not test ${instance.name}.`), "bad"); }
-    finally { state.testing.delete(instance.id); }
+    finally { state.testing.delete(instance.id); button.removeAttribute('aria-busy'); }
   }
 
   async function toggleEnabled(state, instance, button) {
@@ -526,7 +528,7 @@
 
   async function runTestAll(state) {
     if (state.testAllRunning) return;
-    state.testAllRunning = true; state.testAll.disabled = true; state.testAll.textContent = "Starting tests…";
+    state.testAllRunning = true; state.testAll.disabled = true; state.testAll.setAttribute('aria-busy', 'true'); state.testAll.textContent = "Starting tests…";
     setLive(state, "Starting download-client tests. Disabled clients will be skipped.", "");
     try {
       const accepted = await api("/api/download-clients/test-all", {method: "POST", body: {}});
@@ -552,7 +554,7 @@
       }
       renderCards(state); setLive(state, `Test All complete: ${passed} connected, ${failed} failed, ${skipped} skipped.`, failed ? "bad" : "good");
     } catch (err) { setLive(state, errorText(err, "Test All failed."), "bad"); }
-    finally { state.testAllRunning = false; state.testAll.disabled = false; state.testAll.textContent = "Test All Clients"; }
+    finally { state.testAllRunning = false; state.testAll.disabled = false; state.testAll.removeAttribute('aria-busy'); state.testAll.textContent = "Test All Clients"; }
   }
 
   async function load(state) {

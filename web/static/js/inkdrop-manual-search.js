@@ -318,10 +318,10 @@
           <button type="button" class="manual-search-icon-button" data-close-manual-search aria-label="Close Manual Search">Close</button>
         </header>
         <div class="manual-search-toolbar">
-          <button type="button" class="manual-search-button primary" data-start-search ${state.busy || isRunning ? "disabled" : ""}>${state.run ? "Search Again" : "Search"}</button>
-          <button type="button" class="manual-search-button" data-search-selected ${state.busy || isRunning || !state.attempts.length ? "disabled" : ""}>Search selected providers</button>
-          <button type="button" class="manual-search-button" data-refresh-run ${!state.run || state.busy ? "disabled" : ""}>Refresh</button>
-          <button type="button" class="manual-search-button danger" data-cancel-run ${!isRunning || state.busy ? "disabled" : ""}>Cancel</button>
+          <button type="button" class="manual-search-button primary" data-start-search ${state.busy || isRunning ? "disabled" : ""} ${state.busy ? 'aria-busy="true"' : ""}>${state.run ? "Search Again" : "Search"}</button>
+          <button type="button" class="manual-search-button" data-search-selected ${state.busy || isRunning || !state.attempts.length ? "disabled" : ""} ${state.busy ? 'aria-busy="true"' : ""}>Search selected providers</button>
+          <button type="button" class="manual-search-button" data-refresh-run ${!state.run || state.busy ? "disabled" : ""} ${state.busy ? 'aria-busy="true"' : ""}>Refresh</button>
+          <button type="button" class="manual-search-button danger" data-cancel-run ${!isRunning || state.busy ? "disabled" : ""} ${state.busy ? 'aria-busy="true"' : ""}>Cancel</button>
           <label class="manual-search-toggle"><input type="checkbox" data-include-rejected ${state.includeRejected ? "checked" : ""}> Show rejected results</label>
           <span class="manual-search-run-state ${isRunning ? "searching" : ""}">${escapeHtml(statusLabel(runState))}</span>
         </div>
@@ -350,7 +350,11 @@
     const preferred = element.querySelector("[data-start-search], [data-close-manual-search]");
     if (!element.dataset.focused && preferred) {
       element.dataset.focused = "1";
-      window.requestAnimationFrame(() => preferred.focus());
+      window.requestAnimationFrame(() => {
+        if (preferred && preferred.isConnected) {
+          preferred.focus();
+        }
+      });
     }
   }
 
@@ -463,15 +467,27 @@
     const proof = evidence(candidate);
     if (forceRejected) {
       const reasons = proof.negative.length ? proof.negative.map(humanize).join("; ") : "Core could not safely match this result";
+      // TODO: Replace window.confirm with inkdropConfirmModal in a future refactor.
+      // For now, mark the trigger as busy so the user cannot double-fire.
+      const trigger = root()?.querySelector(`[data-force-grab="${escapeHtml(candidateId)}"]`);
+      if (trigger) { trigger.setAttribute('aria-busy', 'true'); trigger.disabled = true; }
       const acknowledged = window.confirm(
         `Core rejected this candidate for: ${reasons}. Force-grabbing can download the wrong work, edition, language, unit, or pack and consume bandwidth and storage. Automatic Search policy is unchanged. Continue anyway?`
       );
+      if (trigger) { trigger.removeAttribute('aria-busy'); trigger.disabled = false; }
       if (!acknowledged) return;
     }
     const warning = candidate.pack_candidate || proof.negative.includes("pack_size_warning") || ["possible", "possible_match"].includes(text(candidate.decision?.decision).toLowerCase());
     if (warning && !forceRejected) {
       const coverage = candidate.likely_wanted_coverage ? ` InkDrop estimates ${candidate.likely_wanted_coverage} wanted items may be included.` : "";
-      if (!window.confirm(`${candidate.pack_candidate ? `Large pack: ${formatBytes(candidate.size_bytes)}.` : "This candidate carries a warning."}${coverage} Continue with this explicit grab?`)) return;
+      // TODO: Replace window.confirm with inkdropConfirmModal in a future refactor.
+      const trigger = root()?.querySelector(`[data-grab="${escapeHtml(candidateId)}"]`);
+      if (trigger) { trigger.setAttribute('aria-busy', 'true'); trigger.disabled = true; }
+      if (!window.confirm(`${candidate.pack_candidate ? `Large pack: ${formatBytes(candidate.size_bytes)}.` : "This candidate carries a warning."}${coverage} Continue with this explicit grab?`)) {
+        if (trigger) { trigger.removeAttribute('aria-busy'); trigger.disabled = false; }
+        return;
+      }
+      if (trigger) { trigger.removeAttribute('aria-busy'); trigger.disabled = false; }
     }
     if (state.pendingGrabs.has(text(candidateId))) return;
     state.pendingGrabs.add(text(candidateId));
@@ -563,6 +579,15 @@
     }
     state.returnFocus = document.activeElement;
     reset(context);
+    // Re-register event listeners (destroyed by close())
+    if (!state._keydownHandler) {
+      state._keydownHandler = onKeydown;
+      document.addEventListener("keydown", onKeydown);
+    }
+    if (!state._popstateHandler) {
+      state._popstateHandler = onPopstate;
+      window.addEventListener("popstate", onPopstate);
+    }
     let element = root();
     if (!element) {
       element = document.createElement("div");
@@ -583,6 +608,7 @@
 
   function close({ fromPopState = false } = {}) {
     stopPolling();
+    destroy();
     const element = root();
     if (element) element.remove();
     document.body.classList.remove("manual-search-open");
@@ -595,12 +621,29 @@
     }
   }
 
-  window.addEventListener("popstate", () => {
-    if (root() && new URL(window.location.href).searchParams.get(ROUTE_KEY) !== "1") close({ fromPopState: true });
-  });
-  document.addEventListener("keydown", (event) => {
+  function destroy() {
+    if (state._keydownHandler) {
+      document.removeEventListener("keydown", state._keydownHandler);
+      state._keydownHandler = null;
+    }
+    if (state._popstateHandler) {
+      window.removeEventListener("popstate", state._popstateHandler);
+      state._popstateHandler = null;
+    }
+  }
+
+  function onKeydown(event) {
     if (event.key === "Escape" && root()) close();
-  });
+  }
+
+  function onPopstate() {
+    if (root() && new URL(window.location.href).searchParams.get(ROUTE_KEY) !== "1") close({ fromPopState: true });
+  }
+
+  state._keydownHandler = onKeydown;
+  state._popstateHandler = onPopstate;
+  document.addEventListener("keydown", onKeydown);
+  window.addEventListener("popstate", onPopstate);
 
   window.InkDropManualSearch = { open, close, refresh: refreshRun, _state: state };
 })();

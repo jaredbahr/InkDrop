@@ -205,6 +205,8 @@
   }
 
   async function mutate(action, live, buttons) {
+    if (state.busy) return;
+    state.busy = true;
     for (const button of buttons) button.disabled = true;
     state.actionError = null;
     live.classList.remove("bad");
@@ -224,6 +226,8 @@
       live.textContent = state.actionError.message;
       for (const button of buttons) button.disabled = false;
       if (state.payload) renderPayload(state.payload);
+    } finally {
+      state.busy = false;
     }
   }
 

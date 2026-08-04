@@ -762,6 +762,7 @@ HTML = r"""<!doctype html>
         <div>
           <h1>InkDrop</h1>
           <p class="lede">Add or monitor a series. InkDrop keeps missing issues moving through automation and separates real decisions from parked source checks.</p>
+        </div>
       </div>
       <div class="status-pill" id="status">Status: <strong>loading...</strong></div>
     </header>
@@ -838,7 +839,7 @@ HTML = r"""<!doctype html>
             <div id="activityList" hidden></div>
           </div>
         </section>
-        <div class="toast" id="toast"></div>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </div>
     </div>
 
@@ -948,7 +949,7 @@ HTML = r"""<!doctype html>
       </div>
     </section>
 
-    <details class="card source-health settings-drawer" id="inkdropSettings" data-arr-page="settings" data-settings-page-shell="index" hidden open>
+    <details class="card source-health settings-drawer" id="inkdropSettings" data-arr-page="settings" data-settings-page-shell="index" hidden>
       <summary>
         <div class="section-title">
           <div>
@@ -1127,7 +1128,7 @@ HTML = r"""<!doctype html>
     </section>
 
     <div id="seriesSearchLegacySlot" hidden></div>
-    <section class="card watch-panel" id="seriesSearchSection" data-arr-page="series queue" aria-expanded="false">
+    <section class="card watch-panel" id="seriesSearchSection" data-arr-page="series queue">
       <div class="series-add-head">
         <div>
           <strong>Add Series</strong>
@@ -1137,7 +1138,7 @@ HTML = r"""<!doctype html>
       </div>
       <div class="series-grid">
         <label>Series
-          <input id="seriesQuery" placeholder="Berserk, Saga, Ice Cream Man, One Piece...">
+          <input id="seriesQuery" type="search" placeholder="Berserk, Saga, Ice Cream Man, One Piece..." autocomplete="off" aria-label="Search series titles">
         </label>
         <label>Source
           <select id="seriesProvider">
@@ -1154,7 +1155,7 @@ HTML = r"""<!doctype html>
           </select>
         </label>
         <label>Mode
-          <span class="checkline"><input id="seriesAuto" type="checkbox" checked> Monitor future releases</span>
+          <span class="checkline"><input id="seriesAuto" type="checkbox" checked aria-label="Monitor future releases"> <label for="seriesAuto">Monitor future releases</label></span>
         </label>
         <button class="primary" id="seriesSearchBtn">Search Series</button>
       </div>

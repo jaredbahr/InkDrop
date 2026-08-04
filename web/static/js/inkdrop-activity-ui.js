@@ -9,6 +9,8 @@
   };
   const mountedRoots = new WeakSet();
   let remountTimer = null;
+  let loadingPromise = null;
+  let activityObserver = null;
 
   function text(value) {
     return value == null ? "" : String(value);
@@ -360,6 +362,7 @@
   }
 
   function load(root) {
+    if (loadingPromise) return loadingPromise;
     root.innerHTML = `<div class="inkdrop-activity-dashboard"><div class="inkdrop-activity-loading">Loading Activity…</div></div>`;
     const fixtureState = {
       summary: fixture(root, "data-activity-summary-fixture"),
@@ -370,9 +373,17 @@
       render(root, fixtureState);
       return Promise.resolve();
     }
-    return Promise.all([apiGet(ENDPOINTS.summary), apiGet(ENDPOINTS.current), apiGet(ENDPOINTS.deferred)])
-      .then(([summary, current, deferred]) => render(root, { summary, current, deferred }))
-      .catch(error => renderError(root, error));
+    loadingPromise = Promise.all([apiGet(ENDPOINTS.summary), apiGet(ENDPOINTS.current), apiGet(ENDPOINTS.deferred)])
+      .then(([summary, current, deferred]) => {
+        render(root, { summary, current, deferred });
+        return null;
+      })
+      .catch(error => {
+        renderError(root, error);
+        return null;
+      })
+      .finally(() => { loadingPromise = null; });
+    return loadingPromise;
   }
 
   function bind(root) {
@@ -458,8 +469,16 @@
     }, 80);
   }
 
-  global.InkDropActivityUi = { mount, renderFixture: render, endpoints: ENDPOINTS };
+  function disconnect() {
+    if (activityObserver) {
+      activityObserver.disconnect();
+      activityObserver = null;
+    }
+  }
+
+  global.InkDropActivityUi = { mount, renderFixture: render, endpoints: ENDPOINTS, disconnect };
   document.addEventListener("DOMContentLoaded", scheduleMount);
   if (document.readyState !== "loading") scheduleMount();
-  new MutationObserver(scheduleMount).observe(document.documentElement, { childList: true, subtree: true });
+  activityObserver = new MutationObserver(scheduleMount);
+  activityObserver.observe(document.documentElement, { childList: true, subtree: true });
 })(window);

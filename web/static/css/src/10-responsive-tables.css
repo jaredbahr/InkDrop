@@ -1,2010 +1,2316 @@
 @media (max-width: 620px) {
-      main {
-        width: 100%;
-        padding: 6px 6px 24px;
-      }
-      main > header {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr);
-        gap: 6px;
-        margin-bottom: 6px;
-        padding: 6px 2px 8px;
-      }
-      main > header h1 {
-        font-size: 18px;
-      }
-      main > header .lede {
-        display: none;
-      }
-      main > header .status-pill {
-        margin-top: 0;
-        padding: 7px 8px;
-        gap: 5px;
-        min-width: 0;
-      }
-      main > header .status-pill .status-row {
-        align-items: center;
-        gap: 8px;
-      }
-      main > header .status-title {
-        font-size: 12px;
-      }
-      main > header .status-sub {
-        display: none;
-      }
-      main > header .status-action {
-        padding: 4px 6px;
-        border-radius: 5px;
-        font-size: 11px;
-      }
-      .arr-nav-shell {
-        position: sticky;
-        margin: 0 0 8px;
-        padding: 5px 0 7px;
-      }
-      .arr-nav,
-      .arr-nav-secondary {
-        display: flex;
-        grid-template-columns: none;
-        flex-wrap: nowrap;
-        gap: 4px;
-        overflow-x: auto;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      /* The strip scrolls with no indication anything is off-screen -- at
+  main {
+    width: 100%;
+    padding: 6px 6px 24px;
+  }
+  main > header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    margin-bottom: 6px;
+    padding: 6px 2px 8px;
+  }
+  main > header h1 {
+    font-size: 18px;
+  }
+  main > header .lede {
+    display: none;
+  }
+  main > header .status-pill {
+    margin-top: 0;
+    padding: 7px 8px;
+    gap: 5px;
+    min-width: 0;
+  }
+  main > header .status-pill .status-row {
+    align-items: center;
+    gap: 8px;
+  }
+  main > header .status-title {
+    font-size: 12px;
+  }
+  main > header .status-sub {
+    display: none;
+  }
+  main > header .status-action {
+    padding: 4px 6px;
+    border-radius: 5px;
+    font-size: 11px;
+  }
+  .arr-nav-shell {
+    position: sticky;
+    margin: 0 0 8px;
+    padding: 5px 0 7px;
+  }
+  .arr-nav,
+  .arr-nav-secondary {
+    display: flex;
+    grid-template-columns: none;
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  /* The strip scrolls with no indication anything is off-screen -- at
          this width "System" sits well past the visible edge. A fading
          right-hand edge is the lightest way to say "there is more here"
          without adding a visible scrollbar or arrow control. */
-      .arr-nav-shell::after {
-        content: "";
-        position: absolute;
-        top: 5px;
-        right: 0;
-        bottom: 9px;
-        width: 20px;
-        background: linear-gradient(to right, transparent, rgba(24, 28, 33, .96));
-        pointer-events: none;
-      }
-      .arr-nav {
-        grid-template-columns: none;
-      }
-      .arr-nav-secondary {
-        margin-top: 5px;
-      }
-      body[data-inkdrop-view="settings"] .arr-settings-subnav {
-        display: flex;
-        flex: 0 0 100%;
-        width: 100%;
-        gap: 4px;
-        margin: 3px 0 0;
-        padding: 4px 0 1px;
-        border-left: 0;
-        border-top: 1px solid var(--line-soft);
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="activity"] .arr-activity-subnav,
-      body[data-inkdrop-view="queue"] .arr-activity-subnav,
-      body[data-inkdrop-view="history"] .arr-activity-subnav,
-      body[data-inkdrop-view="source_memory"] .arr-activity-subnav {
-        display: flex;
-        flex: 0 0 100%;
-        width: 100%;
-        gap: 4px;
-        margin: 3px 0 0;
-        padding: 4px 0 1px;
-        border-left: 0;
-        border-top: 1px solid var(--line-soft);
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      .arr-nav .arr-settings-subnav button,
-      .arr-nav .arr-activity-subnav button {
-        flex: 0 0 auto;
-        width: auto;
-        min-height: 27px;
-        border: 1px solid rgba(49, 80, 109, .78);
-        border-radius: 4px;
-        padding: 4px 8px;
-        white-space: nowrap;
-      }
-      .arr-nav .arr-settings-subnav button:hover,
-      .arr-nav .arr-settings-subnav button:focus,
-      .arr-nav .arr-settings-subnav button.active,
-      .arr-nav .arr-settings-subnav button[aria-current="page"],
-      .arr-nav .arr-activity-subnav button:hover,
-      .arr-nav .arr-activity-subnav button:focus,
-      .arr-nav .arr-activity-subnav button.active,
-      .arr-nav .arr-activity-subnav button[aria-current="page"] {
-        border-color: rgba(54, 169, 214, .6);
-        box-shadow: inset 0 -2px 0 var(--accent);
-      }
-      .arr-nav-group-label {
-        display: none;
-      }
-      .arr-nav button,
-      .arr-nav-secondary button {
-        flex: 0 0 auto;
-        width: auto;
-        min-height: 30px;
-        grid-template-columns: minmax(0, auto) auto;
-        padding: 5px 7px;
-        white-space: nowrap;
-      }
-      .arr-nav button::before,
-      .arr-nav-secondary button::before {
-        display: none;
-      }
-      /* The icon is hidden just above, so its 20px track has to go with it.
+  .arr-nav-shell::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    right: 0;
+    bottom: 9px;
+    width: 20px;
+    background: linear-gradient(to right, transparent, rgba(24, 28, 33, 0.96));
+    pointer-events: none;
+  }
+  .arr-nav {
+    grid-template-columns: none;
+  }
+  .arr-nav-secondary {
+    margin-top: 5px;
+  }
+  body[data-inkdrop-view="settings"] .arr-settings-subnav {
+    display: flex;
+    flex: 0 0 100%;
+    width: 100%;
+    gap: 4px;
+    margin: 3px 0 0;
+    padding: 4px 0 1px;
+    border-left: 0;
+    border-top: 1px solid var(--line-soft);
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="activity"] .arr-activity-subnav,
+  body[data-inkdrop-view="queue"] .arr-activity-subnav,
+  body[data-inkdrop-view="history"] .arr-activity-subnav,
+  body[data-inkdrop-view="source_memory"] .arr-activity-subnav {
+    display: flex;
+    flex: 0 0 100%;
+    width: 100%;
+    gap: 4px;
+    margin: 3px 0 0;
+    padding: 4px 0 1px;
+    border-left: 0;
+    border-top: 1px solid var(--line-soft);
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  .arr-nav .arr-settings-subnav button,
+  .arr-nav .arr-activity-subnav button {
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 27px;
+    border: 1px solid rgba(49, 80, 109, 0.78);
+    border-radius: 4px;
+    padding: 4px 8px;
+    white-space: nowrap;
+  }
+  .arr-nav .arr-settings-subnav button:hover,
+  .arr-nav .arr-settings-subnav button:focus,
+  .arr-nav .arr-settings-subnav button.active,
+  .arr-nav .arr-settings-subnav button[aria-current="page"],
+  .arr-nav .arr-activity-subnav button:hover,
+  .arr-nav .arr-activity-subnav button:focus,
+  .arr-nav .arr-activity-subnav button.active,
+  .arr-nav .arr-activity-subnav button[aria-current="page"] {
+    border-color: rgba(54, 169, 214, 0.6);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .arr-nav-group-label {
+    display: none;
+  }
+  .arr-nav button,
+  .arr-nav-secondary button {
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 30px;
+    grid-template-columns: minmax(0, auto) auto;
+    padding: 5px 7px;
+    white-space: nowrap;
+  }
+  .arr-nav button::before,
+  .arr-nav-secondary button::before {
+    display: none;
+  }
+  /* The icon is hidden just above, so its 20px track has to go with it.
          These variants set that track at a higher specificity in the base
          sheet, which outranks the plain `.arr-nav button` rule above -- without
          repeating the selectors here the label is auto-placed into the empty
          icon column and ellipsizes to "S...", "W..", "M...". */
-      .arr-nav button[data-arr-static-nav="true"],
-      .arr-nav-secondary button[data-arr-static-nav="true"],
-      .arr-nav button[data-arr-section="settings"],
-      .arr-nav button[data-arr-section="system"],
-      .arr-nav-secondary button[data-arr-section="settings"],
-      .arr-nav-secondary button[data-arr-section="system"],
-      .arr-nav button[data-arr-badge-mode="label"],
-      .arr-nav-secondary button[data-arr-badge-mode="label"] {
-        grid-template-columns: minmax(0, auto) auto;
-      }
-      .arr-nav-secondary button {
-        min-height: 28px;
-        padding: 4px 7px;
-        font-size: 11px;
-      }
-      .arr-nav-count {
-        min-width: 20px;
-        padding: 1px 5px;
-        font-size: 10px;
-      }
-      .arr-nav-actions {
-        justify-content: flex-end;
-        margin-top: 6px;
-      }
-      .arr-nav-add {
-        min-height: 30px;
-        padding: 5px 10px;
-      }
-      .source-grid { grid-template-columns: 1fr; }
-      .workflow-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .arr-section-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .core-overview-drawer .arr-section-grid { grid-template-columns: 1fr; }
-      .section-triage-strip,
-      .section-workbench,
-      .section-workbench-drawer-body,
-      .section-table-guide-shortcuts { grid-template-columns: 1fr; }
-      .core-filter-bar.laned {
-        grid-template-columns: 1fr;
-      }
-      .core-filter-bar.laned.views-bar .section-filter-lane {
-        grid-template-columns: 1fr;
-        gap: 5px;
-      }
-      .series-library-actions,
-      .series-library-filters {
-        justify-content: flex-start;
-      }
-      .series-result-main {
-        --series-result-cover-width: 84px;
-        grid-template-columns: var(--series-result-cover-width) minmax(0, 1fr);
-        gap: 10px;
-        min-height: 132px;
-      }
-      .series-art.result {
-        width: var(--series-result-cover-width);
-      }
-      .series-detail-toolbar {
-        align-items: stretch;
-      }
-      .series-detail-toolbar-actions {
-        width: 100%;
-        justify-content: stretch;
-      }
-      .series-detail-back {
-        flex: 1 1 130px;
-      }
-      .series-detail-remove-primary,
-      .series-detail-removed-badge {
-        flex: 1 1 130px;
-        justify-content: center;
-      }
-      .series-detail-commandbar button {
-        flex: 1 1 76px;
-      }
-      .series-detail-hero {
-        grid-template-columns: 1fr;
-        gap: 10px;
-        padding: 10px;
-      }
-      .series-art.detail {
-        width: min(58vw, 188px);
-      }
-      .series-detail-title h3 {
-        font-size: 24px;
-      }
-      .series-detail-stat-grid,
-      .series-detail-panel-grid {
-        grid-template-columns: 1fr 1fr;
-      }
-      .series-detail-issues-head {
-        align-items: stretch;
-      }
-      .series-detail-issues-actions {
-        justify-content: flex-start;
-      }
-      .series-detail-issue-groups {
-        gap: 8px;
-        padding: 0 8px 8px;
-      }
-      .series-detail-issue-group-head {
-        align-items: flex-start;
-        padding: 8px 9px;
-      }
-      .series-detail-issue-group-stats {
-        justify-content: flex-start;
-      }
-      .series-detail-issue-group .series-detail-issue-table {
-        padding: 0;
-      }
-      .series-detail-issue-row.head {
-        display: none;
-      }
-      .series-detail-issue-row {
-        grid-template-columns: minmax(48px, auto) minmax(0, 1fr);
-        grid-template-areas:
-          "number main"
-          "state state"
-          "detail detail"
-          "actions actions";
-        gap: 4px 8px;
-        align-items: start;
-        min-height: 0;
-        padding: 8px 9px;
-      }
-      .series-detail-issue-number {
-        grid-area: number;
-        font-size: 12px;
-      }
-      .series-detail-issue-main {
-        grid-area: main;
-        gap: 1px;
-      }
-      .series-detail-issue-main strong {
-        font-size: 12px;
-        line-height: 1.18;
-      }
-      .series-detail-issue-main span {
-        font-size: 10px;
-      }
-      .series-detail-issue-row > .series-detail-issue-state {
-        grid-area: state;
-        width: 100%;
-        justify-content: flex-start;
-        min-height: 20px;
-        padding: 3px 6px;
-        font-size: 9px;
-      }
-      .series-detail-issue-detail {
-        grid-area: detail;
-        font-size: 10px;
-        line-height: 1.25;
-      }
-      .series-detail-issue-actions {
-        grid-area: actions;
-        display: flex;
-        flex-wrap: wrap;
-        justify-content: flex-start;
-        gap: 4px;
-        overflow: visible;
-        padding-bottom: 0;
-      }
-      .series-detail-issue-actions button {
-        width: 28px;
-        min-width: 28px;
-        height: 26px;
-        min-height: 26px;
-        padding: 0;
-        font-size: 0;
-        white-space: nowrap;
-      }
-      .series-poster-shelf-full .series-poster-grid {
-        grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-      }
-      .series-poster-layout {
-        grid-template-columns: minmax(0, 1fr);
-      }
-      .series-alpha-rail.series-alpha-side-rail {
-        display: none;
-        height: auto;
-      }
-      .series-loading-grid {
-        grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-      }
-      .series-library-tool,
-      .series-library-filter {
-        flex: 1 1 118px;
-      }
-      .series-alpha-rail {
-        flex-wrap: nowrap;
-        overflow-x: auto;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      .series-alpha-button {
-        flex: 0 0 auto;
-      }
-      .section-operator-now-actions button {
-        flex: 1 1 132px;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now,
-      body[data-inkdrop-view="wanted"] .section-operator-now {
-        gap: 2px;
-        margin: 2px 0 4px;
-        padding: 4px 5px;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-main,
-      body[data-inkdrop-view="wanted"] .section-operator-now-main {
-        gap: 4px;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-title,
-      body[data-inkdrop-view="wanted"] .section-operator-now-title {
-        font-size: 13px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-detail,
-      body[data-inkdrop-view="wanted"] .section-operator-now-detail {
-        display: none;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: 1;
-        overflow: hidden;
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-stats,
-      body[data-inkdrop-view="queue"] .section-operator-now-actions,
-      body[data-inkdrop-view="wanted"] .section-operator-now-stats,
-      body[data-inkdrop-view="wanted"] .section-operator-now-actions {
-        flex-wrap: nowrap;
-        gap: 4px;
-        max-width: 100%;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-stat,
-      body[data-inkdrop-view="wanted"] .section-operator-now-stat {
-        flex: 0 0 auto;
-        min-width: 96px;
-        min-height: 26px;
-        padding: 3px 6px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-stat strong,
-      body[data-inkdrop-view="wanted"] .section-operator-now-stat strong {
-        font-size: 13px;
-      }
-      body[data-inkdrop-view="queue"] .section-operator-now-actions button,
-      body[data-inkdrop-view="wanted"] .section-operator-now-actions button {
-        flex: 0 0 auto;
-        min-height: 24px;
-        padding: 2px 7px;
-        font-size: 11px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-lane-board,
-      body[data-inkdrop-view="wanted"] .section-lane-board,
-      body[data-inkdrop-view="manual_review"] .section-lane-board {
-        display: flex;
-        flex-wrap: nowrap;
-        gap: 5px;
-        margin: 3px 0 5px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-lane-card,
-      body[data-inkdrop-view="wanted"] .section-lane-card,
-      body[data-inkdrop-view="manual_review"] .section-lane-card {
-        flex: 0 0 132px;
-        grid-template-columns: minmax(0, 1fr) auto;
-        min-height: 38px;
-        gap: 2px 6px;
-        padding: 5px 7px;
-      }
-      body[data-inkdrop-view="queue"] .section-lane-card.active,
-      body[data-inkdrop-view="wanted"] .section-lane-card.active,
-      body[data-inkdrop-view="manual_review"] .section-lane-card.active {
-        box-shadow: inset 3px 0 0 rgba(61, 194, 255, .9);
-      }
-      body[data-inkdrop-view="queue"] .section-lane-card-label,
-      body[data-inkdrop-view="wanted"] .section-lane-card-label,
-      body[data-inkdrop-view="manual_review"] .section-lane-card-label {
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="queue"] .section-lane-card-value,
-      body[data-inkdrop-view="wanted"] .section-lane-card-value,
-      body[data-inkdrop-view="manual_review"] .section-lane-card-value {
-        font-size: 14px;
-      }
-      body[data-inkdrop-view="queue"] .section-lane-card-detail,
-      body[data-inkdrop-view="wanted"] .section-lane-card-detail,
-      body[data-inkdrop-view="manual_review"] .section-lane-card-detail {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-controlbar,
-      body[data-inkdrop-view="wanted"] .arr-table-controlbar {
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 3px;
-        min-height: 0;
-        margin: 2px 0 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 3px 4px;
-        scrollbar-width: none;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-controlbar::-webkit-scrollbar,
-      body[data-inkdrop-view="wanted"] .arr-table-controlbar::-webkit-scrollbar {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-controlbar-left,
-      body[data-inkdrop-view="queue"] .arr-table-controlbar-right,
-      body[data-inkdrop-view="wanted"] .arr-table-controlbar-left,
-      body[data-inkdrop-view="wanted"] .arr-table-controlbar-right {
-        flex: 0 0 auto;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 4px;
-        overflow: visible;
-        padding-bottom: 0;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-icon-button,
-      body[data-inkdrop-view="queue"] .arr-table-menu > summary,
-      body[data-inkdrop-view="wanted"] .arr-table-icon-button,
-      body[data-inkdrop-view="wanted"] .arr-table-menu > summary {
-        height: 24px;
-        grid-template-columns: auto;
-        min-width: max-content;
-        min-height: 24px;
-        gap: 3px;
-        padding: 0 6px;
-        font-size: 10px;
-        line-height: 1;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-sort-state,
-      body[data-inkdrop-view="wanted"] .arr-table-sort-state {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-view-strip,
-      body[data-inkdrop-view="wanted"] .arr-table-view-strip {
-        flex: 0 0 auto;
-        flex-wrap: nowrap;
-        gap: 4px;
-        min-width: max-content;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 0 0 0 4px;
-        border-top: 0;
-        border-left: 1px solid var(--line-soft);
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .arr-table-view-chip,
-      body[data-inkdrop-view="wanted"] .arr-table-view-chip {
-        flex: 0 0 auto;
-        min-width: 76px;
-        min-height: 24px;
-        padding: 2px 5px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-context-strip,
-      body[data-inkdrop-view="wanted"] .section-table-context-strip {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 5px;
-        margin: 0 0 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 5px 7px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-table-context-main,
-      body[data-inkdrop-view="wanted"] .section-table-context-main {
-        flex: 0 0 auto;
-      }
-      body[data-inkdrop-view="queue"] .section-table-context-main strong,
-      body[data-inkdrop-view="wanted"] .section-table-context-main strong {
-        font-size: 12px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-context-main span,
-      body[data-inkdrop-view="wanted"] .section-table-context-main span,
-      body[data-inkdrop-view="queue"] .section-table-toolbar-title span,
-      body[data-inkdrop-view="wanted"] .section-table-toolbar-title span {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .section-table-context-actions,
-      body[data-inkdrop-view="wanted"] .section-table-context-actions,
-      body[data-inkdrop-view="queue"] .section-table-key,
-      body[data-inkdrop-view="wanted"] .section-table-key {
-        flex-wrap: nowrap;
-        justify-content: flex-start;
-        max-width: 100%;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-table-toolbar,
-      body[data-inkdrop-view="wanted"] .section-table-toolbar {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 5px;
-        margin: 2px 0 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 4px 6px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-table-toolbar-title,
-      body[data-inkdrop-view="wanted"] .section-table-toolbar-title {
-        flex: 0 0 auto;
-      }
-      body[data-inkdrop-view="queue"] .section-table-toolbar-title strong,
-      body[data-inkdrop-view="wanted"] .section-table-toolbar-title strong {
-        font-size: 12px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-key-chip,
-      body[data-inkdrop-view="wanted"] .section-table-key-chip {
-        flex: 0 0 auto;
-        min-height: 20px;
-        padding: 2px 6px;
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-lane-header,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-lane-header {
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: 6px;
-        padding: 5px 8px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-lane-header strong,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-lane-header strong {
-        overflow: hidden;
-        font-size: 12px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-lane-header span:not(.section-table-lane-count),
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-lane-header span:not(.section-table-lane-count) {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-lane-count,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-lane-count {
-        min-height: 20px;
-        padding: 2px 6px;
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
-        grid-template-columns: minmax(0, 1fr) minmax(74px, auto);
-        grid-template-areas:
-          "item state"
-          "detail detail"
-          "actions actions";
-        gap: 5px 7px;
-        align-items: start;
-        padding: 6px 34px 6px 10px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-item,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-item {
-        grid-area: item;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-state,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-state {
-        grid-area: state;
-        justify-self: end;
-        max-width: 112px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-detail,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-detail {
-        grid-area: detail;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-actions,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-actions {
-        grid-area: actions;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-select,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-select {
-        top: 7px;
-        right: 7px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-with-art,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-with-art {
-        grid-template-columns: 46px minmax(0, 1fr);
-        gap: 9px;
-        align-items: start;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .series-art.table,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .series-art.table {
-        width: 46px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line {
-        flex-wrap: nowrap;
-        gap: 4px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line > strong,
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line > .section-table-series-link,
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-title-line > .section-table-series-link > strong,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line > strong {
-        flex: 1 1 auto;
-        overflow: hidden;
-        font-size: 12px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line > .section-table-series-link,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-title-line > .section-table-series-link > strong {
-        flex: 1 1 auto;
-        overflow: hidden;
-        font-size: 12px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-bucket-badge,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-bucket-badge {
-        flex: 0 0 auto;
-        max-width: 112px;
-        min-height: 18px;
-        overflow: hidden;
-        padding: 2px 5px;
-        font-size: 9px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-context,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-context {
-        display: -webkit-box;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: 1;
-        margin-top: 1px;
-        overflow: hidden;
-        font-size: 10px;
-        line-height: 1.25;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-flags,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flags,
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary {
-        flex-wrap: nowrap;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 1px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-flags,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flags {
-        margin-top: 3px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-flag,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flag {
-        flex: 0 0 auto;
-        min-height: 18px;
-        padding: 2px 5px;
-        font-size: 9px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-state-stack,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-state-stack {
-        display: flex;
-        flex-wrap: nowrap;
-        justify-content: flex-end;
-        gap: 3px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-state-stack .core-state,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-state-stack .core-state {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-lane-pill,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-lane-pill {
-        flex: 0 0 auto;
-        min-height: 18px;
-        padding: 2px 5px;
-        font-size: 9px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-intent,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-intent {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-compact,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-compact {
-        gap: 4px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary {
-        margin-top: 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-chip,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-chip {
-        flex: 0 0 auto;
-        max-width: 142px;
-        min-height: 19px;
-        padding: 2px 5px;
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-chip strong,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-chip strong {
-        font-size: 8px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-chip span,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-chip span {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer > summary,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer > summary {
-        min-height: 22px;
-        padding: 3px 6px;
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer-body,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer-body {
-        gap: 4px;
-        padding: 0 6px 6px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        justify-items: start;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail .section-table-action-group,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail .section-table-action-group {
-        flex: 0 0 auto;
-        grid-template-columns: 1fr;
-        gap: 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail .section-table-action-group-buttons,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail .section-table-action-group-buttons {
-        flex-wrap: nowrap;
-        gap: 3px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail button,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail button {
-        max-width: none;
-        min-width: 48px;
-        min-height: 23px;
-        grid-template-columns: minmax(0, auto);
-        padding: 0 5px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail button[data-action-role="inspect"],
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail button[data-action-role="navigate"],
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail button[data-action-role="inspect"],
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail button[data-action-role="navigate"] {
-        width: auto;
-        min-width: 48px;
-        grid-template-columns: minmax(0, auto);
-        padding: 0 5px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail button[data-action-role="inspect"] .section-table-action-text,
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail button[data-action-role="navigate"] .section-table-action-text,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail button[data-action-role="inspect"] .section-table-action-text,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail button[data-action-role="navigate"] .section-table-action-text {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"],
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] {
-        flex-wrap: wrap;
-        justify-content: flex-start;
-        overflow: visible;
-        padding-bottom: 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] .section-table-action-more,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] .section-table-action-more {
-        flex: 0 1 auto;
-        min-width: 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] .section-table-action-more > summary,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] .section-table-action-more > summary {
-        min-height: 23px;
-        padding: 0 6px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] .section-table-action-more-body,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] .section-table-action-more-body {
-        min-width: min(190px, calc(100vw - 42px));
-      }
-      body[data-inkdrop-view="queue"] main > header,
-      body[data-inkdrop-view="wanted"] main > header {
-        grid-template-columns: minmax(0, auto) minmax(118px, 1fr);
-        align-items: center;
-        gap: 5px;
-        margin-bottom: 3px;
-        padding: 3px 2px 4px;
-        border-bottom: 0;
-      }
-      body[data-inkdrop-view="queue"] main > header .inkdrop-header-brand,
-      body[data-inkdrop-view="wanted"] main > header .inkdrop-header-brand {
-        gap: 7px;
-      }
-      body[data-inkdrop-view="queue"] main > header .inkdrop-logo-mark,
-      body[data-inkdrop-view="wanted"] main > header .inkdrop-logo-mark {
-        width: 30px;
-        height: 30px;
-        border-radius: 6px;
-      }
-      body[data-inkdrop-view="queue"] main > header h1,
-      body[data-inkdrop-view="wanted"] main > header h1 {
-        overflow: hidden;
-        font-size: 16px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] main > header .status-pill,
-      body[data-inkdrop-view="wanted"] main > header .status-pill {
-        min-height: 30px;
-        padding: 4px 6px;
-        gap: 0;
-      }
-      body[data-inkdrop-view="queue"] main > header .status-title,
-      body[data-inkdrop-view="wanted"] main > header .status-title {
-        gap: 5px;
-        overflow: hidden;
-        font-size: 11px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] main > header .status-title strong,
-      body[data-inkdrop-view="wanted"] main > header .status-title strong {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] main > header .status-dot,
-      body[data-inkdrop-view="wanted"] main > header .status-dot {
-        width: 7px;
-        height: 7px;
-        box-shadow: none;
-      }
-      body[data-inkdrop-view="queue"] main > header .status-metrics,
-      body[data-inkdrop-view="wanted"] main > header .status-metrics,
-      body[data-inkdrop-view="queue"] main > header .status-sub,
-      body[data-inkdrop-view="wanted"] main > header .status-sub {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] main > header .status-action,
-      body[data-inkdrop-view="wanted"] main > header .status-action {
-        min-height: 22px;
-        padding: 2px 5px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav-shell,
-      body[data-inkdrop-view="wanted"] .arr-nav-shell {
-        margin-bottom: 4px;
-        padding: 3px 0 4px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav,
-      body[data-inkdrop-view="queue"] .arr-nav-secondary,
-      body[data-inkdrop-view="wanted"] .arr-nav,
-      body[data-inkdrop-view="wanted"] .arr-nav-secondary {
-        gap: 3px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav-secondary,
-      body[data-inkdrop-view="wanted"] .arr-nav-secondary {
-        margin-top: 3px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav button,
-      body[data-inkdrop-view="wanted"] .arr-nav button {
-        min-height: 26px;
-        padding: 3px 6px;
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav-secondary button,
-      body[data-inkdrop-view="wanted"] .arr-nav-secondary button {
-        min-height: 24px;
-        padding: 3px 6px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav-actions,
-      body[data-inkdrop-view="wanted"] .arr-nav-actions {
-        margin-top: 3px;
-      }
-      body[data-inkdrop-view="queue"] .arr-nav-add,
-      body[data-inkdrop-view="wanted"] .arr-nav-add {
-        min-height: 26px;
-        padding: 4px 8px;
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="queue"] #inkdropSectionPanel > .section-commandbar,
-      body[data-inkdrop-view="wanted"] #inkdropSectionPanel > .section-commandbar {
-        grid-template-columns: minmax(0, 1fr) auto;
-        align-items: center;
-        gap: 6px;
-        margin-bottom: 4px;
-        padding-bottom: 4px;
-      }
-      body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-heading h3,
-      body[data-inkdrop-view="wanted"] #inkdropSectionPanel .section-heading h3 {
-        margin: 0;
-        font-size: 15px;
-      }
-      body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-eyebrow,
-      body[data-inkdrop-view="wanted"] #inkdropSectionPanel .section-eyebrow {
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-command-actions,
-      body[data-inkdrop-view="wanted"] #inkdropSectionPanel .section-command-actions {
-        flex-wrap: nowrap;
-        justify-content: flex-end;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-command-actions button,
-      body[data-inkdrop-view="wanted"] #inkdropSectionPanel .section-command-actions button {
-        flex: 0 0 auto;
-        min-height: 24px;
-        padding: 2px 7px;
-        font-size: 11px;
-        text-transform: none;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .queue-cause-strip,
-      body[data-inkdrop-view="wanted"] .queue-cause-strip,
-      body[data-inkdrop-view="manual_review"] .queue-cause-strip {
-        grid-template-columns: minmax(0, 1fr);
-        gap: 5px;
-        margin-bottom: 6px;
-        padding: 6px 7px;
-      }
-      body[data-inkdrop-view="queue"] .queue-cause-main,
-      body[data-inkdrop-view="wanted"] .queue-cause-main,
-      body[data-inkdrop-view="manual_review"] .queue-cause-main {
-        gap: 0;
-      }
-      body[data-inkdrop-view="queue"] .queue-cause-main strong,
-      body[data-inkdrop-view="wanted"] .queue-cause-main strong,
-      body[data-inkdrop-view="manual_review"] .queue-cause-main strong {
-        overflow: hidden;
-        font-size: 11px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="queue"] .queue-cause-main span,
-      body[data-inkdrop-view="wanted"] .queue-cause-main span,
-      body[data-inkdrop-view="manual_review"] .queue-cause-main span {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .queue-cause-actions,
-      body[data-inkdrop-view="wanted"] .queue-cause-actions,
-      body[data-inkdrop-view="manual_review"] .queue-cause-actions {
-        flex-wrap: nowrap;
-        justify-content: flex-start;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 1px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="queue"] .queue-cause-actions button,
-      body[data-inkdrop-view="wanted"] .queue-cause-actions button,
-      body[data-inkdrop-view="manual_review"] .queue-cause-actions button {
-        flex: 0 0 auto;
-        min-height: 22px;
-        padding: 2px 6px;
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="manual_review"] .manual-review-cause-strip {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 5px;
-        margin-bottom: 4px;
-        overflow: hidden;
-        padding: 4px 6px;
-      }
-      body[data-inkdrop-view="manual_review"] .manual-review-cause-strip .queue-cause-main {
-        flex: 0 0 min(128px, 36%);
-        max-width: min(128px, 36%);
-      }
-      body[data-inkdrop-view="manual_review"] .manual-review-cause-strip .manual-review-cause-actions {
-        flex: 1 1 auto;
-        max-width: 100%;
-        min-width: 0;
-        overflow-x: auto;
-        overflow-y: hidden;
-      }
-      body[data-inkdrop-view="manual_review"] .manual-review-cause-strip .manual-review-cause-actions button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        height: 22px;
-        min-height: 22px;
-        max-height: 22px;
-        padding: 1px 6px;
-        line-height: 1;
-      }
-      body[data-inkdrop-view="manual_review"] main > header {
-        grid-template-columns: minmax(0, auto) minmax(118px, 1fr);
-        align-items: center;
-        gap: 5px;
-        margin-bottom: 3px;
-        padding: 3px 2px 4px;
-        border-bottom: 0;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .inkdrop-header-brand {
-        gap: 7px;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .inkdrop-logo-mark {
-        width: 30px;
-        height: 30px;
-        border-radius: 6px;
-      }
-      body[data-inkdrop-view="manual_review"] main > header h1 {
-        overflow: hidden;
-        font-size: 16px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .status-pill {
-        min-height: 30px;
-        padding: 4px 6px;
-        gap: 0;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .status-title {
-        gap: 5px;
-        overflow: hidden;
-        font-size: 11px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .status-title strong {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .status-dot {
-        width: 7px;
-        height: 7px;
-        box-shadow: none;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .status-metrics,
-      body[data-inkdrop-view="manual_review"] main > header .status-sub {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] main > header .status-action {
-        min-height: 22px;
-        padding: 2px 5px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav-shell {
-        margin-bottom: 4px;
-        padding: 3px 0 4px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav,
-      body[data-inkdrop-view="manual_review"] .arr-nav-secondary {
-        gap: 3px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav-secondary {
-        margin-top: 3px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav button {
-        min-height: 26px;
-        padding: 3px 6px;
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav-secondary button {
-        min-height: 24px;
-        padding: 3px 6px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav-actions {
-        margin-top: 3px;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-nav-add {
-        min-height: 26px;
-        padding: 4px 8px;
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel > .section-commandbar {
-        grid-template-columns: minmax(0, 1fr) auto;
-        align-items: center;
-        gap: 6px;
-        margin-bottom: 4px;
-        padding-bottom: 4px;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel .section-heading p,
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel .section-eyebrow {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel .section-heading h3 {
-        margin: 0;
-        font-size: 15px;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel .section-eyebrow {
-        font-size: 9px;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel .section-command-actions {
-        flex-wrap: nowrap;
-        justify-content: flex-end;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionPanel .section-command-actions button {
-        flex: 0 0 auto;
-        min-height: 24px;
-        padding: 2px 7px;
-        font-size: 11px;
-        text-transform: none;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now {
-        grid-template-columns: minmax(0, 1fr);
-        gap: 4px;
-        margin: 4px 0 6px;
-        padding: 6px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-main {
-        gap: 4px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-title {
-        overflow: hidden;
-        font-size: 13px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-detail {
-        display: none;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: 1;
-        overflow: hidden;
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-stats,
-      body[data-inkdrop-view="manual_review"] .section-operator-now-actions {
-        flex-wrap: nowrap;
-        gap: 4px;
-        max-width: 100%;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-stat {
-        flex: 0 0 auto;
-        min-height: 20px;
-        padding: 2px 6px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-stat strong {
-        font-size: 11px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-actions button {
-        flex: 0 0 auto;
-        min-height: 24px;
-        padding: 2px 7px;
-        font-size: 11px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-operator-now-actions {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-strip {
-        display: flex;
-        flex-wrap: nowrap;
-        gap: 5px;
-        margin: 4px 0 5px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 1px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-main,
-      body[data-inkdrop-view="manual_review"] .section-policy-card {
-        flex: 0 0 min(318px, calc(100vw - 16px));
-        padding: 6px 7px;
-        border-radius: 4px;
-        gap: 4px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-main {
-        flex-basis: calc(100vw - 16px);
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-card {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-main strong,
-      body[data-inkdrop-view="manual_review"] .section-policy-card strong {
-        font-size: 12px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-main p,
-      body[data-inkdrop-view="manual_review"] .section-policy-card span {
-        display: -webkit-box;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: 1;
-        overflow: hidden;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-chips,
-      body[data-inkdrop-view="manual_review"] .section-policy-actions {
-        flex-wrap: nowrap;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 1px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-chip {
-        flex: 0 0 auto;
-        min-height: 19px;
-        padding: 2px 6px;
-        font-size: 9px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionSummary {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .section-policy-actions button {
-        flex: 0 0 auto;
-        min-height: 22px;
-        padding: 2px 7px;
-        font-size: 10px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-triage-strip {
-        display: flex;
-        flex-wrap: nowrap;
-        gap: 5px;
-        margin: 5px 0;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 1px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-triage-item {
-        flex: 0 0 132px;
-        min-height: 46px;
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: 3px 6px;
-        padding: 6px 7px;
-        border-radius: 4px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-triage-label {
-        overflow: hidden;
-        font-size: 9px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-triage-count {
-        font-size: 16px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-triage-detail {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionFilters.views-bar {
-        display: flex;
-        flex-wrap: nowrap;
-        gap: 5px;
-        margin: 5px 0;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 6px 7px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionFilters.views-bar .section-filter-lane {
-        flex: 0 0 150px;
-        display: grid;
-        gap: 4px;
-        min-width: 0;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionFilters.views-bar .section-filter-lane-title {
-        overflow: hidden;
-        font-size: 9px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionFilters.views-bar .section-filter-group {
-        display: flex;
-        flex-wrap: nowrap;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 1px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] #inkdropSectionFilters.views-bar .section-filter-pill {
-        flex: 0 0 auto;
-        min-height: 24px;
-        padding: 2px 7px;
-        font-size: 10px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-lane-ribbon {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 5px;
-        margin: 5px 0;
-        padding: 6px 7px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-lane-ribbon-main {
-        flex: 0 0 auto;
-        max-width: 220px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-lane-ribbon-main strong {
-        overflow: hidden;
-        font-size: 12px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-lane-ribbon-main span {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .section-lane-ribbon-actions {
-        flex: 0 0 auto;
-        flex-wrap: nowrap;
-        gap: 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-lane-ribbon-actions button {
-        flex: 0 0 auto;
-        min-height: 22px;
-        padding: 2px 7px;
-        font-size: 10px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-controlbar {
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 3px;
-        min-height: 0;
-        margin: 3px 0 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 3px 4px;
-        scrollbar-width: none;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-controlbar::-webkit-scrollbar {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-controlbar-left,
-      body[data-inkdrop-view="manual_review"] .arr-table-controlbar-right {
-        flex: 0 0 auto;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 4px;
-        overflow: visible;
-        padding-bottom: 0;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-icon-button,
-      body[data-inkdrop-view="manual_review"] .arr-table-menu > summary {
-        height: 24px;
-        grid-template-columns: auto;
-        min-width: max-content;
-        min-height: 24px;
-        gap: 3px;
-        padding: 0 6px;
-        font-size: 10px;
-        line-height: 1;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-sort-state {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-view-strip {
-        flex: 0 0 auto;
-        flex-wrap: nowrap;
-        gap: 4px;
-        min-width: max-content;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 0 0 0 4px;
-        border-top: 0;
-        border-left: 1px solid var(--line-soft);
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .arr-table-view-chip {
-        flex: 0 0 auto;
-        min-width: 76px;
-        min-height: 24px;
-        padding: 2px 5px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-context-strip {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 5px;
-        margin: 0 0 4px;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 5px 7px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-context-main {
-        flex: 0 0 auto;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-context-main strong {
-        font-size: 12px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-context-main span,
-      body[data-inkdrop-view="manual_review"] .section-table-toolbar-title span {
-        display: none;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-context-actions,
-      body[data-inkdrop-view="manual_review"] .section-table-key {
-        flex-wrap: nowrap;
-        justify-content: flex-start;
-        max-width: 100%;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding-bottom: 2px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-toolbar {
-        display: flex;
-        flex-wrap: nowrap;
-        align-items: center;
-        gap: 5px;
-        margin: 4px 0;
-        overflow-x: auto;
-        overflow-y: hidden;
-        padding: 5px 7px;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-toolbar-title {
-        flex: 0 0 auto;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-toolbar-title strong {
-        font-size: 12px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="manual_review"] .section-table-key-chip {
-        flex: 0 0 auto;
-        min-height: 20px;
-        padding: 2px 6px;
-        font-size: 9px;
-      }
-      .arr-section-tile {
-        min-height: 148px;
-      }
-      .settings-grid,
-      .settings-group-body { grid-template-columns: 1fr; }
-      body[data-inkdrop-view="settings"] .settings-body {
-        gap: 8px;
-        padding: 8px;
-      }
-      body[data-inkdrop-view="settings"] .settings-actions {
-        justify-content: flex-start;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="settings"] .settings-actions button {
-        /* see the 519px block: a fixed basis under the label width makes the
+  .arr-nav button[data-arr-static-nav="true"],
+  .arr-nav-secondary button[data-arr-static-nav="true"],
+  .arr-nav button[data-arr-section="settings"],
+  .arr-nav button[data-arr-section="system"],
+  .arr-nav-secondary button[data-arr-section="settings"],
+  .arr-nav-secondary button[data-arr-section="system"],
+  .arr-nav button[data-arr-badge-mode="label"],
+  .arr-nav-secondary button[data-arr-badge-mode="label"] {
+    grid-template-columns: minmax(0, auto) auto;
+  }
+  .arr-nav-secondary button {
+    min-height: 28px;
+    padding: 4px 7px;
+    font-size: 11px;
+  }
+  .arr-nav-count {
+    min-width: 20px;
+    padding: 1px 5px;
+    font-size: 10px;
+  }
+  .arr-nav-actions {
+    justify-content: flex-end;
+    margin-top: 6px;
+  }
+  .arr-nav-add {
+    min-height: 30px;
+    padding: 5px 10px;
+  }
+  .source-grid {
+    grid-template-columns: 1fr;
+  }
+  .workflow-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .arr-section-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .core-overview-drawer .arr-section-grid {
+    grid-template-columns: 1fr;
+  }
+  .section-triage-strip,
+  .section-workbench,
+  .section-workbench-drawer-body,
+  .section-table-guide-shortcuts {
+    grid-template-columns: 1fr;
+  }
+  .core-filter-bar.laned {
+    grid-template-columns: 1fr;
+  }
+  .core-filter-bar.laned.views-bar .section-filter-lane {
+    grid-template-columns: 1fr;
+    gap: 5px;
+  }
+  .series-library-actions,
+  .series-library-filters {
+    justify-content: flex-start;
+  }
+  .series-result-main {
+    --series-result-cover-width: 84px;
+    grid-template-columns: var(--series-result-cover-width) minmax(0, 1fr);
+    gap: 10px;
+    min-height: 132px;
+  }
+  .series-art.result {
+    width: var(--series-result-cover-width);
+  }
+  .series-detail-toolbar {
+    align-items: stretch;
+  }
+  .series-detail-toolbar-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+  .series-detail-back {
+    flex: 1 1 130px;
+  }
+  .series-detail-remove-primary,
+  .series-detail-removed-badge {
+    flex: 1 1 130px;
+    justify-content: center;
+  }
+  .series-detail-commandbar button {
+    flex: 1 1 76px;
+  }
+  .series-detail-hero {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding: 10px;
+  }
+  .series-art.detail {
+    width: min(58vw, 188px);
+  }
+  .series-detail-title h3 {
+    font-size: 24px;
+  }
+  .series-detail-stat-grid,
+  .series-detail-panel-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .series-detail-issues-head {
+    align-items: stretch;
+  }
+  .series-detail-issues-actions {
+    justify-content: flex-start;
+  }
+  .series-detail-issue-groups {
+    gap: 8px;
+    padding: 0 8px 8px;
+  }
+  .series-detail-issue-group-head {
+    align-items: flex-start;
+    padding: 8px 9px;
+  }
+  .series-detail-issue-group-stats {
+    justify-content: flex-start;
+  }
+  .series-detail-issue-group .series-detail-issue-table {
+    padding: 0;
+  }
+  .series-detail-issue-row.head {
+    display: none;
+  }
+  .series-detail-issue-row {
+    grid-template-columns: minmax(48px, auto) minmax(0, 1fr);
+    grid-template-areas:
+      "number main"
+      "state state"
+      "detail detail"
+      "actions actions";
+    gap: 4px 8px;
+    align-items: start;
+    min-height: 0;
+    padding: 8px 9px;
+  }
+  .series-detail-issue-number {
+    grid-area: number;
+    font-size: 12px;
+  }
+  .series-detail-issue-main {
+    grid-area: main;
+    gap: 1px;
+  }
+  .series-detail-issue-main strong {
+    font-size: 12px;
+    line-height: 1.18;
+  }
+  .series-detail-issue-main span {
+    font-size: 10px;
+  }
+  .series-detail-issue-row > .series-detail-issue-state {
+    grid-area: state;
+    width: 100%;
+    justify-content: flex-start;
+    min-height: 20px;
+    padding: 3px 6px;
+    font-size: 9px;
+  }
+  .series-detail-issue-detail {
+    grid-area: detail;
+    font-size: 10px;
+    line-height: 1.25;
+  }
+  .series-detail-issue-actions {
+    grid-area: actions;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 4px;
+    overflow: visible;
+    padding-bottom: 0;
+  }
+  .series-detail-issue-actions button {
+    width: 28px;
+    min-width: 28px;
+    height: 26px;
+    min-height: 26px;
+    padding: 0;
+    font-size: 0;
+    white-space: nowrap;
+  }
+  .series-poster-shelf-full .series-poster-grid {
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  }
+  .series-poster-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .series-alpha-rail.series-alpha-side-rail {
+    display: none;
+    height: auto;
+  }
+  .series-loading-grid {
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  }
+  .series-library-tool,
+  .series-library-filter {
+    flex: 1 1 118px;
+  }
+  .series-alpha-rail {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  .series-alpha-button {
+    flex: 0 0 auto;
+  }
+  .section-operator-now-actions button {
+    flex: 1 1 132px;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now,
+  body[data-inkdrop-view="wanted"] .section-operator-now {
+    gap: 2px;
+    margin: 2px 0 4px;
+    padding: 4px 5px;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-main,
+  body[data-inkdrop-view="wanted"] .section-operator-now-main {
+    gap: 4px;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-title,
+  body[data-inkdrop-view="wanted"] .section-operator-now-title {
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-detail,
+  body[data-inkdrop-view="wanted"] .section-operator-now-detail {
+    display: none;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    overflow: hidden;
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-stats,
+  body[data-inkdrop-view="queue"] .section-operator-now-actions,
+  body[data-inkdrop-view="wanted"] .section-operator-now-stats,
+  body[data-inkdrop-view="wanted"] .section-operator-now-actions {
+    flex-wrap: nowrap;
+    gap: 4px;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-stat,
+  body[data-inkdrop-view="wanted"] .section-operator-now-stat {
+    flex: 0 0 auto;
+    min-width: 96px;
+    min-height: 26px;
+    padding: 3px 6px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-stat strong,
+  body[data-inkdrop-view="wanted"] .section-operator-now-stat strong {
+    font-size: 13px;
+  }
+  body[data-inkdrop-view="queue"] .section-operator-now-actions button,
+  body[data-inkdrop-view="wanted"] .section-operator-now-actions button {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 2px 7px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .section-lane-board,
+  body[data-inkdrop-view="wanted"] .section-lane-board,
+  body[data-inkdrop-view="manual_review"] .section-lane-board {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 5px;
+    margin: 3px 0 5px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .section-lane-card,
+  body[data-inkdrop-view="wanted"] .section-lane-card,
+  body[data-inkdrop-view="manual_review"] .section-lane-card {
+    flex: 0 0 132px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    min-height: 38px;
+    gap: 2px 6px;
+    padding: 5px 7px;
+  }
+  body[data-inkdrop-view="queue"] .section-lane-card.active,
+  body[data-inkdrop-view="wanted"] .section-lane-card.active,
+  body[data-inkdrop-view="manual_review"] .section-lane-card.active {
+    box-shadow: inset 3px 0 0 rgba(61, 194, 255, 0.9);
+  }
+  body[data-inkdrop-view="queue"] .section-lane-card-label,
+  body[data-inkdrop-view="wanted"] .section-lane-card-label,
+  body[data-inkdrop-view="manual_review"] .section-lane-card-label {
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="queue"] .section-lane-card-value,
+  body[data-inkdrop-view="wanted"] .section-lane-card-value,
+  body[data-inkdrop-view="manual_review"] .section-lane-card-value {
+    font-size: 14px;
+  }
+  body[data-inkdrop-view="queue"] .section-lane-card-detail,
+  body[data-inkdrop-view="wanted"] .section-lane-card-detail,
+  body[data-inkdrop-view="manual_review"] .section-lane-card-detail {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-controlbar,
+  body[data-inkdrop-view="wanted"] .arr-table-controlbar {
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 3px;
+    min-height: 0;
+    margin: 2px 0 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 3px 4px;
+    scrollbar-width: none;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-controlbar::-webkit-scrollbar,
+  body[data-inkdrop-view="wanted"] .arr-table-controlbar::-webkit-scrollbar {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-controlbar-left,
+  body[data-inkdrop-view="queue"] .arr-table-controlbar-right,
+  body[data-inkdrop-view="wanted"] .arr-table-controlbar-left,
+  body[data-inkdrop-view="wanted"] .arr-table-controlbar-right {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 4px;
+    overflow: visible;
+    padding-bottom: 0;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-icon-button,
+  body[data-inkdrop-view="queue"] .arr-table-menu > summary,
+  body[data-inkdrop-view="wanted"] .arr-table-icon-button,
+  body[data-inkdrop-view="wanted"] .arr-table-menu > summary {
+    height: 24px;
+    grid-template-columns: auto;
+    min-width: max-content;
+    min-height: 24px;
+    gap: 3px;
+    padding: 0 6px;
+    font-size: 10px;
+    line-height: 1;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-sort-state,
+  body[data-inkdrop-view="wanted"] .arr-table-sort-state {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-strip,
+  body[data-inkdrop-view="wanted"] .arr-table-view-strip {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: max-content;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0 0 0 4px;
+    border-top: 0;
+    border-left: 1px solid var(--line-soft);
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip {
+    flex: 0 0 auto;
+    min-width: 76px;
+    min-height: 24px;
+    padding: 2px 5px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"] .section-table-context-strip,
+  body[data-inkdrop-view="wanted"] .section-table-context-strip {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin: 0 0 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 5px 7px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .section-table-context-main,
+  body[data-inkdrop-view="wanted"] .section-table-context-main {
+    flex: 0 0 auto;
+  }
+  body[data-inkdrop-view="queue"] .section-table-context-main strong,
+  body[data-inkdrop-view="wanted"] .section-table-context-main strong {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .section-table-context-main span,
+  body[data-inkdrop-view="wanted"] .section-table-context-main span,
+  body[data-inkdrop-view="queue"] .section-table-toolbar-title span,
+  body[data-inkdrop-view="wanted"] .section-table-toolbar-title span {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .section-table-context-actions,
+  body[data-inkdrop-view="wanted"] .section-table-context-actions,
+  body[data-inkdrop-view="queue"] .section-table-key,
+  body[data-inkdrop-view="wanted"] .section-table-key {
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .section-table-toolbar,
+  body[data-inkdrop-view="wanted"] .section-table-toolbar {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin: 2px 0 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 4px 6px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .section-table-toolbar-title,
+  body[data-inkdrop-view="wanted"] .section-table-toolbar-title {
+    flex: 0 0 auto;
+  }
+  body[data-inkdrop-view="queue"] .section-table-toolbar-title strong,
+  body[data-inkdrop-view="wanted"] .section-table-toolbar-title strong {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .section-table-key-chip,
+  body[data-inkdrop-view="wanted"] .section-table-key-chip {
+    flex: 0 0 auto;
+    min-height: 20px;
+    padding: 2px 6px;
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-lane-header,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-lane-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px;
+    padding: 5px 8px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-lane-header
+    strong,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-lane-header
+    strong {
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-lane-header
+    span:not(.section-table-lane-count),
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-lane-header
+    span:not(.section-table-lane-count) {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-lane-count,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-lane-count {
+    min-height: 20px;
+    padding: 2px 6px;
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
+    grid-template-columns: minmax(0, 1fr) minmax(74px, auto);
+    grid-template-areas:
+      "item state"
+      "detail detail"
+      "actions actions";
+    gap: 5px 7px;
+    align-items: start;
+    padding: 6px 34px 6px 10px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-row
+    > .section-table-item,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-row
+    > .section-table-item {
+    grid-area: item;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-row
+    > .section-table-state,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-row
+    > .section-table-state {
+    grid-area: state;
+    justify-self: end;
+    max-width: 112px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-row
+    > .section-table-detail,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-row
+    > .section-table-detail {
+    grid-area: detail;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-row
+    > .section-table-actions,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-row
+    > .section-table-actions {
+    grid-area: actions;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-select,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-select {
+    top: 7px;
+    right: 7px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-title-with-art,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-title-with-art {
+    grid-template-columns: 46px minmax(0, 1fr);
+    gap: 9px;
+    align-items: start;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .series-art.table,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .series-art.table {
+    width: 46px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-title-line,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-title-line {
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-title-line
+    > strong,
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-title-line
+    > .section-table-series-link,
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-title-line
+    > .section-table-series-link
+    > strong,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-title-line
+    > strong {
+    flex: 1 1 auto;
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-title-line
+    > .section-table-series-link,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-title-line
+    > .section-table-series-link
+    > strong {
+    flex: 1 1 auto;
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-bucket-badge,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-bucket-badge {
+    flex: 0 0 auto;
+    max-width: 112px;
+    min-height: 18px;
+    overflow: hidden;
+    padding: 2px 5px;
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-context,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-context {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    margin-top: 1px;
+    overflow: hidden;
+    font-size: 10px;
+    line-height: 1.25;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-flags,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flags,
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-summary,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-summary {
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-flags,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flags {
+    margin-top: 3px;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-flag,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flag {
+    flex: 0 0 auto;
+    min-height: 18px;
+    padding: 2px 5px;
+    font-size: 9px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-state-stack,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-state-stack {
+    display: flex;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    gap: 3px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-state-stack
+    .core-state,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-state-stack
+    .core-state {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-lane-pill,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-lane-pill {
+    flex: 0 0 auto;
+    min-height: 18px;
+    padding: 2px 5px;
+    font-size: 9px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-intent,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-intent {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-compact,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-compact {
+    gap: 4px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-summary,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-summary {
+    margin-top: 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-chip,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-chip {
+    flex: 0 0 auto;
+    max-width: 142px;
+    min-height: 19px;
+    padding: 2px 5px;
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-chip
+    strong,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-chip
+    strong {
+    font-size: 8px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-chip
+    span,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-chip
+    span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-drawer
+    > summary,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-drawer
+    > summary {
+    min-height: 22px;
+    padding: 3px 6px;
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-drawer-body,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-drawer-body {
+    gap: 4px;
+    padding: 0 6px 6px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-items: start;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    .section-table-action-group,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    .section-table-action-group {
+    flex: 0 0 auto;
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    .section-table-action-group-buttons,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    .section-table-action-group-buttons {
+    flex-wrap: nowrap;
+    gap: 3px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    button,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    button {
+    max-width: none;
+    min-width: 48px;
+    min-height: 23px;
+    grid-template-columns: minmax(0, auto);
+    padding: 0 5px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    button[data-action-role="inspect"],
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    button[data-action-role="navigate"],
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    button[data-action-role="inspect"],
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    button[data-action-role="navigate"] {
+    width: auto;
+    min-width: 48px;
+    grid-template-columns: minmax(0, auto);
+    padding: 0 5px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    button[data-action-role="inspect"]
+    .section-table-action-text,
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail
+    button[data-action-role="navigate"]
+    .section-table-action-text,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    button[data-action-role="inspect"]
+    .section-table-action-text,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail
+    button[data-action-role="navigate"]
+    .section-table-action-text {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"],
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"] {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    overflow: visible;
+    padding-bottom: 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"]
+    .section-table-action-more,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"]
+    .section-table-action-more {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"]
+    .section-table-action-more
+    > summary,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"]
+    .section-table-action-more
+    > summary {
+    min-height: 23px;
+    padding: 0 6px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"]
+    .section-table-action-more-body,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-actions.compact-action-rail[data-secondary-actions-collapsed="1"]
+    .section-table-action-more-body {
+    min-width: min(190px, calc(100vw - 42px));
+  }
+  body[data-inkdrop-view="queue"] main > header,
+  body[data-inkdrop-view="wanted"] main > header {
+    grid-template-columns: minmax(0, auto) minmax(118px, 1fr);
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 3px;
+    padding: 3px 2px 4px;
+    border-bottom: 0;
+  }
+  body[data-inkdrop-view="queue"] main > header .inkdrop-header-brand,
+  body[data-inkdrop-view="wanted"] main > header .inkdrop-header-brand {
+    gap: 7px;
+  }
+  body[data-inkdrop-view="queue"] main > header .inkdrop-logo-mark,
+  body[data-inkdrop-view="wanted"] main > header .inkdrop-logo-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+  }
+  body[data-inkdrop-view="queue"] main > header h1,
+  body[data-inkdrop-view="wanted"] main > header h1 {
+    overflow: hidden;
+    font-size: 16px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] main > header .status-pill,
+  body[data-inkdrop-view="wanted"] main > header .status-pill {
+    min-height: 30px;
+    padding: 4px 6px;
+    gap: 0;
+  }
+  body[data-inkdrop-view="queue"] main > header .status-title,
+  body[data-inkdrop-view="wanted"] main > header .status-title {
+    gap: 5px;
+    overflow: hidden;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] main > header .status-title strong,
+  body[data-inkdrop-view="wanted"] main > header .status-title strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] main > header .status-dot,
+  body[data-inkdrop-view="wanted"] main > header .status-dot {
+    width: 7px;
+    height: 7px;
+    box-shadow: none;
+  }
+  body[data-inkdrop-view="queue"] main > header .status-metrics,
+  body[data-inkdrop-view="wanted"] main > header .status-metrics,
+  body[data-inkdrop-view="queue"] main > header .status-sub,
+  body[data-inkdrop-view="wanted"] main > header .status-sub {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] main > header .status-action,
+  body[data-inkdrop-view="wanted"] main > header .status-action {
+    min-height: 22px;
+    padding: 2px 5px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav-shell,
+  body[data-inkdrop-view="wanted"] .arr-nav-shell {
+    margin-bottom: 4px;
+    padding: 3px 0 4px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav,
+  body[data-inkdrop-view="queue"] .arr-nav-secondary,
+  body[data-inkdrop-view="wanted"] .arr-nav,
+  body[data-inkdrop-view="wanted"] .arr-nav-secondary {
+    gap: 3px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav-secondary,
+  body[data-inkdrop-view="wanted"] .arr-nav-secondary {
+    margin-top: 3px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav button,
+  body[data-inkdrop-view="wanted"] .arr-nav button {
+    min-height: 26px;
+    padding: 3px 6px;
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav-secondary button,
+  body[data-inkdrop-view="wanted"] .arr-nav-secondary button {
+    min-height: 24px;
+    padding: 3px 6px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav-actions,
+  body[data-inkdrop-view="wanted"] .arr-nav-actions {
+    margin-top: 3px;
+  }
+  body[data-inkdrop-view="queue"] .arr-nav-add,
+  body[data-inkdrop-view="wanted"] .arr-nav-add {
+    min-height: 26px;
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="queue"] #inkdropSectionPanel > .section-commandbar,
+  body[data-inkdrop-view="wanted"] #inkdropSectionPanel > .section-commandbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+  }
+  body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-heading h3,
+  body[data-inkdrop-view="wanted"] #inkdropSectionPanel .section-heading h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-eyebrow,
+  body[data-inkdrop-view="wanted"] #inkdropSectionPanel .section-eyebrow {
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="queue"] #inkdropSectionPanel .section-command-actions,
+  body[data-inkdrop-view="wanted"]
+    #inkdropSectionPanel
+    .section-command-actions {
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"]
+    #inkdropSectionPanel
+    .section-command-actions
+    button,
+  body[data-inkdrop-view="wanted"]
+    #inkdropSectionPanel
+    .section-command-actions
+    button {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 2px 7px;
+    font-size: 11px;
+    text-transform: none;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .queue-cause-strip,
+  body[data-inkdrop-view="wanted"] .queue-cause-strip,
+  body[data-inkdrop-view="manual_review"] .queue-cause-strip {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+    margin-bottom: 6px;
+    padding: 6px 7px;
+  }
+  body[data-inkdrop-view="queue"] .queue-cause-main,
+  body[data-inkdrop-view="wanted"] .queue-cause-main,
+  body[data-inkdrop-view="manual_review"] .queue-cause-main {
+    gap: 0;
+  }
+  body[data-inkdrop-view="queue"] .queue-cause-main strong,
+  body[data-inkdrop-view="wanted"] .queue-cause-main strong,
+  body[data-inkdrop-view="manual_review"] .queue-cause-main strong {
+    overflow: hidden;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="queue"] .queue-cause-main span,
+  body[data-inkdrop-view="wanted"] .queue-cause-main span,
+  body[data-inkdrop-view="manual_review"] .queue-cause-main span {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .queue-cause-actions,
+  body[data-inkdrop-view="wanted"] .queue-cause-actions,
+  body[data-inkdrop-view="manual_review"] .queue-cause-actions {
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="queue"] .queue-cause-actions button,
+  body[data-inkdrop-view="wanted"] .queue-cause-actions button,
+  body[data-inkdrop-view="manual_review"] .queue-cause-actions button {
+    flex: 0 0 auto;
+    min-height: 22px;
+    padding: 2px 6px;
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="manual_review"] .manual-review-cause-strip {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 4px;
+    overflow: hidden;
+    padding: 4px 6px;
+  }
+  body[data-inkdrop-view="manual_review"]
+    .manual-review-cause-strip
+    .queue-cause-main {
+    flex: 0 0 min(128px, 36%);
+    max-width: min(128px, 36%);
+  }
+  body[data-inkdrop-view="manual_review"]
+    .manual-review-cause-strip
+    .manual-review-cause-actions {
+    flex: 1 1 auto;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  body[data-inkdrop-view="manual_review"]
+    .manual-review-cause-strip
+    .manual-review-cause-actions
+    button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 1px 6px;
+    line-height: 1;
+  }
+  body[data-inkdrop-view="manual_review"] main > header {
+    grid-template-columns: minmax(0, auto) minmax(118px, 1fr);
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 3px;
+    padding: 3px 2px 4px;
+    border-bottom: 0;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .inkdrop-header-brand {
+    gap: 7px;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .inkdrop-logo-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+  }
+  body[data-inkdrop-view="manual_review"] main > header h1 {
+    overflow: hidden;
+    font-size: 16px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .status-pill {
+    min-height: 30px;
+    padding: 4px 6px;
+    gap: 0;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .status-title {
+    gap: 5px;
+    overflow: hidden;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .status-title strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .status-dot {
+    width: 7px;
+    height: 7px;
+    box-shadow: none;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .status-metrics,
+  body[data-inkdrop-view="manual_review"] main > header .status-sub {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] main > header .status-action {
+    min-height: 22px;
+    padding: 2px 5px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav-shell {
+    margin-bottom: 4px;
+    padding: 3px 0 4px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav,
+  body[data-inkdrop-view="manual_review"] .arr-nav-secondary {
+    gap: 3px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav-secondary {
+    margin-top: 3px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav button {
+    min-height: 26px;
+    padding: 3px 6px;
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav-secondary button {
+    min-height: 24px;
+    padding: 3px 6px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav-actions {
+    margin-top: 3px;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-nav-add {
+    min-height: 26px;
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    > .section-commandbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    .section-heading
+    p,
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    .section-eyebrow {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    .section-heading
+    h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    .section-eyebrow {
+    font-size: 9px;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    .section-command-actions {
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionPanel
+    .section-command-actions
+    button {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 2px 7px;
+    font-size: 11px;
+    text-transform: none;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+    margin: 4px 0 6px;
+    padding: 6px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-main {
+    gap: 4px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-title {
+    overflow: hidden;
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-detail {
+    display: none;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    overflow: hidden;
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-stats,
+  body[data-inkdrop-view="manual_review"] .section-operator-now-actions {
+    flex-wrap: nowrap;
+    gap: 4px;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-stat {
+    flex: 0 0 auto;
+    min-height: 20px;
+    padding: 2px 6px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-stat strong {
+    font-size: 11px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-actions button {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 2px 7px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-operator-now-actions {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-strip {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 5px;
+    margin: 4px 0 5px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-main,
+  body[data-inkdrop-view="manual_review"] .section-policy-card {
+    flex: 0 0 min(318px, calc(100vw - 16px));
+    padding: 6px 7px;
+    border-radius: 4px;
+    gap: 4px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-main {
+    flex-basis: calc(100vw - 16px);
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-card {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-main strong,
+  body[data-inkdrop-view="manual_review"] .section-policy-card strong {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-main p,
+  body[data-inkdrop-view="manual_review"] .section-policy-card span {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    overflow: hidden;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-chips,
+  body[data-inkdrop-view="manual_review"] .section-policy-actions {
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-chip {
+    flex: 0 0 auto;
+    min-height: 19px;
+    padding: 2px 6px;
+    font-size: 9px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] #inkdropSectionSummary {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .section-policy-actions button {
+    flex: 0 0 auto;
+    min-height: 22px;
+    padding: 2px 7px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-triage-strip {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 5px;
+    margin: 5px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-triage-item {
+    flex: 0 0 132px;
+    min-height: 46px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 3px 6px;
+    padding: 6px 7px;
+    border-radius: 4px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-triage-label {
+    overflow: hidden;
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-triage-count {
+    font-size: 16px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-triage-detail {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] #inkdropSectionFilters.views-bar {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 5px;
+    margin: 5px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 6px 7px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionFilters.views-bar
+    .section-filter-lane {
+    flex: 0 0 150px;
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionFilters.views-bar
+    .section-filter-lane-title {
+    overflow: hidden;
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionFilters.views-bar
+    .section-filter-group {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"]
+    #inkdropSectionFilters.views-bar
+    .section-filter-pill {
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 2px 7px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-lane-ribbon {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin: 5px 0;
+    padding: 6px 7px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-lane-ribbon-main {
+    flex: 0 0 auto;
+    max-width: 220px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-lane-ribbon-main strong {
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-lane-ribbon-main span {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .section-lane-ribbon-actions {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-lane-ribbon-actions button {
+    flex: 0 0 auto;
+    min-height: 22px;
+    padding: 2px 7px;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-table-controlbar {
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 3px;
+    min-height: 0;
+    margin: 3px 0 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 3px 4px;
+    scrollbar-width: none;
+  }
+  body[data-inkdrop-view="manual_review"]
+    .arr-table-controlbar::-webkit-scrollbar {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-table-controlbar-left,
+  body[data-inkdrop-view="manual_review"] .arr-table-controlbar-right {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 4px;
+    overflow: visible;
+    padding-bottom: 0;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-table-icon-button,
+  body[data-inkdrop-view="manual_review"] .arr-table-menu > summary {
+    height: 24px;
+    grid-template-columns: auto;
+    min-width: max-content;
+    min-height: 24px;
+    gap: 3px;
+    padding: 0 6px;
+    font-size: 10px;
+    line-height: 1;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-table-sort-state {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-table-view-strip {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: max-content;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0 0 0 4px;
+    border-top: 0;
+    border-left: 1px solid var(--line-soft);
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip {
+    flex: 0 0 auto;
+    min-width: 76px;
+    min-height: 24px;
+    padding: 2px 5px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-context-strip {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin: 0 0 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 5px 7px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-context-main {
+    flex: 0 0 auto;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-context-main strong {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-context-main span,
+  body[data-inkdrop-view="manual_review"] .section-table-toolbar-title span {
+    display: none;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-context-actions,
+  body[data-inkdrop-view="manual_review"] .section-table-key {
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-toolbar {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 5px;
+    margin: 4px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 5px 7px;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-toolbar-title {
+    flex: 0 0 auto;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-toolbar-title strong {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="manual_review"] .section-table-key-chip {
+    flex: 0 0 auto;
+    min-height: 20px;
+    padding: 2px 6px;
+    font-size: 9px;
+  }
+  .arr-section-tile {
+    min-height: 148px;
+  }
+  .settings-grid,
+  .settings-group-body {
+    grid-template-columns: 1fr;
+  }
+  body[data-inkdrop-view="settings"] .settings-body {
+    gap: 8px;
+    padding: 8px;
+  }
+  body[data-inkdrop-view="settings"] .settings-actions {
+    justify-content: flex-start;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="settings"] .settings-actions button {
+    /* see the 519px block: a fixed basis under the label width makes the
            text overflow the button, so size to content and let the row wrap. */
-        flex: 0 0 auto;
-        width: auto;
-        max-width: 100%;
-        min-height: 44px;
-      }
-      .settings-category-shell {
-        grid-template-columns: 1fr;
-        padding: 0;
-        overflow: hidden;
-      }
-      .settings-category-rail {
-        display: none;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 0 8px;
-        overflow: visible;
-        padding-right: 0;
-        padding-bottom: 8px;
-        border-right: 0;
-        border-bottom: 1px solid rgba(255, 255, 255, .10);
-      }
-      .settings-category-rail-title {
-        display: none;
-      }
-      .settings-category-button {
-        grid-template-columns: minmax(0, 1fr);
-        gap: 2px;
-        min-height: 34px;
-        padding: 6px 0 6px 8px;
-        border-left-width: 2px;
-      }
-      .settings-category-icon {
-        display: none;
-      }
-      .settings-category-name {
-        font-size: 11px;
-      }
-      .settings-category-count {
-        display: none;
-        font-size: 10px;
-      }
-      .settings-category-detail {
-        display: none;
-      }
-      .settings-hub-tile {
-        grid-template-columns: minmax(0, 1fr);
-        min-height: 54px;
-        gap: 3px;
-        padding: 8px 0 10px;
-      }
-      .settings-hub-tile .settings-hub-icon {
-        display: none;
-      }
-      .settings-hub-copy {
-        grid-column: 1;
-        grid-row: 1 / span 2;
-      }
-      .settings-hub-tile strong {
-        overflow: hidden;
-        font-size: 16px;
-        text-decoration: underline;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .settings-hub-tile span {
-        display: -webkit-box;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: 1;
-        overflow: hidden;
-        font-size: 10px;
-      }
-      .settings-hub-tile em {
-        display: none;
-        grid-column: 2;
-        grid-row: 1 / span 2;
-        max-width: 74px;
-        overflow: hidden;
-        font-size: 10px;
-        text-align: right;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .settings-first-run-group-row {
-        grid-template-columns: minmax(0, 1fr);
-        gap: 3px;
-      }
-      .settings-setup-review {
-        align-items: stretch;
-        flex-direction: column;
-      }
-      .settings-first-run-row-action {
-        justify-content: flex-start;
-        padding-top: 2px;
-      }
-      .settings-form-row,
-      .settings-provider-form-row {
-        grid-template-columns: 1fr;
-        gap: 5px;
-        padding: 9px 0;
-      }
-      .settings-form-label,
-      .settings-provider-form-label {
-        padding-top: 0;
-        text-align: left;
-      }
-      .settings-form-label span,
-      .settings-provider-form-label span {
-        display: none;
-      }
-      .settings-provider-form {
-        padding: 0 10px;
-      }
-      .settings-provider-grid .settings-card[open] > .settings-card-head {
-        grid-template-columns: minmax(0, 1fr);
-        padding: 11px 10px;
-      }
-      .settings-provider-grid .settings-card[open] .settings-summary-badges {
-        justify-content: flex-start;
-      }
-      .settings-provider-grid .settings-card[open] > .settings-meta {
-        margin: 0 10px 10px;
-      }
-      .settings-provider-grid .settings-card[open] > .actions {
-        justify-content: flex-start;
-        padding: 10px;
-      }
-      .settings-provider-grid .settings-provider-delete {
-        flex: 1 1 100%;
-        margin-left: 0;
-      }
-      .settings-provider-grid .settings-provider-delete-collapsed {
-        right: 10px;
-        bottom: 10px;
-        width: calc(100% - 20px);
-      }
-      .settings-form-actions {
-        justify-content: flex-start;
-      }
-      .settings-form-actions button {
-        width: auto;
-      }
-      .download-client-cleanup-actions {
-        margin-left: 0;
-      }
-      .download-client-torrent-status {
-        grid-template-columns: 1fr;
-        gap: 5px;
-        padding: 10px 0;
-      }
-      .torrent-cleanup-card {
-        padding: 9px 10px;
-      }
-      .settings-form-note {
-        margin-left: 0;
-      }
-      .workflow-next { grid-template-columns: 1fr; }
-      .workflow-tile {
-        min-height: 82px;
-        padding: 8px;
-        gap: 5px;
-      }
-      .workflow-tile > span:nth-of-type(2) {
-        display: none;
-      }
-      .status-metrics {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 4px;
-      }
-      .status-metric {
-        padding: 5px 6px;
-        font-size: 10px;
-      }
-      .status-metric strong {
-        font-size: 16px;
-      }
-      .status-action { width: auto; }
-      .activity-region {
-        left: 8px;
-        right: 8px;
-        bottom: calc(14px + env(safe-area-inset-bottom));
-        width: auto;
-        gap: 6px;
-      }
-      .activity-status,
-      .activity-dock,
-      .toast {
-        padding: 7px 8px;
-        border-radius: 6px;
-      }
-      .activity-status {
-        grid-template-columns: auto minmax(0, 1fr) auto;
-        gap: 7px;
-        min-height: 42px;
-      }
-      .activity-status-dot {
-        width: 9px;
-        height: 9px;
-      }
-      .activity-status-text strong {
-        font-size: 12px;
-      }
-      .activity-status-text span {
-        font-size: 11px;
-      }
-      .activity-status-action {
-        grid-column: 3;
-        justify-self: start;
-        margin-top: 2px;
-        padding: 3px 7px;
-        font-size: 11px;
-      }
-      .activity-status-text > .activity-status-detail {
-        display: none;
-      }
-      .activity-dock {
-        max-height: min(30vh, 228px);
-        overflow: auto;
-      }
-      .activity-dock.compact {
-        max-height: min(16vh, 124px);
-        overflow: hidden;
-      }
-      .activity-dock.compact .activity-dock-head {
-        grid-template-columns: auto minmax(0, 1fr) auto auto;
-        gap: 6px;
-        margin-bottom: 4px;
-      }
-      .activity-dock.compact .activity-spinner {
-        width: 10px;
-        height: 10px;
-        border-width: 2px;
-      }
-      .activity-dock.compact .activity-dock-title {
-        gap: 0;
-      }
-      .activity-dock.compact .activity-dock-head strong {
-        display: block;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-size: 12px;
-      }
-      .activity-dock.compact .activity-dock-title > span {
-        display: none;
-      }
-      .activity-dock.compact .activity-dock-compact-target:not([hidden]) {
-        max-height: 50px;
-        margin-top: 2px;
-        overflow: hidden;
-      }
-      .activity-dock.compact .activity-compact-target-button {
-        min-height: 40px;
-        padding: 5px 6px;
-      }
-      .activity-dock.compact .activity-compact-target-main {
-        gap: 2px;
-      }
-      .activity-dock.compact .activity-compact-target-main strong {
-        font-size: 10px;
-      }
-      .activity-dock.compact .activity-compact-target-kicker {
-        width: 9px;
-        min-width: 9px;
-        height: 9px;
-        min-height: 9px;
-      }
-      .activity-dock.compact .activity-compact-target-facts .activity-route-fact {
-        max-width: 82px;
-        min-height: 15px;
-        padding: 1px 4px;
-        font-size: 8px;
-      }
-      .activity-dock.compact .activity-compact-target-status {
-        font-size: 8px;
-      }
-      .activity-dock.compact .activity-compact-target-facts .activity-route-fact:nth-child(n+3) {
-        display: none;
-      }
-      .activity-dock.compact .activity-dock-destination,
-      .activity-dock.compact .activity-count {
-        display: none;
-      }
-      .activity-dock.compact .activity-lane-chip span,
-      .activity-dock.compact .activity-route-button strong {
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .activity-dock.compact .activity-lane-strip {
-        margin-top: 4px;
-        max-height: 26px;
-      }
-      .activity-dock.compact .activity-route-strip {
-        margin-top: 4px;
-        max-height: 28px;
-      }
-      .activity-dock.compact .activity-route-button {
-        min-width: 96px;
-        min-height: 24px;
-        padding: 3px 6px;
-      }
-      .activity-dock.compact .activity-dock-action,
-      .activity-dock.compact .activity-dock-toggle {
-        grid-column: auto;
-        justify-self: end;
-        min-height: 24px;
-        max-width: 94px;
-        padding: 3px 6px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-size: 10px;
-      }
-      body.activity-dock-visible .arr-content-shell {
-        padding-bottom: min(17vh, 136px);
-      }
-      .activity-route-strip {
-        grid-template-columns: 1fr;
-      }
-      .activity-dock-head {
-        grid-template-columns: auto minmax(0, 1fr);
-      }
-      .activity-count,
-      .activity-dock-action,
-      .activity-dock-toggle {
-        grid-column: 2;
-        justify-self: start;
-      }
-      .activity-row {
-        grid-template-columns: 1fr;
-        gap: 6px;
-      }
-      .activity-row-meta {
-        justify-content: flex-start;
-      }
-      .toast {
-        font-size: 12px;
-      }
-      .toast-action {
-        margin-top: 2px;
-      }
-    }
-    @media (min-width: 520px) and (max-width: 620px) {
-      .arr-nav,
-      .arr-nav-secondary {
-        display: grid;
-        grid-template-columns: 1fr;
-        gap: 2px;
-        overflow-x: hidden;
-        padding-bottom: 0;
-      }
-      .arr-nav-shell {
-        position: sticky;
-        top: 0;
-        overflow-x: hidden;
-      }
-      .arr-nav-group-label {
-        display: block;
-        margin: 6px 2px 2px;
-        font-size: 9px;
-      }
-      .arr-nav button,
-      .arr-nav-secondary button {
-        flex: none;
-        width: 100%;
-        min-width: 0;
-        grid-template-columns: 15px minmax(0, 1fr) auto;
-        gap: 4px;
-        white-space: normal;
-      }
-      .arr-nav button::before,
-      .arr-nav-secondary button::before {
-        display: inline-grid;
-        width: 13px;
-        height: 13px;
-      }
-      .arr-nav-secondary button {
-        font-size: 10px;
-      }
-      .arr-nav-secondary .arr-nav-count {
-        display: none;
-      }
-      .arr-nav-count {
-        min-width: 20px;
-        padding: 1px 5px;
-      }
-      body[data-inkdrop-view="series"] .series-library-toolbar {
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: 5px 6px;
-        margin-bottom: 6px;
-        padding: 6px;
-        border-radius: 4px;
-      }
-      body[data-inkdrop-view="series"] .series-library-title {
-        gap: 1px;
-      }
-      body[data-inkdrop-view="series"] .series-library-title strong {
-        font-size: 12px;
-      }
-      body[data-inkdrop-view="series"] .series-library-title span {
-        overflow: visible;
-        font-size: 10px;
-        overflow-wrap: anywhere;
-        text-overflow: clip;
-        white-space: normal;
-      }
-      body[data-inkdrop-view="series"] .series-library-actions {
-        flex-wrap: nowrap;
-        gap: 4px;
-        justify-content: flex-end;
-        justify-self: end;
-        max-width: 100%;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
-      }
-      body[data-inkdrop-view="series"] .series-library-tool {
-        flex: 0 0 auto;
-        width: auto;
-        min-width: max-content;
-        min-height: 28px;
-        overflow: visible;
-        padding: 4px 7px;
-        white-space: nowrap;
-      }
-      body[data-inkdrop-view="series"] .series-library-tool span {
-        display: inline;
-      }
-      body[data-inkdrop-view="series"] .series-library-mobile-drawer {
-        padding-top: 3px;
-        border-top: 0;
-      }
-      body[data-inkdrop-view="series"] .series-library-mobile-drawer > summary {
-        min-height: 26px;
-        padding: 4px 7px;
-        font-size: 10px;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-compact,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-compact {
-        grid-template-columns: minmax(0, 1fr) auto;
-        align-items: start;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary {
-        min-width: 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-compact,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-compact {
-        grid-template-columns: auto;
-        justify-items: start;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary-inline,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary-inline {
-        display: none;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary-detail,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary-detail {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
-        margin-top: 6px;
-        overflow: visible;
-        padding: 6px 0 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-micro-summary-detail .section-table-micro-chip,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-micro-summary-detail .section-table-micro-chip {
-        flex: 1 1 132px;
-        max-width: 100%;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer {
-        justify-self: start;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer[open],
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer[open] {
-        grid-column: 1 / -1;
-        width: 100%;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer > summary,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer > summary {
-        justify-content: center;
-        width: 24px;
-        min-width: 24px;
-        min-height: 21px;
-        padding: 0;
-        font-size: 0;
-      }
-      body[data-inkdrop-view="queue"] .section-table-queue .section-table-detail-drawer > summary::after,
-      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-detail-drawer > summary::after {
-        margin-left: 0;
-        font-size: 13px;
-      }
-    }
-    
+    flex: 0 0 auto;
+    width: auto;
+    max-width: 100%;
+    min-height: 44px;
+  }
+  .settings-category-shell {
+    grid-template-columns: 1fr;
+    padding: 0;
+    overflow: hidden;
+  }
+  .settings-category-rail {
+    display: none;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 8px;
+    overflow: visible;
+    padding-right: 0;
+    padding-bottom: 8px;
+    border-right: 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .settings-category-rail-title {
+    display: none;
+  }
+  .settings-category-button {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    min-height: 34px;
+    padding: 6px 0 6px 8px;
+    border-left-width: 2px;
+  }
+  .settings-category-icon {
+    display: none;
+  }
+  .settings-category-name {
+    font-size: 11px;
+  }
+  .settings-category-count {
+    display: none;
+    font-size: 10px;
+  }
+  .settings-category-detail {
+    display: none;
+  }
+  .settings-hub-tile {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 54px;
+    gap: 3px;
+    padding: 8px 0 10px;
+  }
+  .settings-hub-tile .settings-hub-icon {
+    display: none;
+  }
+  .settings-hub-copy {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+  }
+  .settings-hub-tile strong {
+    overflow: hidden;
+    font-size: 16px;
+    text-decoration: underline;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .settings-hub-tile span {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    overflow: hidden;
+    font-size: 10px;
+  }
+  .settings-hub-tile em {
+    display: none;
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    max-width: 74px;
+    overflow: hidden;
+    font-size: 10px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .settings-first-run-group-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+  .settings-setup-review {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .settings-first-run-row-action {
+    justify-content: flex-start;
+    padding-top: 2px;
+  }
+  .settings-form-row,
+  .settings-provider-form-row {
+    grid-template-columns: 1fr;
+    gap: 5px;
+    padding: 9px 0;
+  }
+  .settings-form-label,
+  .settings-provider-form-label {
+    padding-top: 0;
+    text-align: left;
+  }
+  .settings-form-label span,
+  .settings-provider-form-label span {
+    display: none;
+  }
+  .settings-provider-form {
+    padding: 0 10px;
+  }
+  .settings-provider-grid .settings-card[open] > .settings-card-head {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 11px 10px;
+  }
+  .settings-provider-grid .settings-card[open] .settings-summary-badges {
+    justify-content: flex-start;
+  }
+  .settings-provider-grid .settings-card[open] > .settings-meta {
+    margin: 0 10px 10px;
+  }
+  .settings-provider-grid .settings-card[open] > .actions {
+    justify-content: flex-start;
+    padding: 10px;
+  }
+  .settings-provider-grid .settings-provider-delete {
+    flex: 1 1 100%;
+    margin-left: 0;
+  }
+  .settings-provider-grid .settings-provider-delete-collapsed {
+    right: 10px;
+    bottom: 10px;
+    width: calc(100% - 20px);
+  }
+  .settings-form-actions {
+    justify-content: flex-start;
+  }
+  .settings-form-actions button {
+    width: auto;
+  }
+  .download-client-cleanup-actions {
+    margin-left: 0;
+  }
+  .download-client-torrent-status {
+    grid-template-columns: 1fr;
+    gap: 5px;
+    padding: 10px 0;
+  }
+  .torrent-cleanup-card {
+    padding: 9px 10px;
+  }
+  .settings-form-note {
+    margin-left: 0;
+  }
+  .workflow-next {
+    grid-template-columns: 1fr;
+  }
+  .workflow-tile {
+    min-height: 82px;
+    padding: 8px;
+    gap: 5px;
+  }
+  .workflow-tile > span:nth-of-type(2) {
+    display: none;
+  }
+  .status-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+  }
+  .status-metric {
+    padding: 5px 6px;
+    font-size: 10px;
+  }
+  .status-metric strong {
+    font-size: 16px;
+  }
+  .status-action {
+    width: auto;
+  }
+  .activity-region {
+    left: 8px;
+    right: 8px;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    width: auto;
+    gap: 6px;
+  }
+  .activity-status,
+  .activity-dock,
+  .toast {
+    padding: 7px 8px;
+    border-radius: 6px;
+  }
+  .activity-status {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 7px;
+    min-height: 42px;
+  }
+  .activity-status-dot {
+    width: 9px;
+    height: 9px;
+  }
+  .activity-status-text strong {
+    font-size: 12px;
+  }
+  .activity-status-text span {
+    font-size: 11px;
+  }
+  .activity-status-action {
+    grid-column: 3;
+    justify-self: start;
+    margin-top: 2px;
+    padding: 3px 7px;
+    font-size: 11px;
+  }
+  .activity-status-text > .activity-status-detail {
+    display: none;
+  }
+  .activity-dock {
+    max-height: min(30vh, 228px);
+    overflow: auto;
+  }
+  .activity-dock.compact {
+    max-height: min(16vh, 124px);
+    overflow: hidden;
+  }
+  .activity-dock.compact .activity-dock-head {
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    gap: 6px;
+    margin-bottom: 4px;
+  }
+  .activity-dock.compact .activity-spinner {
+    width: 10px;
+    height: 10px;
+    border-width: 2px;
+  }
+  .activity-dock.compact .activity-dock-title {
+    gap: 0;
+  }
+  .activity-dock.compact .activity-dock-head strong {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .activity-dock.compact .activity-dock-title > span {
+    display: none;
+  }
+  .activity-dock.compact .activity-dock-compact-target:not([hidden]) {
+    max-height: 50px;
+    margin-top: 2px;
+    overflow: hidden;
+  }
+  .activity-dock.compact .activity-compact-target-button {
+    min-height: 40px;
+    padding: 5px 6px;
+  }
+  .activity-dock.compact .activity-compact-target-main {
+    gap: 2px;
+  }
+  .activity-dock.compact .activity-compact-target-main strong {
+    font-size: 10px;
+  }
+  .activity-dock.compact .activity-compact-target-kicker {
+    width: 9px;
+    min-width: 9px;
+    height: 9px;
+    min-height: 9px;
+  }
+  .activity-dock.compact .activity-compact-target-facts .activity-route-fact {
+    max-width: 82px;
+    min-height: 15px;
+    padding: 1px 4px;
+    font-size: 8px;
+  }
+  .activity-dock.compact .activity-compact-target-status {
+    font-size: 8px;
+  }
+  .activity-dock.compact
+    .activity-compact-target-facts
+    .activity-route-fact:nth-child(n + 3) {
+    display: none;
+  }
+  .activity-dock.compact .activity-dock-destination,
+  .activity-dock.compact .activity-count {
+    display: none;
+  }
+  .activity-dock.compact .activity-lane-chip span,
+  .activity-dock.compact .activity-route-button strong {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .activity-dock.compact .activity-lane-strip {
+    margin-top: 4px;
+    max-height: 26px;
+  }
+  .activity-dock.compact .activity-route-strip {
+    margin-top: 4px;
+    max-height: 28px;
+  }
+  .activity-dock.compact .activity-route-button {
+    min-width: 96px;
+    min-height: 24px;
+    padding: 3px 6px;
+  }
+  .activity-dock.compact .activity-dock-action,
+  .activity-dock.compact .activity-dock-toggle {
+    grid-column: auto;
+    justify-self: end;
+    min-height: 24px;
+    max-width: 94px;
+    padding: 3px 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+  }
+  body.activity-dock-visible .arr-content-shell {
+    padding-bottom: min(17vh, 136px);
+  }
+  .activity-route-strip {
+    grid-template-columns: 1fr;
+  }
+  .activity-dock-head {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .activity-count,
+  .activity-dock-action,
+  .activity-dock-toggle {
+    grid-column: 2;
+    justify-self: start;
+  }
+  .activity-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+  .activity-row-meta {
+    justify-content: flex-start;
+  }
+  .toast {
+    font-size: 12px;
+  }
+  .toast-action {
+    margin-top: 2px;
+  }
+}
+@media (min-width: 520px) and (max-width: 620px) {
+  .arr-nav,
+  .arr-nav-secondary {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2px;
+    overflow-x: hidden;
+    padding-bottom: 0;
+  }
+  .arr-nav-shell {
+    position: sticky;
+    top: 0;
+    overflow-x: hidden;
+  }
+  .arr-nav-group-label {
+    display: block;
+    margin: 6px 2px 2px;
+    font-size: 9px;
+  }
+  .arr-nav button,
+  .arr-nav-secondary button {
+    flex: none;
+    width: 100%;
+    min-width: 0;
+    grid-template-columns: 15px minmax(0, 1fr) auto;
+    gap: 4px;
+    white-space: normal;
+  }
+  .arr-nav button::before,
+  .arr-nav-secondary button::before {
+    display: inline-grid;
+    width: 13px;
+    height: 13px;
+  }
+  .arr-nav-secondary button {
+    font-size: 10px;
+  }
+  .arr-nav-secondary .arr-nav-count {
+    display: none;
+  }
+  .arr-nav-count {
+    min-width: 20px;
+    padding: 1px 5px;
+  }
+  body[data-inkdrop-view="series"] .series-library-toolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 5px 6px;
+    margin-bottom: 6px;
+    padding: 6px;
+    border-radius: 4px;
+  }
+  body[data-inkdrop-view="series"] .series-library-title {
+    gap: 1px;
+  }
+  body[data-inkdrop-view="series"] .series-library-title strong {
+    font-size: 12px;
+  }
+  body[data-inkdrop-view="series"] .series-library-title span {
+    overflow: visible;
+    font-size: 10px;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    white-space: normal;
+  }
+  body[data-inkdrop-view="series"] .series-library-actions {
+    flex-wrap: nowrap;
+    gap: 4px;
+    justify-content: flex-end;
+    justify-self: end;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  body[data-inkdrop-view="series"] .series-library-tool {
+    flex: 0 0 auto;
+    width: auto;
+    min-width: max-content;
+    min-height: 28px;
+    overflow: visible;
+    padding: 4px 7px;
+    white-space: nowrap;
+  }
+  body[data-inkdrop-view="series"] .series-library-tool span {
+    display: inline;
+  }
+  body[data-inkdrop-view="series"] .series-library-mobile-drawer {
+    padding-top: 3px;
+    border-top: 0;
+  }
+  body[data-inkdrop-view="series"] .series-library-mobile-drawer > summary {
+    min-height: 26px;
+    padding: 4px 7px;
+    font-size: 10px;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-compact,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-compact {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-summary,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-summary {
+    min-width: 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-compact,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-compact {
+    grid-template-columns: auto;
+    justify-items: start;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-summary-inline,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-summary-inline {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-summary-detail,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-summary-detail {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+    overflow: visible;
+    padding: 6px 0 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-micro-summary-detail
+    .section-table-micro-chip,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-micro-summary-detail
+    .section-table-micro-chip {
+    flex: 1 1 132px;
+    max-width: 100%;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-drawer,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-drawer {
+    justify-self: start;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-drawer[open],
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-drawer[open] {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-drawer
+    > summary,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-drawer
+    > summary {
+    justify-content: center;
+    width: 24px;
+    min-width: 24px;
+    min-height: 21px;
+    padding: 0;
+    font-size: 0;
+  }
+  body[data-inkdrop-view="queue"]
+    .section-table-queue
+    .section-table-detail-drawer
+    > summary::after,
+  body[data-inkdrop-view="wanted"]
+    .section-table-wanted
+    .section-table-detail-drawer
+    > summary::after {
+    margin-left: 0;
+    font-size: 13px;
+  }
+}

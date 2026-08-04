@@ -88,6 +88,9 @@
         return appendScript(documentRef, assetName, options).then(function () {
           summary.loaded.push(assetName);
           return summary;
+        }).catch(function (err) {
+          console.warn('Asset failed to load, continuing:', assetName, err);
+          return summary;
         });
       });
     }, Promise.resolve(summary));
@@ -101,8 +104,15 @@
 
   function once(node, key, mount) {
     if (!node || node.dataset[key] === "mounted") return null;
-    node.dataset[key] = "mounted";
-    return mount(node);
+    try {
+      const result = mount(node);
+      node.dataset[key] = "mounted";
+      return result;
+    } catch (e) {
+      console.error('Mount failed for', key, e);
+      // Don't mark as mounted so it can be retried
+      return null;
+    }
   }
 
   function requireApi(name) {
