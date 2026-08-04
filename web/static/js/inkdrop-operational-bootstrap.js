@@ -8,7 +8,7 @@
     "inkdrop-operational-row-controls.js",
     "inkdrop-transfer-telemetry.js",
     "inkdrop-version-about.js",
-    "inkdrop-operational-bootstrap.js"
+    "inkdrop-operational-bootstrap.js",
   ]);
 
   var ASSET_GLOBALS = Object.freeze({
@@ -18,7 +18,7 @@
     "inkdrop-operational-row-controls.js": "InkDropOperationalRowControls",
     "inkdrop-transfer-telemetry.js": "InkDropTransferTelemetry",
     "inkdrop-version-about.js": "InkDropVersionAbout",
-    "inkdrop-operational-bootstrap.js": "InkDropOperationalBootstrap"
+    "inkdrop-operational-bootstrap.js": "InkDropOperationalBootstrap",
   });
 
   function asRoot(root) {
@@ -42,17 +42,23 @@
     var apiName = assetGlobalName(assetName);
     if (apiName && global[apiName]) return true;
     if (!documentRef?.querySelectorAll) return false;
-    return Array.from(documentRef.querySelectorAll("script[src]")).some(function (script) {
-      var src = script.getAttribute("src") || script.src || "";
-      src = src.split(/[?#]/)[0];
-      return src.endsWith("/" + assetName) || src.endsWith(assetName);
-    });
+    return Array.from(documentRef.querySelectorAll("script[src]")).some(
+      function (script) {
+        var src = script.getAttribute("src") || script.src || "";
+        src = src.split(/[?#]/)[0];
+        return src.endsWith("/" + assetName) || src.endsWith(assetName);
+      },
+    );
   }
 
   function appendScript(documentRef, assetName, options) {
     return new Promise(function (resolve, reject) {
       if (!documentRef?.createElement) {
-        reject(new Error("A document with createElement is required to load InkDrop UI assets"));
+        reject(
+          new Error(
+            "A document with createElement is required to load InkDrop UI assets",
+          ),
+        );
         return;
       }
       var script = documentRef.createElement("script");
@@ -60,11 +66,20 @@
       script.async = false;
       if (options.defer !== false) script.defer = true;
       if (options.nonce) script.nonce = options.nonce;
-      script.onload = function () { resolve({ asset: assetName, state: "loaded" }); };
-      script.onerror = function () { reject(new Error("Failed to load " + assetName)); };
-      var parent = documentRef.head || documentRef.body || documentRef.documentElement;
+      script.onload = function () {
+        resolve({ asset: assetName, state: "loaded" });
+      };
+      script.onerror = function () {
+        reject(new Error("Failed to load " + assetName));
+      };
+      var parent =
+        documentRef.head || documentRef.body || documentRef.documentElement;
       if (!parent?.appendChild && !parent?.append) {
-        reject(new Error("A document head or body is required to load InkDrop UI assets"));
+        reject(
+          new Error(
+            "A document head or body is required to load InkDrop UI assets",
+          ),
+        );
         return;
       }
       if (parent.appendChild) parent.appendChild(script);
@@ -85,21 +100,26 @@
           summary.skipped.push(assetName);
           return summary;
         }
-        return appendScript(documentRef, assetName, options).then(function () {
-          summary.loaded.push(assetName);
-          return summary;
-        }).catch(function (err) {
-          console.warn('Asset failed to load, continuing:', assetName, err);
-          return summary;
-        });
+        return appendScript(documentRef, assetName, options)
+          .then(function () {
+            summary.loaded.push(assetName);
+            return summary;
+          })
+          .catch(function (err) {
+            console.warn("Asset failed to load, continuing:", assetName, err);
+            return summary;
+          });
       });
     }, Promise.resolve(summary));
   }
 
   function parseJson(value, fallback) {
     if (!value) return fallback || {};
-    try { return JSON.parse(value); }
-    catch (_error) { return fallback || {}; }
+    try {
+      return JSON.parse(value);
+    } catch (_error) {
+      return fallback || {};
+    }
   }
 
   function once(node, key, mount) {
@@ -109,7 +129,7 @@
       node.dataset[key] = "mounted";
       return result;
     } catch (e) {
-      console.error('Mount failed for', key, e);
+      console.error("Mount failed for", key, e);
       // Don't mark as mounted so it can be retried
       return null;
     }
@@ -123,65 +143,122 @@
 
   function mountTableControls(root, adapters) {
     var api = requireApi("InkDropOperationalTableControls");
-    return Array.from(root.querySelectorAll("[data-inkdrop-table-controls]")).map(function (node) {
+    return Array.from(
+      root.querySelectorAll("[data-inkdrop-table-controls]"),
+    ).map(function (node) {
       return once(node, "inkdropTableControlsMounted", function () {
         var tableSelector = node.getAttribute("data-table");
         var statusSelector = node.getAttribute("data-status");
-        return api.mount(Object.assign({}, adapters.tableControls || {}, parseJson(node.getAttribute("data-config")), {
-          root: node,
-          table: tableSelector ? root.querySelector(tableSelector) : node.closest("[data-inkdrop-operational-region]")?.querySelector("table"),
-          status: statusSelector ? root.querySelector(statusSelector) : undefined
-        }));
+        return api.mount(
+          Object.assign(
+            {},
+            adapters.tableControls || {},
+            parseJson(node.getAttribute("data-config")),
+            {
+              root: node,
+              table: tableSelector
+                ? root.querySelector(tableSelector)
+                : node
+                    .closest("[data-inkdrop-operational-region]")
+                    ?.querySelector("table"),
+              status: statusSelector
+                ? root.querySelector(statusSelector)
+                : undefined,
+            },
+          ),
+        );
       });
     });
   }
 
   function mountQueryControls(root, adapters) {
     var api = requireApi("InkDropOperationalQueryControls");
-    return Array.from(root.querySelectorAll("[data-inkdrop-query-controls]")).map(function (node) {
+    return Array.from(
+      root.querySelectorAll("[data-inkdrop-query-controls]"),
+    ).map(function (node) {
       return once(node, "inkdropQueryControlsMounted", function () {
         var resetSelector = node.getAttribute("data-reset");
-        return api.mount(Object.assign({}, adapters.queryControls || {}, parseJson(node.getAttribute("data-config")), {
-          root: node,
-          resetHost: resetSelector ? root.querySelector(resetSelector) : node.querySelector("[data-query-reset-host]") || undefined,
-          routeKey: node.getAttribute("data-route-key") || undefined,
-          fullSetLoaded: node.getAttribute("data-full-set-loaded") === "true"
-        }));
+        return api.mount(
+          Object.assign(
+            {},
+            adapters.queryControls || {},
+            parseJson(node.getAttribute("data-config")),
+            {
+              root: node,
+              resetHost: resetSelector
+                ? root.querySelector(resetSelector)
+                : node.querySelector("[data-query-reset-host]") || undefined,
+              routeKey: node.getAttribute("data-route-key") || undefined,
+              fullSetLoaded:
+                node.getAttribute("data-full-set-loaded") === "true",
+            },
+          ),
+        );
       });
     });
   }
 
   function mountRowControls(root, adapters) {
     var api = requireApi("InkDropOperationalRowControls");
-    return Array.from(root.querySelectorAll("[data-inkdrop-row-controls]")).map(function (node) {
-      return once(node, "inkdropRowControlsMounted", function () {
-        var detailSelector = node.getAttribute("data-details");
-        var menuSelector = node.getAttribute("data-menu");
-        var statusSelector = node.getAttribute("data-status");
-        return api.mount(Object.assign({}, adapters.rowControls || {}, parseJson(node.getAttribute("data-config")), {
-          details: detailSelector ? root.querySelector(detailSelector) : undefined,
-          disclosureHost: node.querySelector("[data-row-disclosure-host]") || undefined,
-          menuHost: menuSelector ? root.querySelector(menuSelector) : node.querySelector("[data-row-menu-host]") || undefined,
-          statusHost: statusSelector ? root.querySelector(statusSelector) : node.querySelector("[data-row-status-host]") || undefined
-        }));
-      });
-    });
+    return Array.from(root.querySelectorAll("[data-inkdrop-row-controls]")).map(
+      function (node) {
+        return once(node, "inkdropRowControlsMounted", function () {
+          var detailSelector = node.getAttribute("data-details");
+          var menuSelector = node.getAttribute("data-menu");
+          var statusSelector = node.getAttribute("data-status");
+          return api.mount(
+            Object.assign(
+              {},
+              adapters.rowControls || {},
+              parseJson(node.getAttribute("data-config")),
+              {
+                details: detailSelector
+                  ? root.querySelector(detailSelector)
+                  : undefined,
+                disclosureHost:
+                  node.querySelector("[data-row-disclosure-host]") || undefined,
+                menuHost: menuSelector
+                  ? root.querySelector(menuSelector)
+                  : node.querySelector("[data-row-menu-host]") || undefined,
+                statusHost: statusSelector
+                  ? root.querySelector(statusSelector)
+                  : node.querySelector("[data-row-status-host]") || undefined,
+              },
+            ),
+          );
+        });
+      },
+    );
   }
 
   function renderTransferTelemetry(root) {
     var api = requireApi("InkDropTransferTelemetry");
-    return Array.from(root.querySelectorAll("[data-inkdrop-transfer-telemetry]")).map(function (node) {
+    return Array.from(
+      root.querySelectorAll("[data-inkdrop-transfer-telemetry]"),
+    ).map(function (node) {
       return once(node, "inkdropTransferTelemetryMounted", function () {
-        return api.render(node, parseJson(node.getAttribute("data-transfer-row")));
+        return api.render(
+          node,
+          parseJson(node.getAttribute("data-transfer-row")),
+        );
       });
     });
   }
 
   function mountVersionAbout(root, adapters) {
     var api = requireApi("InkDropVersionAbout");
-    return Array.from(root.querySelectorAll("[data-inkdrop-version-about]")).map(function (node) {
+    return Array.from(
+      root.querySelectorAll("[data-inkdrop-version-about]"),
+    ).map(function (node) {
       return once(node, "inkdropVersionAboutMounted", function () {
-        return api.mount(node, Object.assign({}, adapters.versionAbout || {}, parseJson(node.getAttribute("data-config"))));
+        return api.mount(
+          node,
+          Object.assign(
+            {},
+            adapters.versionAbout || {},
+            parseJson(node.getAttribute("data-config")),
+          ),
+        );
       });
     });
   }
@@ -194,7 +271,7 @@
       queryControls: mountQueryControls(root, adapters),
       rowControls: mountRowControls(root, adapters),
       transferTelemetry: renderTransferTelemetry(root),
-      versionAbout: mountVersionAbout(root, adapters)
+      versionAbout: mountVersionAbout(root, adapters),
     });
   }
 
@@ -205,6 +282,6 @@
     },
     loadAssets: loadAssets,
     mount: mount,
-    parseJson: parseJson
+    parseJson: parseJson,
   });
 })(typeof window !== "undefined" ? window : globalThis);
