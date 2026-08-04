@@ -883,10 +883,9 @@ pre {
 .activity-subview-head,
 .activity-subview-row {
   display: grid;
-  grid-template-columns: minmax(160px, 1.15fr) minmax(92px, 0.42fr) minmax(
-      190px,
-      1fr
-    ) minmax(120px, auto);
+  grid-template-columns:
+    minmax(160px, 1.15fr) minmax(92px, 0.42fr) minmax(190px, 1fr)
+    minmax(120px, auto);
   gap: 8px;
   align-items: center;
   min-width: 0;

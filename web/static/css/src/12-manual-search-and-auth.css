@@ -867,13 +867,10 @@ body.manual-search-open {
 .manual-search-results-columns,
 .manual-search-result-grid {
   display: grid;
-  grid-template-columns: minmax(88px, 0.8fr) minmax(0, 2.2fr) minmax(
-      0,
-      1.25fr
-    ) minmax(0, 1fr) minmax(0, 0.78fr) minmax(0, 0.95fr) minmax(
-      42px,
-      0.42fr
-    ) minmax(118px, 1.2fr);
+  grid-template-columns:
+    minmax(88px, 0.8fr) minmax(0, 2.2fr) minmax(0, 1.25fr)
+    minmax(0, 1fr) minmax(0, 0.78fr) minmax(0, 0.95fr) minmax(42px, 0.42fr)
+    minmax(118px, 1.2fr);
   gap: 10px;
   padding-inline: 18px;
 }
@@ -1037,10 +1034,9 @@ body.manual-search-open {
   }
   .manual-search-results-columns,
   .manual-search-result-grid {
-    grid-template-columns: minmax(88px, 0.85fr) minmax(0, 2fr) minmax(
-        0,
-        1.2fr
-      ) minmax(0, 1fr) minmax(42px, 0.45fr) minmax(118px, 1.2fr);
+    grid-template-columns:
+      minmax(88px, 0.85fr) minmax(0, 2fr) minmax(0, 1.2fr)
+      minmax(0, 1fr) minmax(42px, 0.45fr) minmax(118px, 1.2fr);
   }
   .manual-search-results-columns > :nth-child(4),
   .manual-search-results-columns > :nth-child(5),
@@ -1748,20 +1744,18 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   .section-table-head,
 .section-table.arr-table-hide-state:not(.arr-table-hide-detail)
   .section-table-row {
-  grid-template-columns: 30px minmax(220px, 1.35fr) minmax(
-      300px,
-      1.65fr
-    ) minmax(168px, 0.7fr);
+  grid-template-columns:
+    30px minmax(220px, 1.35fr) minmax(300px, 1.65fr)
+    minmax(168px, 0.7fr);
 }
 
 .section-table.arr-table-hide-detail:not(.arr-table-hide-state)
   .section-table-head,
 .section-table.arr-table-hide-detail:not(.arr-table-hide-state)
   .section-table-row {
-  grid-template-columns: 30px minmax(240px, 1.65fr) minmax(
-      126px,
-      0.55fr
-    ) minmax(168px, 0.7fr);
+  grid-template-columns:
+    30px minmax(240px, 1.65fr) minmax(126px, 0.55fr)
+    minmax(168px, 0.7fr);
 }
 
 .section-table.arr-table-hide-state.arr-table-hide-detail .section-table-head,
@@ -1816,10 +1810,9 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
 
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
   body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
-    grid-template-columns: 24px minmax(220px, 1.1fr) minmax(
-        190px,
-        0.9fr
-      ) minmax(64px, auto);
+    grid-template-columns:
+      24px minmax(220px, 1.1fr) minmax(190px, 0.9fr)
+      minmax(64px, auto);
     grid-template-areas:
       "select item state actions"
       "select detail detail actions";

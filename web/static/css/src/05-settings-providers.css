@@ -713,10 +713,9 @@ body[data-inkdrop-view="wanted"]
 }
 .system-table-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(120px, 0.42fr) minmax(
-      120px,
-      0.42fr
-    ) minmax(140px, 0.38fr);
+  grid-template-columns:
+    minmax(180px, 1fr) minmax(120px, 0.42fr) minmax(120px, 0.42fr)
+    minmax(140px, 0.38fr);
   gap: 12px;
   align-items: center;
   min-height: 34px;
@@ -755,10 +754,9 @@ body[data-inkdrop-view="wanted"]
     );
 }
 .system-table-row[data-system-columns="5"] {
-  grid-template-columns: 70px minmax(160px, 0.55fr) minmax(300px, 1fr) minmax(
-      110px,
-      0.34fr
-    ) minmax(130px, 0.38fr);
+  grid-template-columns:
+    70px minmax(160px, 0.55fr) minmax(300px, 1fr) minmax(110px, 0.34fr)
+    minmax(130px, 0.38fr);
 }
 .system-meter {
   display: grid;
@@ -1193,10 +1191,9 @@ body:not(.settings-advanced-visible) .settings-provider-form-label span {
 }
 .settings-first-run-group-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.35fr) minmax(92px, 0.36fr) minmax(
-      140px,
-      0.72fr
-    ) minmax(138px, 0.5fr);
+  grid-template-columns:
+    minmax(220px, 1.35fr) minmax(92px, 0.36fr) minmax(140px, 0.72fr)
+    minmax(138px, 0.5fr);
   gap: 12px;
   align-items: center;
   min-width: 0;
@@ -1252,10 +1249,9 @@ body:not(.settings-advanced-visible) .settings-provider-form-label span {
   margin-bottom: 14px;
 }
 .settings-setup-area-row {
-  grid-template-columns: minmax(190px, 1fr) minmax(120px, 0.42fr) minmax(
-      240px,
-      1.35fr
-    ) minmax(104px, 0.38fr);
+  grid-template-columns:
+    minmax(190px, 1fr) minmax(120px, 0.42fr) minmax(240px, 1.35fr)
+    minmax(104px, 0.38fr);
 }
 /* Same shape as the .settings-form-row problem: these four tracks need
        about 654px plus gaps, which does not fit next to the sidebar until
@@ -1716,10 +1712,9 @@ details.settings-card[open] > summary.settings-card-head {
 }
 .settings-path-map-row {
   display: grid;
-  grid-template-columns: minmax(120px, 0.75fr) minmax(180px, 1fr) minmax(
-      180px,
-      1fr
-    ) 28px;
+  grid-template-columns:
+    minmax(120px, 0.75fr) minmax(180px, 1fr) minmax(180px, 1fr)
+    28px;
   gap: 12px;
   align-items: center;
   min-width: 0;

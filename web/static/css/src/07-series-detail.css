@@ -2067,10 +2067,9 @@ button.series-detail-panel:focus {
 }
 .series-detail-issue-row {
   display: grid;
-  grid-template-columns: minmax(62px, 0.28fr) minmax(240px, 1.8fr) minmax(
-      112px,
-      0.52fr
-    ) minmax(220px, 1.28fr) minmax(116px, max-content);
+  grid-template-columns:
+    minmax(62px, 0.28fr) minmax(240px, 1.8fr) minmax(112px, 0.52fr)
+    minmax(220px, 1.28fr) minmax(116px, max-content);
   gap: 7px;
   align-items: center;
   min-width: 0;

@@ -1068,20 +1068,18 @@ button.activity-operator-card:focus {
   }
   .section-table.section-table-operational .section-table-head,
   .section-table.section-table-operational .section-table-row {
-    grid-template-columns: minmax(282px, 1.22fr) minmax(190px, 0.78fr) minmax(
-        290px,
-        1.08fr
-      ) minmax(150px, 0.54fr);
+    grid-template-columns:
+      minmax(282px, 1.22fr) minmax(190px, 0.78fr) minmax(290px, 1.08fr)
+      minmax(150px, 0.54fr);
     gap: 8px;
   }
   .section-table.section-table-operational.section-table-manual_review
     .section-table-head,
   .section-table.section-table-operational.section-table-manual_review
     .section-table-row {
-    grid-template-columns: minmax(282px, 1.24fr) minmax(148px, 0.58fr) minmax(
-        330px,
-        1.34fr
-      ) minmax(174px, 0.66fr);
+    grid-template-columns:
+      minmax(282px, 1.24fr) minmax(148px, 0.58fr) minmax(330px, 1.34fr)
+      minmax(174px, 0.66fr);
   }
   .section-table.section-table-operational .section-table-head {
     top: 0;
@@ -1324,10 +1322,9 @@ button.activity-operator-card:focus {
     grid-template-columns: 1fr 1fr;
   }
   .series-detail-issue-row {
-    grid-template-columns: minmax(56px, 0.34fr) minmax(170px, 1.55fr) minmax(
-        108px,
-        0.7fr
-      ) minmax(180px, 1fr) minmax(132px, 0.72fr);
+    grid-template-columns:
+      minmax(56px, 0.34fr) minmax(170px, 1.55fr) minmax(108px, 0.7fr)
+      minmax(180px, 1fr) minmax(132px, 0.72fr);
     gap: 8px;
   }
   .section-table-toolbar {

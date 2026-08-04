@@ -1338,10 +1338,9 @@ button.section-table-key-chip:focus {
 .section-table-head,
 .section-table-row {
   display: grid;
-  grid-template-columns: 30px minmax(210px, 1.15fr) minmax(
-      126px,
-      0.55fr
-    ) minmax(260px, 1.65fr) minmax(168px, 0.8fr);
+  grid-template-columns:
+    30px minmax(210px, 1.15fr) minmax(126px, 0.55fr)
+    minmax(260px, 1.65fr) minmax(168px, 0.8fr);
   gap: 10px;
   align-items: center;
   min-width: 0;

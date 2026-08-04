@@ -402,10 +402,9 @@
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
     min-width: 1000px;
-    grid-template-columns: minmax(330px, 1.45fr) minmax(120px, 0.34fr) minmax(
-        300px,
-        0.9fr
-      ) minmax(132px, 0.34fr);
+    grid-template-columns:
+      minmax(330px, 1.45fr) minmax(120px, 0.34fr) minmax(300px, 0.9fr)
+      minmax(132px, 0.34fr);
   }
 
   body[data-inkdrop-view="queue"]
@@ -444,10 +443,9 @@
 
 @media (min-width: 621px) and (max-width: 1099px) {
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-head {
-    grid-template-columns: minmax(220px, 1.1fr) minmax(120px, 0.58fr) minmax(
-        190px,
-        0.9fr
-      ) minmax(64px, auto);
+    grid-template-columns:
+      minmax(220px, 1.1fr) minmax(120px, 0.58fr) minmax(190px, 0.9fr)
+      minmax(64px, auto);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
