@@ -1,0 +1,232 @@
+name: CI
+
+on:
+  push:
+    branches: [main, frontend]
+  pull_request:
+    branches: [main, frontend]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prelint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: cd web/frontend && npm ci
+
+      - name: Check Prettier formatting (CSS source files)
+        run: npx prettier@3 --check 'web/static/css/src/*.css'
+
+      - name: Check Prettier formatting (JS source files)
+        run: npx prettier@3 --check 'web/static/js/*.js'
+
+      - name: Validate JS syntax
+        run: find web/static/js -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Validate Python syntax
+        run: python3 -m py_compile inkdrop_web.py
+
+      - name: Validate docker-compose.yml
+        run: docker compose config --quiet
+
+  precheck:
+    name: Frontend Build & Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: cd web/frontend && npm ci
+
+      - name: Check Prettier formatting (frontend)
+        run: cd web/frontend && npx prettier@3 --check 'src/**/*.{jsx,js,json}'
+
+      - name: Build frontend
+        run: cd web/frontend && npm run build
+
+      - name: Verify build output
+        run: |
+          test -f web/frontend/dist/index.html || { echo "ERROR: dist/index.html missing"; exit 1; }
+          test -n "$(ls web/frontend/dist/assets/*.js 2>/dev/null)" || { echo "ERROR: No JS assets in dist"; exit 1; }
+          test -n "$(ls web/frontend/dist/assets/*.css 2>/dev/null)" || { echo "ERROR: No CSS assets in dist"; exit 1; }
+          echo "Frontend build verified OK"
+
+  build-amd64:
+    name: Build amd64
+    needs: [prelint, precheck]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          VERSION=$(python3 -c "
+          import re
+          m = re.search(r'__version__\s*=\s*[\"']([^\"']+)', open('inkdrop_version.py').read())
+          print(m.group(1) if m else 'dev')
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push amd64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/inkdrop,push-by-digest=true
+          build-args: |
+            INKDROP_VERSION=${{ steps.meta.outputs.version }}
+            INKDROP_COMMIT_SHA=${{ github.sha }}
+            INKDROP_BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            INKDROP_RELEASE_CHANNEL=stable
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,scope=amd64,mode=max
+
+  build-arm64:
+    name: Build arm64
+    needs: [prelint, precheck]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          VERSION=$(python3 -c "
+          import re
+          m = re.search(r'__version__\s*=\s*[\"']([^\"']+)', open('inkdrop_version.py').read())
+          print(m.group(1) if m else 'dev')
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push arm64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/inkdrop,push-by-digest=true
+          build-args: |
+            INKDROP_VERSION=${{ steps.meta.outputs.version }}
+            INKDROP_COMMIT_SHA=${{ github.sha }}
+            INKDROP_BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            INKDROP_RELEASE_CHANNEL=stable
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,scope=arm64,mode=max
+
+  manifest:
+    name: Push multi-arch manifest
+    needs: [build-amd64, build-arm64]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/inkdrop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: meta
+        run: |
+          echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          VERSION=$(python3 -c "
+          import re
+          m = re.search(r'__version__\s*=\s*[\"']([^\"']+)', open('inkdrop_version.py').read())
+          print(m.group(1) if m else 'dev')
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:latest \
+            -t ${{ env.IMAGE }}:${{ steps.meta.outputs.version }} \
+            -t ${{ env.IMAGE }}:sha-${{ steps.meta.outputs.short_sha }} \
+            ${{ env.IMAGE }}@${{ needs.build-amd64.outputs.digest }} \
+            ${{ env.IMAGE }}@${{ needs.build-arm64.outputs.digest }}
+
+      - name: Verify manifest
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE }}:latest
