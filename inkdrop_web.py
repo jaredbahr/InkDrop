@@ -46934,6 +46934,52 @@ def remove_inkdrop_series_library_files(plan):
     }
 
 
+def _strip_watch_reactivation_flags(series_id):
+    """Remove inkdropUserAdded and createdBy reactivation triggers from a
+    series' watch entry so that sync_watches cannot resurrect the series
+    via the explicit_removed_reactivation path in upsert_series().
+
+    Without this, a removed series' watch entry still carries
+    inkdropUserAdded=True and createdBy='inkdrop_add_series', which causes
+    upsert_series() to bypass the removed-by-user guard and reactivate
+    the series on the next sync cycle.
+    """
+    series_id = str(series_id or "").strip()
+    if not series_id:
+        return
+    try:
+        data = load_comic_series()
+    except Exception:
+        return
+    watches = data.get("watches") or []
+    changed = False
+    for watch in watches:
+        if not isinstance(watch, dict):
+            continue
+        # Match by series_identity to find the watch for this series.
+        watch_sid = inkdrop_state.series_identity(watch)
+        if watch_sid != series_id:
+            # Also try matching by comicvineId / metadata_id embedded in series_id.
+            # series_id format is typically "comicvine:12345" or "kapowarr:67890".
+            provider, _, metadata_id = series_id.partition(":")
+            cv_id = str(watch.get("comicvineId") or "").strip()
+            kw_id = str(watch.get("kapowarrId") or "").strip()
+            if provider == "comicvine" and cv_id == metadata_id:
+                pass  # matched
+            elif provider == "kapowarr" and kw_id == metadata_id:
+                pass  # matched
+            else:
+                continue
+        # Strip the reactivation flags.
+        if watch.pop("inkdropUserAdded", None) is not None:
+            changed = True
+        if str(watch.get("createdBy") or "").strip() == "inkdrop_add_series":
+            watch.pop("createdBy", None)
+            changed = True
+    if changed:
+        save_comic_series(data)
+
+
 def remove_inkdrop_series(payload):
     payload = payload or {}
     series_id = str((payload or {}).get("id") or (payload or {}).get("series_id") or (payload or {}).get("seriesId") or "").strip()
@@ -46973,6 +47019,12 @@ def remove_inkdrop_series(payload):
         raise ValueError(result.get("error") or result.get("reason") or "series remove failed")
     if remove_files:
         file_removal = remove_inkdrop_series_library_files(file_removal)
+    # Strip reactivation flags from the watch entry so sync_watches cannot
+    # resurrect this series via inkdropUserAdded / createdBy.
+    # Without this, the watch still carries inkdropUserAdded=True, which
+    # triggers explicit_removed_reactivation in upsert_series() and
+    # un-parks the series on the next sync.
+    _strip_watch_reactivation_flags(series_id)
     updated = inkdrop_state.series_item(INKDROP_STATE_DB, series_id)
     watch_log(
         "inkdrop_series_remove",

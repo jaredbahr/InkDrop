@@ -22655,6 +22655,10 @@ def sync_watches(con, state_dir, now):
     for watch in data.get("watches") or []:
         if not isinstance(watch, dict):
             continue
+        sid = series_identity(watch)
+        if sid and series_id_user_removed(con, sid):
+            retire_removed_series_work(con, sid, now, source="sync_watches_removed_series")
+            continue
         try:
             series_id = upsert_series(con, watch, now)
         except SeriesIdentityTombstoneBlocked:
@@ -22702,6 +22706,11 @@ def sync_queue(
         if not isinstance(item, dict):
             continue
         effective_state = resolved_queue_state(item, resolved_keys, ambiguous_issue_keys)
+        item_sid = series_identity(item)
+        if item_sid and series_id_user_removed(con, item_sid):
+            retire_removed_series_work(con, item_sid, now, source="sync_queue_removed_series")
+            count += 1
+            continue
         try:
             series_id = upsert_series(con, item, now)
         except SeriesIdentityTombstoneBlocked:
