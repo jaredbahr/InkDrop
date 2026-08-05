@@ -115,11 +115,10 @@ def reconcile_deferred_syncs(db_path, *, batch_size=25, stale_after=24 * 3600, n
     audit = classify_deferred_syncs(db_path, stale_after=stale_after, now=now)
     batch_limit = max(1, min(int(batch_size), 100))
     stale_selected = [row for row in audit["rows"] if row["permanently_stale"]]
-    eligible_selected = [
-        row for row in audit["rows"]
-        if row.get("eligible_now") and not row.get("permanently_stale")
-    ]
-    selected = [*stale_selected, *eligible_selected][:batch_limit]
+    # Eligible snapshots still need the owning worker to replay their payload.
+    # Maintenance has no replay callback, so marking one "applied" here would
+    # manufacture success and let the later applied-row acknowledger retire it.
+    selected = stale_selected[:batch_limit]
     if not selected:
         return {**audit, "dry_run": False, "reconciled": 0, "failed": 0, "stale": int(audit.get("permanently_stale") or 0)}
     con = sqlite3.connect(Path(db_path), timeout=5)
@@ -129,10 +128,7 @@ def reconcile_deferred_syncs(db_path, *, batch_size=25, stale_after=24 * 3600, n
         con.execute("begin immediate")
         changed = 0
         for row in selected:
-            if row.get("permanently_stale"):
-                cur = con.execute("update deferred_queue_syncs set status='acked',acked_at=? where id=? and status='pending'", (now, row["id"]))
-            else:
-                cur = con.execute("update deferred_queue_syncs set status='applied',applied_at=? where id=? and status='pending'", (now, row["id"]))
+            cur = con.execute("update deferred_queue_syncs set status='acked',acked_at=? where id=? and status='pending'", (now, row["id"]))
             changed += max(0, int(cur.rowcount or 0))
         event_id = f"deferred-sync-reconcile:{int(now * 1000)}"
         classifications = dict(Counter(row["classification"] for row in selected))

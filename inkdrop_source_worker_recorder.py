@@ -400,6 +400,7 @@ def _active_pack_queue_rows(db_path, limit=PACK_COVERAGE_ROW_LIMIT):
                 _select_column("i", "metadata_id", "issue_metadata_id", icols),
                 _select_column("i", "kapowarr_issue_id", "kapowarr_issue_id", icols),
                 _select_column("w", "status", "wanted_status", wcols) if wcols else "null as wanted_status",
+                _select_column("q", "raw_json", "raw_json", qcols),
             ]
             rows = con.execute(
                 f"""
@@ -421,10 +422,33 @@ def _active_pack_queue_rows(db_path, limit=PACK_COVERAGE_ROW_LIMIT):
         return []
 
 
+def _queue_row_unit_metadata(row):
+    # unit_type/volume_number aren't real queue_items columns -- they live in
+    # raw_json (see inkdrop_state's own queue-item hydration, which reads
+    # raw.get("unitType") or raw.get("unit_type") the same way). Without
+    # this, every queue row silently classified as an issue-unit candidate,
+    # so a volume-shaped wanted item could never match a pack's volume-named
+    # manifest entries in _manifest_pack_queue_coverage below.
+    raw = row.get("raw_json")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        "unit_type": _first_value(parsed.get("unitType"), parsed.get("unit_type")),
+        "volume_number": _first_value(parsed.get("volume_number"), parsed.get("volumeNumber"), parsed.get("volume")),
+    }
+
+
 def _manifest_candidate_for_queue_row(row):
     row = _dict(row)
     provider = _first_value(row.get("issue_metadata_provider"), row.get("metadata_provider"))
     metadata_id = _first_value(row.get("issue_metadata_id"), row.get("metadata_id"))
+    unit_metadata = _queue_row_unit_metadata(row)
     return {
         "series_title": row.get("series") or row.get("title"),
         "series": row.get("series") or row.get("title"),
@@ -436,6 +460,8 @@ def _manifest_candidate_for_queue_row(row):
         "series_source": row.get("metadata_provider"),
         "media_type": row.get("media_type"),
         "publisher": row.get("publisher"),
+        "unit_type": unit_metadata.get("unit_type"),
+        "volume_number": unit_metadata.get("volume_number"),
     }
 
 
@@ -459,6 +485,14 @@ def _manifest_pack_queue_coverage(db_path, queue, attempt, pack_match):
         match = None
         for entry in entries:
             match = providers.indexer_manifest_entry_matches_candidate(probe, entry)
+            if not match:
+                # indexer_manifest_pack_match() (the canonical single-candidate
+                # matcher) already falls back to the volume matcher when the
+                # issue matcher misses -- this loop only ever tried the issue
+                # matcher, so a volume-unit wanted row could never be
+                # recognized as covered by a pack even when the pack's
+                # manifest genuinely contained a matching volume file.
+                match = providers.indexer_manifest_entry_matches_volume_candidate(probe, entry)
             if match:
                 break
         if not match:
@@ -722,8 +756,16 @@ def _attempt_with_pack_value(attempt, pack_match, decision):
     raw["pack_match_summary"] = {
         "coverage_source": (pack_match or {}).get("coverage_source"),
         "useful_missing_count": (pack_match or {}).get("useful_missing_count"),
-        "covered_queue_ids": list((pack_match or {}).get("covered_queue_ids") or [])[:50],
-        "covered_series": list((pack_match or {}).get("covered_series") or [])[:50],
+        # Unbounded here on purpose: the coordinator reads this list back to
+        # mark every sibling queue item this pack covers as satisfied, not
+        # just a display sample. It's already bounded upstream by
+        # PACK_COVERAGE_ENTRY_LIMIT (manifest entries scanned), so this can
+        # never exceed that. Truncating it here silently dropped coverage
+        # for any pack matching more than the old cap -- those wanted issues
+        # never got marked covered and kept getting searched and re-grabbed
+        # even though the pack already had them.
+        "covered_queue_ids": list((pack_match or {}).get("covered_queue_ids") or []),
+        "covered_series": list((pack_match or {}).get("covered_series") or []),
         "multi_series": bool((pack_match or {}).get("multi_series")),
     }
     enriched["raw"] = raw

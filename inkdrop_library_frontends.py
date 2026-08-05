@@ -7,6 +7,7 @@ are optional scan/visibility adapters that can be asked to catch up afterwards.
 
 import inspect
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -43,6 +44,88 @@ def _log(log_event, payload):
         log_event(payload)
     except Exception:
         pass
+
+
+_ERROR_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:api[_-]?key|apikey|access[_-]?token|token|password|passwd|secret)=)[^&\s]+"
+)
+_ERROR_NAMED_SECRET_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|apikey|access[_-]?token|token|password|passwd|secret|authorization|x-api-key)\b"
+    r"[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+)?[^\s,;\"'}]+"
+)
+_ERROR_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
+_KOMGA_FAILURE_BACKOFF = {}
+_KOMGA_FAILURE_BACKOFF_LOCK = threading.Lock()
+
+
+def safe_error_text(exc, secrets=(), limit=1000):
+    """Return bounded diagnostic text with common credential forms removed."""
+    text = str(exc or "")
+    for secret in secrets or ():
+        secret = str(secret or "")
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = _ERROR_URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
+    text = _ERROR_QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
+    text = _ERROR_NAMED_SECRET_RE.sub(r"\1[REDACTED]", text)
+    limit = max(80, int(limit or 1000))
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _komga_backoff_key(settings):
+    return str((settings or {}).get("base_url") or "").strip().rstrip("/").casefold()
+
+
+def _komga_failure_backoff_seconds(settings):
+    try:
+        value = int((settings or {}).get("failure_backoff_seconds") or 30)
+    except (TypeError, ValueError):
+        value = 30
+    return max(5, min(value, 300))
+
+
+def _komga_failure_backoff_status(settings):
+    key = _komga_backoff_key(settings)
+    if not key:
+        return None
+    now = time.monotonic()
+    with _KOMGA_FAILURE_BACKOFF_LOCK:
+        until = float(_KOMGA_FAILURE_BACKOFF.get(key) or 0)
+        if until <= now:
+            _KOMGA_FAILURE_BACKOFF.pop(key, None)
+            return None
+    return {
+        "reason": "komga_temporarily_unavailable",
+        "retry_after_seconds": max(1, int(until - now + 0.999)),
+    }
+
+
+def _remember_komga_failure(settings):
+    key = _komga_backoff_key(settings)
+    if not key:
+        return
+    with _KOMGA_FAILURE_BACKOFF_LOCK:
+        _KOMGA_FAILURE_BACKOFF[key] = time.monotonic() + _komga_failure_backoff_seconds(settings)
+
+
+def _clear_komga_failure(settings):
+    key = _komga_backoff_key(settings)
+    if not key:
+        return
+    with _KOMGA_FAILURE_BACKOFF_LOCK:
+        _KOMGA_FAILURE_BACKOFF.pop(key, None)
+
+
+def _komga_endpoint_unavailable(exc):
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        return True
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        return True
+    return status_code in {401, 403, 408, 429} or status_code >= 500
 
 
 def _call_kavita_scan(trigger, folder, force_library_scan):
@@ -85,7 +168,7 @@ def _visibility_error(provider, exc):
         "provider": provider,
         "visible": False,
         "status": "error",
-        "error": f"{type(exc).__name__}: {exc}",
+        "error": f"{type(exc).__name__}: {safe_error_text(exc)}",
     }
 
 
@@ -166,6 +249,10 @@ def trigger_komga_scan_folder(host_folder, *, settings, comic_root, manga_root):
     if not library_ids:
         result.update({"skipped": True, "reason": f"komga_{media_type}_library_ids_missing"})
         return result
+    backoff = _komga_failure_backoff_status(settings)
+    if backoff:
+        result.update({"skipped": True, **backoff})
+        return result
     statuses = []
     errors = []
     for library_id in library_ids:
@@ -183,11 +270,24 @@ def trigger_komga_scan_folder(host_folder, *, settings, comic_root, manga_root):
             else:
                 response.raise_for_status()
         except Exception as exc:
-            errors.append({"library_id": library_id, "error": str(exc)})
+            errors.append(
+                {
+                    "library_id": library_id,
+                    "error": safe_error_text(
+                        exc,
+                        (settings.get("username"), settings.get("password")),
+                    ),
+                }
+            )
+            if _komga_endpoint_unavailable(exc):
+                _remember_komga_failure(settings)
+                break
     result["libraries"] = statuses
     if errors:
         result["errors"] = errors
     result["status_code"] = statuses[0]["status_code"] if statuses else None
+    if statuses:
+        _clear_komga_failure(settings)
     if not statuses and errors:
         raise RuntimeError(f"Komga scan failed for all configured {media_type} libraries: {errors[:3]}")
     return result
@@ -343,6 +443,10 @@ def komga_file_visible_for_host_path(host_path, *, settings, comic_root, manga_r
         result.update({"status": "skipped", "reason": "komga_path_mapping_failed"})
         return result
     result["komga_path"] = komga_path
+    backoff = _komga_failure_backoff_status(settings)
+    if backoff:
+        result.update({"status": "error", **backoff})
+        return result
     queries = [host_path.name]
     if host_path.stem and host_path.stem not in queries:
         queries.append(host_path.stem)
@@ -352,8 +456,35 @@ def komga_file_visible_for_host_path(host_path, *, settings, comic_root, manga_r
         try:
             search = komga_search_books(settings, query, library_ids)
         except Exception as exc:
-            errors.append({"query": query, "error": str(exc)})
-            continue
+            errors.append(
+                {
+                    "query": query,
+                    "error": safe_error_text(
+                        exc,
+                        (settings.get("username"), settings.get("password")),
+                    ),
+                }
+            )
+            if _komga_endpoint_unavailable(exc):
+                _remember_komga_failure(settings)
+                result.update(
+                    {
+                        "errors": errors[:5],
+                        "status": "error",
+                        "reason": "komga_temporarily_unavailable",
+                        "retry_after_seconds": _komga_failure_backoff_seconds(settings),
+                    }
+                )
+            else:
+                result.update(
+                    {
+                        "errors": errors[:5],
+                        "status": "error",
+                        "reason": "komga_visibility_search_failed",
+                    }
+                )
+            return result
+        _clear_komga_failure(settings)
         books = search.get("books") or []
         result["candidate_count"] += len(books)
         for book in books:
@@ -377,8 +508,20 @@ def komga_file_visible_for_host_path(host_path, *, settings, comic_root, manga_r
         try:
             listing = komga_list_books_page(settings, library_ids, page=page, limit=100)
         except Exception as exc:
-            errors.append({"query": "path_scan", "page": page, "error": str(exc)})
+            errors.append(
+                {
+                    "query": "path_scan",
+                    "page": page,
+                    "error": safe_error_text(
+                        exc,
+                        (settings.get("username"), settings.get("password")),
+                    ),
+                }
+            )
+            if _komga_endpoint_unavailable(exc):
+                _remember_komga_failure(settings)
             break
+        _clear_komga_failure(settings)
         books = listing.get("books") or []
         result["path_scan_pages_checked"] += 1
         result["candidate_count"] += len(books)
@@ -407,7 +550,11 @@ def komga_file_visible_for_host_path(host_path, *, settings, comic_root, manga_r
     if errors:
         result["errors"] = errors[:5]
         result["status"] = "error"
-        result["reason"] = "komga_visibility_search_failed"
+        backoff = _komga_failure_backoff_status(settings)
+        if backoff:
+            result.update(backoff)
+        else:
+            result["reason"] = "komga_visibility_search_failed"
     else:
         result["status"] = "not_visible"
         result["reason"] = "komga_no_matching_book"
@@ -531,12 +678,18 @@ def kavita_file_visible_for_host_path(
 
 def kavita_plugin_token(settings):
     settings = settings if isinstance(settings, dict) else {}
-    response = http_requests().post(
-        settings["base_url"].rstrip("/") + "/Plugin/authenticate",
-        params={"apiKey": settings["api_key"], "pluginName": settings["plugin_name"]},
-        timeout=30,
-    )
-    response.raise_for_status()
+    try:
+        response = http_requests().post(
+            settings["base_url"].rstrip("/") + "/Plugin/authenticate",
+            params={"apiKey": settings["api_key"], "pluginName": settings["plugin_name"]},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            "Kavita plugin authentication failed: "
+            + safe_error_text(exc, (settings.get("api_key"),))
+        ) from None
     token = response.json().get("token")
     if not token:
         raise RuntimeError("Kavita plugin authentication did not return a token")
@@ -671,7 +824,12 @@ def trigger_kavita_scan_folder(
             settings=settings,
             library_id_for_folder=library_id_for_folder,
             mode="library_scan_fallback_after_folder_scan_unreachable",
-            details={"folder_scan_error": str(last_exc)},
+            details={
+                "folder_scan_error": safe_error_text(
+                    last_exc,
+                    (settings.get("api_key"),),
+                )
+            },
         )
     if response.status_code < 400:
         return {"folder": folder, "status_code": response.status_code, "mode": "folder_scan"}
@@ -702,7 +860,15 @@ def trigger_kavita_scan_folder(
                 scan.raise_for_status()
                 statuses.append({"series_id": int(series_id), "status_code": scan.status_code})
             except Exception as exc:
-                errors.append({"series_id": int(series_id), "error": str(exc)})
+                errors.append(
+                    {
+                        "series_id": int(series_id),
+                        "error": safe_error_text(
+                            exc,
+                            (settings.get("api_key"), token),
+                        ),
+                    }
+                )
         if statuses and not errors:
             return {
                 "folder": folder,
@@ -821,7 +987,7 @@ def sync_library_frontends(
                 kavita_tasks.append(result)
                 _log(log_event, {"event": event_prefix + "kavita_scan_folder_queued", **(result if isinstance(result, dict) else {"result": result})})
             except Exception as exc:
-                task = {"provider": "kavita", "folder": folder, "error": str(exc)}
+                task = {"provider": "kavita", "folder": folder, "error": safe_error_text(exc)}
                 kavita_tasks.append(task)
                 _log(log_event, {"event": event_prefix + "kavita_scan_folder_failed", **task})
     else:
@@ -838,9 +1004,10 @@ def sync_library_frontends(
         try:
             komga_settings = _load_komga_settings(load_komga_settings)
         except Exception as exc:
-            task = {"provider": "komga", "skipped": True, "reason": "komga_settings_load_failed", "error": str(exc), "folders": folders}
+            error = safe_error_text(exc)
+            task = {"provider": "komga", "skipped": True, "reason": "komga_settings_load_failed", "error": error, "folders": folders}
             komga_tasks.append(task)
-            _log(log_event, {"event": event_prefix + "komga_settings_load_failed", "error": str(exc)})
+            _log(log_event, {"event": event_prefix + "komga_settings_load_failed", "error": error})
             komga_settings = {"enabled": False}
         if komga_settings.get("enabled"):
             if not callable(trigger_komga_scan):
@@ -862,7 +1029,7 @@ def sync_library_frontends(
                             },
                         )
                     except Exception as exc:
-                        task = {"provider": "komga", "folder": folder, "error": str(exc)}
+                        task = {"provider": "komga", "folder": folder, "error": safe_error_text(exc)}
                         komga_tasks.append(task)
                         _log(log_event, {"event": event_prefix + "komga_scan_folder_failed", **task})
     else:

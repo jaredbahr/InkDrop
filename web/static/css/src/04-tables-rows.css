@@ -131,7 +131,7 @@
     .section-table-wanted .section-table-head,
     .section-table-wanted .section-table-row {
       min-width: 1040px;
-      grid-template-columns: 30px minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+      grid-template-columns: 30px minmax(280px, 1.15fr) minmax(108px, .3fr) minmax(130px, .4fr) minmax(260px, .85fr) minmax(132px, .34fr);
       gap: 8px;
     }
     .section-table-queue,
@@ -152,7 +152,7 @@
     .section-table-history .section-table-head,
     .section-table-history .section-table-row {
       min-width: 980px;
-      grid-template-columns: minmax(320px, .95fr) minmax(112px, .28fr) minmax(420px, 1.5fr) minmax(210px, .55fr);
+      grid-template-columns: minmax(280px, .85fr) minmax(112px, .28fr) minmax(130px, .4fr) minmax(340px, 1.3fr) minmax(210px, .55fr);
       gap: 12px;
     }
     .section-table-history {
@@ -168,7 +168,7 @@
     .section-table-source_memory .section-table-head,
     .section-table-source_memory .section-table-row {
       min-width: 940px;
-      grid-template-columns: minmax(250px, 1.15fr) minmax(150px, .55fr) minmax(300px, 1.5fr) minmax(200px, .7fr);
+      grid-template-columns: minmax(220px, 1fr) minmax(150px, .55fr) minmax(130px, .4fr) minmax(240px, 1.2fr) minmax(200px, .7fr);
       gap: 12px;
     }
     .section-table-source_memory {
@@ -179,6 +179,32 @@
     .section-table-source_memory .section-table-row {
       min-height: 64px;
       align-items: center;
+    }
+    /* Issues, Source Attempts, Download Tasks, and Imports joined
+       SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py, adding a "source" cell
+       between state and detail. Unlike Blocklist/History (no select
+       checkbox), these four keep their row-select checkbox, so -- like
+       Manual Review's own override -- they need six tracks, not the
+       five-track base grid, or the row-select checkbox track eats the
+       source cell's space and Actions wraps onto a second implicit row. */
+    .section-table-issues .section-table-head,
+    .section-table-issues .section-table-row,
+    .section-table-source_attempts .section-table-head,
+    .section-table-source_attempts .section-table-row,
+    .section-table-download_tasks .section-table-head,
+    .section-table-download_tasks .section-table-row,
+    .section-table-imports .section-table-head,
+    .section-table-imports .section-table-row {
+      min-width: 1040px;
+      grid-template-columns: 30px minmax(200px, 1.1fr) minmax(110px, .5fr) minmax(140px, .5fr) minmax(230px, 1.35fr) minmax(160px, .75fr);
+      gap: 10px;
+    }
+    .section-table-issues,
+    .section-table-source_attempts,
+    .section-table-download_tasks,
+    .section-table-imports {
+      overflow-x: auto;
+      scrollbar-width: thin;
     }
     .section-table-history .section-table-row {
       min-height: 64px;
@@ -1503,7 +1529,7 @@
     body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head,
     body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
       min-width: 1040px;
-      grid-template-columns: 30px minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+      grid-template-columns: 30px minmax(280px, 1.15fr) minmax(108px, .3fr) minmax(130px, .4fr) minmax(260px, .85fr) minmax(132px, .34fr);
       gap: 8px;
     }
     body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,

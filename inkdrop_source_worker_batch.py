@@ -9,6 +9,7 @@ directly; provider enablement and implementation gates stay in settings.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -591,10 +592,18 @@ def _initial_search_opportunity_pending(plan):
     priority_at = _initial_search_priority_at(plan)
     if priority_at <= 0:
         return False
+    # series_latest_source_attempt_at is the max timestamp over every
+    # source_attempts row, including non-executing bookkeeping (queue sync,
+    # importer, Kavita, source-ladder, retry normalization) that routine
+    # queue activity writes on its own schedule. Checking that raw
+    # timestamp before the automated-attempt count let ordinary bookkeeping
+    # consume a series' one-time initial-search reservation with zero real
+    # provider executions. Zero automated attempts means the opportunity is
+    # still pending regardless of what bookkeeping happened to run since.
+    if int((plan or {}).get(AUTOMATED_ATTEMPT_COUNT_FIELD) or 0) <= 0:
+        return True
     latest_attempt_at = _float((plan or {}).get("series_latest_source_attempt_at"), 0.0)
-    if latest_attempt_at >= priority_at:
-        return False
-    return int((plan or {}).get(AUTOMATED_ATTEMPT_COUNT_FIELD) or 0) <= 0
+    return latest_attempt_at < priority_at
 
 
 def _reserve_initial_search_opportunity(plans, window, limit):
@@ -1398,6 +1407,129 @@ def _slice_after_local_page_pack_history(plan):
     return plan
 
 
+def _rotate_local_page_pack_fast_lane_for_runtime_budget(plan):
+    """When the fast lane's sole Suwayomi-only selection cannot fit the
+    remaining pass budget, rotate to one feasible deferred sibling instead of
+    resubmitting the same impossible sole selection every pass. Returns a
+    rotated plan, or None if no rotation applies."""
+
+    plan = plan if isinstance(plan, dict) else {}
+    slice_info = plan.get("source_worker_slice")
+    slice_info = slice_info if isinstance(slice_info, dict) else {}
+    if slice_info.get("kind") != LOCAL_PAGE_PACK_FAST_LANE_SLICE_KIND:
+        return None
+    deferred_provider_ids = [
+        str(value).strip().lower()
+        for value in _list(slice_info.get("deferred_provider_ids"))
+        if str(value or "").strip()
+    ]
+    if not deferred_provider_ids:
+        return None
+    original_provider_ids = [
+        str(value).strip().lower()
+        for value in _list(slice_info.get("original_selected_provider_ids"))
+        if str(value or "").strip()
+    ] or deferred_provider_ids
+    provider_counts = plan.get("source_worker_provider_attempt_counts")
+    provider_counts = provider_counts if isinstance(provider_counts, dict) else {}
+    terminal_counts = plan.get("source_worker_terminal_provider_attempt_counts")
+    terminal_counts = terminal_counts if isinstance(terminal_counts, dict) else {}
+    first_index = {}
+    for index, provider_id in enumerate(original_provider_ids):
+        first_index.setdefault(provider_id, index)
+    selected_sibling_id = sorted(
+        deferred_provider_ids,
+        key=lambda provider_id: (
+            _provider_history_count(provider_counts, provider_id)
+            + _provider_history_count(terminal_counts, provider_id),
+            first_index.get(provider_id, len(deferred_provider_ids)),
+            provider_id,
+        ),
+    )[0]
+    selected_provider_ids = [selected_sibling_id]
+    remaining_deferred_ids = [
+        provider_id for provider_id in deferred_provider_ids if provider_id != selected_sibling_id
+    ]
+    candidate = dict(plan)
+    candidate["selected_provider_ids"] = list(selected_provider_ids)
+    if isinstance(candidate.get("provider_attempt_plan"), list):
+        candidate["provider_attempt_plan"] = _slice_provider_attempt_plan(
+            candidate.get("provider_attempt_plan"),
+            selected_provider_ids,
+            remaining_deferred_ids,
+            deferred_attempt_state=LOCAL_PAGE_PACK_SIBLING_ROTATION_SLICE_KIND,
+            deferred_reason=(
+                "Local page-pack provider's plan did not fit the remaining source-worker "
+                "runtime budget this pass; one sibling source will run instead."
+            ),
+        )
+        _refresh_provider_attempt_counts(candidate)
+    candidate["source_worker_slice"] = {
+        "kind": LOCAL_PAGE_PACK_SIBLING_ROTATION_SLICE_KIND,
+        "selected_provider_ids": list(selected_provider_ids),
+        "deferred_provider_ids": list(remaining_deferred_ids),
+        "original_selected_provider_ids": list(original_provider_ids),
+        "selection_reason": "local_page_pack_runtime_budget_rotation",
+        "runtime_budget_rotated_from_provider_ids": list(slice_info.get("selected_provider_ids") or []),
+        "previous_slice": slice_info,
+    }
+    return candidate
+
+
+def _persist_runtime_budget_skip_evidence(db_path, plan, *, estimate, remaining, now=None):
+    """Persist durable, explicitly-non-attempt evidence that this queue item's
+    only runtime-budget-feasible plan could not run this pass. Uses the same
+    recognized "source_runtime_budget_skipped" kind/reason text that
+    inkdrop_series_autopilot already writes, so starvation-age tracking
+    (_is_runtime_budget_skipped_plan) and the non-attempt classifier
+    (_is_non_attempt_source_attempt) both recognize it -- without inflating any
+    provider's real attempt/health counters, since those explicitly skip rows
+    carrying this kind."""
+
+    queue_id = str((plan or {}).get("queue_id") or "").strip()
+    if not queue_id:
+        return
+    provider_ids = _selected_provider_ids(plan)
+    provider_id = provider_ids[0] if provider_ids else ""
+    if not provider_id:
+        return
+    now = time.time() if now is None else now
+    reason = (
+        f"{provider_id} did not start before the worker runtime budget "
+        f"({int(estimate)}s estimate, {int(max(0.0, _float(remaining, 0.0)))}s available); "
+        "automatic retry scheduled"
+    )
+    attempt = {
+        "ts": now,
+        "source": provider_id,
+        "provider_id": provider_id,
+        "provider": provider_id,
+        "status": "retry_scheduled",
+        "lifecycle_phase": "retry_later",
+        "display_phase": "retry_later",
+        "outcome": "no_candidate",
+        "retry_eligible": True,
+        "reason": reason,
+        "failure_reason": reason,
+        "kind": "source_runtime_budget_skipped",
+        "title": str(_plan_wanted_item(plan).get("series") or "").strip(),
+    }
+    try:
+        with inkdrop_state.connect(db_path) as con:
+            inkdrop_state.record_source_attempt(
+                con,
+                queue_id,
+                plan.get("wanted_id"),
+                plan.get("series_id"),
+                plan.get("issue_id"),
+                attempt,
+                started_at=now,
+                completed_at=now,
+            )
+    except Exception:
+        pass
+
+
 def _provider_history_count(provider_history_counts, provider_id):
     try:
         return int((provider_history_counts or {}).get(provider_id) or 0)
@@ -1439,6 +1571,16 @@ def _trusted_comic_pack_child_provider_ids(child_provider_ids):
         if provider_key in COMIC_PACK_PROWLARR_CHILD_PROVIDER_IDS and provider_key not in out:
             out.append(provider_key)
     return out
+
+
+def _comic_pack_trusted_child_rotation_key(plan, provider_id):
+    """Deterministic per-row tie-break so equal-history children spread
+    across queue rows instead of always resolving to the same
+    registry-order first child (e.g. DOGnzb ahead of TorrentLeech on every
+    row whose history is tied)."""
+
+    seed = str((plan or {}).get("queue_id") or (plan or {}).get("series_id") or "")
+    return hashlib.sha1(f"{seed}:{provider_id}".encode("utf-8")).hexdigest()
 
 
 def _comic_pack_prowlarr_child_lane_limit(value=None):
@@ -1620,9 +1762,25 @@ def _slice_prowlarr_child_lanes(plan, provider_counts, *, comic_pack_child_lane_
     selection_reason = ""
     if _plan_looks_comic_pack_eligible(plan) and child_preference != "manga_prowlarr_child_preference":
         comic_pack_limit = _comic_pack_prowlarr_child_lane_limit(comic_pack_child_lane_limit)
-        selected_child_ids = _trusted_comic_pack_child_provider_ids(child_provider_ids)[
-            :comic_pack_limit
-        ]
+        trusted_comic_child_ids = _trusted_comic_pack_child_provider_ids(child_provider_ids)
+        terminal_counts = plan.get("source_worker_terminal_provider_attempt_counts")
+        terminal_counts = terminal_counts if isinstance(terminal_counts, dict) else {}
+        # Rank by durable history (total + terminal) ascending, not by fixed
+        # registry order -- a trusted child that has never been tried (or
+        # only has non-terminal history) must be preferred over one with
+        # dozens of terminal attempts. Ties (including the common "both
+        # zero" case) fall through to in-pass demand, then a per-row
+        # deterministic hash so different queue rows don't all resolve the
+        # tie to the same child.
+        selected_child_ids = sorted(
+            trusted_comic_child_ids,
+            key=lambda provider_id: (
+                _provider_history_count(provider_history_counts, provider_id)
+                + _provider_history_count(terminal_counts, provider_id),
+                provider_counts.get(provider_id, 0),
+                _comic_pack_trusted_child_rotation_key(plan, provider_id),
+            ),
+        )[:comic_pack_limit]
         if selected_child_ids:
             selection_reason = "comic_pack_trusted_child_rotation"
     if not selected_child_ids:
@@ -2665,6 +2823,9 @@ def _run_summary(
         "retryable_source_candidate_searching_requeued": int(
             pre_schedule_cleanup.get("retryable_source_candidate_searching_requeued") or 0
         ),
+        "active_queue_terminal_wanted_cleanup": int(
+            pre_schedule_cleanup.get("active_queue_terminal_wanted_cleanup") or 0
+        ),
     }
 
 
@@ -2695,12 +2856,13 @@ def _run_pre_schedule_cleanups(
     lock_retry_initial_delay=None,
 ):
     if not execute_jobs or dry_run:
-        return {"retryable_source_candidate_searching_requeued": 0}
+        return {"retryable_source_candidate_searching_requeued": 0, "active_queue_terminal_wanted_cleanup": 0}
     try:
         import inkdrop_state
     except Exception as exc:
         return {
             "retryable_source_candidate_searching_requeued": 0,
+            "active_queue_terminal_wanted_cleanup": 0,
             "error": f"inkdrop_state_import_failed:{exc}",
         }
     now = time.time() if now is None else now
@@ -2717,14 +2879,15 @@ def _run_pre_schedule_cleanups(
     def _cleanup():
         with inkdrop_state.connect(db_path) as con:
             inkdrop_state.init_schema(con)
-            changed = inkdrop_state.cleanup_retryable_source_candidate_searching_queue_rows(con, now)
-            if changed:
+            requeued = inkdrop_state.cleanup_retryable_source_candidate_searching_queue_rows(con, now)
+            terminal_wanted_cleaned = inkdrop_state.cleanup_active_queue_rows_with_terminal_wanted(con, now)
+            if requeued or terminal_wanted_cleaned:
                 inkdrop_state.update_sync_meta(con, now, "source_worker_pre_schedule_cleanup")
             con.commit()
-            return int(changed or 0)
+            return int(requeued or 0), int(terminal_wanted_cleaned or 0)
 
     try:
-        changed = inkdrop_state.with_db_lock_retry(
+        changed, terminal_wanted_cleaned = inkdrop_state.with_db_lock_retry(
             _cleanup,
             attempts=attempts,
             initial_delay=initial_delay,
@@ -2735,6 +2898,7 @@ def _run_pre_schedule_cleanups(
             raise
         return {
             "retryable_source_candidate_searching_requeued": 0,
+            "active_queue_terminal_wanted_cleanup": 0,
             "skipped": True,
             "reason": "database_locked",
             "error": str(exc),
@@ -2743,6 +2907,7 @@ def _run_pre_schedule_cleanups(
         }
     return {
         "retryable_source_candidate_searching_requeued": int(changed or 0),
+        "active_queue_terminal_wanted_cleanup": int(terminal_wanted_cleaned or 0),
         "lock_retry_attempts": int(retry_metrics.get("attempts") or 1),
         "lock_retry_retries": int(retry_metrics.get("retries") or 0),
     }
@@ -2891,10 +3056,22 @@ def run_source_worker_batch(
             ),
         }
 
-    recovering_pending_handoff = bool(pending_handoff_queue_ids)
+    # A pending row existing isn't recovery activity -- an intrinsically
+    # oversized accepted task (bigger than the hourly handoff cap) can sit
+    # here forever, policy-deferred without ever reaching the client. Only
+    # suppress the normal schedule when this pass actually made or attempted
+    # real client progress on a pending row; an all-policy-deferred batch
+    # must fall through to ordinary provider scheduling (which already knows
+    # to exclude these queue IDs) so unrelated series aren't stalled behind
+    # one row that can never become admissible by waiting.
+    recovering_pending_handoff = bool(
+        int(pending_download_client_handoff.get("tasks_handed_off") or 0)
+        or int(pending_download_client_handoff.get("tasks_failed") or 0)
+    )
     if recovering_pending_handoff:
         pre_schedule_cleanup = {
             "retryable_source_candidate_searching_requeued": 0,
+            "active_queue_terminal_wanted_cleanup": 0,
             "skipped": True,
             "reason": "pending_download_client_handoff_priority",
         }
@@ -3064,19 +3241,37 @@ def run_source_worker_batch(
             remaining = _runtime_remaining_seconds(started_monotonic, max_run_seconds)
             estimate = _plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds)
             if remaining is not None and remaining < estimate:
-                skipped = dict(plan or {})
-                skipped["runtime_estimate_seconds"] = int(estimate)
-                skipped["runtime_remaining_seconds"] = int(remaining)
-                budget_skipped.append(skipped)
-                continue
-            if dynamic_runtime_fill:
-                eligible.append(plan)
+                rotated_plan = _rotate_local_page_pack_fast_lane_for_runtime_budget(plan)
+                rotated_estimate = (
+                    _plan_runtime_estimate(rotated_plan, source_http_timeout_seconds=source_http_timeout_seconds)
+                    if rotated_plan is not None
+                    else None
+                )
+                if rotated_plan is not None and rotated_estimate is not None and remaining >= rotated_estimate:
+                    plan = rotated_plan
+                    estimate = rotated_estimate
+                else:
+                    if not dry_run:
+                        _persist_runtime_budget_skip_evidence(
+                            db_path,
+                            plan,
+                            estimate=estimate,
+                            remaining=remaining,
+                            now=now,
+                        )
+                    skipped = dict(plan or {})
+                    skipped["runtime_estimate_seconds"] = int(estimate)
+                    skipped["runtime_remaining_seconds"] = int(remaining)
+                    budget_skipped.append(skipped)
+                    continue
             selected_provider_ids = [
                 str(value).strip()
                 for value in _list(plan.get("selected_provider_ids") or provider_ids)
                 if str(value or "").strip()
             ]
             if not selected_provider_ids:
+                if dynamic_runtime_fill:
+                    eligible.append(plan)
                 runs.append(
                     {
                         "queue_id": plan.get("queue_id"),
@@ -3098,9 +3293,26 @@ def run_source_worker_batch(
                     raw={"provider_ids": selected_provider_ids},
                 )
                 if not claim.get("acquired"):
+                    # This plan was ADMITTED (passed runtime-budget and
+                    # provider-selection checks) but never actually ran a
+                    # provider request -- another worker already holds the
+                    # queue claim. It must NOT appear in selected_queue_ids/
+                    # selected_plans (eligible), because downstream projection
+                    # treats "selected" as "a search happened" and would
+                    # otherwise manufacture a false searched_no_candidates
+                    # result for a row the provider never touched. The
+                    # truthful record of this skip lives in queue_claim_skips.
                     claim_skips.append({"queue_id": queue_id, "operation": "source_worker_search", "claim": claim})
                     continue
                 _record_aged_zero_provider_coverage_evidence(db_path, plan, now=now)
+            # Only now -- past every pre-execution skip (runtime budget,
+            # provider-pass-failure budget, no-selected-providers, and a lost
+            # queue claim) -- is this plan actually about to execute a
+            # provider request (or, for dry_run, would have). This is the
+            # single place selected_queue_ids/selected_plans gets populated,
+            # so "selected" can never again mean anything other than "ran".
+            if dynamic_runtime_fill:
+                eligible.append(plan)
             # Absolute wall-clock deadline for this queue run: whatever pass
             # budget remains right now. Slow serial fetch plans (MangaDex
             # volume page packs) stop cleanly at this deadline and persist the
@@ -3160,6 +3372,7 @@ def run_source_worker_batch(
         or (pending_direct_stage.get("runs") if pending_direct_stage else [])
         or (managed_folder_stage and not managed_folder_stage.get("skipped"))
         or int(pre_schedule_cleanup.get("retryable_source_candidate_searching_requeued") or 0)
+        or int(pre_schedule_cleanup.get("active_queue_terminal_wanted_cleanup") or 0)
     )
     filesystem_runs = bool(
         (runs and stage_direct)

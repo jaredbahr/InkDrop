@@ -251,6 +251,172 @@ def main():
     if not series_scan_call or series_scan_call[1].get("headers", {}).get("Authorization") != "Bearer plugin-token":
         fail(f"neutral Kavita series scan did not use plugin auth header: {fake_requests.calls}")
 
+    secret_kavita_key = "kavita-secret-value"
+
+    class FailedKavitaAuthResponse:
+        status_code = 401
+
+        def raise_for_status(self):
+            raise RuntimeError(
+                "HTTP 401 for "
+                f"https://operator:password@kavita.example/Plugin/authenticate?apiKey={secret_kavita_key}&pluginName=inkdrop"
+            )
+
+    class FailedKavitaAuthRequests:
+        def post(self, _url, **_kwargs):
+            return FailedKavitaAuthResponse()
+
+    old_requests = inkdrop_library_frontends._requests
+    inkdrop_library_frontends._requests = FailedKavitaAuthRequests()
+    try:
+        try:
+            inkdrop_library_frontends.kavita_plugin_token(
+                {
+                    "base_url": "https://kavita.example",
+                    "api_key": secret_kavita_key,
+                    "plugin_name": "inkdrop",
+                }
+            )
+            fail("failed Kavita plugin authentication unexpectedly succeeded")
+        except RuntimeError as exc:
+            auth_error = str(exc)
+    finally:
+        inkdrop_library_frontends._requests = old_requests
+    if secret_kavita_key in auth_error or "operator:password" in auth_error:
+        fail(f"Kavita plugin authentication exposed credentials: {auth_error}")
+    if "[REDACTED]" not in auth_error:
+        fail(f"Kavita plugin authentication did not preserve redacted diagnostics: {auth_error}")
+
+    failure_logs = []
+    failed_sync = inkdrop_library_frontends.sync_library_frontends(
+        ["/library/A", "/library/B"],
+        frontend_sync_enabled=True,
+        kavita_scan_enabled=True,
+        trigger_kavita_scan=lambda folder, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(f"apiKey={secret_kavita_key} failed for {folder}")
+        ),
+        load_komga_settings=lambda: {"enabled": True},
+        trigger_komga_scan=lambda folder: (_ for _ in ()).throw(
+            RuntimeError(f"password=komga-secret-value failed for {folder}")
+        ),
+        log_event=failure_logs.append,
+        event_prefix="failure_",
+    )
+    failure_text = repr({"sync": failed_sync, "logs": failure_logs})
+    if secret_kavita_key in failure_text or "komga-secret-value" in failure_text:
+        fail(f"frontend scan failure status or logging exposed credentials: {failure_text}")
+    if len(failed_sync.get("errors") or []) != 4:
+        fail(f"frontend failures should be returned without escaping or dropping later folders: {failed_sync}")
+    if failed_sync.get("requested") != 0:
+        fail(f"failed optional frontend scans must not be reported as accepted requests: {failed_sync}")
+    if len(failure_logs) != 4:
+        fail(f"all isolated frontend failures should retain secret-safe diagnostic events: {failure_logs}")
+
+    secret_komga_password = "komga-basic-secret"
+
+    class PartialKomgaResponse:
+        def __init__(self, status_code, url):
+            self.status_code = status_code
+            self.url = url
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(
+                    f"HTTP {self.status_code} password={secret_komga_password} for {self.url}"
+                )
+
+    class PartialKomgaRequests:
+        def post(self, url, **kwargs):
+            library_id = url.split("/libraries/", 1)[1].split("/", 1)[0]
+            return PartialKomgaResponse(202 if library_id == "good" else 503, url)
+
+    old_requests = inkdrop_library_frontends._requests
+    inkdrop_library_frontends._requests = PartialKomgaRequests()
+    try:
+        partial_komga = inkdrop_library_frontends.trigger_komga_scan_folder(
+            "/library/comics/Series",
+            settings={
+                "enabled": True,
+                "add_after_import": True,
+                "base_url": "https://komga.example",
+                "username": "operator",
+                "password": secret_komga_password,
+                "comic_library_ids": ["good", "bad"],
+            },
+            comic_root="/library/comics",
+            manga_root="/library/manga",
+        )
+    finally:
+        inkdrop_library_frontends._requests = old_requests
+    if partial_komga.get("status_code") != 202 or len(partial_komga.get("errors") or []) != 1:
+        fail(f"Komga partial scan success should retain bounded per-library error evidence: {partial_komga}")
+    if secret_komga_password in repr(partial_komga):
+        fail(f"Komga partial scan evidence exposed its password: {partial_komga}")
+
+    unavailable_password = "komga-unavailable-secret"
+
+    class UnavailableKomgaRequests:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(("get", url, kwargs))
+            raise RuntimeError(f"password={unavailable_password} connection refused")
+
+        def post(self, url, **kwargs):
+            self.calls.append(("post", url, kwargs))
+            raise RuntimeError(f"password={unavailable_password} connection refused")
+
+    unavailable_settings = {
+        "enabled": True,
+        "add_after_import": True,
+        "base_url": "https://unavailable-komga.example",
+        "username": "operator",
+        "password": unavailable_password,
+        "comic_library_ids": ["comics"],
+        "failure_backoff_seconds": 30,
+    }
+    old_requests = inkdrop_library_frontends._requests
+    unavailable_requests = UnavailableKomgaRequests()
+    inkdrop_library_frontends._requests = unavailable_requests
+    inkdrop_library_frontends._clear_komga_failure(unavailable_settings)
+    try:
+        first_unavailable = inkdrop_library_frontends.komga_file_visible_for_host_path(
+            "/library/comics/Series/Series #001.cbz",
+            settings=unavailable_settings,
+            comic_root="/library/comics",
+            manga_root="/library/manga",
+        )
+        second_unavailable = inkdrop_library_frontends.komga_file_visible_for_host_path(
+            "/library/comics/Series/Series #002.cbz",
+            settings=unavailable_settings,
+            comic_root="/library/comics",
+            manga_root="/library/manga",
+        )
+        scan_during_backoff = inkdrop_library_frontends.trigger_komga_scan_folder(
+            "/library/comics/Series",
+            settings=unavailable_settings,
+            comic_root="/library/comics",
+            manga_root="/library/manga",
+        )
+    finally:
+        inkdrop_library_frontends._clear_komga_failure(unavailable_settings)
+        inkdrop_library_frontends._requests = old_requests
+    if len(unavailable_requests.calls) != 1:
+        fail(
+            "one Komga outage should make one bounded probe, not two searches plus a listing per file: "
+            f"{unavailable_requests.calls}"
+        )
+    if first_unavailable.get("reason") != "komga_temporarily_unavailable" or first_unavailable.get("status") != "error":
+        fail(f"first Komga outage did not return retryable visibility evidence: {first_unavailable}")
+    if second_unavailable.get("reason") != "komga_temporarily_unavailable" or not second_unavailable.get("retry_after_seconds"):
+        fail(f"subsequent Komga visibility did not honor the endpoint backoff: {second_unavailable}")
+    if not scan_during_backoff.get("skipped") or scan_during_backoff.get("reason") != "komga_temporarily_unavailable":
+        fail(f"Komga scan trigger did not preserve explicit retry evidence during backoff: {scan_during_backoff}")
+    outage_text = repr((first_unavailable, second_unavailable, scan_during_backoff))
+    if unavailable_password in outage_text:
+        fail(f"Komga outage evidence exposed its password: {outage_text}")
+
     komga_disabled = inkdrop_library_frontends.trigger_komga_scan_folder(
         "/library/comics/Series",
         settings={"enabled": False},

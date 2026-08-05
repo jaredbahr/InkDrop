@@ -42,7 +42,7 @@ EVENT_TYPES = (
 
 CHANNEL_TYPES = ("discord", "pushover")
 
-DELIVERY_STATUSES = ("sent", "failed", "queued", "deduped", "filtered", "disabled")
+DELIVERY_STATUSES = ("sent", "sending", "failed", "queued", "deduped", "filtered", "disabled")
 QUEUE_REASONS = ("quiet_hours", "retry", "rate_limit")
 
 DEFAULT_URGENT_EVENTS = ("health_issue",)
@@ -108,6 +108,8 @@ create index if not exists idx_notification_deliveries_created
     on notification_deliveries(created_at);
 create index if not exists idx_notification_deliveries_channel_sent
     on notification_deliveries(channel_id, status, created_at);
+create index if not exists idx_notification_deliveries_channel_delivered
+    on notification_deliveries(channel_id, status, coalesce(delivered_at, created_at));
 create table if not exists notification_watch_state (
     key text primary key,
     value_json text not null default '{}',
@@ -394,7 +396,17 @@ def record_delivery(
         return _delivery_row(row)
 
 
-def update_delivery(db_path, delivery_id, *, status, error_detail=None, next_attempt_at=None, attempt=None, queue_reason=None):
+def update_delivery(
+    db_path,
+    delivery_id,
+    *,
+    status,
+    error_detail=None,
+    next_attempt_at=None,
+    attempt=None,
+    queue_reason=None,
+    expected_lease_until=None,
+):
     if status not in DELIVERY_STATUSES:
         raise ValueError(f"unknown delivery status: {status}")
     now = time.time()
@@ -406,10 +418,12 @@ def update_delivery(db_path, delivery_id, *, status, error_detail=None, next_att
             fields["attempt"] = int(attempt)
         fields["queue_reason"] = queue_reason if status == "queued" else None
         assignments = ", ".join(f"{key}=?" for key in fields)
-        con.execute(
-            f"update notification_deliveries set {assignments} where id=?",
-            [*fields.values(), delivery_id],
-        )
+        where = "id=?"
+        params = [*fields.values(), delivery_id]
+        if expected_lease_until is not None:
+            where += " and status='sending' and next_attempt_at=?"
+            params.append(float(expected_lease_until))
+        con.execute(f"update notification_deliveries set {assignments} where {where}", params)
         row = con.execute("select * from notification_deliveries where id=?", (delivery_id,)).fetchone()
         return _delivery_row(row)
 
@@ -418,24 +432,30 @@ def last_sent_at(db_path, occurrence_key, channel_id, *, within_seconds=None):
     """Most recent successful (or still-queued) delivery timestamp for this
     occurrence on this channel, or None. Used for dedup."""
     with _connection(db_path) as con:
-        clause = ""
+        sent_clause = ""
         params = [occurrence_key, channel_id]
         if within_seconds is not None:
-            clause = " and created_at >= ?"
+            sent_clause = " and coalesce(delivered_at, created_at) >= ?"
             params.append(time.time() - float(within_seconds))
         row = con.execute(
-            f"""select created_at from notification_deliveries
-                where occurrence_key=? and channel_id=? and status in ('sent','queued'){clause}
-                order by created_at desc limit 1""",
+            f"""select coalesce(delivered_at, created_at) as occurred_at
+                from notification_deliveries
+                where occurrence_key=? and channel_id=? and (
+                    status in ('sending','queued')
+                    or (status='sent'{sent_clause})
+                )
+                order by occurred_at desc limit 1""",
             params,
         ).fetchone()
-        return row["created_at"] if row else None
+        return row["occurred_at"] if row else None
 
 
 def sent_count_since(db_path, channel_id, since_ts):
     with _connection(db_path) as con:
         row = con.execute(
-            "select count(*) as n from notification_deliveries where channel_id=? and status='sent' and created_at>=?",
+            """select count(*) as n from notification_deliveries
+               where channel_id=? and status='sent'
+                 and coalesce(delivered_at, created_at)>=?""",
             (channel_id, since_ts),
         ).fetchone()
         return int(row["n"] if row else 0)
@@ -451,6 +471,150 @@ def due_queued_deliveries(db_path, *, now=None, limit=100):
             (now, int(limit)),
         ).fetchall()
         return [_delivery_row(row) for row in rows]
+
+
+def reserve_new_delivery(
+    db_path,
+    *,
+    event_type,
+    channel_id,
+    occurrence_key,
+    subject,
+    message,
+    series_id=None,
+    issue_id=None,
+    max_attempts=1,
+    dedup_window_seconds=0,
+    max_per_hour=0,
+    defer_reason=None,
+    next_attempt_at=None,
+    lease_seconds=30,
+):
+    """Atomically deduplicate, reserve capacity, and create one delivery."""
+    now = time.time()
+    delivery_id = _new_id("ndv1")
+    lease_until = now + max(15, min(120, int(lease_seconds or 30)))
+    with _connection(db_path) as con:
+        con.execute("begin immediate")
+        duplicate = None
+        if dedup_window_seconds:
+            duplicate = con.execute(
+                """select 1 from notification_deliveries
+                   where occurrence_key=? and channel_id=?
+                     and (
+                         status in ('sending','queued')
+                         or (status='sent' and coalesce(delivered_at, created_at)>=?)
+                     )
+                   limit 1""",
+                (occurrence_key, channel_id, now - float(dedup_window_seconds)),
+            ).fetchone()
+        if duplicate:
+            status = "deduped"
+            queue_reason = None
+            detail = "already notified for this occurrence within the dedup window"
+            due_at = None
+        elif defer_reason:
+            status = "queued"
+            queue_reason = defer_reason
+            detail = None
+            due_at = next_attempt_at
+        else:
+            reserved = 0
+            if max_per_hour:
+                count_row = con.execute(
+                    """select count(*) as n from notification_deliveries
+                       where channel_id=? and (
+                           (status='sent' and coalesce(delivered_at, created_at)>=?)
+                           or (status='sending' and next_attempt_at>?)
+                       )""",
+                    (channel_id, now - 3600, now),
+                ).fetchone()
+                reserved = int(count_row["n"] if count_row else 0)
+            if max_per_hour and reserved >= int(max_per_hour):
+                oldest = con.execute(
+                    """select min(coalesce(delivered_at, created_at)) as oldest
+                       from notification_deliveries
+                       where channel_id=? and status='sent'
+                         and coalesce(delivered_at, created_at)>=?""",
+                    (channel_id, now - 3600),
+                ).fetchone()
+                oldest_at = oldest["oldest"] if oldest else None
+                status = "queued"
+                queue_reason = "rate_limit"
+                detail = None
+                due_at = max(now + 30, float(oldest_at) + 3601) if oldest_at is not None else now + 30
+            else:
+                status = "sending"
+                queue_reason = None
+                detail = None
+                due_at = lease_until
+        con.execute(
+            """insert into notification_deliveries(
+                id,event_type,channel_id,occurrence_key,series_id,issue_id,
+                subject,message,status,queue_reason,attempt,max_attempts,
+                error_detail,created_at,updated_at,delivered_at,next_attempt_at
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                delivery_id, event_type, channel_id, occurrence_key, series_id, issue_id,
+                subject, message, status, queue_reason, 0 if status == "queued" else 1,
+                int(max_attempts), detail, now, now, None, due_at,
+            ),
+        )
+        row = con.execute("select * from notification_deliveries where id=?", (delivery_id,)).fetchone()
+        return _delivery_row(row)
+
+
+def claim_next_due_delivery(db_path, *, now=None, max_per_hour=0, lease_seconds=30):
+    """Reserve one due delivery and one channel-capacity slot atomically."""
+    now = time.time() if now is None else float(now)
+    lease_until = now + max(15, min(120, int(lease_seconds or 30)))
+    with _connection(db_path) as con:
+        con.execute("begin immediate")
+        rows = con.execute(
+            """select * from notification_deliveries
+               where status in ('queued','sending')
+                 and (next_attempt_at is null or next_attempt_at<=?)
+               order by created_at asc limit 100""",
+            (now,),
+        ).fetchall()
+        for row in rows:
+            count_row = con.execute(
+                """select count(*) as n from notification_deliveries
+                   where channel_id=? and id<>? and (
+                       (status='sent' and coalesce(delivered_at, created_at)>=?)
+                       or (status='sending' and next_attempt_at>?)
+                   )""",
+                (row["channel_id"], row["id"], now - 3600, now),
+            ).fetchone()
+            reserved = int(count_row["n"] if count_row else 0)
+            if max_per_hour and reserved >= int(max_per_hour):
+                oldest = con.execute(
+                    """select min(coalesce(delivered_at, created_at)) as oldest
+                       from notification_deliveries
+                       where channel_id=? and status='sent'
+                         and coalesce(delivered_at, created_at)>=?""",
+                    (row["channel_id"], now - 3600),
+                ).fetchone()
+                oldest_at = oldest["oldest"] if oldest else None
+                due_at = max(now + 30, float(oldest_at) + 3601) if oldest_at is not None else now + 30
+                queue_reason = "retry" if row["queue_reason"] == "retry" else "rate_limit"
+                con.execute(
+                    """update notification_deliveries
+                       set status='queued', queue_reason=?, next_attempt_at=?, updated_at=?
+                       where id=?""",
+                    (queue_reason, due_at, now, row["id"]),
+                )
+                continue
+            con.execute(
+                """update notification_deliveries
+                   set status='sending', next_attempt_at=?, updated_at=? where id=?""",
+                (lease_until, now, row["id"]),
+            )
+            claimed = con.execute(
+                "select * from notification_deliveries where id=?", (row["id"],)
+            ).fetchone()
+            return _delivery_row(claimed)
+        return None
 
 
 def list_deliveries(db_path, *, limit=100, before=None, event_type=None, channel_id=None, status=None):
@@ -484,7 +648,7 @@ def prune_history(db_path, *, retention_days=None):
     cutoff = time.time() - (max(1, int(days)) * 86400)
     with _connection(db_path) as con:
         cur = con.execute(
-            "delete from notification_deliveries where created_at < ? and status not in ('queued')",
+            "delete from notification_deliveries where created_at < ? and status not in ('queued','sending')",
             (cutoff,),
         )
         return {"deleted": cur.rowcount if cur.rowcount is not None else 0}

@@ -49,20 +49,20 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
-      version: "v0.1.06",
-      slug: "v0-1-06",
-      released_at: "2026-08-02",
-      title: "Notifications become a real system, and SLSKD gets smarter searches",
-      summary: "Notifications now support per-channel event triggers, series scoping, quiet hours, and delivery history. SLSKD searches use better terms and more patience, several stuck-download patterns are fixed, and provider secrets no longer leak into diagnostics.",
+      version: "v0.1.07",
+      slug: "v0-1-07",
+      released_at: "2026-08-05",
+      title: "Acquisition, search, and importing get more reliable",
+      summary: "This build focused mainly on making acquisition, search, and importing more reliable. It also includes a security pass, several performance improvements, and some lighter UI work.",
       highlights: [
-        "Notifications are a real system now: per-channel event triggers, series scoping, quiet hours, delivery history, and test buttons for Discord and Pushover.",
-        "SLSKD searches no longer waste queries on literal \"cbz\"/\"cbr\" keywords or miss singular/plural title variants, and get more time before assuming a timeout.",
-        "Fixed several stuck-download patterns: repeat-reject loops, permanent single-timeout blocks, and dead-end searches that only turn up already-rejected results.",
-        "Fixed downloads that were grabbed but never finished landing in your library.",
-        "Rate-limited or temporarily unavailable sources no longer get mislabeled as failed transfers.",
-        "The \"item imported\" notification no longer repeats for the same file on every re-check.",
-        "Provider API keys and webhook tokens no longer show up in error messages or diagnostic output.",
-        "Recover Missing's tiles no longer overlap, Search All's scope is clearer, and SLSKD's default per-user transfer cap was raised."
+        "Manual Search no longer fails across every provider at once — a locking issue meant one slow provider could block the other three from starting; providers now run independently again.",
+        "\"Use this candidate\" in Manual Review now works for downloaded files instead of silently doing nothing, while still checking for corruption and duplicates.",
+        "Fixed a cleanup crash that could break search, imports, and queue processing at the same time.",
+        "Fixed an issue that could import a release into the wrong series when two MangaDex titles shared an alias or creator credit.",
+        "Fixed Roman numeral parsing, unnecessary search cooldowns, and several causes of stuck or silently failed downloads, including a new 48-hour Soulseek timeout.",
+        "Search matching is more accurate, and several import problems (ordering, stuck-in-queue, duplicate imports, multi-series packs) are fixed.",
+        "Security improvements: provider credentials are no longer written to persistent storage, and a script-injection issue in search-result data has been fixed.",
+        "Wanted, Queue, History, Blocklist, and Manual Review now use a new page-rendering system — pagination is noticeably faster on larger libraries."
       ]
     })
   ]);
@@ -81,6 +81,13 @@
       previousDate = release.released_at;
     });
     return catalog;
+  }
+
+  function releaseHistorySummary(count) {
+    var visibleCount = Math.max(0, Math.min(DETAILED_RELEASE_LIMIT, Math.floor(Number(count) || 0)));
+    if (!visibleCount) return "No recent updates are shown here. Older release notes remain available on GitHub.";
+    if (visibleCount === 1) return "The latest update is shown here. Older release notes remain available on GitHub.";
+    return "The latest " + visibleCount + " updates are shown here. Older release notes remain available on GitHub.";
   }
 
   validateCatalog(PUBLIC_RELEASES);
@@ -199,7 +206,8 @@
   function renderReleases(container, options) {
     if (!container) return null;
     options = options || {};
-    var catalog = validateCatalog((options.catalog || PUBLIC_RELEASES).map(publicRelease));
+    var sourceCatalog = Array.isArray(options.catalog) ? options.catalog : PUBLIC_RELEASES;
+    var catalog = validateCatalog(sourceCatalog.map(publicRelease)).slice(0, DETAILED_RELEASE_LIMIT);
     var requested = String(options.releaseVersion || releaseFromHash(options.hash)).trim();
     var selectedIndex = catalog.findIndex(function (release) { return release.version === requested; });
     if (selectedIndex < 0) selectedIndex = 0;
@@ -211,7 +219,7 @@
     var title = document.createElement("h3");
     title.textContent = "Release history";
     var detail = document.createElement("p");
-    detail.textContent = "The latest 10 updates are shown here. Older release notes remain available on GitHub.";
+    detail.textContent = releaseHistorySummary(catalog.length);
     var fullHistory = document.createElement("a");
     fullHistory.href = GITHUB_RELEASE_HISTORY_URL;
     fullHistory.textContent = "Full release history on GitHub";
@@ -321,7 +329,7 @@
     var rows = [
       row("Product", text(metadata.product, "InkDrop"), "Application name"),
       row("Version", productVersionLabel(metadata), "Product version"),
-      row("Build ID", displayVersion(metadata), "Machine-readable SemVer"),
+      row("Build ID", displayVersion(metadata), "InkDrop release identifier"),
       metadata.qa_build_number !== undefined && metadata.qa_build_number !== null && text(metadata.qa_build_number)
         ? row("QA Build", text(metadata.qa_build_number), "QA candidate build number")
         : null,

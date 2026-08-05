@@ -301,6 +301,103 @@ def trusted_issue_subtitle_matches_release(series_title, release_title, issue_ti
     )
 
 
+_LEADING_NUMERIC_PREFIX_RE = re.compile(r"^\s*0*(\d{1,5})(?:\.\d+)?[\s_.:\-]+(?=\S)")
+_TRUSTED_UNIT_AFTER_TITLE_RE = re.compile(
+    r"^[\s:._\-]*(?:#|no\.?|num(?:ber)?\.?|issue|iss)?[\s._-]*0*(\d{1,5}(?:\.\d+)?)"
+    r"(?:\s*(?:\(\s*of\s*0*(\d{1,4})\s*\)|of\s*0*(\d{1,4})|/\s*0*(\d{1,4})))?",
+    re.I,
+)
+
+
+def trusted_numeric_prefix_import_is_safe(stem, trusted_aliases, trusted_issue):
+    """Exempt a bare leading number from the weak-numeric-prefix rejection
+    only when it is provably reading-order/collection metadata rather than an
+    unrelated file, shared by the SLSKD staged matcher and the final import
+    classifier so the two never diverge again.
+
+    Two library conventions are both legitimate and are both recognized here:
+
+    1. Collection ordinal before an exact title before the real unit, e.g.
+       "1. House of X 01 (of 06) ..." or "18 - Ms. Marvel 007 (2016) ...".
+       The leading number is discarded once everything after it begins with
+       the complete canonical title/alias and the next unit number after that
+       exact title is the trusted issue. A well-formed, bounded "(of N)"/
+       "of N" collection-size suffix is allowed after the unit.
+    2. Exact unit before an exact title with nothing else, e.g.
+       "0012 -  - Deadman Wonderland.cbz". The leading number IS the trusted
+       unit, and the title immediately follows with no contradicting number.
+
+    Both require the remainder to BEGIN with the complete title -- a title
+    that merely appears later ("18 Dark Web - Ms. Marvel 001 (2023)") does
+    not count, which is what keeps unrelated collections and mismatched
+    issues rejected. This only rescinds the bare-numeric-prefix veto; every
+    other identity/pack/duplicate/range/ComicInfo/related-subseries gate the
+    caller already runs still applies untouched.
+    """
+
+    expected = _number_text(trusted_issue)
+    if not expected:
+        return False
+    text = str(stem or "").replace("_", " ")
+    prefix_match = _LEADING_NUMERIC_PREFIX_RE.match(text)
+    if not prefix_match:
+        return False
+    remainder = text[prefix_match.end():]
+    remainder_words = re.findall(r"[a-z0-9]+", remainder.casefold())
+
+    best_alias_words = None
+    for alias in trusted_aliases or []:
+        alias_words = re.findall(r"[a-z0-9]+", str(alias or "").casefold())
+        if not alias_words:
+            continue
+        if remainder_words[: len(alias_words)] != alias_words:
+            continue
+        if best_alias_words is None or len(alias_words) > len(best_alias_words):
+            best_alias_words = alias_words
+    if best_alias_words is None:
+        return False
+
+    alias_pattern = r"[\W_]+".join(re.escape(word) for word in best_alias_words)
+    title_match = re.match(rf"^\s*{alias_pattern}(?P<tail>.*)$", remainder, re.I)
+    if not title_match:
+        return False
+    tail = title_match.group("tail")
+
+    def of_total_is_well_formed(match):
+        of_total = match.group(2) or match.group(3) or match.group(4)
+        if of_total is None:
+            return True
+        try:
+            total = int(of_total)
+        except ValueError:
+            return False
+        if not (1 <= total <= 999):
+            return False
+        try:
+            unit_value = int(float(match.group(1)))
+        except ValueError:
+            unit_value = None
+        return unit_value is None or total >= unit_value
+
+    # Case 1: the leading number IS the trusted unit and the exact title
+    # follows immediately with no other numbered unit contradicting it.
+    if _number_text(prefix_match.group(1)) == expected:
+        trailing_unit = _TRUSTED_UNIT_AFTER_TITLE_RE.match(tail)
+        if not trailing_unit:
+            return True
+        if _number_text(trailing_unit.group(1)) == expected and of_total_is_well_formed(trailing_unit):
+            return True
+
+    # Case 2: the leading number is reading-order/collection metadata, and
+    # the unit immediately after the exact title is the trusted issue.
+    unit_match = _TRUSTED_UNIT_AFTER_TITLE_RE.match(tail)
+    if not unit_match:
+        return False
+    if _number_text(unit_match.group(1)) != expected:
+        return False
+    return of_total_is_well_formed(unit_match)
+
+
 def _xml_escape(value):
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -1280,7 +1377,64 @@ def container_annotation_group(value):
     return release_credit_group(value)
 
 
-def benign_exact_title_organizational_folder_tail(tail):
+def _organizational_prefix_marker(text, issue_number):
+    """Strip a leading, unbracketed organizational marker from a container tail.
+
+    Real pack folders often lead with a bare marker before their bracketed
+    annotations -- "001-008 (2017-2018)", "V4 (2016)", "v1 (001 - 037 +
+    Annual)". Only three shapes are trusted, and only the ones that carry no
+    identity ambiguity of their own:
+
+    - a volume marker (v1, V4, vol 1): volumes are a separate numbering axis
+      from issues, so no issue-number match is required;
+    - an issue range that contains the trusted target issue;
+    - the exact trusted issue number standing alone.
+
+    Anything else -- an unrelated number, a range that excludes the target,
+    a bare word -- is left in place for the caller's normal rejection path.
+    """
+
+    if issue_number is None:
+        return text, False
+    try:
+        wanted = float(str(issue_number).strip())
+    except (TypeError, ValueError):
+        return text, False
+    match = re.match(
+        r"""^\s*
+        (?:
+            (?:v|vol|volume)[\s._-]*0*(?P<vol>\d+(?:\.\d+)?)
+            |
+            0*(?P<range_start>\d+(?:\.\d+)?)\s*[-–—]\s*0*(?P<range_end>\d+(?:\.\d+)?)
+            |
+            0*(?P<exact>\d+(?:\.\d+)?)
+        )
+        (?=[\s._+-]*[\[(]|\s*$)
+        """,
+        text,
+        re.I | re.X,
+    )
+    if not match:
+        return text, False
+    if match.group("vol") is None:
+        if match.group("range_start") is not None:
+            try:
+                low, high = sorted((float(match.group("range_start")), float(match.group("range_end"))))
+            except ValueError:
+                return text, False
+            if not (low <= wanted <= high):
+                return text, False
+        else:
+            try:
+                if float(match.group("exact")) != wanted:
+                    return text, False
+            except (TypeError, ValueError):
+                return text, False
+    remainder = re.sub(r"^[\s._+-]+", "", text[match.end():])
+    return remainder, True
+
+
+def benign_exact_title_organizational_folder_tail(tail, issue_number=None):
     """Recognize a container folder that only annotates the series it holds.
 
     A pack folder is named for what it contains: the range, the years it spans,
@@ -1297,6 +1451,10 @@ def benign_exact_title_organizational_folder_tail(tail):
     -- see container_annotation_group -- because "(Conan)" is perfectly well
     bracketed and still means the folder holds a different book.
 
+    A common real-world shape leads with an unbracketed organizational marker
+    before the bracketed groups -- "001-008 (2017-2018)", "V4 (2016)". See
+    _organizational_prefix_marker for the narrow set trusted here.
+
     Only ancestor directories are read this leniently. The file's own name is
     still held to the strict rule, so a stray issue sitting inside an otherwise
     correct pack folder is caught on its own merits.
@@ -1306,6 +1464,7 @@ def benign_exact_title_organizational_folder_tail(tail):
     # A pack folder often welds the title to its first group with punctuation
     # ("Akira.(01-38+trades)"). That separator is not a second title word.
     text = re.sub(r"^[\s._+-]+", "", text)
+    text, _consumed_prefix = _organizational_prefix_marker(text, issue_number)
     groups = []
     while text:
         match = re.match(

@@ -31,11 +31,12 @@ def require(condition, message):
 
 def threshold_smoke():
     original_now = resolver.now
-    original_fallback = resolver.viable_cached_slskd_fallback_count
+    start = 10_000.0
+    later = start + 48 * 60 * 60 + 60
     try:
-        resolver.now = lambda: 10_000.0
-        resolver.viable_cached_slskd_fallback_count = lambda record: 1
-        record = {"candidate_source": "slskd_probe", "ts": 10_000 - 301, "review_id": "review", "filename": "Series 001.cbz"}
+        resolver.now = lambda: start
+        require(resolver.SLSKD_WAITING_QUEUED_STALE_SECONDS == 48 * 60 * 60, "default queued-wait stall must be 48 hours")
+        record = {"candidate_source": "slskd_probe", "ts": start - 301, "review_id": "review", "filename": "Series 001.cbz"}
         remote = {
             "status": "transfer_in_progress",
             "state": "Queued, Remotely",
@@ -46,16 +47,24 @@ def threshold_smoke():
             "same_user_active_transfer_count": 1,
             "same_candidate_active_transfer_count": 0,
         }
-        require(resolver.queued_transfer_stale_seconds(record, remote, local=False) == 5 * 60, "unrelated same-user transfer must not extend remote fallback")
-        require("queued remotely" in resolver.stale_waiting_failure_reason(record, remote), "remote fallback must fail at five minutes")
+        require(
+            resolver.queued_transfer_stale_seconds(remote) == resolver.SLSKD_WAITING_QUEUED_STALE_SECONDS,
+            "an unrelated same-user active transfer must not shorten the queued-wait threshold",
+        )
+        require(not resolver.stale_waiting_failure_reason(record, remote), "a five-minute-old remote queue wait must survive the 48h default")
+        resolver.now = lambda: later
+        require("queued remotely" in resolver.stale_waiting_failure_reason(record, remote), "remote queue wait must fail once it exceeds 48 hours")
+        resolver.now = lambda: start
         local = dict(remote, state="Queued, Locally")
-        record["ts"] = 10_000 - 241
-        require(resolver.queued_transfer_stale_seconds(record, local, local=True) == 4 * 60, "local fallback must be four minutes")
-        require("queued locally" in resolver.stale_waiting_failure_reason(record, local), "local fallback must fail at four minutes")
+        record["ts"] = start - 241
+        require(not resolver.stale_waiting_failure_reason(record, local), "a four-minute-old local queue wait must survive the 48h default")
+        resolver.now = lambda: later
+        require("queued locally" in resolver.stale_waiting_failure_reason(record, local), "local queue wait must fail once it exceeds 48 hours")
+        resolver.now = lambda: start
         remote["same_candidate_active_transfer_count"] = 1
         require(
-            resolver.queued_transfer_stale_seconds(record, remote, local=False) == resolver.SLSKD_WAITING_REMOTE_QUEUE_ACTIVE_USER_STALE_SECONDS,
-            "only same-candidate progress may extend the delay",
+            resolver.queued_transfer_stale_seconds(remote) == resolver.SLSKD_WAITING_REMOTE_QUEUE_ACTIVE_USER_STALE_SECONDS,
+            "only same-candidate progress may shorten the delay",
         )
 
         active = {
@@ -103,7 +112,6 @@ def threshold_smoke():
             not resolver.stale_waiting_failure_reason(record, active, {"enabled": False, "seconds": 5 * 60}),
             "disabled stall gate failed active transfer",
         )
-        resolver.viable_cached_slskd_fallback_count = lambda _record: 0
         queued = dict(active, state="Queued, Remotely", requestedAt="1970-01-01T02:40:40")
         record["ts"] = 10_000 - 6 * 60
         require(
@@ -305,7 +313,6 @@ def threshold_smoke():
                 require(not escaped, f"symlink suffix escaped the SLSKD root: {escaped}")
     finally:
         resolver.now = original_now
-        resolver.viable_cached_slskd_fallback_count = original_fallback
 
 
 def configured_completed_transfer_root_smoke():
@@ -1691,10 +1698,17 @@ def persisted_stall_policy_smoke():
             environment_policy = resolver.slskd_stall_policy(db)
             with inkdrop_state.connect(db) as con:
                 watchdog_environment_policy = inkdrop_state.queue_watchdog_policy(con)
+            active_stall = watchdog_environment_policy["slskd_stall"]
             require(
                 environment_policy["seconds"] == 7200
                 and watchdog_environment_policy["slskd_stale_seconds"] == 7200
-                and watchdog_environment_policy["slskd_stall"] == environment_policy,
+                # resolver.slskd_stall_policy() merges the active-stall policy with the
+                # queued-wait policy into one dict for its callers; inkdrop_state keeps
+                # them as two separate objects for its own watchdog consumers -- so
+                # compare the active-stall fields, then the queued-wait fields, rather
+                # than asserting whole-dict equality across the two shapes.
+                and all(environment_policy.get(key) == value for key, value in active_stall.items())
+                and environment_policy["queued_wait_seconds"] == watchdog_environment_policy["slskd_queued_wait_stale_seconds"],
                 f"worker and durable watchdog split effective environment policy: {environment_policy} {watchdog_environment_policy}",
             )
 

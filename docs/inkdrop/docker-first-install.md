@@ -865,6 +865,29 @@ hiding them in worker code:
 - Failed jobs use bounded exponential backoff capped by
   `INKDROP_SCHEDULER_FAILURE_BACKOFF_MAX_SECONDS`. Optional-provider failures
   remain visible as degraded state without making core worker health fail.
+- The five-minute log-retention job rotates `.log` and `.jsonl` files under
+  `INKDROP_LOG_DIR` at 64 MiB into unique immutable generations; no generation
+  is shifted or overwritten. Linux rotates immediately, so an existing writer
+  stays on its renamed inode while new opens use the recreated active path.
+  Other platforms require a quiet, stable, closed file. Deletion does not trust
+  container-local `/proc`: a generation must be at least two hours old (twice
+  the current maximum 3,600-second scheduled child timeout) and unchanged
+  across a stability sample before count or 14-day retention can remove it.
+  Concurrent scheduler runs defer behind a shared maintenance lock in
+  `INKDROP_LOCK_DIR`.
+- The scheduled-generation envelope is
+  `ceil(writer_grace / interval) * scheduler_count + retained_count`. At the
+  defaults this is 24 protected generations per scheduler plus five retained;
+  the standard two-scheduler Compose topology is therefore 53 generations plus
+  the active path per log (a nominal 3.375 GiB at exactly 64 MiB each). A file
+  can exceed the threshold between passes, so this is a scheduled generation
+  bound, not a strict byte cap. Pre-existing numeric `.1`/`.N` generations are
+  a one-time additive allowance: they are never shifted or overwritten, receive
+  the same grace and stability protection, and then converge to the configured
+  numeric count/age rules.
+  `INKDROP_LOG_ROTATION_*`,
+  `INKDROP_LOG_RETENTION_*`, and the paired scheduler interval/timeout values
+  expose bounded overrides.
 - Leave `INKDROP_CONTAINER_WEB_BASE_URL` blank in normal Compose installs so it
   derives `http://inkdrop:${INKDROP_PORT}` for web-owned maintenance endpoints.
   An explicit value is an advanced worker callback override and must use the

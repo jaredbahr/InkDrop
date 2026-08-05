@@ -28,6 +28,7 @@ except Exception:
 
 import inkdrop_runtime_config
 import inkdrop_qbittorrent_auth
+import inkdrop_acquire
 
 try:
     import inkdrop_language
@@ -58,6 +59,13 @@ PENDING_IMPORTS_LOG = STATE_DIR / "pending-imports.jsonl"
 MAX_IMPORT_STATUS_EVENT_BYTES = 64 * 1024 * 1024
 REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
 MANUAL_REVIEW_ACTIONS_FILE = STATE_DIR / "manual-review-actions.json"
+# Same durable write-time dedup store inkdrop_missing_acquire.py's review()
+# uses -- both append to the same REVIEW_FILE and both had the same gap: a
+# rescan that keeps hitting the same still-unresolved file (a still-bad
+# archive, a still-mismatched target) logged a fresh line every pass with no
+# memory of already having said so.
+MANUAL_REVIEW_DEDUP_FILE = STATE_DIR / "manual-review-dedup.json"
+MANUAL_REVIEW_DEDUP_WINDOW_SECONDS = 6 * 3600
 MANUAL_SOURCE_AUTORESOLVE_STATUS_FILE = STATE_DIR / "manual-source-autoresolve-status.json"
 KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
 KAVITA_API = os.environ.get("INKDROP_KAVITA_URL") or ""
@@ -438,7 +446,7 @@ def related_subseries_source_blocker(series_title, source_path, issue_title=None
         if words:
             tail_text = match.group("tail") or ""
             if segment_index > 0 and inkdrop_artifact_acceptance.benign_exact_title_organizational_folder_tail(
-                tail_text
+                tail_text, issue_number
             ):
                 continue
             if inkdrop_artifact_acceptance.benign_exact_title_publication_tail(
@@ -2910,38 +2918,6 @@ def provider_enabled(provider_id, default=False):
     return bool(config.get("enabled", default))
 
 
-def load_qbit_settings():
-    try:
-        import yaml
-
-        cfg = yaml.safe_load(QBIT_CONFIG.read_text()) if QBIT_CONFIG.exists() else {}
-        qbt = (cfg or {}).get("qbt") or {}
-    except Exception as exc:
-        log({"event": "qbit_config_load_failed", "error": f"{type(exc).__name__}: {exc}"})
-        qbt = {}
-    config = provider_config("qbittorrent") or {}
-    if config and not config.get("enabled", True):
-        raise RuntimeError("qBittorrent provider is disabled in InkDrop settings")
-    settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
-    host = str(config.get("base_url") or settings.get("host") or os.environ.get("INKDROP_QBITTORRENT_URL") or qbt.get("host") or "").strip().rstrip("/")
-    if not host:
-        raise RuntimeError("qBittorrent URL is not configured; set INKDROP_QBITTORRENT_URL or the qBittorrent provider host setting.")
-    if not host.startswith(("http://", "https://")):
-        host = "http://" + host
-    user = str(settings.get("username") or settings.get("user") or os.environ.get("INKDROP_QBITTORRENT_USERNAME") or qbt.get("user") or "").strip()
-    password = str(settings.get("password") or settings.get("pass") or os.environ.get("INKDROP_QBITTORRENT_PASSWORD") or qbt.get("pass") or "").strip()
-    return {
-        "host": host,
-        "user": user,
-        "pass": password,
-        "comics_category": str(settings.get("comics_category") or "comics").strip() or "comics",
-        "ebooks_category": str(settings.get("ebooks_category") or "ebooks").strip() or "ebooks",
-        "comics_save_path": str(settings.get("comics_save_path") or "/downloads/comics").strip() or "/downloads/comics",
-        "ebooks_save_path": str(settings.get("ebooks_save_path") or "/downloads/ebooks").strip() or "/downloads/ebooks",
-        "source": config.get("source") or "fallback",
-    }
-
-
 def path_setting(settings, key, fallback):
     value = str((settings or {}).get(key) or "").strip()
     return Path(value) if value else Path(fallback)
@@ -3141,10 +3117,64 @@ def import_status_sync_deferred(status=None):
     return bool(status.get("defer_inkdrop_import_status_sync"))
 
 
+def manual_review_id_for(reason, payload):
+    payload = payload if isinstance(payload, dict) else {}
+    raw = "|".join(
+        str(value or "").lower()
+        for value in (
+            reason,
+            payload.get("source"),
+            payload.get("dest"),
+            payload.get("matched_series") or payload.get("series"),
+        )
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def manual_review_recently_logged(review_id, now=None):
+    """True if this exact review_id was already logged within the dedup window."""
+
+    if not review_id:
+        return False
+    now = now if now is not None else time.time()
+    dedup = read_json_file(MANUAL_REVIEW_DEDUP_FILE, {}) or {}
+    if not isinstance(dedup, dict):
+        return False
+    try:
+        last_ts = float(dedup.get(review_id) or 0)
+    except (TypeError, ValueError):
+        last_ts = 0
+    return 0 < last_ts and (now - last_ts) < MANUAL_REVIEW_DEDUP_WINDOW_SECONDS
+
+
+def mark_manual_review_logged(review_id, now=None):
+    if not review_id:
+        return
+    now = now if now is not None else time.time()
+    dedup = read_json_file(MANUAL_REVIEW_DEDUP_FILE, {}) or {}
+    if not isinstance(dedup, dict):
+        dedup = {}
+    # Opportunistic pruning keeps this file bounded without a separate job --
+    # nothing past 4x the dedup window can still be suppressing a write.
+    cutoff = now - MANUAL_REVIEW_DEDUP_WINDOW_SECONDS * 4
+    dedup = {
+        key: value
+        for key, value in dedup.items()
+        if isinstance(value, (int, float)) and value >= cutoff
+    }
+    dedup[review_id] = now
+    write_json_atomic(MANUAL_REVIEW_DEDUP_FILE, dedup)
+
+
 def append_manual_review(reason, payload, db_path=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    review_id = manual_review_id_for(reason, payload)
+    if manual_review_recently_logged(review_id, now=now):
+        return
     with REVIEW_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"ts": time.time(), "reason": reason, **payload}, sort_keys=True) + "\n")
+        handle.write(json.dumps({"ts": now, "reason": reason, **payload}, sort_keys=True) + "\n")
+    mark_manual_review_logged(review_id, now=now)
     try:
         import inkdrop_notifications
         inkdrop_notifications.notify_manual_review(
@@ -5782,12 +5812,16 @@ def exact_manga_volume_import_identity(source, target):
 def unsafe_comic_target_match_reason(source, target):
     if not target:
         return None
-    source_name = Path(source).name
-    if is_manga_target(target) and (
-        re.search(r"(?:^|[^a-z0-9])(?:volume|vol\.?|v)[\s._-]*0*\d{1,3}(?!\d)", source_name, re.I)
-        and re.search(r"(?:^|[^a-z0-9])(?:chapter|chap|ch|c|issue|part|pt)\.?[\s._-]*0*\d+", source_name, re.I)
-    ):
-        return "manga_source_conflicting_unit_identity"
+    # A filename carrying both a volume and a chapter token (e.g. "Vol.3
+    # Ch.22") is normal chapter metadata, not a conflicting identity -- the
+    # item is chapter 22, collected in volume 3. This used to be an
+    # unconditional filename-only rejection here, before manga_import_guard()
+    # ever got a chance to make the actual target-aware unit decision (source
+    # unit classification, series unit-model policy, exact number/series
+    # agreement, duplicate/coverage checks). Let that guard decide; it
+    # already treats the volume token as source context, not a competing
+    # target, and still blocks a chapter-shaped file against a volume-only
+    # policy.
     if inkdrop_state is not None:
         issue_title = str(target.get("issue_title") or "").strip()
         queue_context = {
@@ -7160,10 +7194,86 @@ def trusted_issue_mismatch_reason(path, trusted_issue, target=None, comicinfo=No
     return None
 
 
+def pending_record_identity(record):
+    """A durable identity for the one physical transfer `record` describes,
+    independent of its title/query text. Prefers the explicit
+    pending_artifact_id written by record_pending_import() (inkdrop_acquire.py)
+    for current records; for records written before that field existed, it is
+    recomputed here from the same client_id/client_hash/nzo_id/download_url_hash
+    fields those records already carried, so history does not need a data
+    migration to benefit. Returns "" when the record has none of that -- the
+    caller must treat that as "no stable identity", not a match key.
+    """
+    explicit = str(record.get("pending_artifact_id") or "").strip()
+    if explicit:
+        return explicit
+    client_id = str(record.get("client_id") or record.get("client_hash") or record.get("nzo_id") or "").strip()
+    download_url_hash = str(
+        record.get("download_url_hash") or record.get("downloadUrlHash") or record.get("url_hash") or ""
+    ).strip()
+    if not client_id and not download_url_hash:
+        return ""
+    basis = "|".join((
+        str(record.get("protocol") or "").strip().lower(),
+        str(record.get("download_client") or "").strip().lower(),
+        str(client_id or "").strip(),
+        str(download_url_hash or "").strip(),
+    ))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def pending_record_target_identity(record):
+    return {
+        key: str(record.get(key) or "").strip()
+        for key in ("target_series_id", "target_issue_id", "target_queue_id", "target_wanted_id")
+        if str(record.get(key) or "").strip()
+    }
+
+
+def pending_target_identity(target):
+    """Whatever of a completion target's series/issue/queue/Wanted identity is
+    available at match time. This is usually only target_series_id -- the
+    completion pipeline resolves a target by series alias before it knows
+    which issue a file is -- which is still enough to keep two different
+    series that happen to share a title/query from settling each other's
+    pending records.
+    """
+    target = target if isinstance(target, dict) else {}
+    identity = {}
+    for out_key, in_keys in (
+        ("target_queue_id", ("queue_id", "queueId")),
+        ("target_wanted_id", ("wanted_id", "wantedId")),
+        ("target_series_id", ("series_id", "seriesId", "native_series_id", "inkdrop_series_id", "id")),
+        ("target_issue_id", ("issue_id", "issueId", "native_issue_id")),
+    ):
+        for in_key in in_keys:
+            value = str(target.get(in_key) or "").strip()
+            if value:
+                identity[out_key] = value
+                break
+    return identity
+
+
+def pending_identity_dicts_agree(a, b):
+    """True when two partial identity dicts share at least one key and never
+    disagree on a key both provide. Keys neither side has say nothing either
+    way -- absence is not evidence of a match or a mismatch."""
+    shared = set(a) & set(b)
+    if not shared:
+        return False
+    return all(a[key] == b[key] for key in shared)
+
+
 def load_pending_imports(kind):
     if not PENDING_IMPORTS_LOG.exists():
         return []
     latest = {}
+    # Records that share an alias but resolve to two different `latest` keys
+    # are two different physical downloads that happen to share a title or
+    # query (whether or not either has a durable identity) -- not one
+    # download whose later status should erase the other. Track that per
+    # alias so fuzzy alias matching can refuse to guess later.
+    alias_keys = {}
     with PENDING_IMPORTS_LOG.open("r", encoding="utf-8") as handle:
         for line in handle:
             try:
@@ -7172,41 +7282,97 @@ def load_pending_imports(kind):
                 continue
             if record.get("type") != kind:
                 continue
-            for key in ("title", "query"):
-                alias = normalize(record.get(key))
-                if alias:
-                    latest[alias] = record
+            # A quarantine entry is a record of an ambiguous match attempt,
+            # not a new fact about the download itself -- it must never
+            # replace the "sent" record it was quarantined instead of acting
+            # on, or the record would silently vanish from `pending` instead
+            # of staying searchable/retryable.
+            if record.get("event") == "pending_import_status_quarantined":
+                continue
+            aliases = [normalize(record.get(key)) for key in ("title", "query")]
+            aliases = [alias for alias in aliases if alias]
+            identity = pending_record_identity(record)
+            if not identity and not aliases:
+                continue
+            # A record with a durable identity is keyed on that identity alone,
+            # so a status update for one physical download can never replace
+            # another download's "sent" record just because they share a
+            # title/query. Only a record with no durable identity at all falls
+            # back to the legacy alias-joined key, which reproduces the old
+            # (already-ambiguous) collapse behavior for that record only.
+            key = identity or ("alias:" + "|".join(sorted(aliases)))
+            for alias in aliases:
+                alias_keys.setdefault(alias, set()).add(key)
+            latest[key] = record
     pending = []
-    seen_ids = set()
-    for alias, record in latest.items():
+    for record in latest.values():
         if record.get("status") != "sent":
-            continue
-        record_id = (normalize(record.get("title")), normalize(record.get("query")))
-        if record_id in seen_ids:
             continue
         aliases = [normalize(record.get("title")), normalize(record.get("query"))]
         aliases = [item for item in aliases if item]
-        pending.append({**record, "aliases": aliases})
-        seen_ids.add(record_id)
+        ambiguous = any(len(alias_keys.get(alias) or ()) > 1 for alias in aliases)
+        pending.append({
+            **record,
+            "aliases": aliases,
+            "pending_identity": pending_record_identity(record),
+            "pending_ambiguous_alias": ambiguous,
+        })
     return pending
 
 
 def matches_pending_import(path, pending):
-    return bool(matched_pending_records(path, pending))
+    matched, _quarantined = pending_match_records(path, pending)
+    return bool(matched)
 
 
 def matched_pending_records(path, pending):
+    matched, _quarantined = pending_match_records(path, pending)
+    return matched
+
+
+def pending_match_records(path, pending, target=None):
+    """Split alias-matched pending records into ones safe to act on and ones
+    that must be quarantined instead of guessed.
+
+    Fuzzy alias-word matching is kept as the initial recall filter -- it is
+    the only signal available for legacy records with no durable identity.
+    But when it surfaces more than one candidate for the same file, that is
+    exactly the fan-out this ledger used to mishandle by writing the same
+    status to every candidate. Resolve it with identity instead of guessing:
+    prefer records whose own target (series/issue) identity matches the
+    caller's target, when both sides have one; otherwise, if any surviving
+    candidate is flagged ambiguous (its alias is known to cover more than one
+    distinct physical download), quarantine the ambiguous ones rather than
+    writing a real status to a download that may not be the one that
+    actually completed.
+    """
     if not pending:
-        return []
+        return [], []
     haystack_words = clean_words(" ".join([path.name, path.parent.name]))
-    matched = []
+    candidates = []
     for record in pending:
-        for alias in record["aliases"]:
+        for alias in record.get("aliases") or []:
             alias_words = alias.split()
             if contains_sequence(haystack_words, alias_words):
-                matched.append(record)
+                candidates.append(record)
                 break
-    return matched
+    if len(candidates) <= 1:
+        return candidates, []
+    target_identity = pending_target_identity(target) if target else {}
+    if target_identity:
+        identity_matched = [
+            record for record in candidates
+            if pending_identity_dicts_agree(target_identity, pending_record_target_identity(record))
+        ]
+        # A confident identity match resolves the ambiguity outright -- the
+        # other alias-matched candidates are not "ambiguous", they are simply
+        # a different, known target and are excluded, not quarantined.
+        if identity_matched:
+            return identity_matched, []
+    unambiguous = [record for record in candidates if not record.get("pending_ambiguous_alias")]
+    if unambiguous:
+        return unambiguous, [record for record in candidates if record not in unambiguous]
+    return [], candidates
 
 
 def pending_only_source_roots(sources, pending):
@@ -7247,9 +7413,7 @@ def pending_only_source_roots(sources, pending):
 
 
 def append_pending_status(kind, path, status, dest=None, target=None, pending=None):
-    matched = matched_pending_records(path, pending or [])
-    if not matched:
-        return 0
+    matched, quarantined = pending_match_records(path, pending or [], target=target)
     identity_keys = (
         "downloadUrlHash",
         "download_url_hash",
@@ -7263,8 +7427,16 @@ def append_pending_status(kind, path, status, dest=None, target=None, pending=No
         "nzo_id",
         "nzo_ids",
         "protocol",
+        "download_client",
+        "pending_artifact_id",
+        "target_series_id",
+        "target_issue_id",
+        "target_queue_id",
+        "target_wanted_id",
     )
     now = time.time()
+    if not matched and not quarantined:
+        return 0
     with PENDING_IMPORTS_LOG.open("a", encoding="utf-8") as handle:
         for record in matched:
             payload = {
@@ -7284,6 +7456,35 @@ def append_pending_status(kind, path, status, dest=None, target=None, pending=No
                 if value not in (None, "", []):
                     payload[key] = value
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        # An ambiguous alias with no way to tell which physical download it
+        # actually refers to must not silently receive a real status -- that
+        # is exactly how one target's outcome used to overwrite another's.
+        # Record the ambiguity itself so an operator can see it and the
+        # record stays "sent" (still searchable/retryable) instead of being
+        # marked with a status that may belong to a different download.
+        for record in quarantined:
+            payload = {
+                "event": "pending_import_status_quarantined",
+                "type": kind,
+                "attempted_status": status,
+                "reason": "ambiguous_alias_multiple_physical_downloads",
+                "title": record.get("title"),
+                "query": record.get("query"),
+                "source": str(path),
+                "created_at": now,
+            }
+            for key in identity_keys:
+                value = record.get(key)
+                if value not in (None, "", []):
+                    payload[key] = value
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            log({
+                "event": "pending_import_status_quarantined",
+                "title": record.get("title"),
+                "query": record.get("query"),
+                "source": str(path),
+                "attempted_status": status,
+            })
     return len(matched)
 
 
@@ -7349,13 +7550,45 @@ def qbit_host_path(save_path, file_name, qbit=None):
     return QBIT_HOST_DOWNLOAD_ROOT / rel_save / file_name
 
 
+class QbitIncompleteResult(set):
+    """A set of incomplete-download paths, same as callers have always gotten,
+    plus a verification_failed flag that only inkdrop_completed_import's own
+    fail-closed check reads. Several other callers (inkdrop_pack_import.py,
+    inkdrop_reconcile_imports.py) iterate/copy this as a plain set of paths;
+    subclassing keeps that contract exactly intact instead of forcing every
+    caller to learn a new (paths, ok) return shape.
+    """
+
+    def __new__(cls, iterable=(), *, verification_failed=False):
+        instance = super().__new__(cls, iterable)
+        return instance
+
+    def __init__(self, iterable=(), *, verification_failed=False):
+        super().__init__(iterable)
+        self.verification_failed = verification_failed
+
+
 def load_qbit_incomplete_paths(kind):
+    """Return a QbitIncompleteResult (a set of incomplete-download paths).
+
+    result.verification_failed is only True when qBittorrent is actually
+    configured and enabled but the live probe itself failed (auth, network,
+    bad response) -- as opposed to qBittorrent simply not being set up, which
+    is a normal, fully-resolved state (nothing to gate on). Callers that care
+    about fail-closed behavior must check verification_failed for any
+    candidate under qBittorrent's own download root: an unreachable client
+    must not be read as "nothing is incomplete".
+    """
     if kind not in {"comics", "ebooks"}:
-        return set()
+        return QbitIncompleteResult()
     try:
-        qbit = load_qbit_settings()
-        if not qbit.get("api_key") and not (qbit.get("user") and qbit.get("pass")):
-            raise RuntimeError("qBittorrent credentials are unavailable")
+        qbit = inkdrop_acquire.load_qbit_settings()
+    except Exception as exc:
+        # Not configured / disabled / no credentials at all: qBittorrent is
+        # legitimately not in play, so there is nothing to verify.
+        log({"event": "qbit_incomplete_probe_not_configured", "kind": kind, "error": str(exc)})
+        return QbitIncompleteResult()
+    try:
         target_category = qbit["comics_category"] if kind == "comics" else qbit["ebooks_category"]
         target_save_path = qbit["comics_save_path"] if kind == "comics" else qbit["ebooks_save_path"]
         category_keys = {normalize(target_category)}
@@ -7397,10 +7630,13 @@ def load_qbit_incomplete_paths(kind):
                 host_path = qbit_host_path(torrent.get("save_path"), item.get("name"), qbit)
                 if host_path:
                     incomplete.add(str(host_path))
-        return incomplete
+        return QbitIncompleteResult(incomplete)
     except Exception as exc:
+        # qBittorrent IS configured/enabled but the live probe failed -- fail
+        # closed rather than silently treating "couldn't check" as "nothing
+        # is incomplete".
         log({"event": "qbit_incomplete_probe_failed", "kind": kind, "error": str(exc)})
-        return set()
+        return QbitIncompleteResult(verification_failed=True)
 
 def scan_sources(kind, manual_inbox=False, suwayomi_staging=False, slskd_staging=False):
     if kind == "comics":
@@ -7610,7 +7846,9 @@ def native_manga_explicit_chapter_import_is_safe(path, target, number, trusted_i
     return True
 
 
-def classify_import_filename_safety(path, target=None, kind="comics", trusted_issue=None, comicinfo=None):
+def classify_import_filename_safety(
+    path, target=None, kind="comics", trusted_issue=None, comicinfo=None, collection_range_proof=None
+):
     if str(kind or "").lower() not in {"comics", "manga"} or not target:
         return {"ok": True, "score": 99, "evidence": ["not_comic_target"]}
     path = Path(path)
@@ -7657,7 +7895,14 @@ def classify_import_filename_safety(path, target=None, kind="comics", trusted_is
     issue_mismatch = trusted_issue_mismatch_reason(path, trusted_issue, target=target, comicinfo=info)
     if issue_mismatch:
         return reject(issue_mismatch, "Trusted queue issue does not match the filename number.")
-    if filename_has_range_or_pack(path):
+    # collection_range_proof is set only by direct_import_destination_unit_gate(),
+    # and only when the caller already proved this exact issue is a member of a
+    # collected-edition archive's derived collection_coverage (a range-named
+    # source is expected in that case -- it's the same file for every issue it
+    # covers). Every other gate in this function -- source identity, wrong
+    # unit type, trusted-issue mismatch, duplicate-copy suffix, weak numeric
+    # prefix, filename confidence score -- still runs untouched.
+    if filename_has_range_or_pack(path) and not collection_range_proof:
         return reject(
             "pack_candidate_requires_pack_handling",
             "Filename looks like a pack or issue/volume range, so it should use pack review instead of single-item import.",
@@ -7667,7 +7912,13 @@ def classify_import_filename_safety(path, target=None, kind="comics", trusted_is
             "duplicate_copy_suffix",
             "Filename ends with a duplicate-copy suffix and needs review before completing a wanted row.",
         )
-    if filename_has_weak_numeric_prefix(path) and not explicit_unit:
+    if (
+        filename_has_weak_numeric_prefix(path)
+        and not explicit_unit
+        and not inkdrop_artifact_acceptance.trusted_numeric_prefix_import_is_safe(
+            path.stem, target_aliases(target), trusted_issue
+        )
+    ):
         return reject(
             "weak_filename_unit_evidence",
             "Filename starts with a bare number before the title and does not provide an issue/chapter/volume token.",
@@ -8184,7 +8435,7 @@ def known_bad_artifact_path(path, *, file_sha256=None, decision=None):
         conn.close()
 
 
-def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, matched_only=False, series_filter=None, all_series=False, pending_only=False, manual_inbox=False, suwayomi_staging=False, max_files=None, source_files=None, trusted_volume_id=None, trusted_issue=None, trusted_series_id=None, trusted_issue_title=None, trusted_issue_id=None, wait_for_kavita_scan=True, apply_planned_path=None, wait_for_library_scan=None, slskd_staging=False):
+def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, matched_only=False, series_filter=None, all_series=False, pending_only=False, manual_inbox=False, suwayomi_staging=False, max_files=None, source_files=None, trusted_volume_id=None, trusted_issue=None, trusted_series_id=None, trusted_issue_title=None, trusted_issue_id=None, wait_for_kavita_scan=True, apply_planned_path=None, wait_for_library_scan=None, slskd_staging=False, human_approved=False):
     if wait_for_library_scan is None:
         wait_for_library_scan = bool(wait_for_kavita_scan)
     path_settings = apply_path_provider_settings()
@@ -8203,6 +8454,23 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
     explicit_sources = bool(source_files)
     if source_files:
         sources = [Path(source) for source in source_files]
+    # A human already looked at this exact file in Manual Review and confirmed it is
+    # correct -- honor that decision over the automated confidence/identity gates
+    # below, which exist to protect *unattended* imports. Scoped to explicit
+    # --source-file runs only, so it can never affect a batch/autopilot scan.
+    human_override_active = bool(human_approved and explicit_sources)
+
+    def human_override(gate, reason, detail=None, path=None):
+        if not human_override_active:
+            return False
+        log({
+            "event": "human_override_bypassed_gate",
+            "gate": gate,
+            "reason": reason,
+            "detail": detail,
+            "source": str(path) if path is not None else None,
+        })
+        return True
     if manual_inbox:
         for source in sources:
             if not dry_run and not source.is_file():
@@ -8259,6 +8527,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
             trusted_target.setdefault("issue_number", trusted_issue)
             trusted_target.setdefault("normalized_number", trusted_issue)
     incomplete_qbit_paths = load_qbit_incomplete_paths(kind)
+    qbit_verification_failed = getattr(incomplete_qbit_paths, "verification_failed", False)
     pending_imports = load_pending_imports(kind) if pending_only else []
     if pending_only and not explicit_sources and not manual_inbox and not suwayomi_staging and not slskd_staging:
         sources = pending_only_source_roots(sources, pending_imports)
@@ -8312,6 +8581,19 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     "event": "skip_incomplete_qbit_file",
                     "skip_reason": "source_file_incomplete_qbit_download",
                     "detail": "qBittorrent still reports this exact source file as incomplete; retry after the transfer finishes.",
+                    "source": str(path),
+                    "kind": kind,
+                    "action_needed": "automatic_wait",
+                }
+                log(event)
+                if explicit_sources:
+                    skipped.append(event)
+                continue
+            if qbit_verification_failed and media_management_path_under_root(path, [QBIT_HOST_DOWNLOAD_ROOT]):
+                event = {
+                    "event": "skip_unverifiable_qbit_completion",
+                    "skip_reason": "qbit_completion_unverifiable",
+                    "detail": "qBittorrent is configured but could not be queried, so this file's completion state can't be confirmed; retry once qBittorrent is reachable.",
                     "source": str(path),
                     "kind": kind,
                     "action_needed": "automatic_wait",
@@ -8417,6 +8699,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 continue
             target_dir = comic_import_target_dir(target) if kind == "comics" and target else dest_dir
             unsafe_match_reason = unsafe_comic_target_match_reason(path, target) if kind == "comics" and target and not collection else None
+            if unsafe_match_reason and human_override("unsafe_comic_target_match_reason", unsafe_match_reason, path=path):
+                unsafe_match_reason = None
             if unsafe_match_reason:
                 event = {
                     "event": "skip_unsafe_collection_part_match",
@@ -8442,6 +8726,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 skipped.append(event)
                 continue
             supplemental_reason = supplemental_source_blocker(path) if kind == "comics" and target and not collection else None
+            if supplemental_reason and human_override("supplemental_source_blocker", supplemental_reason, path=path):
+                supplemental_reason = None
             if supplemental_reason:
                 event = {
                     "event": "skip_supplemental_source_file",
@@ -8470,6 +8756,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 if kind == "comics" and target and not collection
                 else None
             )
+            if related_subseries_reason and human_override("related_subseries_source_blocker", related_subseries_reason, path=path):
+                related_subseries_reason = None
             if related_subseries_reason:
                 event = {
                     "event": "skip_related_subseries_match",
@@ -8492,6 +8780,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 if kind == "comics" and target and not collection
                 else {"ok": True}
             )
+            if not weak_filename_gate.get("ok") and human_override(
+                "weak_filename_import_guard", weak_filename_gate.get("reason"), weak_filename_gate.get("detail"), path=path
+            ):
+                weak_filename_gate = {"ok": True}
             if not weak_filename_gate.get("ok"):
                 event = {
                     "event": "skip_weak_filename_import_guard",
@@ -8697,6 +8989,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                             archive_check=archive_check,
                             collection=collection,
                         )
+                        if not decision.get("completion_eligible") and human_override(
+                            "artifact_acceptance_decision", decision.get("decision"), path=path
+                        ):
+                            decision = {**decision, "completion_eligible": True}
                         if not decision.get("completion_eligible"):
                             artifact_acceptance_skip_event(event, decision)
                             log(event)
@@ -8760,6 +9056,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                             archive_check=archive_check,
                             collection=collection,
                         )
+                        if not decision.get("completion_eligible") and human_override(
+                            "artifact_acceptance_decision", decision.get("decision"), path=path
+                        ):
+                            decision = {**decision, "completion_eligible": True}
                         if not decision.get("completion_eligible"):
                             artifact_acceptance_skip_event(event, decision)
                             log(event)
@@ -8975,6 +9275,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     archive_check=archive_check,
                     collection=collection,
                 )
+                if not decision.get("completion_eligible") and human_override(
+                    "artifact_acceptance_decision", decision.get("decision"), path=path
+                ):
+                    decision = {**decision, "completion_eligible": True}
                 if not decision.get("completion_eligible"):
                     artifact_acceptance_skip_event(event, decision)
                     attach_media_management_preview(event, target, path, event.get("dest"))
@@ -9417,6 +9721,11 @@ def main():
     parser.add_argument("--trusted-issue", help="For an explicit source file, require this watched issue number when present")
     parser.add_argument("--trusted-issue-title", help="For an explicit source file, carry the native watched issue title as import evidence")
     parser.add_argument("--trusted-issue-id", help="For an explicit source file, bind trusted issue metadata to this exact InkDrop issue row")
+    parser.add_argument(
+        "--human-approved",
+        action="store_true",
+        help="For an explicit --source-file, skip the automated filename/content-confidence gates (weak filename evidence, wrong unit type, related-subseries, supplemental, artifact acceptance) because a human already visually confirmed this exact file in Manual Review. Hard checks (archive integrity, duplicate-hash) still apply. No effect without --source-file.",
+    )
     parser.add_argument("--approve-reader-binding-work-id", help="Operator-approved InkDrop/native work id to bind to one Kavita series")
     parser.add_argument("--approve-reader-series-id", help="Kavita series id for --approve-reader-binding-work-id")
     parser.add_argument("--approve-reader-library-id", help="Kavita library id for --approve-reader-binding-work-id")
@@ -9508,6 +9817,7 @@ def main():
         wait_for_library_scan=not args.no_wait_for_library_scan,
         apply_planned_path=True if args.apply_planned_path else None,
         slskd_staging=args.slskd_staging,
+        human_approved=bool(args.human_approved),
     )
 
 

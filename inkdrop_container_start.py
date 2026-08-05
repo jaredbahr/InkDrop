@@ -37,9 +37,7 @@ def run_supervised() -> int:
     container that is half-alive (UI up, no background work -- or the
     reverse) is worse than one that visibly restarts.
     """
-    web = subprocess.Popen([sys.executable, "-B", "inkdrop_web.py"])
-    scheduler = subprocess.Popen([sys.executable, "-B", "inkdrop_container_scheduler.py"])
-    children = (web, scheduler)
+    children = []
 
     def forward(signum, _frame):
         for child in children:
@@ -48,11 +46,16 @@ def run_supervised() -> int:
             except OSError:
                 pass
 
-    signal.signal(signal.SIGTERM, forward)
-    signal.signal(signal.SIGINT, forward)
-
     exit_code = 0
     try:
+        web = subprocess.Popen([sys.executable, "-B", "inkdrop_web.py"])
+        children.append(web)
+        scheduler = subprocess.Popen([sys.executable, "-B", "inkdrop_container_scheduler.py"])
+        children.append(scheduler)
+
+        signal.signal(signal.SIGTERM, forward)
+        signal.signal(signal.SIGINT, forward)
+
         while True:
             finished = next((child for child in children if child.poll() is not None), None)
             if finished is not None:

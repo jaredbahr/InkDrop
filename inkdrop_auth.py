@@ -178,12 +178,17 @@ def validate_password(password, policy=None):
     return password
 
 
-def password_hash(password, *, salt=None, iterations=PASSWORD_ITERATIONS, policy=None):
-    password = validate_password(password, policy)
+def _password_hash_verified(password, *, salt=None, iterations=PASSWORD_ITERATIONS):
+    password = _password_text(password)
     iterations = max(260_000, int(iterations or PASSWORD_ITERATIONS))
     salt_bytes = bytes.fromhex(salt) if salt else secrets.token_bytes(16)
     value = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, iterations)
     return f"{PASSWORD_ALGORITHM}${iterations}${salt_bytes.hex()}${value.hex()}"
+
+
+def password_hash(password, *, salt=None, iterations=PASSWORD_ITERATIONS, policy=None):
+    password = validate_password(password, policy)
+    return _password_hash_verified(password, salt=salt, iterations=iterations)
 
 
 def verify_password(password, stored_hash):
@@ -1041,7 +1046,9 @@ def login(db_path, username, password, *, remote_addr=None, user_agent=None, ttl
             raise AuthError("invalid_credentials", "invalid username or password", status=429 if retry else 401, retry_after=retry)
         con.execute("delete from auth_login_attempts where bucket_key=?", (key,))
         if password_needs_rehash(row["password_hash"]):
-            con.execute("update auth_users set password_hash=?,updated_at=? where id=?", (password_hash(password), now, row["id"]))
+            # The stored credential already verified. A policy increase must
+            # not lock out an existing user while upgrading hash iterations.
+            con.execute("update auth_users set password_hash=?,updated_at=? where id=?", (_password_hash_verified(password), now, row["id"]))
         token = _token(SESSION_PREFIX)
         csrf_token = _token("ic")
         session_id = uuid.uuid4().hex

@@ -109,9 +109,135 @@ def _clean_number(value):
     return text
 
 
+def _metadata_declares_multiple_issues(value):
+    cleaned = _clean_number(value)
+    return bool(_positive_numeric_id(cleaned) and int(cleaned) > 1)
+
+
 def _positive_numeric_id(value):
     text = str(value or "").strip()
     return bool(text.isdigit() and int(text) > 0)
+
+
+def _row_dict(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "keys"):
+        return {key: value[key] for key in value.keys()}
+    return {}
+
+
+def _explicit_comicvine_replay_aliases(issue_rows):
+    """Return unambiguous Kapowarr replay issue -> ComicVine issue aliases.
+
+    Queue snapshots can replay a Kapowarr issue ID through ``issues`` while
+    labelling it ComicVine. The authoritative ComicVine row retains the exact
+    bridge in its raw payload, so use only that reciprocal relationship. Sparse
+    rows, duplicate mappings, and look-alike issue numbers deliberately remain
+    separate and therefore fail the singleton proof closed.
+    """
+
+    rows = [_row_dict(row) for row in issue_rows]
+    rows_by_metadata_id = {}
+    for row in rows:
+        metadata_id = str(row.get("metadata_id") or "").strip()
+        if (
+            str(row.get("metadata_provider") or "").strip().lower() == "comicvine"
+            and _positive_numeric_id(metadata_id)
+        ):
+            rows_by_metadata_id.setdefault(metadata_id, []).append(row)
+
+    candidate_pairs = []
+    for authoritative in rows:
+        authoritative_metadata_id = str(authoritative.get("metadata_id") or "").strip()
+        if (
+            str(authoritative.get("metadata_provider") or "").strip().lower() != "comicvine"
+            or not _positive_numeric_id(authoritative_metadata_id)
+        ):
+            continue
+        authoritative_raw_id = str(authoritative.get("raw_issue_id") or "").strip()
+        replay_metadata_id = str(authoritative.get("raw_kapowarr_issue_id") or "").strip()
+        if (
+            authoritative_raw_id != authoritative_metadata_id
+            or not _positive_numeric_id(replay_metadata_id)
+            or replay_metadata_id == authoritative_metadata_id
+        ):
+            continue
+        replay_rows = rows_by_metadata_id.get(replay_metadata_id) or []
+        if len(replay_rows) != 1:
+            continue
+        replay = replay_rows[0]
+        replay_raw_id = str(replay.get("raw_issue_id") or "").strip()
+        replay_raw_kapowarr_id = str(replay.get("raw_kapowarr_issue_id") or "").strip()
+        if replay_raw_id != replay_metadata_id or replay_raw_kapowarr_id != replay_metadata_id:
+            continue
+        authoritative_issue_id = str(authoritative.get("id") or "").strip()
+        replay_issue_id = str(replay.get("id") or "").strip()
+        if not authoritative_issue_id or not replay_issue_id or authoritative_issue_id == replay_issue_id:
+            continue
+        candidate_pairs.append((authoritative_issue_id, replay_issue_id))
+
+    authoritative_counts = {}
+    replay_counts = {}
+    for authoritative_issue_id, replay_issue_id in candidate_pairs:
+        authoritative_counts[authoritative_issue_id] = authoritative_counts.get(authoritative_issue_id, 0) + 1
+        replay_counts[replay_issue_id] = replay_counts.get(replay_issue_id, 0) + 1
+    return {
+        replay_issue_id: authoritative_issue_id
+        for authoritative_issue_id, replay_issue_id in candidate_pairs
+        if authoritative_counts.get(authoritative_issue_id) == 1
+        and replay_counts.get(replay_issue_id) == 1
+    }
+
+
+def _project_authoritative_comicvine_issue_rows(issue_rows, wanted_rows):
+    alias_to_authoritative = _explicit_comicvine_replay_aliases(issue_rows)
+    if not alias_to_authoritative:
+        return list(issue_rows), list(wanted_rows), 0
+
+    row_by_issue_id = {str(row["id"] or "").strip(): row for row in issue_rows}
+    projected_issues = [
+        row for row in issue_rows if str(row["id"] or "").strip() not in alias_to_authoritative
+    ]
+
+    grouped_wanted = {}
+    wanted_order = []
+    for row in wanted_rows:
+        projected = _row_dict(row)
+        original_issue_id = str(projected.get("issue_id") or "").strip()
+        authoritative_issue_id = alias_to_authoritative.get(original_issue_id, original_issue_id)
+        authoritative = row_by_issue_id.get(authoritative_issue_id)
+        if authoritative is not None and original_issue_id in alias_to_authoritative:
+            for field in ("title", "issue_number", "normalized_number", "metadata_provider", "metadata_id"):
+                projected[field] = authoritative[field]
+            projected["issue_id"] = authoritative_issue_id
+        projected["_original_issue_id"] = original_issue_id
+        grouped_wanted.setdefault(authoritative_issue_id, []).append(projected)
+        if authoritative_issue_id not in wanted_order:
+            wanted_order.append(authoritative_issue_id)
+
+    projected_wanted = []
+    for authoritative_issue_id in wanted_order:
+        group = grouped_wanted[authoritative_issue_id]
+        replay_issue_ids = {
+            replay_issue_id
+            for replay_issue_id, target_issue_id in alias_to_authoritative.items()
+            if target_issue_id == authoritative_issue_id
+        }
+        original_issue_ids = {row["_original_issue_id"] for row in group}
+        # Collapse only one authoritative claim paired with its one explicit
+        # replay claim. Repeated claims against either row remain visible so
+        # the existing duplicate-Wanted safety gate still fails closed.
+        if (
+            len(group) == 2
+            and len(replay_issue_ids) == 1
+            and original_issue_ids == {authoritative_issue_id, next(iter(replay_issue_ids))}
+        ):
+            group = [next(row for row in group if row["_original_issue_id"] == authoritative_issue_id)]
+        for row in group:
+            row.pop("_original_issue_id", None)
+            projected_wanted.append(row)
+    return projected_issues, projected_wanted, len(alias_to_authoritative)
 
 
 def _collected_singleton_markers(*values):
@@ -168,7 +294,11 @@ def singleton_issue_contexts_by_series_id(db_path, series_ids, *, now=None, con=
                 series_ids,
             ).fetchall()
             target_issue_rows = lookup_con.execute(
-                f"select series_id, id, title, metadata_provider, metadata_id from issues where series_id in ({placeholders}) and "
+                "select series_id, id, title, issue_number, normalized_number, metadata_provider, metadata_id, "
+                "json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.id') raw_issue_id, "
+                "coalesce(json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.kapowarrIssueId'), "
+                "json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.kapowarr_issue_id')) raw_kapowarr_issue_id "
+                f"from issues where series_id in ({placeholders}) and "
                 "(coalesce(normalized_number,'')=? or (coalesce(normalized_number,'')='' and coalesce(issue_number,'') in ('1','01','001','0001')))",
                 (*series_ids, normalized_one),
             ).fetchall()
@@ -234,6 +364,13 @@ def _singleton_issue_context_from_rows(
     metadata_fresh = bool(updated_at > 0 and 0 <= metadata_age <= SINGLETON_METADATA_MAX_AGE_SECONDS)
     raw = _json_loads(series_row["raw_json"] if series_row and stable_provider_identity and metadata_fresh else None)
     metadata_issue_count = inkdrop_state.series_display_metadata_from_raw(raw).get("issue_count")
+    raw_canonical_one_row_count = len(target_issue_rows)
+    raw_collected_wanted_count = len(collected_wanted_rows)
+    explicit_replay_alias_count = 0
+    if stable_provider_identity:
+        target_issue_rows, collected_wanted_rows, explicit_replay_alias_count = (
+            _project_authoritative_comicvine_issue_rows(target_issue_rows, collected_wanted_rows)
+        )
     canonical_one_row_count = len(target_issue_rows)
     canonical_positive_metadata_ids = {
         str(row["metadata_id"] or "").strip()
@@ -269,6 +406,7 @@ def _singleton_issue_context_from_rows(
     collected_singleton_proof = bool(
         stable_provider_identity
         and metadata_fresh
+        and not _metadata_declares_multiple_issues(metadata_issue_count)
         and trusted_issue_identity
         and series_row
         and bool(series_row["monitored"])
@@ -311,6 +449,8 @@ def _singleton_issue_context_from_rows(
         "canonical_issue_count": canonical_issue_count,
         "canonical_issue_one_row_count": canonical_one_row_count,
         "canonical_issue_positive_metadata_id_count": len(canonical_positive_metadata_ids),
+        "canonical_issue_one_row_count_before_replay_projection": raw_canonical_one_row_count,
+        "comicvine_replay_alias_count": explicit_replay_alias_count,
         "metadata_issue_count": metadata_issue_count,
         "singleton_metadata_trusted": stable_provider_identity,
         "singleton_metadata_fresh": metadata_fresh,
@@ -318,6 +458,7 @@ def _singleton_issue_context_from_rows(
         "singleton_issue_proof": singleton_issue_proof,
         "singleton_issue_proof_source": singleton_issue_proof_source,
         "collected_singleton_wanted_count": len(collected_wanted_rows),
+        "collected_singleton_wanted_count_before_replay_projection": raw_collected_wanted_count,
         "collected_singleton_markers": collected_markers,
         "collected_singleton_title_aliases": collected_title_aliases,
         "collected_singleton_proof": collected_singleton_proof,
@@ -482,6 +623,8 @@ def source_jobs_for_queue(
     provider_health_map=None,
     singleton_context=None,
     con=None,
+    settings_snapshot=None,
+    registry_rows=None,
 ):
     queue = queue if isinstance(queue, dict) and queue else None
     if queue is None:
@@ -492,7 +635,11 @@ def source_jobs_for_queue(
     if not queue:
         return {"ok": False, "reason": "queue_item_not_found", "queue_id": queue_id}
     wanted = wanted_item_from_queue(queue, db_path=db_path, con=con, singleton_context=singleton_context)
-    snapshot = inkdrop_state.settings_snapshot(db_path)
+    # A caller planning a whole pass (many queue rows) can precompute the
+    # snapshot/registry once -- both are identical for every row in the pass
+    # -- and pass them in via settings_snapshot/registry_rows instead of
+    # having every row rebuild them from scratch.
+    snapshot = settings_snapshot if isinstance(settings_snapshot, dict) else inkdrop_state.settings_snapshot(db_path)
     if provider_health_map is None:
         provider_health_map = {}
         with _borrowed_or_read_con(db_path, con) as health_con:
@@ -505,6 +652,7 @@ def source_jobs_for_queue(
         include_blocked=include_blocked,
         limit=job_limit,
         provider_health_map=provider_health_map,
+        registry_rows=registry_rows,
     )
     jobs = _select_jobs(jobs, provider_ids=provider_ids)
     return {
@@ -989,8 +1137,8 @@ def _public_task_evidence(value, depth=0):
                 out[f"{key}_hash"] = _protected_locator_hash(item)
                 continue
             if lowered in {
-                "api_key", "apikey", "authorization", "proxy-authorization", "cookie", "set-cookie",
-                "password", "secret", "token",
+                "api-key", "api_key", "apikey", "authorization", "proxy-authorization", "cookie", "set-cookie",
+                "password", "passkey", "secret", "token", "x-api-key", "x-auth-token",
             }:
                 out[key] = "[redacted]"
                 continue
@@ -1344,14 +1492,14 @@ def _covered_pack_queue_ids(task, primary_queue_id):
 
 
 def _task_media_type(task):
-    task = _dict(task)
-    raw = _dict(task.get("raw_json"))
-    wanted = _dict(raw.get("wanted_item"))
-    media_type = _first_text(raw.get("media_type"), wanted.get("media_type")).lower()
-    category = _first_text(task.get("category"), raw.get("category")).lower()
-    if "ebook" in media_type or "book" == media_type or "ebook" in category:
-        return "ebooks"
-    return "comics"
+    # inkdrop_download_client_routing.select_url_handoff_instances() already
+    # uses the shared classifier to pick a media-aware client instance (e.g.
+    # a Manga-mapped qBittorrent instance) -- this local copy only recognized
+    # ebooks and fell through to "comics" for everything else, including
+    # Manga, so a correctly-instance-selected Manga handoff still got
+    # materialized and dispatched with comics category/path. Delegating to
+    # the same classifier both call sites agree with fixes the mismatch.
+    return inkdrop_download_client_routing.task_media_type(task)
 
 
 def _normalize_handoff_client(value):
@@ -1528,6 +1676,7 @@ def _default_download_client_adder(task):
         unique_tag = _task_handoff_unique_tag(task)
         failures = []
         for candidate in instance_candidates:
+            instance = None
             try:
                 instance = inkdrop_download_client_routing.materialize_instance_settings(
                     db_path, candidate["download_client_instance_id"], _task_media_type(task)
@@ -1551,7 +1700,7 @@ def _default_download_client_adder(task):
             payload = dict(outcome or {})
             payload.setdefault("download_client_instance_id", candidate["download_client_instance_id"])
             payload["routing_reason"] = candidate["routing_reason"]
-            if candidate["client_type"] == "sabnzbd":
+            if candidate["client_type"] == "sabnzbd" and instance is not None:
                 payload = _resolve_sab_handoff_by_stable_key(task, payload, instance["settings"])
             if _download_client_handoff_ok(payload) or _download_client_handoff_ambiguous(payload) or _client_external_id(payload) or payload.get("added") is True:
                 payload["instance_failover_attempts"] = failures
@@ -2021,9 +2170,54 @@ def _trusted_page_endpoint_from_registry(db_path, task):
     return str(policy.get("suwayomi_page_base_url") or row.get("base_url") or "").strip()
 
 
-def _stage_download_task(task, *, http_get=None, staging_root=None, trusted_page_endpoint=""):
+def _direct_download_registry_row(db_path, task):
+    provider_id = inkdrop_sources.provider_key(
+        (task or {}).get("provider_id") or (task or {}).get("provider") or (task or {}).get("source")
+    )
+    if not provider_id or not db_path:
+        return None
+    try:
+        rows = inkdrop_source_registry.registry_from_db(db_path, include_disabled=True)
+    except Exception:
+        return None
+    return next(
+        (row for row in rows if inkdrop_sources.provider_key(row.get("provider_id")) == provider_id),
+        None,
+    )
+
+
+def _stage_download_task(task, *, http_get=None, staging_root=None, trusted_page_endpoint="", registry_row=None):
     download_client = str((task or {}).get("download_client") or "").strip().lower()
-    existing = _existing_staged_file_result(task, staging_root=staging_root)
+    effective_staging_root = staging_root
+    effective_incomplete_root = None
+    if download_client == "inkdrop_direct":
+        provider_id = inkdrop_sources.provider_key(
+            (task or {}).get("provider_id") or (task or {}).get("provider") or (task or {}).get("source")
+        )
+        if registry_row is not None and not registry_row.get("enabled", True):
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "provider_disabled",
+                "failure_reason": "provider_disabled",
+                "failure_class": "policy",
+                "provider_id": provider_id,
+            }
+        # A provider's finished/in-progress files can live under their own
+        # configured download_root/incomplete_root (see inkdrop_source_providers
+        # .direct_download_task_seed), not just the shared staging root -- the
+        # confinement root used to stage a task must match the root it was
+        # created under, or a customized provider path always misses. The two
+        # roots are resolved and passed independently -- an incomplete_root on
+        # a separate volume from download_root is a supported configuration,
+        # not a common-ancestor fallback.
+        effective_staging_root = str(
+            inkdrop_source_providers.direct_download_provider_root(staging_root, provider_id, registry_row)
+        )
+        effective_incomplete_root = str(
+            inkdrop_source_providers.direct_download_incomplete_root(effective_staging_root, registry_row)
+        )
+    existing = _existing_staged_file_result(task, staging_root=effective_staging_root)
     if existing:
         return existing
     if download_client == "inkdrop_page_pack":
@@ -2037,7 +2231,9 @@ def _stage_download_task(task, *, http_get=None, staging_root=None, trusted_page
         return direct_downloader.download_direct_task(
             task,
             http_get=http_get,
-            staging_root=staging_root,
+            staging_root=effective_staging_root,
+            download_root=effective_staging_root,
+            incomplete_root=effective_incomplete_root,
         )
     return {
         "ok": False,
@@ -2085,11 +2281,18 @@ def stage_direct_download_tasks(
     if dry_run or not tasks:
         return out
     for task in tasks:
+        download_client = str(task.get("download_client") or "").strip().lower()
+        registry_row = (
+            _direct_download_registry_row(db_path, task)
+            if download_client == "inkdrop_direct"
+            else None
+        )
         result = _stage_download_task(
             task,
             http_get=http_get,
             staging_root=staging_root,
             trusted_page_endpoint=_trusted_page_endpoint_from_registry(db_path, task),
+            registry_row=registry_row,
         )
         out["stage_results"].append(result)
         if source_memory_db_path:

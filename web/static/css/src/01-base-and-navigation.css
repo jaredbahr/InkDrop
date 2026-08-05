@@ -58,6 +58,9 @@
       background: var(--bg);
       min-height: 100vh;
     }
+    /* Narrow-viewport layout only. At >=1100px the desktop sidebar shell in
+       15-redesign-shell.css overrides main and main > .arr-content-shell and
+       owns content width -- change desktop width there, not here. */
     main { width: min(1280px, calc(100vw - 32px)); margin: 0 auto; padding: 16px 0 40px; }
     header {
       display: flex;
@@ -926,13 +929,19 @@
     .arr-page-stat.good { border-color: rgba(120, 217, 155, .34); }
     .arr-page-stat.warn { border-color: rgba(247, 201, 111, .44); }
     .arr-page-stat.bad { border-color: rgba(255, 125, 125, .44); }
-    .arr-page-stat strong {
+    .arr-page-stat-body strong {
       display: block;
       color: var(--text);
       font-size: 17px;
       line-height: 1.1;
     }
-    .arr-page-stat span {
+    /* Label styling must stay scoped to .arr-page-stat-body: the stat chip
+       also contains span.arr-page-stat-icon, and a bare `.arr-page-stat span`
+       here out-specifies `.arr-page-stat-icon { display: inline-grid }` in
+       15-redesign-shell.css (0,1,1 vs 0,1,0). That blockified the icon, left
+       its ::before inline at 0x0, and every masthead glyph rendered as an
+       empty circle. */
+    .arr-page-stat-body span {
       display: block;
       color: var(--muted);
       font-size: 10px;

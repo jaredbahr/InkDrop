@@ -98,12 +98,21 @@
     node.className = `inkdrop-auth-message ${tone || ""}`;
   }
 
+  function focusAuthCard(host) {
+    const card = host?.querySelector(".inkdrop-auth-card");
+    if (!card) return;
+    const target = card.querySelector("input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex='-1'])");
+    if (!target) card.tabIndex = -1;
+    (target || card).focus({preventScroll: true});
+  }
+
   function authCard(title, copy, formHtml) {
     const host = root();
     if (!host) return null;
     applyAuthArtworkPreference(host);
     host.innerHTML = `<section class="inkdrop-auth-card" role="dialog" aria-modal="true" aria-labelledby="inkdropAuthTitle"><img src="/inkdrop-logo-mark.png?v=20260728-opaque-logo" alt="" class="inkdrop-auth-logo"><h1 id="inkdropAuthTitle">${escapeHtml(title)}</h1><p>${escapeHtml(copy)}</p>${formHtml}</section>`;
     host.hidden = false;
+    focusAuthCard(host);
     return host.querySelector("form");
   }
 

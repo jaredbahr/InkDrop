@@ -58,6 +58,9 @@
       background: var(--bg);
       min-height: 100vh;
     }
+    /* Narrow-viewport layout only. At >=1100px the desktop sidebar shell in
+       15-redesign-shell.css overrides main and main > .arr-content-shell and
+       owns content width -- change desktop width there, not here. */
     main { width: min(1280px, calc(100vw - 32px)); margin: 0 auto; padding: 16px 0 40px; }
     header {
       display: flex;
@@ -926,13 +929,19 @@
     .arr-page-stat.good { border-color: rgba(120, 217, 155, .34); }
     .arr-page-stat.warn { border-color: rgba(247, 201, 111, .44); }
     .arr-page-stat.bad { border-color: rgba(255, 125, 125, .44); }
-    .arr-page-stat strong {
+    .arr-page-stat-body strong {
       display: block;
       color: var(--text);
       font-size: 17px;
       line-height: 1.1;
     }
-    .arr-page-stat span {
+    /* Label styling must stay scoped to .arr-page-stat-body: the stat chip
+       also contains span.arr-page-stat-icon, and a bare `.arr-page-stat span`
+       here out-specifies `.arr-page-stat-icon { display: inline-grid }` in
+       15-redesign-shell.css (0,1,1 vs 0,1,0). That blockified the icon, left
+       its ::before inline at 0x0, and every masthead glyph rendered as an
+       empty circle. */
+    .arr-page-stat-body span {
       display: block;
       color: var(--muted);
       font-size: 10px;
@@ -3406,6 +3415,10 @@
     .core-state.good { color: var(--good); border-color: rgba(120, 217, 155, .35); }
     .core-state.warn { color: var(--warn); border-color: rgba(247, 201, 111, .45); }
     .core-state.bad { color: var(--bad); border-color: rgba(255, 125, 125, .45); }
+    /* Active work in progress (searching/downloading/importing) -- same
+       accent/blue used for the "auto" lane pill elsewhere, so a row that's
+       actively moving never reads as the same idle-amber as one that isn't. */
+    .core-state.auto { color: var(--accent); border-color: rgba(114, 210, 255, .4); }
     .core-actions {
       display: flex;
       justify-content: flex-end;
@@ -4146,6 +4159,15 @@
       align-items: center;
       min-width: 0;
     }
+    /* Wanted, Queue, History, and Blocklist pull Source out of the combined
+       detail column into its own track (inkdropOperatorColumnRoles() /
+       SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py). The actual per-view
+       grid-template-columns overrides live in 04-tables-rows.css (Wanted's
+       6-track rule with its row-select column, Queue/History/Blocklist's
+       5-track rule without one) -- that file already owned each of these
+       selectors before this column existed, so the new source track was
+       added there instead of here to keep one file per selector.
+       See .section-table-col-source below for the new cell's own styling. */
     .section-table-column-heading {
       min-width: 0;
       overflow: hidden;
@@ -4158,6 +4180,18 @@
     }
     .section-table-col-detail {
       align-self: stretch;
+    }
+    .section-table-col-source {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: var(--font-sm, 12px);
+      font-weight: 700;
+    }
+    .section-table-source-empty::before {
+      content: "\2013";
     }
     .section-table-select {
       display: flex;
@@ -4610,7 +4644,7 @@
     .section-table-wanted .section-table-head,
     .section-table-wanted .section-table-row {
       min-width: 1040px;
-      grid-template-columns: 30px minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+      grid-template-columns: 30px minmax(280px, 1.15fr) minmax(108px, .3fr) minmax(130px, .4fr) minmax(260px, .85fr) minmax(132px, .34fr);
       gap: 8px;
     }
     .section-table-queue,
@@ -4631,7 +4665,7 @@
     .section-table-history .section-table-head,
     .section-table-history .section-table-row {
       min-width: 980px;
-      grid-template-columns: minmax(320px, .95fr) minmax(112px, .28fr) minmax(420px, 1.5fr) minmax(210px, .55fr);
+      grid-template-columns: minmax(280px, .85fr) minmax(112px, .28fr) minmax(130px, .4fr) minmax(340px, 1.3fr) minmax(210px, .55fr);
       gap: 12px;
     }
     .section-table-history {
@@ -4647,7 +4681,7 @@
     .section-table-source_memory .section-table-head,
     .section-table-source_memory .section-table-row {
       min-width: 940px;
-      grid-template-columns: minmax(250px, 1.15fr) minmax(150px, .55fr) minmax(300px, 1.5fr) minmax(200px, .7fr);
+      grid-template-columns: minmax(220px, 1fr) minmax(150px, .55fr) minmax(130px, .4fr) minmax(240px, 1.2fr) minmax(200px, .7fr);
       gap: 12px;
     }
     .section-table-source_memory {
@@ -4658,6 +4692,32 @@
     .section-table-source_memory .section-table-row {
       min-height: 64px;
       align-items: center;
+    }
+    /* Issues, Source Attempts, Download Tasks, and Imports joined
+       SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py, adding a "source" cell
+       between state and detail. Unlike Blocklist/History (no select
+       checkbox), these four keep their row-select checkbox, so -- like
+       Manual Review's own override -- they need six tracks, not the
+       five-track base grid, or the row-select checkbox track eats the
+       source cell's space and Actions wraps onto a second implicit row. */
+    .section-table-issues .section-table-head,
+    .section-table-issues .section-table-row,
+    .section-table-source_attempts .section-table-head,
+    .section-table-source_attempts .section-table-row,
+    .section-table-download_tasks .section-table-head,
+    .section-table-download_tasks .section-table-row,
+    .section-table-imports .section-table-head,
+    .section-table-imports .section-table-row {
+      min-width: 1040px;
+      grid-template-columns: 30px minmax(200px, 1.1fr) minmax(110px, .5fr) minmax(140px, .5fr) minmax(230px, 1.35fr) minmax(160px, .75fr);
+      gap: 10px;
+    }
+    .section-table-issues,
+    .section-table-source_attempts,
+    .section-table-download_tasks,
+    .section-table-imports {
+      overflow-x: auto;
+      scrollbar-width: thin;
     }
     .section-table-history .section-table-row {
       min-height: 64px;
@@ -5982,7 +6042,7 @@
     body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head,
     body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
       min-width: 1040px;
-      grid-template-columns: 30px minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+      grid-template-columns: 30px minmax(280px, 1.15fr) minmax(108px, .3fr) minmax(130px, .4fr) minmax(260px, .85fr) minmax(132px, .34fr);
       gap: 8px;
     }
     body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
@@ -10136,6 +10196,75 @@
     .manual-review-decision-body {
       gap: 14px;
     }
+    .manual-review-decision-heading {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+    .manual-review-evidence-columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+    }
+    .manual-review-evidence-column {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .manual-review-evidence-column h4 {
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+    @media (max-width: 640px) {
+      .manual-review-evidence-columns {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+    .manual-review-decision-advanced {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 2px 10px;
+    }
+    .manual-review-decision-advanced summary {
+      cursor: pointer;
+      padding: 6px 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+    }
+    .manual-review-decision-actions-secondary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 4px 0 10px;
+    }
+    .manual-review-decision-actions-secondary button {
+      display: grid;
+      gap: 2px;
+      align-content: center;
+      min-height: 38px;
+      padding: 6px 10px;
+      text-align: left;
+    }
+    .manual-review-decision-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 16px;
+      border-top: 1px solid var(--line);
+    }
+    .manual-review-decision-nav span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
     .manual-review-decision-grid {
       display: grid;
       grid-template-columns: minmax(140px, .32fr) minmax(0, 1fr);
@@ -13039,6 +13168,12 @@
       background: rgba(10, 18, 30, 0.36);
     }
     @media (min-width: 1100px) {
+      /* Historical 188px fixed-nav desktop layout, superseded at this same
+         breakpoint by 15-redesign-shell.css (loaded after this file, so it
+         wins the cascade): main, .arr-nav-shell and its children, and
+         .activity-region are all re-declared there with current values.
+         See that file's header comment for the full ownership note. Editing
+         the rules below changes nothing a user can see at >=1100px. */
       main {
         position: relative;
         display: block;
@@ -13295,7 +13430,19 @@
       }
       .section-table.section-table-operational.section-table-manual_review .section-table-head,
       .section-table.section-table-operational.section-table-manual_review .section-table-row {
-        grid-template-columns: minmax(282px, 1.24fr) minmax(148px, .58fr) minmax(330px, 1.34fr) minmax(174px, .66fr);
+        /* Manual Review keeps its row-select checkbox (selectableTable in
+           inkdrop_web.py includes "manual_review"), unlike Queue -- the
+           shared .section-table-operational rule above is 4 tracks with no
+           select column, which crushed this row's title into the checkbox
+           track exactly like Blocklist's rows used to (see the "Blocklist
+           rows carry four cells" comment in 04-tables-rows.css). Six tracks,
+           not five: manual_review joined SPLIT_SOURCE_COLUMN_VIEWS in
+           inkdrop_web.py, adding a "source" cell between state and detail --
+           without its own track here it wrapped onto a second implicit grid
+           row (default grid-auto-flow: row), scattering Actions below the
+           rest of the row instead of crushing it, since this rule still had
+           only enough tracks for the pre-split five-cell row. */
+        grid-template-columns: 30px minmax(260px, 1.15fr) minmax(120px, .48fr) minmax(140px, .48fr) minmax(280px, 1.15fr) minmax(174px, .66fr);
       }
       .section-table.section-table-operational .section-table-head {
         top: 0;
@@ -14458,11 +14605,29 @@
         padding: 2px 6px;
         font-size: 9px;
       }
+      /* Queue/Wanted's desktop min-width:1040px (04-tables-rows.css) is
+         declared on the same ".section-table-head, .section-table-row"
+         selector pair; this query only ever overrode .section-table-row's
+         grid-template-columns/areas, never its min-width and never touched
+         .section-table-head at all. The result on a real phone: the header
+         stayed pinned to the full 6-track desktop grid (forcing 1040px+
+         horizontal scroll) while rows tried to lay out as a 2-column card
+         inside a container still stretched to that same 1040px min-width --
+         so both the header labels and the row content ended up scrolled to
+         unrelated positions instead of the intended narrow single-column
+         card. Manual Review and Issues (11-responsive-layout.css) already
+         hide their head the same way this now does. */
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head {
+        display: none;
+      }
       body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
       body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
+        min-width: 0;
         grid-template-columns: minmax(0, 1fr) minmax(74px, auto);
         grid-template-areas:
           "item state"
+          "source source"
           "detail detail"
           "actions actions";
         gap: 5px 7px;
@@ -14478,6 +14643,10 @@
         grid-area: state;
         justify-self: end;
         max-width: 112px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-source,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-source {
+        grid-area: source;
       }
       body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-detail,
       body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-detail {
@@ -17675,11 +17844,13 @@
     body[data-inkdrop-view="manual_review"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-glyph],
     body[data-inkdrop-view="manual_review"] .section-table-actions.compact-action-rail > .section-table-action-more > summary[data-action-glyph] {
       grid-template-columns: minmax(0, 1fr) !important;
+      place-items: center stretch;
       width: auto !important;
       min-width: 88px !important;
       max-width: 154px !important;
       height: 28px;
       padding: 0 8px !important;
+      overflow: visible;
       font-size: 11px !important;
     }
     body[data-inkdrop-view="manual_review"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-glyph]::before,
@@ -17692,11 +17863,13 @@
     }
     body[data-inkdrop-view="queue"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph] {
       grid-template-columns: minmax(0, 1fr) !important;
+      place-items: center stretch;
       width: auto !important;
       min-width: 74px !important;
       max-width: 120px !important;
       height: 28px;
       padding: 0 10px !important;
+      overflow: visible;
       font-size: 11px !important;
     }
     body[data-inkdrop-view="queue"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph]::before {
@@ -17708,11 +17881,13 @@
     body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph],
     body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-more > summary[data-action-force-text="1"][data-action-glyph] {
       grid-template-columns: minmax(0, 1fr) !important;
+      place-items: center stretch;
       width: auto !important;
       min-width: 56px !important;
       max-width: 92px !important;
       height: 30px;
       padding: 0 10px !important;
+      overflow: visible;
       font-size: 11px !important;
     }
     body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph]::before,
@@ -18356,26 +18531,6 @@ body:not(.settings-advanced-visible) .settings-advanced-only {
   color: var(--muted);
 }
 
-.lifecycle-vocabulary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-bottom: 0;
-  background: var(--panel-2);
-}
-
-.lifecycle-vocabulary > span {
-  padding: 3px 7px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
 @media (max-width: 620px) {
   .settings-setup-minimum-path li { grid-template-columns: minmax(0, 1fr) auto; }
   .settings-setup-minimum-path li > button { grid-column: 1 / -1; width: 100%; }
@@ -18525,6 +18680,29 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   grid-template-columns: 30px minmax(240px, 1fr) minmax(168px, .35fr);
 }
 
+/* Wanted and Queue have a Source column the rules above don't know about
+   (see 03-tables-core.css's SPLIT_SOURCE_COLUMN_VIEWS override) -- keep it
+   visible and reflow the remaining tracks instead of letting these three
+   generic rules misalign it. */
+.section-table-wanted.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
+.section-table-wanted.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row,
+.section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
+.section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row {
+  grid-template-columns: 30px minmax(220px, 1.35fr) minmax(140px, .6fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
+}
+.section-table-wanted.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
+.section-table-wanted.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row,
+.section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
+.section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
+  grid-template-columns: 30px minmax(240px, 1.65fr) minmax(126px, .55fr) minmax(140px, .6fr) minmax(168px, .7fr);
+}
+.section-table-wanted.arr-table-hide-state.arr-table-hide-detail .section-table-head,
+.section-table-wanted.arr-table-hide-state.arr-table-hide-detail .section-table-row,
+.section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-head,
+.section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
+  grid-template-columns: 30px minmax(240px, 1fr) minmax(140px, .6fr) minmax(168px, .35fr);
+}
+
 .section-table.arr-table-expanded-details .section-table-detail-drawer[open] {
   border-color: rgba(54, 169, 214, .34);
 }
@@ -18568,13 +18746,31 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
 
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
   body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
-    grid-template-columns: 24px minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
+    /* Written before Queue/Wanted's Source column split
+       (SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py); "source" is now a real
+       cell in the DOM with no area of its own here, which used to land it
+       on top of "state" (both auto-placed into the same leftover slot). */
+    grid-template-columns: 24px minmax(190px, 1fr) minmax(100px, .5fr) minmax(100px, .5fr) minmax(64px, auto);
     grid-template-areas:
-      "select item state actions"
-      "select detail detail actions";
+      "select item state source actions"
+      "select detail detail detail actions";
     gap: 5px 8px;
     align-items: start;
     padding: 7px 8px;
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-source,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-source {
+    grid-area: source;
+    /* No justify-self override, unlike .section-table-state below --
+       .section-table-col-source's base rule already has overflow:hidden +
+       text-overflow:ellipsis (03-tables-core.css), but that only clips
+       correctly when the box stretches to fill its track. justify-self:start
+       sizes the box to its own content instead (shrink-to-fit) with nothing
+       left to clip against, so a long provider name ("Torrentleech (InkDrop
+       Comics All)") rendered past the track's right edge, overlapping
+       Actions. */
+    min-width: 0;
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-select,
@@ -19281,35 +19477,63 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
     min-width: 1000px;
-    grid-template-columns: minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+    grid-template-columns: minmax(280px, 1.15fr) minmax(108px, .3fr) minmax(130px, .4fr) minmax(260px, .85fr) minmax(132px, .34fr);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row {
-    grid-template-columns: minmax(330px, 1.35fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
+    grid-template-columns: minmax(330px, 1.35fr) minmax(140px, .5fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
-    grid-template-columns: minmax(350px, 1.65fr) minmax(126px, .55fr) minmax(168px, .7fr);
+    grid-template-columns: minmax(350px, 1.65fr) minmax(126px, .55fr) minmax(140px, .5fr) minmax(168px, .7fr);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
-    grid-template-columns: minmax(360px, 1fr) minmax(168px, .35fr);
+    grid-template-columns: minmax(360px, 1fr) minmax(140px, .5fr) minmax(168px, .35fr);
   }
 }
 
 @media (min-width: 621px) and (max-width: 1099px) {
-  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head {
-    grid-template-columns: minmax(220px, 1.1fr) minmax(120px, .58fr) minmax(190px, .9fr) minmax(64px, auto);
+  /* This tablet/phone-landscape breakpoint predates Queue/Wanted's Source
+     column split (inkdrop_web.py's SPLIT_SOURCE_COLUMN_VIEWS). The ROW's
+     layout at this breakpoint is owned by 12-manual-search-and-auth.css
+     (its own @media (min-width: 621px) and (max-width: 1099px) block) --
+     that rule now carries "source", see the comment there. But neither that
+     rule nor any other ever touched the HEAD row at this breakpoint, so it
+     kept using the base 6-track desktop grid-template-columns meant for a
+     1040px-wide table squeezed into ~900px, with no matching per-cell
+     grid-area assignment -- cells landed in overlapping/implicit tracks and
+     "Series / Issue" collapsed to ~30px, reading as "Ser..." on a real phone
+     in landscape (the width this breakpoint actually covers). Give the head
+     the same 4-area layout the row uses, source included. */
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head {
+    grid-template-columns: minmax(170px, 1fr) minmax(90px, .5fr) minmax(90px, .5fr) minmax(64px, auto);
+    grid-template-areas: "item state source actions";
   }
-
-  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
-    grid-template-columns: minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
-    grid-template-areas:
-      "item state actions"
-      "detail detail actions";
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-item,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-item { grid-area: item; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-state,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-state { grid-area: state; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-source,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-source { grid-area: source; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-actions,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-actions { grid-area: actions; }
+  /* Queue has no select column at this breakpoint (never has, at any
+     width); Wanted's select column here is its own "select" grid-area in
+     12-manual-search-and-auth.css's row layout, which the head has no
+     matching line for. Both hide from the head. The row's "detail" cell
+     spans a second line under item/state/source; the head has no second
+     line to put a matching label on, and an unassigned grid item falls
+     back into the already-occupied "item" area and overlaps its label. */
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-select,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-select,
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-detail,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-detail {
+    display: none;
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head {
@@ -20089,9 +20313,75 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   gap: 16px;
 }
 
+.missing-recovery-heading-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* Same tinted-circle-plus-mask-icon language as the page-masthead stat cards
+   (.arr-page-stat-icon in 15-redesign-shell.css) so this banner reads as
+   part of the same visual system instead of a bespoke card. */
+.missing-recovery-icon {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: rgba(114, 210, 255, .16);
+}
+.missing-recovery-icon::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  background: var(--accent);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4,12a8,8 0,1,1 2.3,5.6M4,12v5h5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4,12a8,8 0,1,1 2.3,5.6M4,12v5h5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
 .missing-recovery-copy h3,
 .missing-recovery-copy p {
   margin: 2px 0 0;
+}
+.missing-recovery-copy h3 {
+  font-size: var(--font-md, 14px);
+}
+
+/* Collapsed by default -- the always-visible surface is just the heading,
+   any notice, and the footer (result + Start/Pause). The nine-tile progress
+   grid and the advanced admission-limit metrics are real operator detail,
+   not clutter, but they don't need to be on screen before anyone asks. */
+.missing-recovery-details {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 12px 12px;
+  background: var(--panel-2);
+}
+.missing-recovery-details > summary {
+  cursor: pointer;
+  padding: 8px 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: var(--weight-medium, 600);
+  user-select: none;
+}
+.missing-recovery-details[open] > summary { color: var(--text); }
+.missing-recovery-details > p.mini {
+  margin: 0 0 12px;
+}
+/* .missing-recovery-progress/.missing-recovery-metrics/.missing-recovery-categories
+   all set their own `display: grid` below. An author `display` declaration
+   beats the browser's built-in `details:not([open]) > *:not(summary) {
+   display: none }` rule regardless of selector order (author origin always
+   wins over the user-agent sheet) -- so without this, closed <details>
+   content with its own `display` rule renders anyway. Same trap as
+   `[hidden]` (see 04-tables-rows.css), just triggered by <details> instead.
+   Applies to the pre-existing .missing-recovery-advanced nesting too. */
+.missing-recovery-details:not([open]) > *:not(summary),
+.missing-recovery-advanced:not([open]) > *:not(summary) {
+  display: none;
 }
 
 .missing-recovery-state,
@@ -20182,6 +20472,9 @@ button.missing-recovery-metric:focus-visible {
 .missing-recovery-result {
   display: grid;
   gap: 8px;
+}
+.missing-recovery-progress {
+  margin: 0 0 14px;
 }
 
 .missing-recovery-advanced {
@@ -20355,3 +20648,875 @@ button.missing-recovery-metric:focus-visible {
     .calendar-status-pip.calendar-status-warn { background: var(--warn); }
     .calendar-status-pip.calendar-status-accent { background: var(--accent); }
     .calendar-status-pip.calendar-status-muted { background: var(--muted); }
+/* Desktop sidebar shell.
+   Below 1100px the app already has a carefully tuned collapsed/stacked nav
+   (see 10-responsive-tables.css / 11-responsive-layout.css); this block only
+   takes over at desktop widths, where it converts the horizontal top
+   .arr-nav-shell into a fixed left column. Loaded last so its rules win the
+   cascade over the unprefixed (all-width) base rules in earlier modules
+   without having to touch those files' narrow-viewport behavior.
+
+   Ownership at >=1100px: this file is the single owner of layout for
+   `main`, `main > .arr-nav-shell` (and its .arr-nav / .arr-nav-actions /
+   .arr-nav-brand / .arr-nav-search children), and
+   `main > .arr-nav-shell > .activity-region`. 09-activity-dock.css still
+   carries an older desktop ruleset for the same selectors (a fixed 188px
+   nav from before this redesign) that this block overrides property-by-
+   property at this breakpoint -- see the pointer comment there. Changing
+   desktop-width layout for any of these selectors belongs here; changing
+   09-activity-dock.css's copy only affects a codepath the cascade never
+   reaches at this width. inkdrop-css-selector-conflict-smoke.py enforces
+   that no *new* property gets split across files undocumented; it doesn't
+   by itself tell you which of an existing pair is live -- this comment is
+   that answer for this selector family. */
+
+/* Shared glyph library. One data-URI per glyph, exposed as custom properties
+   so every consumer (masthead stat circles, Blocklist summary cards, table
+   lane headers) masks the same artwork instead of pasting its own copy of
+   the SVG. Add new glyphs here, then point a consumer's mask var at it. */
+:root {
+  --arr-glyph-search: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='10.5' cy='10.5' r='6.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M15.5,15.5L20,20' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --arr-glyph-cloud-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7,17a4,4 0,1,1 1,-7.9a5,5 0,0,1 9.6,1.9a3.5,3.5 0,0,1 -.6,7z' fill='none' stroke='black' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M12,11v7M9,15l3,3l3,-3' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-upload: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12,20v-11M8,13l4,-4l4,4M5,20h14' fill='none' stroke='black' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-clock: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M12,7v5l3.5,2' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M8.5,12.3l2.4,2.4l4.6,-5.4' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-x: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M9,9l6,6M15,9l-6,6' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --arr-glyph-refresh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4,12a8,8 0,1,1 2.3,5.6M4,12v5h5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-eye: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M2,12s3.5,-6.5 10,-6.5s10,6.5 10,6.5s-3.5,6.5 -10,6.5s-10,-6.5 -10,-6.5z' fill='none' stroke='black' stroke-width='2' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='12' r='2.6' fill='none' stroke='black' stroke-width='2'/%3E%3C/svg%3E");
+  --arr-glyph-alert: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M12,7.5v6M12,16.5h.01' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --arr-glyph-shield: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12,3.5l7,3v5c0,5 -3,8 -7,9c-4,-1 -7,-4 -7,-9v-5z' fill='none' stroke='black' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-calendar: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='4' y='5' width='16' height='15' rx='1.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M4,10h16M8,3v4M16,3v4' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+@media (min-width: 1100px) {
+  body {
+    padding-left: var(--sidebar-width, 230px);
+  }
+  main {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
+  main > header {
+    display: none;
+  }
+  /* Single source of truth for desktop content width. The shell fills the
+     viewport beside the sidebar -- gutters only, no centered max-width cap.
+     Sonarr/Radarr run their tables edge-to-edge the same way, and the old
+     1180px cap here is what left the dead margin Jared kept seeing on the
+     redesigned pages. The `main` width rules earlier in the bundle
+     (01-base-and-navigation.css, 09-activity-dock.css) still own narrow
+     viewports; at >=1100px this block wins the cascade, so any width change
+     belongs here, not there. */
+  main > .arr-content-shell {
+    max-width: none;
+    margin: 0;
+    padding: 22px 28px 40px;
+  }
+  main > .arr-nav-shell {
+    position: fixed;
+    z-index: 30;
+    top: 0;
+    left: 0;
+    display: flex;
+    flex-direction: column;
+    width: var(--sidebar-width, 230px);
+    height: 100vh;
+    margin: 0;
+    padding: 16px 12px;
+    border-right: 1px solid var(--line-soft);
+    background: var(--surface);
+    backdrop-filter: none;
+  }
+  .arr-nav-brand {
+    display: flex;
+  }
+  .arr-nav-search {
+    display: block;
+  }
+  main > .arr-nav-shell > .arr-nav {
+    display: block;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 0 -4px;
+    padding: 0 4px;
+  }
+  main > .arr-nav-shell > .arr-nav > * {
+    margin-bottom: 3px;
+  }
+  main > .arr-nav-shell .arr-nav-group-label {
+    display: block;
+  }
+  main > .arr-nav-shell .arr-nav button,
+  main > .arr-nav-shell .arr-nav-secondary button {
+    width: 100%;
+  }
+  main > .arr-nav-shell > .arr-nav-actions {
+    flex: 0 0 auto;
+    justify-content: stretch;
+    margin: 10px 0 0;
+    padding-top: 10px;
+    border-top: 1px solid var(--line-soft);
+  }
+  main > .arr-nav-shell > .arr-nav-actions .arr-nav-add {
+    width: 100%;
+  }
+  main > .arr-nav-shell > .activity-region {
+    position: static;
+    flex: 0 0 auto;
+    inset: auto;
+    width: 100%;
+    max-height: none;
+    margin: 8px 0 0;
+    padding-top: 8px;
+    border-top: 1px solid var(--line-soft);
+    gap: 6px;
+    z-index: auto;
+    pointer-events: auto;
+  }
+
+  /* Masthead: title/description + top-right actions on one row, stat cards
+     as their own full-width row underneath. .arr-page-side is unwrapped with
+     display:contents so its two children (stats/actions) can each land in a
+     different grid area without changing the existing JS/DOM.
+
+     Scoped to the five redesigned pages only -- Series/Settings/System/
+     Sources/Imports/etc keep whatever masthead treatment they already have.
+     Queue, Wanted, and Manual Review previously hid .arr-page-masthead
+     entirely (relying on a bespoke "operator now" bar instead); History hid
+     it with !important. The mockups put all five on this same masthead +
+     stat-card pattern, so visibility is forced back on here rather than
+     patched at each of those scattered legacy rules (own layer, `!important`
+     needed to beat the pre-existing `!important` hide on History). */
+  body[data-inkdrop-view="queue"] .arr-page-masthead,
+  body[data-inkdrop-view="wanted"] .arr-page-masthead,
+  body[data-inkdrop-view="history"] .arr-page-masthead,
+  body[data-inkdrop-view="source_memory"] .arr-page-masthead,
+  body[data-inkdrop-view="manual_review"] .arr-page-masthead {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "heading actions" "stats stats";
+    row-gap: 16px;
+    margin: 0 0 20px;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0;
+    padding: 0 0 16px;
+    background: transparent;
+  }
+  body[data-inkdrop-view="queue"] #inkdropPageDescription,
+  body[data-inkdrop-view="wanted"] #inkdropPageDescription,
+  body[data-inkdrop-view="history"] #inkdropPageDescription,
+  body[data-inkdrop-view="source_memory"] #inkdropPageDescription,
+  body[data-inkdrop-view="manual_review"] #inkdropPageDescription {
+    display: block !important;
+  }
+  /* The masthead above now carries the page title/description for these five
+     views. .section-commandbar's own .section-heading (eyebrow + h3 + meta)
+     used to render a second "Wanted"/"Queue"/etc. title directly beneath it
+     -- two headers stacked ~20px apart repeating the same word. Only the
+     heading is hidden; .section-command-actions (Refresh, active-filter
+     chip) still does real work and stays. */
+  body[data-inkdrop-view="queue"] .section-heading,
+  body[data-inkdrop-view="wanted"] .section-heading,
+  body[data-inkdrop-view="history"] .section-heading,
+  body[data-inkdrop-view="source_memory"] .section-heading,
+  body[data-inkdrop-view="manual_review"] .section-heading {
+    display: none;
+  }
+  body[data-inkdrop-view="queue"] .section-commandbar,
+  body[data-inkdrop-view="wanted"] .section-commandbar,
+  body[data-inkdrop-view="history"] .section-commandbar,
+  body[data-inkdrop-view="source_memory"] .section-commandbar,
+  body[data-inkdrop-view="manual_review"] .section-commandbar {
+    grid-template-columns: 1fr;
+    justify-items: end;
+  }
+  body[data-inkdrop-view="queue"] .arr-page-heading,
+  body[data-inkdrop-view="wanted"] .arr-page-heading,
+  body[data-inkdrop-view="history"] .arr-page-heading,
+  body[data-inkdrop-view="source_memory"] .arr-page-heading,
+  body[data-inkdrop-view="manual_review"] .arr-page-heading {
+    grid-area: heading;
+  }
+  body[data-inkdrop-view="queue"] .arr-page-side,
+  body[data-inkdrop-view="wanted"] .arr-page-side,
+  body[data-inkdrop-view="history"] .arr-page-side,
+  body[data-inkdrop-view="source_memory"] .arr-page-side,
+  body[data-inkdrop-view="manual_review"] .arr-page-side {
+    display: contents !important;
+  }
+  body[data-inkdrop-view="queue"] .arr-page-actions,
+  body[data-inkdrop-view="wanted"] .arr-page-actions,
+  body[data-inkdrop-view="history"] .arr-page-actions,
+  body[data-inkdrop-view="source_memory"] .arr-page-actions,
+  body[data-inkdrop-view="manual_review"] .arr-page-actions {
+    grid-area: actions;
+    justify-content: flex-end;
+  }
+  body[data-inkdrop-view="queue"] .arr-page-stats,
+  body[data-inkdrop-view="wanted"] .arr-page-stats,
+  body[data-inkdrop-view="history"] .arr-page-stats,
+  body[data-inkdrop-view="source_memory"] .arr-page-stats,
+  body[data-inkdrop-view="manual_review"] .arr-page-stats {
+    grid-area: stats;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+    justify-content: stretch;
+  }
+  body[data-inkdrop-view="queue"] .arr-page-stat,
+  body[data-inkdrop-view="wanted"] .arr-page-stat,
+  body[data-inkdrop-view="history"] .arr-page-stat,
+  body[data-inkdrop-view="source_memory"] .arr-page-stat,
+  body[data-inkdrop-view="manual_review"] .arr-page-stat {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    min-height: 0;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    padding: 12px 14px;
+    text-align: left;
+    background: var(--panel);
+  }
+  .arr-page-stat-body {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+  body[data-inkdrop-view="queue"] .arr-page-stat strong,
+  body[data-inkdrop-view="wanted"] .arr-page-stat strong,
+  body[data-inkdrop-view="history"] .arr-page-stat strong,
+  body[data-inkdrop-view="source_memory"] .arr-page-stat strong,
+  body[data-inkdrop-view="manual_review"] .arr-page-stat strong {
+    font-size: var(--font-2xl, 22px);
+    font-weight: var(--weight-bold, 800);
+  }
+  body[data-inkdrop-view="queue"] .arr-page-stat-body span,
+  body[data-inkdrop-view="wanted"] .arr-page-stat-body span,
+  body[data-inkdrop-view="history"] .arr-page-stat-body span,
+  body[data-inkdrop-view="source_memory"] .arr-page-stat-body span,
+  body[data-inkdrop-view="manual_review"] .arr-page-stat-body span {
+    font-size: var(--font-xs, 11px);
+    font-weight: var(--weight-medium, 600);
+  }
+  .arr-page-stat-icon,
+  .section-workbench-card-icon {
+    flex: 0 0 auto;
+    display: inline-grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 999px;
+    background: rgba(114, 210, 255, .16);
+  }
+  .arr-page-stat-icon::before,
+  .section-workbench-card-icon::before {
+    content: "";
+    /* Explicit display: the glyph box is sized by width/height, and an inline
+       pseudo ignores both -- it collapses to 0x0 and the circle looks empty.
+       Grid blockification normally covers this, but only while the parent's
+       inline-grid survives the cascade; state the outcome directly instead of
+       depending on it. */
+    display: block;
+    width: 18px;
+    height: 18px;
+    background: var(--accent);
+    -webkit-mask: var(--arr-stat-icon-mask, radial-gradient(circle at center, #000 0 52%, transparent 54%)) center / contain no-repeat;
+    mask: var(--arr-stat-icon-mask, radial-gradient(circle at center, #000 0 52%, transparent 54%)) center / contain no-repeat;
+  }
+  .arr-page-stat.good .arr-page-stat-icon { background: rgba(120, 217, 155, .18); }
+  .arr-page-stat.good .arr-page-stat-icon::before { background: var(--good); }
+  .arr-page-stat.warn .arr-page-stat-icon { background: rgba(247, 201, 111, .18); }
+  .arr-page-stat.warn .arr-page-stat-icon::before { background: var(--warn); }
+  .arr-page-stat.bad .arr-page-stat-icon { background: rgba(255, 125, 125, .18); }
+  .arr-page-stat.bad .arr-page-stat-icon::before { background: var(--bad); }
+  .arr-page-stat-icon[data-icon="search"],
+  .section-workbench-card-icon[data-icon="search"] { --arr-stat-icon-mask: var(--arr-glyph-search); }
+  .arr-page-stat-icon[data-icon="cloud-download"],
+  .section-workbench-card-icon[data-icon="cloud-download"] { --arr-stat-icon-mask: var(--arr-glyph-cloud-download); }
+  .arr-page-stat-icon[data-icon="upload"],
+  .section-workbench-card-icon[data-icon="upload"] { --arr-stat-icon-mask: var(--arr-glyph-upload); }
+  .arr-page-stat-icon[data-icon="clock"],
+  .section-workbench-card-icon[data-icon="clock"] { --arr-stat-icon-mask: var(--arr-glyph-clock); }
+  .arr-page-stat-icon[data-icon="check"],
+  .section-workbench-card-icon[data-icon="check"] { --arr-stat-icon-mask: var(--arr-glyph-check); }
+  .arr-page-stat-icon[data-icon="x"],
+  .section-workbench-card-icon[data-icon="x"] { --arr-stat-icon-mask: var(--arr-glyph-x); }
+  .arr-page-stat-icon[data-icon="refresh"],
+  .section-workbench-card-icon[data-icon="refresh"] { --arr-stat-icon-mask: var(--arr-glyph-refresh); }
+  .arr-page-stat-icon[data-icon="eye"],
+  .section-workbench-card-icon[data-icon="eye"] { --arr-stat-icon-mask: var(--arr-glyph-eye); }
+  .arr-page-stat-icon[data-icon="alert"],
+  .section-workbench-card-icon[data-icon="alert"] { --arr-stat-icon-mask: var(--arr-glyph-alert); }
+  .arr-page-stat-icon[data-icon="shield"],
+  .section-workbench-card-icon[data-icon="shield"] { --arr-stat-icon-mask: var(--arr-glyph-shield); }
+  .arr-page-stat-icon[data-icon="calendar"],
+  .section-workbench-card-icon[data-icon="calendar"] { --arr-stat-icon-mask: var(--arr-glyph-calendar); }
+
+  /* Workbench summary cards with an icon (today: the Blocklist counts).
+     The card is a single-column grid of title/count/detail spans; when
+     sectionWorkbenchCard() adds an icon the circle takes a left column and
+     the text keeps its stack on the right, matching the masthead stat-card
+     look from the mockups. Tone follows the card's existing good/warn/bad
+     class the same way the masthead circles do. */
+  .section-workbench-card:has(.section-workbench-card-icon) {
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 12px;
+    align-content: center;
+  }
+  .section-workbench-card-icon {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+    align-self: center;
+  }
+  /* :not() keeps the icon span out of this text-column rule -- the icon is
+     also a span, and without the exclusion this selector out-specifies the
+     icon's own grid-column: 1 above. */
+  .section-workbench-card:has(.section-workbench-card-icon) > span:not(.section-workbench-card-icon),
+  .section-workbench-card:has(.section-workbench-card-icon) > strong {
+    grid-column: 2;
+  }
+  .section-workbench-card.good .section-workbench-card-icon { background: rgba(120, 217, 155, .18); }
+  .section-workbench-card.good .section-workbench-card-icon::before { background: var(--good); }
+  .section-workbench-card.warn .section-workbench-card-icon { background: rgba(247, 201, 111, .18); }
+  .section-workbench-card.warn .section-workbench-card-icon::before { background: var(--warn); }
+  .section-workbench-card.bad .section-workbench-card-icon { background: rgba(255, 125, 125, .18); }
+  .section-workbench-card.bad .section-workbench-card-icon::before { background: var(--bad); }
+}
+
+/* Filter/tab pill row: restyles the existing arr-table-view-strip/chip
+   framework (already shared by Queue/Wanted/Manual Review, and reused here
+   for History/Blocklist) into filled-pill tabs instead of bordered chips.
+   Scoped to the five redesigned pages so every other table keeps its
+   current chip look. */
+@media (min-width: 1100px) {
+  body[data-inkdrop-view="queue"] .arr-table-view-strip,
+  body[data-inkdrop-view="wanted"] .arr-table-view-strip,
+  body[data-inkdrop-view="history"] .arr-table-view-strip,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-strip,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-strip {
+    flex: 0 1 auto;
+    gap: 8px;
+    padding-top: 0;
+    border-top: 0;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip,
+  body[data-inkdrop-view="history"] .arr-table-view-chip,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-chip,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip {
+    grid-template-columns: minmax(0, auto) auto;
+    min-width: 0;
+    min-height: 34px;
+    border-radius: 999px;
+    padding: 6px 14px;
+    background: transparent;
+    font-size: var(--font-sm, 12px);
+    font-weight: var(--weight-medium, 600);
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip.active,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip.active,
+  body[data-inkdrop-view="history"] .arr-table-view-chip.active,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-chip.active,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip.active {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #0b1720;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip.active.good,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip.active.good,
+  body[data-inkdrop-view="history"] .arr-table-view-chip.active.good,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-chip.active.good,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip.active.good {
+    border-color: var(--good);
+    background: var(--good);
+    color: #0b1720;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip.active.warn,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip.active.warn,
+  body[data-inkdrop-view="history"] .arr-table-view-chip.active.warn,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-chip.active.warn,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip.active.warn {
+    border-color: var(--warn);
+    background: var(--warn);
+    color: #0b1720;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip.active.bad,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip.active.bad,
+  body[data-inkdrop-view="history"] .arr-table-view-chip.active.bad,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-chip.active.bad,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip.active.bad {
+    border-color: var(--bad);
+    background: var(--bad);
+    color: #0b1720;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-view-chip.active .arr-table-view-count,
+  body[data-inkdrop-view="wanted"] .arr-table-view-chip.active .arr-table-view-count,
+  body[data-inkdrop-view="history"] .arr-table-view-chip.active .arr-table-view-count,
+  body[data-inkdrop-view="source_memory"] .arr-table-view-chip.active .arr-table-view-count,
+  body[data-inkdrop-view="manual_review"] .arr-table-view-chip.active .arr-table-view-count {
+    border-color: rgba(11, 23, 32, .3);
+    color: #0b1720;
+    background: rgba(11, 23, 32, .16);
+  }
+}
+
+/* Blocklist's 4 real filter cards (Blocked/Recent/SLSKD/Prowlarr) already
+   sit exactly where the mockup wants a stat-card row -- right below the
+   masthead, always visible, correct counts (source_memory's masthead
+   deliberately carries no stats of its own; see the model comment in
+   inkdropPageMastheadModel). This gives them the same icon-badge tinted-
+   circle treatment as .arr-page-stat, and widens the row to 4 columns so
+   they sit on one line instead of wrapping 3+1. */
+@media (min-width: 1100px) {
+  body[data-inkdrop-view="source_memory"] .section-workbench {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card {
+    grid-template-columns: 34px 1fr;
+    grid-template-rows: repeat(3, auto);
+    column-gap: 10px;
+    row-gap: 2px;
+    align-items: center;
+  }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+    display: inline-grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    background: rgba(114, 210, 255, .16);
+  }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon::before {
+    content: "";
+    width: 16px;
+    height: 16px;
+    background: var(--accent);
+    -webkit-mask: var(--arr-stat-icon-mask, radial-gradient(circle at center, #000 0 52%, transparent 54%)) center / contain no-repeat;
+    mask: var(--arr-stat-icon-mask, radial-gradient(circle at center, #000 0 52%, transparent 54%)) center / contain no-repeat;
+  }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card.good .section-workbench-card-icon { background: rgba(120, 217, 155, .18); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card.good .section-workbench-card-icon::before { background: var(--good); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card.warn .section-workbench-card-icon { background: rgba(247, 201, 111, .18); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card.warn .section-workbench-card-icon::before { background: var(--warn); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card.bad .section-workbench-card-icon { background: rgba(255, 125, 125, .18); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card.bad .section-workbench-card-icon::before { background: var(--bad); }
+}
+
+.arr-table-text-filter {
+  flex: 0 1 240px;
+  min-width: 140px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 12px);
+}
+.arr-table-text-filter::placeholder {
+  color: var(--muted);
+}
+
+/* Right-hand detail panel: a shared docked list+detail pattern for
+   Blocklist and Manual Review. Manual Review already had a decision dialog
+   -- it was a full-screen `.series-remove-modal` overlay reusing the same
+   dialog markup as the Remove Series/Move Library confirmation modals.
+   Rather than fork a parallel dialog system, #manualReviewDecisionModal was
+   moved in the HTML to sit beside #inkdropCore inside a shared
+   #manualReviewDock wrapper (see inkdrop_web.py) and is docked here instead
+   of centered -- .series-remove-modal itself is untouched so the other
+   modals that still use it keep working exactly as before. Blocklist has no
+   prior panel; Task 9 builds its markup reusing this same dialog/dock
+   pattern for visual consistency. */
+@media (min-width: 1100px) {
+  body[data-inkdrop-view="manual_review"] #opDetailDock,
+  body[data-inkdrop-view="source_memory"] #opDetailDock {
+    display: grid;
+    grid-template-columns: minmax(300px, 1fr) minmax(320px, .78fr);
+    gap: 20px;
+    align-items: start;
+  }
+  body[data-inkdrop-view="manual_review"] #inkdropCore,
+  body[data-inkdrop-view="source_memory"] #inkdropCore {
+    min-width: 0;
+  }
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-modal:not([hidden]),
+  body[data-inkdrop-view="source_memory"] .source-memory-detail-panel:not([hidden]) {
+    display: block !important;
+    position: sticky;
+    top: 22px;
+    inset: auto;
+    z-index: 1;
+    padding: 0;
+    background: transparent;
+    align-self: start;
+  }
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-dialog,
+  body[data-inkdrop-view="source_memory"] .source-memory-detail-dialog {
+    width: 100%;
+    max-height: calc(100vh - 44px);
+    border-color: var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+  }
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-modal .series-remove-close,
+  body[data-inkdrop-view="source_memory"] .source-memory-detail-panel .series-remove-close {
+    display: none;
+  }
+  /* Both pages start with no row selected -- showing a placeholder card here
+     would be misleading (nothing is "selected" yet), so the column collapses
+     instead of reserving space for an empty card. */
+  body[data-inkdrop-view="source_memory"] #opDetailDock:has(.source-memory-detail-panel[hidden]),
+  body[data-inkdrop-view="manual_review"] #opDetailDock:has(.manual-review-decision-modal[hidden]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  body[data-inkdrop-view="source_memory"] .section-table-row.selected-detail-row,
+  body[data-inkdrop-view="manual_review"] .section-table-row.selected-detail-row {
+    background: rgba(114, 210, 255, .07);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  /* Manual Review's existing bucket filter (All/Source hints/Ambiguous/
+     Packs/Failures/Other, already real and wired) restyled to match the
+     pill-tab look used everywhere else rather than adding a parallel one. */
+  body[data-inkdrop-view="manual_review"] .review-filter-buttons button {
+    border-radius: 999px;
+    font-size: var(--font-sm, 12px);
+  }
+  body[data-inkdrop-view="manual_review"] .review-filter-buttons button.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #0b1720;
+    font-weight: var(--weight-semibold, 700);
+  }
+}
+
+/* Page-level alert banner (currently used by Queue's "N downloads need
+   attention" row). Hidden by default; only pages whose masthead model sets
+   `banner` populate and show it. */
+.arr-page-alert-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0 0 16px;
+  border: 1px solid rgba(255, 125, 125, .38);
+  border-radius: 10px;
+  padding: 12px 16px;
+  background: rgba(255, 125, 125, .1);
+}
+.arr-page-alert-banner.warn {
+  border-color: rgba(247, 201, 111, .42);
+  background: rgba(247, 201, 111, .1);
+}
+.arr-page-alert-banner-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.arr-page-alert-banner-text strong {
+  color: var(--bad);
+  font-size: var(--font-md, 14px);
+}
+.arr-page-alert-banner.warn .arr-page-alert-banner-text strong {
+  color: var(--warn);
+}
+.arr-page-alert-banner-text span {
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+}
+.arr-page-alert-banner button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 16px;
+  background: var(--bad);
+  color: #0b1720;
+  font-weight: var(--weight-semibold, 700);
+}
+.arr-page-alert-banner.warn button {
+  background: var(--warn);
+}
+/* Table row treatment for the five redesigned pages: filled status badges,
+   rounder cover thumbnails, circular icon actions, softer group headers.
+   The underlying row/lane-header/badge components already exist and are
+   shared app-wide (.section-table-row, .section-table-lane-header,
+   .core-state, .arr-table-icon-button) -- this restyles them in place
+   rather than introducing a parallel table system, scoped to the five
+   redesigned views so every other table (Series, Sources, Imports, etc.)
+   keeps its current look. */
+@media (min-width: 1100px) {
+  body[data-inkdrop-view="queue"] .section-table,
+  body[data-inkdrop-view="wanted"] .section-table,
+  body[data-inkdrop-view="history"] .section-table,
+  body[data-inkdrop-view="source_memory"] .section-table,
+  body[data-inkdrop-view="manual_review"] .section-table {
+    border-radius: 10px;
+    background: var(--panel);
+  }
+  body[data-inkdrop-view="queue"] .section-table-row,
+  body[data-inkdrop-view="wanted"] .section-table-row,
+  body[data-inkdrop-view="history"] .section-table-row,
+  body[data-inkdrop-view="source_memory"] .section-table-row,
+  body[data-inkdrop-view="manual_review"] .section-table-row {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+  body[data-inkdrop-view="queue"] .section-table-row:hover,
+  body[data-inkdrop-view="wanted"] .section-table-row:hover,
+  body[data-inkdrop-view="history"] .section-table-row:hover,
+  body[data-inkdrop-view="source_memory"] .section-table-row:hover,
+  body[data-inkdrop-view="manual_review"] .section-table-row:hover {
+    background: rgba(255, 255, 255, .025);
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header,
+  body[data-inkdrop-view="history"] .section-table-lane-header,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header {
+    padding: 9px 14px;
+    background: transparent;
+    font-weight: var(--weight-semibold, 700);
+  }
+  body[data-inkdrop-view="queue"] .series-art.table,
+  body[data-inkdrop-view="wanted"] .series-art.table,
+  body[data-inkdrop-view="history"] .series-art.table,
+  body[data-inkdrop-view="source_memory"] .series-art.table,
+  body[data-inkdrop-view="manual_review"] .series-art.table {
+    width: 40px;
+    border-radius: 6px;
+  }
+  /* Status badges: filled tone background instead of an outline, matching
+     the mockups' solid Downloading/Importing/Verified/Failed pills.
+     .section-table-lane-pill/-intent/-status-badge/-bucket-badge and
+     .core-state are the several existing pill components rows use depending
+     on view; .auto is that family's name for the accent/blue tone. */
+  body[data-inkdrop-view="queue"] .core-state,
+  body[data-inkdrop-view="wanted"] .core-state,
+  body[data-inkdrop-view="history"] .core-state,
+  body[data-inkdrop-view="source_memory"] .core-state,
+  body[data-inkdrop-view="manual_review"] .core-state,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill,
+  body[data-inkdrop-view="history"] .section-table-lane-pill,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill,
+  body[data-inkdrop-view="queue"] .section-table-intent,
+  body[data-inkdrop-view="wanted"] .section-table-intent,
+  body[data-inkdrop-view="history"] .section-table-intent,
+  body[data-inkdrop-view="source_memory"] .section-table-intent,
+  body[data-inkdrop-view="manual_review"] .section-table-intent,
+  body[data-inkdrop-view="queue"] .section-table-status-badge,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge,
+  body[data-inkdrop-view="history"] .section-table-status-badge,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge {
+    border-color: transparent;
+    background: rgba(114, 210, 255, .16);
+    color: var(--accent);
+    font-weight: var(--weight-semibold, 700);
+  }
+  body[data-inkdrop-view="queue"] .core-state.good,
+  body[data-inkdrop-view="wanted"] .core-state.good,
+  body[data-inkdrop-view="history"] .core-state.good,
+  body[data-inkdrop-view="source_memory"] .core-state.good,
+  body[data-inkdrop-view="manual_review"] .core-state.good,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="history"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="queue"] .section-table-intent.good,
+  body[data-inkdrop-view="wanted"] .section-table-intent.good,
+  body[data-inkdrop-view="history"] .section-table-intent.good,
+  body[data-inkdrop-view="source_memory"] .section-table-intent.good,
+  body[data-inkdrop-view="manual_review"] .section-table-intent.good,
+  body[data-inkdrop-view="queue"] .section-table-status-badge.good,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge.good,
+  body[data-inkdrop-view="history"] .section-table-status-badge.good,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge.good,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge.good {
+    background: rgba(120, 217, 155, .16);
+    color: var(--good);
+  }
+  body[data-inkdrop-view="queue"] .core-state.warn,
+  body[data-inkdrop-view="wanted"] .core-state.warn,
+  body[data-inkdrop-view="history"] .core-state.warn,
+  body[data-inkdrop-view="source_memory"] .core-state.warn,
+  body[data-inkdrop-view="manual_review"] .core-state.warn,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="history"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="queue"] .section-table-intent.warn,
+  body[data-inkdrop-view="wanted"] .section-table-intent.warn,
+  body[data-inkdrop-view="history"] .section-table-intent.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-intent.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-intent.warn,
+  body[data-inkdrop-view="queue"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="history"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge.warn {
+    background: rgba(247, 201, 111, .16);
+    color: var(--warn);
+  }
+  body[data-inkdrop-view="queue"] .core-state.bad,
+  body[data-inkdrop-view="wanted"] .core-state.bad,
+  body[data-inkdrop-view="history"] .core-state.bad,
+  body[data-inkdrop-view="source_memory"] .core-state.bad,
+  body[data-inkdrop-view="manual_review"] .core-state.bad,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="history"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="queue"] .section-table-intent.bad,
+  body[data-inkdrop-view="wanted"] .section-table-intent.bad,
+  body[data-inkdrop-view="history"] .section-table-intent.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-intent.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-intent.bad,
+  body[data-inkdrop-view="queue"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="history"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge.bad {
+    background: rgba(255, 125, 125, .16);
+    color: var(--bad);
+  }
+  /* Icon actions: round, compact, icon-only buttons instead of bordered
+     rectangles -- matches the mockups' trailing pause/folder/eye/more rail. */
+  body[data-inkdrop-view="queue"] .arr-table-icon-button,
+  body[data-inkdrop-view="wanted"] .arr-table-icon-button,
+  body[data-inkdrop-view="history"] .arr-table-icon-button,
+  body[data-inkdrop-view="source_memory"] .arr-table-icon-button,
+  body[data-inkdrop-view="manual_review"] .arr-table-icon-button {
+    min-width: 30px;
+    min-height: 30px;
+    border-radius: 999px;
+    border-color: transparent;
+    background: transparent;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="wanted"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="history"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="source_memory"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="manual_review"] .arr-table-icon-button:hover {
+    background: rgba(255, 255, 255, .06);
+    border-color: transparent;
+  }
+  /* Lane-header glyph + tinted label, matching the mockups' colored
+     "Downloading / Importing / Waiting" group headings. The glyph masks the
+     shared --arr-glyph-* artwork (15-redesign-shell.css) and rides
+     currentColor, so tinting the label tints the glyph with it. Keyed on the
+     lane keys renderInkdropTableLaneHeader() stamps into data-table-lane;
+     lanes without a mapping keep a plain dot so a new lane never renders an
+     unmasked square. */
+  body[data-inkdrop-view="queue"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="history"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header strong::before {
+    content: "";
+    display: inline-block;
+    width: 13px;
+    height: 13px;
+    margin-right: 6px;
+    vertical-align: -2px;
+    background: currentColor;
+    -webkit-mask: var(--arr-lane-glyph, radial-gradient(circle at center, #000 0 34%, transparent 36%)) center / contain no-repeat;
+    mask: var(--arr-lane-glyph, radial-gradient(circle at center, #000 0 34%, transparent 36%)) center / contain no-repeat;
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="history"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header.good strong {
+    color: var(--good);
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="history"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header.warn strong {
+    color: var(--warn);
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="history"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header.bad strong {
+    color: var(--bad);
+  }
+  .section-table-lane-header[data-table-lane="queue-work"],
+  .section-table-lane-header[data-table-lane="wanted-moving"] { --arr-lane-glyph: var(--arr-glyph-cloud-download); }
+  .section-table-lane-header[data-table-lane="queue-automatic"],
+  .section-table-lane-header[data-table-lane="queue-retry"],
+  .section-table-lane-header[data-table-lane="wanted-retry"] { --arr-lane-glyph: var(--arr-glyph-refresh); }
+  .section-table-lane-header[data-table-lane="queue-provider-wait"],
+  .section-table-lane-header[data-table-lane="wanted-provider-wait"],
+  .section-table-lane-header[data-table-lane="manual-parked"] { --arr-lane-glyph: var(--arr-glyph-clock); }
+  .section-table-lane-header[data-table-lane="queue-no-candidate"],
+  .section-table-lane-header[data-table-lane="wanted-no-candidate"],
+  .section-table-lane-header[data-table-lane="wanted-missing"],
+  .section-table-lane-header[data-table-lane="manual-source"] { --arr-lane-glyph: var(--arr-glyph-search); }
+  .section-table-lane-header[data-table-lane="queue-covered"],
+  .section-table-lane-header[data-table-lane="wanted-covered"] { --arr-lane-glyph: var(--arr-glyph-check); }
+  .section-table-lane-header[data-table-lane="queue-attention"],
+  .section-table-lane-header[data-table-lane="wanted-needs-user"],
+  .section-table-lane-header[data-table-lane="manual-decision"] { --arr-lane-glyph: var(--arr-glyph-alert); }
+  .section-table-lane-header[data-table-lane="manual-blocked"] { --arr-lane-glyph: var(--arr-glyph-x); }
+  .section-table-lane-header[data-table-lane="manual-ready-import"] { --arr-lane-glyph: var(--arr-glyph-upload); }
+}
+/* Styling for React-mounted sections (web/frontend). Reuses arr-table and
+   the app's existing button styles for the parts that are structurally
+   identical to the vanilla-rendered tables; only the pieces every island
+   shares but the vanilla shell doesn't have a class for already (an inline
+   error banner, a pager) get shared rules here. */
+
+.inkdrop-react-error-banner {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid #a33;
+  background: rgba(170, 51, 51, 0.12);
+  color: inherit;
+}
+
+.inkdrop-react-pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.inkdrop-react-pager span {
+  opacity: 0.75;
+}

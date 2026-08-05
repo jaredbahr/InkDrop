@@ -259,11 +259,13 @@
     body[data-inkdrop-view="manual_review"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-glyph],
     body[data-inkdrop-view="manual_review"] .section-table-actions.compact-action-rail > .section-table-action-more > summary[data-action-glyph] {
       grid-template-columns: minmax(0, 1fr) !important;
+      place-items: center stretch;
       width: auto !important;
       min-width: 88px !important;
       max-width: 154px !important;
       height: 28px;
       padding: 0 8px !important;
+      overflow: visible;
       font-size: 11px !important;
     }
     body[data-inkdrop-view="manual_review"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-glyph]::before,
@@ -276,11 +278,13 @@
     }
     body[data-inkdrop-view="queue"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph] {
       grid-template-columns: minmax(0, 1fr) !important;
+      place-items: center stretch;
       width: auto !important;
       min-width: 74px !important;
       max-width: 120px !important;
       height: 28px;
       padding: 0 10px !important;
+      overflow: visible;
       font-size: 11px !important;
     }
     body[data-inkdrop-view="queue"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph]::before {
@@ -292,11 +296,13 @@
     body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph],
     body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-more > summary[data-action-force-text="1"][data-action-glyph] {
       grid-template-columns: minmax(0, 1fr) !important;
+      place-items: center stretch;
       width: auto !important;
       min-width: 56px !important;
       max-width: 92px !important;
       height: 30px;
       padding: 0 10px !important;
+      overflow: visible;
       font-size: 11px !important;
     }
     body[data-inkdrop-view="wanted"] .section-table-actions.compact-action-rail > .section-table-action-group .section-table-action-group-buttons > button[data-action-force-text="1"][data-action-glyph]::before,
@@ -940,26 +946,6 @@ body:not(.settings-advanced-visible) .settings-advanced-only {
   color: var(--muted);
 }
 
-.lifecycle-vocabulary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-bottom: 0;
-  background: var(--panel-2);
-}
-
-.lifecycle-vocabulary > span {
-  padding: 3px 7px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
 @media (max-width: 620px) {
   .settings-setup-minimum-path li { grid-template-columns: minmax(0, 1fr) auto; }
   .settings-setup-minimum-path li > button { grid-column: 1 / -1; width: 100%; }
@@ -1109,6 +1095,29 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   grid-template-columns: 30px minmax(240px, 1fr) minmax(168px, .35fr);
 }
 
+/* Wanted and Queue have a Source column the rules above don't know about
+   (see 03-tables-core.css's SPLIT_SOURCE_COLUMN_VIEWS override) -- keep it
+   visible and reflow the remaining tracks instead of letting these three
+   generic rules misalign it. */
+.section-table-wanted.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
+.section-table-wanted.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row,
+.section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
+.section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row {
+  grid-template-columns: 30px minmax(220px, 1.35fr) minmax(140px, .6fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
+}
+.section-table-wanted.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
+.section-table-wanted.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row,
+.section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
+.section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
+  grid-template-columns: 30px minmax(240px, 1.65fr) minmax(126px, .55fr) minmax(140px, .6fr) minmax(168px, .7fr);
+}
+.section-table-wanted.arr-table-hide-state.arr-table-hide-detail .section-table-head,
+.section-table-wanted.arr-table-hide-state.arr-table-hide-detail .section-table-row,
+.section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-head,
+.section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
+  grid-template-columns: 30px minmax(240px, 1fr) minmax(140px, .6fr) minmax(168px, .35fr);
+}
+
 .section-table.arr-table-expanded-details .section-table-detail-drawer[open] {
   border-color: rgba(54, 169, 214, .34);
 }
@@ -1152,13 +1161,31 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
 
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
   body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
-    grid-template-columns: 24px minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
+    /* Written before Queue/Wanted's Source column split
+       (SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py); "source" is now a real
+       cell in the DOM with no area of its own here, which used to land it
+       on top of "state" (both auto-placed into the same leftover slot). */
+    grid-template-columns: 24px minmax(190px, 1fr) minmax(100px, .5fr) minmax(100px, .5fr) minmax(64px, auto);
     grid-template-areas:
-      "select item state actions"
-      "select detail detail actions";
+      "select item state source actions"
+      "select detail detail detail actions";
     gap: 5px 8px;
     align-items: start;
     padding: 7px 8px;
+  }
+
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-source,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-source {
+    grid-area: source;
+    /* No justify-self override, unlike .section-table-state below --
+       .section-table-col-source's base rule already has overflow:hidden +
+       text-overflow:ellipsis (03-tables-core.css), but that only clips
+       correctly when the box stretches to fill its track. justify-self:start
+       sizes the box to its own content instead (shrink-to-fit) with nothing
+       left to clip against, so a long provider name ("Torrentleech (InkDrop
+       Comics All)") rendered past the track's right edge, overlapping
+       Actions. */
+    min-width: 0;
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-select,

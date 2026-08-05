@@ -304,6 +304,16 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
         "validated_at": datetime.fromtimestamp(NOW, timezone.utc).isoformat().replace("+00:00", ".123456Z"),
         "previous_state_schema_version": contract["previous_state_schema_version"],
         "target_state_schema_version": candidate["state_schema_version"],
+        "release_image_tags": contract["image_tags"],
+        "platforms": ["linux/amd64", "linux/arm64"],
+        "platform_runtime": [
+            {"platform": "linux/amd64", "machine": "x86_64", "passed": True},
+            {"platform": "linux/arm64", "machine": "aarch64", "passed": True},
+        ],
+        "checks": [
+            "candidate_identity", "image_platforms", "platform_runtime", "oci_labels",
+            "strict_preflight", "container_health", "public_http",
+        ],
     }
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
     generated = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"])

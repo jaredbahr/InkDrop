@@ -61,9 +61,24 @@ NUMBER_WORDS = {
 ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100}
 WORD_TOKEN = "|".join(NUMBER_WORDS)
 NUMBER_TOKEN = rf"(?:\d+(?:\.\d+)?|{WORD_TOKEN}|[ivxlc]+)"
+ROMAN_ONLY_TOKEN = r"[ivxlc]+"
+NUMBER_TOKEN_NO_ROMAN = rf"(?:\d+(?:\.\d+)?|{WORD_TOKEN})"
 
 PREVIEW_RE = re.compile(r"(?i)\b(?:preview|sample|excerpt|teaser)\b")
-VOLUME_RE = re.compile(rf"(?i)\b(?:vol(?:ume)?|v|tome|band)\.?\s*0*({NUMBER_TOKEN})\b")
+# The bare "v" prefix is a separate alternative from vol(ume)/tome/band: those
+# are unambiguous whole words, but a lone "v" glued directly (no separator)
+# to more Roman-numeral-valid letters collides with real editorial
+# abbreviations -- "VC" (variant cover, credited e.g. "VC - Derrick Chew")
+# parses as prefix "v" + Roman "C" = volume 100, fabricating a volume
+# identity that then wrongly blocks the real candidate. Digits/number-words
+# after a bare "v" stay separator-optional ("v3", "v09") since those aren't
+# ambiguous with anything; a Roman-numeral token after a bare "v" now
+# requires an actual separator (a period or whitespace), which real Roman
+# volume markers ("V. IX", "V IX") already carry.
+VOLUME_RE = re.compile(
+    rf"(?i)\b(?:vol(?:ume)?|tome|band)\.?\s*0*({NUMBER_TOKEN})\b"
+    rf"|\bv(?:\.?\s*0*({NUMBER_TOKEN_NO_ROMAN})|[.\s]\s*0*({ROMAN_ONLY_TOKEN}))\b"
+)
 BOOK_RE = re.compile(rf"(?i)\bbook\s+0*({NUMBER_TOKEN})\b")
 CHAPTER_RE = re.compile(rf"(?i)\b(?:chapter|chap|ch|c)\.?\s*#?\s*0*({NUMBER_TOKEN})\b")
 ISSUE_RE = re.compile(rf"(?i)(?:\b(?:issue|iss|no|number)\.?\s*#?\s*|#)0*({NUMBER_TOKEN})\b")
@@ -75,6 +90,10 @@ YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 PUBLICATION_DATE_RE = re.compile(
     r"(?<!\d)((?:19|20)\d{2})-(\d{1,2})(?:-(\d{1,2}))?(?![-\d])"
 )
+BRACKETED_MONTH_YEAR_RE = re.compile(
+    r"(?P<open>[\[(])\s*(?P<month>\d{1,2})-(?P<year>(?:19|20)\d{2})\s*(?P<close>[\])])"
+)
+V_YEAR_RE = re.compile(r"(?i)\bv\.?\s*0*((?:19|20)\d{2})\b")
 UNIT_PREFIX_TOKENS = {
     "book", "books", "c", "ch", "chap", "chapter", "chapters", "chs",
     "iss", "issue", "issues", "no", "number", "numbers", "tome", "tomes",
@@ -268,9 +287,26 @@ def publication_date_evidence(value):
         dates.append(publication_date)
         year_months.append(year_month)
         masked[match.start():match.end()] = " " * (match.end() - match.start())
+    # Reversed comic release stamps are safe only inside one complete,
+    # matching wrapper.  A bare/prefixed ``10-2019`` remains unit coverage.
+    for match in BRACKETED_MONTH_YEAR_RE.finditer(original):
+        if (match.group("open"), match.group("close")) not in {("(", ")"), ("[", "]")}:
+            continue
+        if has_unit_prefix_before_number(original, match.start()):
+            continue
+        month = match.group("month")
+        year = match.group("year")
+        try:
+            date(int(year), int(month), 1)
+        except ValueError:
+            continue
+        year_month = f"{year}-{int(month):02d}"
+        dates.append(year_month)
+        year_months.append(year_month)
+        masked[match.start():match.end()] = " " * (match.end() - match.start())
     return {
-        "dates": dates,
-        "year_months": year_months,
+        "dates": list(dict.fromkeys(dates)),
+        "year_months": list(dict.fromkeys(year_months)),
         "masked_text": "".join(masked),
     }
 
@@ -303,7 +339,7 @@ def parse_release_title(value):
     issue_match = ISSUE_RE.search(identity_source)
     coverage_match = COVERAGE_RE.search(unit_text)
     volume_range_match = COMPACT_VOLUME_RANGE_RE.search(unit_text)
-    volume = _number(volume_match.group(1)) if volume_match else ""
+    volume = _number(_first(*volume_match.groups())) if volume_match else ""
     book = _number(book_match.group(1)) if book_match else ""
     chapter = _number(chapter_match.group(1)) if chapter_match else ""
     issue = _number(issue_match.group(1)) if issue_match else ""
@@ -1028,6 +1064,87 @@ def normalize_candidate(candidate, wanted_item=None):
     return out
 
 
+def _reinterpret_vyear_run_for_issue_target(candidate, target, evidence):
+    """Treat ``VYYYY N`` as run-year plus issue N under narrow target proof."""
+
+    wanted = str(target.get("issue_number") or "")
+    if target.get("unit_type") not in ISSUE_UNITS or not wanted:
+        return
+    if any(
+        candidate.get(key) not in (None, "")
+        for key in ("source_volume_number", "provider_volume_number", "volume")
+    ):
+        return
+    run_year = str(evidence.get("volume_number") or "")
+    if not (run_year.isdigit() and 1900 <= int(run_year) <= 2099):
+        return
+    if any(
+        evidence.get(key)
+        for key in ("book_number", "chapter_number", "coverage_start", "coverage_end")
+    ):
+        return
+
+    sources = evidence.get("sources") if isinstance(evidence.get("sources"), list) else []
+    volume_sources = [source for source in sources if source.get("volume_number")]
+    if not volume_sources:
+        return
+    separate_numbers = set()
+    for source in sources:
+        text = str(source.get("parsed_identity_text") or source.get("unit_identity_title") or "")
+        year_matches = list(V_YEAR_RE.finditer(text))
+        if len(year_matches) > 1:
+            return
+        if source.get("volume_number"):
+            if (
+                source.get("volume_number") != run_year
+                or len(year_matches) != 1
+                or year_matches[0].group(1) != run_year
+            ):
+                return
+        masked = publication_date_evidence(text).get("masked_text", text)
+        masked = V_YEAR_RE.sub(lambda match: " " * (match.end() - match.start()), masked)
+        if VOLUME_RE.search(masked) or BOOK_RE.search(masked) or CHAPTER_RE.search(masked):
+            return
+        if COVERAGE_RE.search(masked) or COMPACT_VOLUME_RANGE_RE.search(masked):
+            return
+        source_numbers = []
+        for match in re.finditer(r"(?<![A-Za-z0-9])0*(\d{1,4})(?![A-Za-z0-9])", masked):
+            number = _number(match.group(1))
+            if number and not (number.isdigit() and 1900 <= int(number) <= 2099):
+                source_numbers.append(number)
+                separate_numbers.add(number)
+        # Each asserted source must carry at most one unit token, and a
+        # source carrying VYYYY must carry exactly one separate wanted issue.
+        # A set alone would collapse ``V1992 277 277`` into false certainty.
+        if len(source_numbers) > 1 or (source_numbers and source_numbers[0] != wanted):
+            return
+        if source.get("volume_number") and source_numbers != [wanted]:
+            return
+    # More than one trailing number is ambiguous (for example ``V1992 277
+    # 278``); never pick the target number out of that larger claim.
+    if separate_numbers != {wanted}:
+        return
+    if evidence.get("issue_number") and evidence.get("issue_number") != wanted:
+        return
+
+    evidence["run_year"] = run_year
+    evidence["volume_number"] = ""
+    evidence["issue_number"] = wanted
+    evidence["unit_type"] = "issue"
+    evidence["present_unit_fields"] = ["issue_number"]
+    evidence["ambiguous"] = False
+    evidence["conflicts"] = [
+        field for field in (evidence.get("conflicts") or []) if field not in {"volume_number", "issue_number"}
+    ]
+    for source in sources:
+        if source.get("volume_number") == run_year:
+            source["run_year"] = run_year
+            source["volume_number"] = ""
+            source["issue_number"] = wanted
+            source["unit_type"] = "issue"
+            source["ambiguous"] = False
+
+
 def collected_singleton_alias_exact_title_match(candidate, wanted_item=None):
     """Return whether a raw result is an exact alias for a proven collected singleton."""
 
@@ -1054,6 +1171,7 @@ def candidate_compatibility(candidate, wanted_item=None):
     ):
         target["unit_type"] = "chapter"
         target["chapter_number"] = target.get("chapter_number") or target.get("issue_number")
+    _reinterpret_vyear_run_for_issue_target(candidate, target, evidence)
     blocked = []
     review = []
     positive = []

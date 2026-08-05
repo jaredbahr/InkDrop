@@ -315,7 +315,14 @@ def forced_grab_candidate_gate(public: dict[str, Any], handoff_capsule: dict[str
     if _capsule_contains_rejected_locator(attempt):
         return {"eligible": False, "reason": "safe_handoff_locator_required", "rejection_codes": reasons}
     if protocol in {"soulseek", "slskd"}:
-        if _text(attempt.get("acquisition_capability")).lower() != "automatic" or _text(attempt.get("status")).lower() != "ready":
+        # Force Grab exists precisely for candidates the automatic gate did
+        # NOT accept (an already-accepted candidate returns above, at
+        # "candidate_already_accepted"), so requiring acquisition_capability
+        # == "automatic" here made this branch impossible to satisfy for any
+        # real rejected SLSKD candidate -- torrent/usenet below have no such
+        # requirement and rely solely on locator validity plus the shared
+        # FORCED_GRAB_IMPOSSIBLE_REJECTION_MARKERS check further down.
+        if _text(attempt.get("status")).lower() != "ready":
             return {"eligible": False, "reason": "supported_handoff_required", "rejection_codes": reasons}
         raw = attempt.get("raw") if isinstance(attempt.get("raw"), dict) else {}
         slskd_candidate = raw.get("candidate") if isinstance(raw.get("candidate"), dict) else {}

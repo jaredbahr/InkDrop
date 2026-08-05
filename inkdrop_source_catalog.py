@@ -218,26 +218,74 @@ def _catalog_path(path=None):
     return Path(path) if path else CATALOG_PATH
 
 
+# load_catalog()/provider_map()/provider_entry() used to re-read, re-parse,
+# and deep-copy the whole catalog on every call -- including once per
+# registry entry inside the source-worker's per-queue-row planning loop.
+# With a few hundred provider rows that meant tens of thousands of full
+# 54-candidate deep copies for a single scheduling pass. Cache the parsed
+# catalog and a normalized alias index keyed by (path, mtime, size) so a
+# lookup only copies the one entry it returns; touching the catalog file on
+# disk (tests, catalog edits) still invalidates it.
+_CATALOG_CACHE = {}
+
+
+def _catalog_cache_key(resolved_path):
+    try:
+        stat = resolved_path.stat()
+        return (str(resolved_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (str(resolved_path), None, None)
+
+
+def _cached_catalog(path=None):
+    resolved_path = _catalog_path(path)
+    cache_key = _catalog_cache_key(resolved_path)
+    cached = _CATALOG_CACHE.get(str(resolved_path))
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    with resolved_path.open("r", encoding="utf-8") as handle:
+        catalog = json.load(handle)
+    candidates = list(catalog.get("provider_candidates") or [])
+    # Keyed by each entry's own raw "id" only -- matching provider_map()'s
+    # original {id: entry} shape exactly. provider_entry() still normalizes
+    # the *lookup* key on the caller's side; indexing catalog ids under their
+    # own normalized/alias forms too would let a lookup match a different
+    # entry than the un-cached linear scan ever could.
+    alias_index = {
+        str(provider.get("id") or "").strip(): provider
+        for provider in candidates
+        if str(provider.get("id") or "").strip()
+    }
+    entry = {"catalog": catalog, "candidates": candidates, "alias_index": alias_index}
+    _CATALOG_CACHE[str(resolved_path)] = (cache_key, entry)
+    return entry
+
+
+def reset_catalog_cache():
+    """Drop the cached catalog. Tests/dev tooling call this after editing the file on disk."""
+
+    _CATALOG_CACHE.clear()
+
+
 def load_catalog(path=None):
     """Return a copy of the structured source catalog."""
-    with _catalog_path(path).open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return copy.deepcopy(_cached_catalog(path)["catalog"])
 
 
 def catalog_version(path=None):
-    return int(load_catalog(path).get("catalog_version") or 0)
+    return int(_cached_catalog(path)["catalog"].get("catalog_version") or 0)
 
 
 def mode_definitions(path=None):
-    return dict(load_catalog(path).get("mode_definitions") or {})
+    return dict(_cached_catalog(path)["catalog"].get("mode_definitions") or {})
 
 
 def implementation_order(path=None):
-    return list(load_catalog(path).get("implementation_order") or [])
+    return list(_cached_catalog(path)["catalog"].get("implementation_order") or [])
 
 
 def provider_candidates(path=None):
-    return list(load_catalog(path).get("provider_candidates") or [])
+    return copy.deepcopy(_cached_catalog(path)["candidates"])
 
 
 def product_provider_candidates(path=None):
@@ -250,17 +298,20 @@ def product_provider_candidates(path=None):
 
 
 def provider_map(path=None):
-    return {provider.get("id"): copy.deepcopy(provider) for provider in provider_candidates(path)}
+    return {
+        provider.get("id"): copy.deepcopy(provider)
+        for provider in _cached_catalog(path)["candidates"]
+    }
 
 
 def provider_entry(provider_id, path=None, default=None):
-    providers = provider_map(path)
+    alias_index = _cached_catalog(path)["alias_index"]
     direct_key = str(provider_id or "").strip()
     normalized_key = inkdrop_sources.normalize_key(provider_id)
     alias_key = inkdrop_sources.provider_key(provider_id)
     for key in (direct_key, normalized_key, alias_key):
-        if key in providers:
-            return copy.deepcopy(providers[key])
+        if key and key in alias_index:
+            return copy.deepcopy(alias_index[key])
     return copy.deepcopy(default)
 
 

@@ -52,6 +52,20 @@ CACHE_FILE = STATE_DIR / "missing-acquire-cache.json"
 RECONCILE_STATUS_FILE = STATE_DIR / "import-reconcile-status.json"
 REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
 MANUAL_REVIEW_ACTIONS_FILE = STATE_DIR / "manual-review-actions.json"
+# review() has no per-item memory: every scheduled search pass that
+# rediscovers the same still-unresolved outcome (a pack candidate still
+# awaiting approval, a series that still has no safe source this pass) has
+# always appended a fresh line, unbounded. Measured live 2026-08-02: one
+# manga's pack candidates alone accounted for 1,339 "pack_candidate_requires_
+# review" lines in 14 days -- the same handful of real candidates,
+# rediscovered on every pass, never remembered as already surfaced. That
+# repeat volume can push genuinely new/different review items out of the
+# UI's tail-window read (inkdrop_web.py's load_manual_review only looks at
+# the last 500 raw lines). This file is shared with
+# inkdrop_completed_import.py's append_manual_review(), which has the same
+# gap, so both write through the same durable dedup store.
+MANUAL_REVIEW_DEDUP_FILE = STATE_DIR / "manual-review-dedup.json"
+MANUAL_REVIEW_DEDUP_WINDOW_SECONDS = 6 * 3600
 PACK_REVIEW_STATE_FILE = STATE_DIR / "pack-review-state.json"
 PENDING_PACKS_LOG = STATE_DIR / "pending-pack-imports.jsonl"
 QBIT_BROAD_TAGS = {"inkdrop", "kavita-acquire"}
@@ -229,13 +243,53 @@ def with_sqlite_lock_retry(fn, label):
             delay = min(delay * 2, 10.0)
 
 
+def manual_review_recently_logged(review_id, now=None):
+    """True if this exact review_id was already logged within the dedup window."""
+
+    if not review_id:
+        return False
+    now = now if now is not None else time.time()
+    dedup = read_json_file(MANUAL_REVIEW_DEDUP_FILE, {})
+    if not isinstance(dedup, dict):
+        return False
+    try:
+        last_ts = float(dedup.get(review_id) or 0)
+    except (TypeError, ValueError):
+        last_ts = 0
+    return 0 < last_ts and (now - last_ts) < MANUAL_REVIEW_DEDUP_WINDOW_SECONDS
+
+
+def mark_manual_review_logged(review_id, now=None):
+    if not review_id:
+        return
+    now = now if now is not None else time.time()
+    dedup = read_json_file(MANUAL_REVIEW_DEDUP_FILE, {})
+    if not isinstance(dedup, dict):
+        dedup = {}
+    dedup[review_id] = now
+    # Opportunistic pruning keeps this file bounded without a separate job --
+    # nothing past 4x the dedup window can still be suppressing a write.
+    cutoff = now - MANUAL_REVIEW_DEDUP_WINDOW_SECONDS * 4
+    dedup = {
+        key: value
+        for key, value in dedup.items()
+        if isinstance(value, (int, float)) and value >= cutoff
+    }
+    dedup[review_id] = now
+    write_json_file(MANUAL_REVIEW_DEDUP_FILE, dedup)
+
+
 def review(reason, payload):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     record = {"ts": time.time(), "reason": reason, **payload}
     if not should_persist_review(reason):
         return record
+    review_id = review_id_for(record)
+    if manual_review_recently_logged(review_id, now=record["ts"]):
+        return record
     with REVIEW_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
+    mark_manual_review_logged(review_id, now=record["ts"])
     return record
 
 
@@ -493,14 +547,9 @@ def quality_language_rules(refresh=False):
     if QUALITY_LANGUAGE_RULES_CACHE is not None and not refresh:
         return QUALITY_LANGUAGE_RULES_CACHE
     rules = {
-        "preferred_language": DEFAULT_QUALITY_LANGUAGE_RULES["preferred_language"],
-        "pdf_allowed": DEFAULT_QUALITY_LANGUAGE_RULES["pdf_allowed"],
-        "packs_allowed": DEFAULT_QUALITY_LANGUAGE_RULES["packs_allowed"],
-        "pack_auto_approve_min_missing": DEFAULT_QUALITY_LANGUAGE_RULES["pack_auto_approve_min_missing"],
-        "complete_pack_min_missing": DEFAULT_QUALITY_LANGUAGE_RULES["complete_pack_min_missing"],
+        **DEFAULT_QUALITY_LANGUAGE_RULES,
         "allowed_extensions": set(DEFAULT_QUALITY_LANGUAGE_RULES["allowed_extensions"]),
         "blocked_release_terms": list(DEFAULT_QUALITY_LANGUAGE_RULES["blocked_release_terms"]),
-        "source": DEFAULT_QUALITY_LANGUAGE_RULES["source"],
     }
     if inkdrop_state is not None:
         try:
@@ -5547,7 +5596,7 @@ def ensure_send_allowed(cache, series, issue_number, chosen):
         raise RuntimeError("selected result is a known failed/duplicate source")
 
 
-def send(acquire, chosen, query, dry_run):
+def send(acquire, chosen, query, dry_run, target=None):
     title = chosen.get("title") or "unknown"
     media_type = "comics"
     url = chosen.get("downloadUrl")
@@ -5561,7 +5610,7 @@ def send(acquire, chosen, query, dry_run):
         outcome = acquire.sab_add(url, title, dry_run=False)
     else:
         raise RuntimeError(f"unsupported protocol: {chosen.get('protocol')}")
-    acquire.record_pending_import(query, media_type, chosen, outcome if isinstance(outcome, dict) else {})
+    acquire.record_pending_import(query, media_type, chosen, outcome if isinstance(outcome, dict) else {}, target=target)
     return outcome
 
 
@@ -6310,7 +6359,7 @@ def retry_failed_downloads(args):
             continue
         try:
             ensure_send_allowed(cache, title, issue, chosen)
-            outcome = send(acquire, chosen, chosen_query, args.dry_run)
+            outcome = send(acquire, chosen, chosen_query, args.dry_run, target=row)
         except Exception as exc:
             failure_reason = send_failure_reason(exc, "alternate_send_failed")
             remember_bad_result(cache, title, issue, chosen, failure_reason)
@@ -6386,7 +6435,7 @@ def retry_failed_downloads(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Guarded missing comics/manga acquisition via Kapowarr + Prowlarr")
+    parser = argparse.ArgumentParser(description="Guarded missing comics/manga acquisition via Prowlarr")
     parser.add_argument("--series", action="append", default=[])
     parser.add_argument("--max-per-series", type=int, default=5)
     parser.add_argument("--max-total", type=int, default=25)
@@ -6755,7 +6804,7 @@ def main():
                         continue
                     try:
                         ensure_send_allowed(cache, title, row["issue_number"], batch_chosen)
-                        outcome = send(acquire, batch_chosen, query, args.dry_run)
+                        outcome = send(acquire, batch_chosen, query, args.dry_run, target=row)
                     except Exception as exc:
                         failure_reason = send_failure_reason(exc, "download_client_send_failed")
                         remember_bad_result(cache, title, row["issue_number"], batch_chosen, failure_reason)

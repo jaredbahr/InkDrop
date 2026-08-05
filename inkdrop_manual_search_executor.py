@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 
@@ -49,7 +50,7 @@ def _provider_matches(row: dict[str, Any], requested: str) -> bool:
     return any(requested and (value.startswith(requested + "_") or requested in value) for value in values)
 
 
-def provider_rows(db_path: str | Path, provider_id: str) -> list[dict[str, Any]]:
+def provider_rows(db_path: str | Path, provider_id: str, *, registry_loader=None) -> list[dict[str, Any]]:
     requested = _provider_key(provider_id)
     # A manual search is allowed to discover through configured Prowlarr child
     # indexers even when an automatic-acquisition safety gate has disabled that
@@ -58,10 +59,13 @@ def provider_rows(db_path: str | Path, provider_id: str) -> list[dict[str, Any]]
     # configured row also prevents a historical source-memory shadow row from
     # replacing the executable Prowlarr adapter contract.
     include_disabled = requested == "prowlarr"
-    rows = inkdrop_source_registry.registry_from_db(
-        db_path,
-        include_disabled=include_disabled,
-    )
+    if registry_loader is not None:
+        rows = registry_loader(include_disabled)
+    else:
+        rows = inkdrop_source_registry.registry_from_db(
+            db_path,
+            include_disabled=include_disabled,
+        )
     matched = [dict(row) for row in rows if _provider_matches(dict(row), requested)]
     if requested != "prowlarr":
         return matched
@@ -455,19 +459,39 @@ def _run_slskd(context: dict[str, Any], queries: list[dict[str, Any]], profile: 
         private_filename = str(candidate.pop("filename", "") or "")
         private_username = str(candidate.pop("username", "") or "")
         acquisition_capability = str(candidate.get("acquisition_capability") or "assisted").strip().lower()
+        # Set this on the candidate itself, not just inside the private
+        # attempt below: normalize_candidate() (inkdrop_manual_search.py)
+        # only uses candidate.get("provider_candidate_identity") when it is
+        # already present -- otherwise it derives its OWN, differently-hashed
+        # value for the public record. Leaving it unset here meant the public
+        # candidate and the private handoff capsule always disagreed on this
+        # candidate's identity, which forced_grab_candidate_gate() treats as
+        # "candidate_handoff_binding_mismatch" -- Force Grab was unreachable
+        # for every real SLSKD candidate for this reason too, independent of
+        # the status/acquisition_capability fix above.
+        provider_candidate_identity = candidate.get("provider_candidate_identity") or candidate.get("candidate_identity")
+        candidate["provider_candidate_identity"] = provider_candidate_identity
         candidate["_inkdrop_manual_attempt"] = {
             "source": "slskd",
             "provider_id": "slskd",
             "protocol": "soulseek",
             "download_client": "SLSKD",
             "candidate_identity": candidate.get("candidate_identity"),
-            "provider_candidate_identity": candidate.get("provider_candidate_identity") or candidate.get("candidate_identity"),
+            "provider_candidate_identity": provider_candidate_identity,
             "locator_digest": slskd.slskd_private_locator_digest({
                 "username": private_username,
                 "filename": private_filename,
                 "size": candidate.get("size"),
             }),
-            "status": "ready" if acquisition_capability == "automatic" else "assisted",
+            # "ready" means InkDrop knows which peer and file to hand off --
+            # true for any real SLSKD search result, whether or not the
+            # automatic accept/reject gate approved it for auto-grab. Gating
+            # this on acquisition_capability == "automatic" made every
+            # rejected SLSKD candidate structurally ineligible for the
+            # explicit Force Grab override (forced_grab_candidate_gate in
+            # inkdrop_manual_search_core.py), even for rejection reasons that
+            # are safe to override on other protocols (e.g. wrong_unit_type).
+            "status": "ready" if (private_filename and private_username) else "assisted",
             "acquisition_capability": acquisition_capability,
             "raw": {
                 "candidate": {
@@ -515,10 +539,10 @@ def _run_slskd(context: dict[str, Any], queries: list[dict[str, Any]], profile: 
     }
 
 
-def run_provider(db_path: str | Path, provider_id: str, context: dict[str, Any], queries: list[dict[str, Any]], profile: dict[str, Any]) -> dict[str, Any]:
+def run_provider(db_path: str | Path, provider_id: str, context: dict[str, Any], queries: list[dict[str, Any]], profile: dict[str, Any], *, registry_loader=None) -> dict[str, Any]:
     if _provider_key(provider_id) == "slskd":
         return _run_slskd(context, queries, profile)
-    rows = provider_rows(db_path, provider_id)
+    rows = provider_rows(db_path, provider_id, registry_loader=registry_loader)
     if not rows:
         return {"completed": False, "error": "provider_not_configured_or_enabled", "candidates": []}
     wanted = _wanted_context(context, queries)
@@ -666,8 +690,46 @@ def run_provider(db_path: str | Path, provider_id: str, context: dict[str, Any],
 
 
 def runner_for_db(db_path: str | Path):
+    # Manual search fans its providers out over concurrent threads, and each
+    # non-SLSKD provider independently called registry_from_db() to build its
+    # row set. Under real SQLite write contention that read alone measured
+    # 15s+, and two threads missing the cache at the same moment each paid
+    # that cost separately -- often burning most of a provider's timeout
+    # budget before a single network request was made. One run's registry
+    # rarely changes in the ~60-120s the run takes, so the fix is to let the
+    # first caller populate a run-scoped cache and have the rest wait on it
+    # instead of repeating the same contended read.
+    #
+    # Providers request one of two distinct row sets: include_disabled=True
+    # for prowlarr, False for everyone else. A single lock shared across both
+    # keys serializes those independent reads -- prowlarr's read has to finish
+    # before rss/direct's *different* read can even start, which sums their
+    # costs instead of letting them run concurrently. Only callers requesting
+    # the SAME key should ever wait on each other, so cache-dict bookkeeping
+    # uses registry_cache_lock (held briefly) while the actual contended read
+    # is guarded by a lock scoped to that key alone.
+    registry_cache: dict[bool, list[dict[str, Any]]] = {}
+    registry_cache_lock = threading.Lock()
+    registry_key_locks: dict[bool, threading.Lock] = {}
+
+    def _shared_registry(include_disabled: bool) -> list[dict[str, Any]]:
+        with registry_cache_lock:
+            cached = registry_cache.get(include_disabled)
+            if cached is not None:
+                return cached
+            key_lock = registry_key_locks.setdefault(include_disabled, threading.Lock())
+        with key_lock:
+            with registry_cache_lock:
+                cached = registry_cache.get(include_disabled)
+                if cached is not None:
+                    return cached
+            rows = inkdrop_source_registry.registry_from_db(db_path, include_disabled=include_disabled)
+            with registry_cache_lock:
+                registry_cache[include_disabled] = rows
+            return rows
+
     def _runner(provider_id, context, queries, profile):
-        return run_provider(db_path, provider_id, context, queries, profile)
+        return run_provider(db_path, provider_id, context, queries, profile, registry_loader=_shared_registry)
 
     return _runner
 

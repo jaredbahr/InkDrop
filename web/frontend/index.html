@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>InkDrop frontend — dev harness</title>
+  </head>
+  <body>
+    <!--
+      Standalone dev harness only (`npm run dev`), not shipped. The real app
+      never loads this file: production pages come from inkdrop_web.py's own
+      HTML, which loads dist/inkdrop-react.js directly and calls
+      window.InkDropReact.mount() itself once a section's payload is fetched.
+    -->
+    <div id="dev-harness-root"></div>
+    <script type="module" src="/src/dev-harness.tsx"></script>
+  </body>
+</html>

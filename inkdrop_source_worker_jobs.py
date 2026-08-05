@@ -353,6 +353,115 @@ def _source_attempt_fetch_evidence(raw):
     return raw.get("fetch") if isinstance(raw.get("fetch"), dict) else {}
 
 
+def _mangadex_query_rotation(db_path, wanted_item, query_pool):
+    """Advance only past the newest attempt's completed clean-zero queries."""
+    wanted_item = _dict(wanted_item)
+    queue_id = str(wanted_item.get("queue_id") or "").strip()
+    queries = [providers.normalized_query(value) for value in query_pool or []]
+    queries = [value for value in queries if value]
+    if not db_path or not queue_id or len(queries) < 2:
+        return {}
+    path = Path(str(db_path))
+    if not path.exists():
+        return {}
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=1.0)
+        con.row_factory = sqlite3.Row
+        if not _sqlite_table_exists(con, "source_attempts"):
+            return {}
+        rows = con.execute(
+            """
+            select id, raw_json
+              from source_attempts
+             where queue_id=?
+               and (
+                    lower(coalesce(provider_id, '')) = 'mangadex'
+                 or lower(coalesce(source, '')) = 'mangadex'
+                 or lower(coalesce(provider, '')) = 'mangadex'
+               )
+             order by coalesce(completed_at, started_at, 0) desc, id desc
+             limit 1
+            """,
+            (queue_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        if con is not None:
+            con.close()
+
+    if not rows:
+        return {}
+    attempt_row = rows[0]
+    fetch = _source_attempt_fetch_evidence(attempt_row["raw_json"])
+    if not fetch:
+        return {}
+    query_keys = [value.casefold() for value in queries]
+    persisted_pool = [providers.normalized_query(value) for value in fetch.get("mangadex_query_pool") or []]
+    persisted_pool = [value for value in persisted_pool if value]
+    planned = [providers.normalized_query(value) for value in fetch.get("query_variants") or []]
+    planned = [value for value in planned if value]
+    if not planned or len(planned) > len(queries) or len({value.casefold() for value in planned}) != len(planned):
+        return {}
+    planned_keys = [value.casefold() for value in planned]
+    window_start = next(
+        (
+            index
+            for index in range(len(queries))
+            if [query_keys[(index + offset) % len(queries)] for offset in range(len(planned))] == planned_keys
+        ),
+        None,
+    )
+    if window_start is None:
+        return {}
+
+    decision = {
+        "offset": window_start,
+        "previous_attempt_id": attempt_row["id"],
+        "previous_completed_query_count": 0,
+        "previous_planned_query_count": len(planned),
+        "advanced_by": 0,
+    }
+    if persisted_pool and [value.casefold() for value in persisted_pool] != query_keys:
+        decision["reason"] = "query_pool_changed"
+        return decision
+    if fetch.get("error") or fetch.get("partial_errors"):
+        decision["reason"] = "previous_attempt_error"
+        return decision
+    counts = fetch.get("variant_result_counts")
+    if not isinstance(counts, list) or not counts or len(counts) > len(planned):
+        decision["reason"] = "missing_or_malformed_result_counts"
+        return decision
+    for index, count in enumerate(counts):
+        if not isinstance(count, dict) or "results" not in count or "matching_manga" not in count:
+            decision["reason"] = "missing_or_malformed_result_counts"
+            return decision
+        query = providers.normalized_query(count.get("query"))
+        try:
+            result_count = int(count.get("results"))
+            matching_count = int(count.get("matching_manga"))
+        except (TypeError, ValueError):
+            decision["reason"] = "missing_or_malformed_result_counts"
+            return decision
+        if query.casefold() != planned_keys[index] or result_count < 0 or matching_count < 0:
+            decision["reason"] = "missing_or_malformed_result_counts"
+            return decision
+        if result_count or matching_count:
+            decision["reason"] = "productive_query"
+            return decision
+    decision.update(
+        {
+            "offset": (window_start + len(counts)) % len(queries),
+            "previous_completed_query_count": len(counts),
+            "previous_last_query": planned[len(counts) - 1],
+            "advanced_by": len(counts),
+            "reason": "completed_clean_zero_queries",
+        }
+    )
+    return decision
+
+
 def _suwayomi_source_error_key(row):
     row = row if isinstance(row, dict) else {}
     source_id = str(row.get("source_id") or row.get("sourceId") or "").strip()
@@ -1543,6 +1652,7 @@ def _fetch_evidence(job, fetch_result, *, reason=""):
     requests_made = [request for request in fetch_result.get("requests_made") or [] if isinstance(request, dict)]
     request_source = requests_made or planned_requests
     query_variants = list(fetch_plan.get("query_variants") or fetch_result.get("query_variants") or payload.get("query_variants") or [])
+    mangadex_query_pool = list(fetch_plan.get("mangadex_query_pool") or [])
     variant_result_counts = list(fetch_result.get("variant_result_counts") or payload.get("variant_result_counts") or [])
     partial_errors = list(fetch_result.get("partial_errors") or payload.get("partial_errors") or [])
     meta_fallbacks = list(fetch_result.get("meta_fallbacks") or payload.get("meta_fallbacks") or [])
@@ -1566,6 +1676,7 @@ def _fetch_evidence(job, fetch_result, *, reason=""):
         "estimated_request_count": max(0, estimated_request_count),
         "requests_made_count": len(requests_made),
         "query_variants": query_variants,
+        "mangadex_query_pool": mangadex_query_pool,
         "variant_result_counts": variant_result_counts,
         "suwayomi_extension_health": _clean_dict(
             {
@@ -2080,11 +2191,20 @@ def source_jobs_from_settings_snapshot(
     include_blocked=False,
     limit=20,
     provider_health_map=None,
+    registry_rows=None,
 ):
-    rows = registry.registry_from_settings_snapshot(
-        snapshot,
-        include_disabled=True,
-        provider_health_map=provider_health_map,
+    # snapshot + provider_health_map are the same for every queue row in a
+    # scheduling pass, so a caller planning many rows can build the registry
+    # once and pass it as registry_rows instead of paying to rebuild it --
+    # deep copies and all -- per row.
+    rows = (
+        registry_rows
+        if registry_rows is not None
+        else registry.registry_from_settings_snapshot(
+            snapshot,
+            include_disabled=True,
+            provider_health_map=provider_health_map,
+        )
     )
     return source_jobs_from_registry(
         rows,
@@ -2196,6 +2316,26 @@ def run_source_job(
             wanted_item=wanted_item,
         )
 
+    mangadex_query_rotation = {}
+    if fetch_plan.get("payload_mode") == "mangadex_search_then_feed" and fetch_plan.get("query_variants"):
+        mangadex_query_rotation = _mangadex_query_rotation(
+            source_memory_db_path,
+            wanted_item,
+            fetch_plan.get("mangadex_query_pool") or fetch_plan.get("query_variants"),
+        )
+        if mangadex_query_rotation.get("offset"):
+            wanted_item = dict(wanted_item)
+            wanted_item["_mangadex_query_offset"] = mangadex_query_rotation["offset"]
+            fetch_plan = adapters.adapter_fetch_plan(
+                row,
+                plan,
+                wanted_item,
+                limit=job.get("limit") or 20,
+            )
+            fetch_plan["mangadex_query_rotation"] = dict(mangadex_query_rotation)
+            job["wanted_item"] = wanted_item
+            job["fetch_plan"] = fetch_plan
+
     if fetch_plan.get("payload_mode") in OPERATOR_PAYLOAD_MODES:
         if operator_payload is None:
             result["result_status"] = "operator_required"
@@ -2225,6 +2365,9 @@ def run_source_job(
     if suwayomi_source_error_cooldown:
         fetch_result = dict(fetch_result)
         fetch_result["suwayomi_source_error_cooldown"] = suwayomi_source_error_cooldown
+    if mangadex_query_rotation:
+        fetch_result = dict(fetch_result)
+        fetch_result["mangadex_query_rotation"] = mangadex_query_rotation
     result["fetch"] = fetch_result
     if not fetch_result.get("ok"):
         reason = fetch_result.get("reason") or "fetch_failed"

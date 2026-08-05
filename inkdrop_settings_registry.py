@@ -67,6 +67,9 @@ NUMBER_SPECS = {
     "automation.queue_watchdog_slskd_never_started_hours": {
         "min": 1, "max": 336, "integer": False, "units": "hours", "default": 24, "recommended": 24,
     },
+    "automation.queue_watchdog_slskd_queued_wait_hours": {
+        "min": 1, "max": 336, "integer": False, "units": "hours", "default": 48, "recommended": 48,
+    },
     "automation.queue_watchdog_handoff_stale_hours": {"min": 1, "max": 168, "integer": False},
     "automation.queue_watchdog_download_client_stale_hours": {"min": 1, "max": 336, "integer": False},
     "automation.queue_watchdog_retry_delay_minutes": {"min": 1, "max": 1440, "integer": True},

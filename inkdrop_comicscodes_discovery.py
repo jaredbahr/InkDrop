@@ -747,7 +747,7 @@ def discover(args):
 def main():
     apply_comicscodes_provider_settings()
     parser = argparse.ArgumentParser(description="Guarded ComicsCodes discovery for InkDrop")
-    parser.add_argument("--series", action="append", default=[], help="limit Kapowarr monitored series set")
+    parser.add_argument("--series", action="append", default=[], help="limit run to InkDrop's watched series set")
     parser.add_argument("--only", action="append", default=[], help="filter processed series by exact title")
     parser.add_argument("--fresh-days", type=float)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)

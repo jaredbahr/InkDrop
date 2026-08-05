@@ -684,6 +684,12 @@
       background: rgba(10, 18, 30, 0.36);
     }
     @media (min-width: 1100px) {
+      /* Historical 188px fixed-nav desktop layout, superseded at this same
+         breakpoint by 15-redesign-shell.css (loaded after this file, so it
+         wins the cascade): main, .arr-nav-shell and its children, and
+         .activity-region are all re-declared there with current values.
+         See that file's header comment for the full ownership note. Editing
+         the rules below changes nothing a user can see at >=1100px. */
       main {
         position: relative;
         display: block;
@@ -940,7 +946,19 @@
       }
       .section-table.section-table-operational.section-table-manual_review .section-table-head,
       .section-table.section-table-operational.section-table-manual_review .section-table-row {
-        grid-template-columns: minmax(282px, 1.24fr) minmax(148px, .58fr) minmax(330px, 1.34fr) minmax(174px, .66fr);
+        /* Manual Review keeps its row-select checkbox (selectableTable in
+           inkdrop_web.py includes "manual_review"), unlike Queue -- the
+           shared .section-table-operational rule above is 4 tracks with no
+           select column, which crushed this row's title into the checkbox
+           track exactly like Blocklist's rows used to (see the "Blocklist
+           rows carry four cells" comment in 04-tables-rows.css). Six tracks,
+           not five: manual_review joined SPLIT_SOURCE_COLUMN_VIEWS in
+           inkdrop_web.py, adding a "source" cell between state and detail --
+           without its own track here it wrapped onto a second implicit grid
+           row (default grid-auto-flow: row), scattering Actions below the
+           rest of the row instead of crushing it, since this rule still had
+           only enough tracks for the pre-split five-cell row. */
+        grid-template-columns: 30px minmax(260px, 1.15fr) minmax(120px, .48fr) minmax(140px, .48fr) minmax(280px, 1.15fr) minmax(174px, .66fr);
       }
       .section-table.section-table-operational .section-table-head {
         top: 0;

@@ -618,6 +618,8 @@ def registry_entry(provider, *, source_order=None):
         "rights_gate": settings.get("rights_gate"),
         "direct_url_policy": settings.get("direct_url_policy"),
         "allowed_extensions": list(settings.get("allowed_extensions") or []),
+        "download_root": str(settings.get("download_root") or "").strip(),
+        "incomplete_root": str(settings.get("incomplete_root") or "").strip(),
         "minimum_seeders": settings.get("minimum_seeders"),
         "search_url_templates": _listish(settings.get("search_url_templates")),
         "policy": policy,

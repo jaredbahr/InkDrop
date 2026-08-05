@@ -18,6 +18,9 @@ INTEGRATION_ALIASES = {
     "comic-vine": "comicvine",
     "qbit": "qbittorrent",
     "q_bit_torrent": "qbittorrent",
+    "u_torrent": "utorrent",
+    "µtorrent": "utorrent",
+    "μtorrent": "utorrent",
     "sab": "sabnzbd",
     "soulseek": "slskd",
     "rss": "rss_direct",
@@ -58,6 +61,12 @@ INTEGRATIONS = {
     "transmission": _spec("Transmission", "download_client", "beta", ("test", "grab", "poll", "progress", "import"), env_url=("INKDROP_TRANSMISSION_URL",), env_secrets=("INKDROP_TRANSMISSION_PASSWORD",), configure_target="download_clients"),
     "deluge": _spec("Deluge", "download_client", "beta", ("test", "grab", "poll", "progress", "import"), env_url=("INKDROP_DELUGE_URL",), env_secrets=("INKDROP_DELUGE_PASSWORD",), configure_target="download_clients"),
     "nzbget": _spec("NZBGet", "download_client", "beta", ("test", "grab", "poll", "progress", "import"), env_url=("INKDROP_NZBGET_URL",), env_secrets=("INKDROP_NZBGET_PASSWORD", "INKDROP_NZBGET_API_KEY"), configure_target="download_clients"),
+    # These clients have configuration, connection tests, and handoff adapters,
+    # but no authoritative recurring status poller yet.  Report only the
+    # capabilities they can currently fulfill instead of silently dropping
+    # their saved provider rows or overstating import/progress support.
+    "utorrent": _spec("uTorrent", "download_client", "beta", ("test", "grab"), configure_target="download_clients", requires_url=True, requires_secret=True),
+    "rtorrent": _spec("rTorrent", "download_client", "beta", ("test", "grab"), configure_target="download_clients", requires_url=True),
     "rss_direct": _spec("Direct / RSS Sources", "download_source", "beta", ("feed", "candidate_discovery", "direct_download", "import"), env_url=("INKDROP_RSS_FEED_URL",), defaults_configured=True, configure_target="download_sources"),
     "local_manual_inbox": _spec("Local / Manual Inbox", "local_source", "implemented", ("local_folder", "manual_intake", "import"), env_url=("INKDROP_MANUAL_INBOX_DIR",), defaults_configured=True, configure_target="paths"),
 }
@@ -136,6 +145,30 @@ def _stored_provider_rows(db_path):
         )]
 
 
+def _stored_download_client_rows(db_path):
+    """Read the authoritative multi-instance download-client configuration."""
+    path = Path(db_path) if db_path else None
+    if not path or not path.exists():
+        return []
+    uri = f"file:{path}?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("pragma query_only=1")
+        instance_table = con.execute(
+            "select 1 from sqlite_master where type='table' and name='download_client_instances' limit 1"
+        ).fetchone()
+        if not instance_table:
+            return []
+        return [dict(row) for row in con.execute(
+            """
+            select id, name, client_type, enabled, base_url, username,
+                   settings_json, secret_refs_json, source, updated_at
+            from download_client_instances
+            where deleted_at is null
+            """
+        )]
+
+
 def _stored_provider_map(rows):
     result = {}
     for row in rows or ():
@@ -146,6 +179,45 @@ def _stored_provider_map(rows):
         if current is None or float(row.get("updated_at") or 0) >= float(current.get("updated_at") or 0):
             result[provider_id] = dict(row)
     return result
+
+
+def _stored_download_client_map(rows):
+    """Collapse configured instances into the type-level effective-config view."""
+    grouped = {}
+    for row in rows or ():
+        client_type = canonical_integration_id(row.get("client_type"))
+        spec = INTEGRATIONS.get(client_type) or {}
+        if spec.get("category") != "download_client":
+            continue
+        settings = _json_object(row.get("settings_json"))
+        username = str(row.get("username") or "").strip()
+        if username:
+            settings["username"] = username
+        secret_refs = _json_object(row.get("secret_refs_json"))
+        secret_ref = next(
+            (str(value).strip() for value in secret_refs.values() if _nonblank(value)),
+            "",
+        )
+        candidate = {
+            "id": client_type,
+            "display_name": row.get("name") or spec.get("display_name") or client_type,
+            "enabled": bool(row.get("enabled")),
+            "base_url": row.get("base_url"),
+            "secret_ref": secret_ref,
+            "settings_json": json.dumps(settings, sort_keys=True),
+            "source": row.get("source") or "user",
+            "updated_at": float(row.get("updated_at") or 0),
+            "_selected_rank": (bool(row.get("enabled")), float(row.get("updated_at") or 0)),
+        }
+        current = grouped.get(client_type)
+        if current is None:
+            grouped[client_type] = candidate
+            continue
+        if candidate["_selected_rank"] > current["_selected_rank"]:
+            grouped[client_type] = candidate
+    for row in grouped.values():
+        row.pop("_selected_rank", None)
+    return grouped
 
 
 def _health_map(health_rows):
@@ -191,10 +263,17 @@ def _sqlite_evidence(row):
     return configured, secret_present, bool(base_url), base_url
 
 
-def resolve_effective_integrations(db_path=None, environ=None, health_rows=None, stored_rows=None):
+def resolve_effective_integrations(db_path=None, environ=None, health_rows=None, stored_rows=None, download_client_rows=None):
     """Return one canonical, secret-free status row per integration."""
     env = os.environ if environ is None else environ
     stored = _stored_provider_map(stored_rows if stored_rows is not None else _stored_provider_rows(db_path))
+    stored.update(
+        _stored_download_client_map(
+            download_client_rows
+            if download_client_rows is not None
+            else _stored_download_client_rows(db_path)
+        )
+    )
     health = _health_map(health_rows)
     rows = []
     for integration_id, spec in INTEGRATIONS.items():

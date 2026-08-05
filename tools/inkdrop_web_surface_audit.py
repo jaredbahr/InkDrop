@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB_FILE = ROOT / "inkdrop_web.py"
+WEB_CONFIG_FILE = ROOT / "inkdrop_web_config.py"
 
 REQUIRED_GET_PATHS = {
     "/",
@@ -171,6 +172,13 @@ def audit():
     if not WEB_FILE.exists():
         return {"ok": False, "findings": [{"kind": "missing_file", "file": str(WEB_FILE), "message": "web implementation file is missing"}]}
     source = WEB_FILE.read_text(encoding="utf-8", errors="replace")
+    # Module-level script_path(...) constants moved to inkdrop_web_config.py
+    # (re-exported into inkdrop_web via `from inkdrop_web_config import *`);
+    # the worker-reference check below spans both files, everything else
+    # here (routes, Handler, status contract) is still inkdrop_web.py only.
+    worker_reference_source = source
+    if WEB_CONFIG_FILE.exists():
+        worker_reference_source += WEB_CONFIG_FILE.read_text(encoding="utf-8", errors="replace")
     handler = _handler_text(source)
     get_text = _method_text(handler, "do_GET")
     post_text = _method_text(handler, "do_POST")
@@ -190,7 +198,7 @@ def audit():
         findings.append({"kind": "missing_server_binding", "message": "web main should bind Handler through ThreadingHTTPServer"})
 
     for constant, filename in REQUIRED_WORKER_REFERENCES.items():
-        if constant not in source or filename not in source:
+        if constant not in worker_reference_source or filename not in worker_reference_source:
             findings.append({"kind": "missing_worker_reference", "constant": constant, "file": filename, "message": f"{constant} should reference {filename}"})
 
     return {

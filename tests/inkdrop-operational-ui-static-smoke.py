@@ -19,7 +19,9 @@ def catalog_matches_release_contract():
     tag = str(contract.get("tag") or "")
     expected_slug = tag.replace(".", "-").lower()
     return f'version: "{tag}"' in catalog and f'slug: "{expected_slug}"' in catalog
-web = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8")
+# inkdrop_web_config.py holds the static-asset registration constants that
+# used to live directly in inkdrop_web.py.
+web = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8") + (ROOT / "inkdrop_web_config.py").read_text(encoding="utf-8")
 css = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")
 dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 gaps = (ROOT / "docs/inkdrop/UI_BACKEND_GAPS.md").read_text(encoding="utf-8")
@@ -122,9 +124,16 @@ checks = {
     and 'appendSectionSummaryChip(box, "sources", facetCountText(sectionFilterRow(viewPayload, "sources")))' in web
     and 'appendSectionSummaryChip(box, "downloads", facetCountText(sectionFilterRow(viewPayload, "downloads")))' in web
     and 'appendSectionSummaryChip(box, "imports", facetCountText(sectionFilterRow(viewPayload, "imports")), "good")' in web
-    and 'historyCard("Sources", "sources", "provider and source events")' in web
-    and 'historyCard("Imports", "imports", "copy, scan, and verify events", "good")' in web
-    and 'sampled recent events; open for full history' in web,
+    # History's stat cards (Completed/Failed/Retried/Needs review) get their
+    # real counts from a cached, sampled rollup (history_outcome_rollup() in
+    # inkdrop_state.py) rather than scanning every history_events row on
+    # every request -- outcomeSummary.sampled visibly labels the cards with
+    # the sample size when a card's count is approximate.
+    and "const outcomeSummary = viewPayload?.outcome_summary || {};" in web
+    and "outcomeSummary.sampled" in web
+    and "recent events)`" in web
+    and 'sectionWorkbenchCard(box, "Completed", Number(outcomeSummary.completed || 0)' in web
+    and 'sectionWorkbenchCard(box, "Needs review", needsReviewCount' in web,
     "page size reloads endpoint": 'loadInkdropSection(key, focus, {scroll: "none", keepExisting: true, limit: size})' in web,
     "operational first paint respects page size": '["queue", "wanted", "manual_review"].includes(view)' in web
     and "inkdropArrTablePrefsForView(view).pageSize" in web,
@@ -217,7 +226,7 @@ checks = {
     and "arr-table-density-detailed" in css
     and "queue-row-progress.stalled" in css
     and 'grid-template-areas:' in css
-    and '"select item state actions"' in css
+    and '"select item state source actions"' in css
     and 'body[data-inkdrop-view="wanted"] .arr-table-controlbar-right' in css
     and "overflow: visible" in css,
     "backend gaps": "Operational table controls" in gaps

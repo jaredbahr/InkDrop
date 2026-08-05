@@ -129,7 +129,11 @@ def main() -> int:
     if f"{private_home}/bin/" in worker_text or f"{private_home}/arr-docker/" in worker_text:
         fail("import-ready worker should not require operator-specific host paths")
 
-    web_text = WEB_IMPL.read_text(encoding="utf-8")
+    # inkdrop_web_config.py holds the module-level script_path(...) constants
+    # that used to live directly in inkdrop_web.py (see
+    # inkdrop_web_config.py's own docstring); the neutral-path checks below
+    # apply to that combined surface, not to inkdrop_web.py alone.
+    web_text = WEB_IMPL.read_text(encoding="utf-8") + (ROOT / "inkdrop_web_config.py").read_text(encoding="utf-8")
     require(web_text, 'script_path("inkdrop_completed_import.py"', "web neutral import command")
     require(web_text, 'script_path("inkdrop_reconcile_imports.py"', "web neutral reconcile command")
     require(web_text, 'script_path("inkdrop_pack_import.py"', "web neutral pack import command")

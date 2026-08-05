@@ -2,7 +2,17 @@
   "use strict";
 
   const API = "/api/missing-recovery";
-  const state = {payload: null, loading: null, lastLoadedAt: 0, refreshTimer: 0, actionError: null};
+  const state = {
+    payload: null,
+    loading: null,
+    lastLoadedAt: 0,
+    refreshTimer: 0,
+    actionError: null,
+    wantedActive: false,
+    activationGeneration: 0,
+    requestGeneration: 0,
+    mutationGeneration: 0,
+  };
   const progressLabels = Object.freeze({
     waiting_to_search: "Waiting to search",
     searching: "Searching",
@@ -61,8 +71,13 @@
   }
 
   function renderMessage(host, message, tone="") {
+    if (!state.wantedActive) return;
     host.replaceChildren(element("div", `missing-recovery-message ${tone}`.trim(), message));
     host.hidden = false;
+  }
+
+  function activationIsCurrent(generation) {
+    return state.wantedActive && state.activationGeneration === generation;
   }
 
   function stateLabel(payload) {
@@ -82,20 +97,23 @@
 
   function renderPayload(payload) {
     const host = surface();
-    if (!host) return;
+    if (!host || !state.wantedActive) return;
     host.replaceChildren();
     host.hidden = false;
     host.dataset.recoveryEnabled = payload.enabled ? "true" : "false";
     host.dataset.recoveryPaused = payload.control?.paused ? "true" : "false";
 
     const heading = element("div", "missing-recovery-heading");
+    const headingMain = element("div", "missing-recovery-heading-main");
+    const icon = element("span", "missing-recovery-icon");
+    icon.setAttribute("aria-hidden", "true");
+    headingMain.append(icon);
     const copy = element("div", "missing-recovery-copy");
-    copy.append(element("span", "section-eyebrow", "Wanted"));
     copy.append(element("h3", "", "Recover Missing"));
-    copy.append(element("p", "mini", "Make one limited pass over the gaps InkDrop has been leaving behind: old misses, downloads that stalled part-way, and imports that never finished."));
-    copy.append(element("p", "mini", "Stays inside today's data cap, staging space, and quiet hours. For an immediate sweep of every Wanted issue instead, use Search All in the table below."));
+    copy.append(element("p", "mini", "Make one limited pass over old misses, stalled downloads, and unfinished imports."));
+    headingMain.append(copy);
     const mode = stateLabel(payload);
-    heading.append(copy, element("span", `missing-recovery-state ${mode.tone}`.trim(), mode.label));
+    heading.append(headingMain, element("span", `missing-recovery-state ${mode.tone}`.trim(), mode.label));
     host.append(heading);
 
     if (!payload.enabled) {
@@ -122,6 +140,10 @@
       host.append(failure);
     }
 
+    const details = element("details", "missing-recovery-details");
+    details.append(element("summary", "", "Recovery details"));
+    details.append(element("p", "mini", "Stays inside today's data cap, staging space, and quiet hours. For an immediate sweep of every Wanted issue instead, use Search All in the table below."));
+
     const progress = element("div", "missing-recovery-progress");
     progress.append(element("strong", "missing-recovery-subtitle", "Where the missing issues are now"));
     const progressGrid = element("div", "missing-recovery-progress-grid");
@@ -138,7 +160,7 @@
       ));
     }
     progress.append(progressGrid);
-    host.append(progress);
+    details.append(progress);
 
     const advanced = element("details", "missing-recovery-advanced");
     advanced.append(element("summary", "", "Advanced: next-pass planning and admission limits"));
@@ -169,7 +191,8 @@
     }
     categories.append(categoryList);
     advanced.append(categories);
-    host.append(advanced);
+    details.append(advanced);
+    host.append(details);
 
     const footer = element("div", "missing-recovery-footer");
     const result = element("div", "missing-recovery-result");
@@ -205,17 +228,26 @@
   }
 
   async function mutate(action, live, buttons) {
+    const activationGeneration = state.activationGeneration;
+    const mutationGeneration = ++state.mutationGeneration;
     for (const button of buttons) button.disabled = true;
     state.actionError = null;
     live.classList.remove("bad");
     live.textContent = action === "start" ? "Starting one recovery pass…" : "Pausing new recovery work…";
     try {
       await window.InkDropApi.request("/api/series-autopilot/run", {method: "POST", body: {missingRecoveryAction: action}});
+      state.payload = null;
+      state.lastLoadedAt = 0;
+      if (!activationIsCurrent(activationGeneration) || mutationGeneration !== state.mutationGeneration) {
+        if (state.wantedActive) load(true);
+        return;
+      }
       live.textContent = action === "start"
         ? "Bounded recovery pass requested."
         : "New recovery admission paused. Active transfers and imports continue.";
       await load(true);
     } catch (error) {
+      if (!activationIsCurrent(activationGeneration) || mutationGeneration !== state.mutationGeneration) return;
       state.actionError = {
         action,
         message: error?.detail || error?.message || "InkDrop could not reach the recovery control.",
@@ -234,33 +266,59 @@
       renderPayload(state.payload);
       return;
     }
-    if (state.loading) return state.loading;
-    state.loading = window.InkDropApi.request(API)
+    const activationGeneration = state.activationGeneration;
+    if (!force && state.loading?.activationGeneration === activationGeneration) return state.loading.promise;
+    const requestGeneration = ++state.requestGeneration;
+    const promise = window.InkDropApi.request(API)
       .then(payload => {
+        if (!activationIsCurrent(activationGeneration) || requestGeneration !== state.requestGeneration) return payload;
         state.payload = payload;
         state.lastLoadedAt = Date.now();
         renderPayload(payload);
         return payload;
       })
-      .catch(error => renderMessage(host, error?.message || "Recovery status is unavailable.", "bad"))
-      .finally(() => { state.loading = null; });
-    return state.loading;
+      .catch(error => {
+        if (!activationIsCurrent(activationGeneration) || requestGeneration !== state.requestGeneration) return;
+        renderMessage(host, error?.message || "Recovery status is unavailable.", "bad");
+      })
+      .finally(() => {
+        if (state.loading?.requestGeneration === requestGeneration) state.loading = null;
+      });
+    state.loading = {activationGeneration, requestGeneration, promise};
+    return promise;
+  }
+
+  function deactivate(targetView="") {
+    if (String(targetView || "").trim().toLowerCase() === "wanted") return false;
+    const host = surface();
+    if (state.wantedActive) state.activationGeneration += 1;
+    state.wantedActive = false;
+    window.clearTimeout(state.refreshTimer);
+    state.actionError = null;
+    if (host) {
+      host.hidden = true;
+      host.replaceChildren();
+    }
+    return true;
   }
 
   function render(viewPayload={}) {
     const host = surface();
     if (!host) return;
     if (String(viewPayload?.view || "") !== "wanted") {
-      window.clearTimeout(state.refreshTimer);
-      state.actionError = null;
-      host.hidden = true;
-      host.replaceChildren();
+      deactivate(viewPayload?.view);
       return;
     }
+    if (!state.wantedActive) {
+      state.activationGeneration += 1;
+      state.payload = null;
+      state.lastLoadedAt = 0;
+    }
+    state.wantedActive = true;
     host.hidden = false;
     if (!state.payload) renderMessage(host, "Loading recovery selection and progress…");
     load(false);
   }
 
-  window.InkDropMissingRecovery = Object.freeze({render, refresh: () => load(true)});
+  window.InkDropMissingRecovery = Object.freeze({deactivate, render, refresh: () => load(true)});
 })();

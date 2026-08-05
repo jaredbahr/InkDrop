@@ -279,6 +279,19 @@ def build_jobs() -> list[ScheduledJob]:
             critical=False,
         ),
         ScheduledJob(
+            "log-retention",
+            int_env("INKDROP_SCHEDULER_LOG_RETENTION_INTERVAL_SECONDS", 300),
+            (py, "-B", "inkdrop_log_retention.py", "--json"),
+            initial_delay_seconds=90,
+            timeout_seconds=bounded_int_env(
+                "INKDROP_SCHEDULER_LOG_RETENTION_TIMEOUT_SECONDS",
+                120,
+                30,
+                600,
+            ),
+            critical=False,
+        ),
+        ScheduledJob(
             "series-status-refresh",
             int_env("INKDROP_SCHEDULER_STATUS_REFRESH_INTERVAL_SECONDS", 120),
             (py, "-B", "inkdrop_series_autopilot.py", "--status-only"),

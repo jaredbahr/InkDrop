@@ -21,6 +21,7 @@ import requests
 import inkdrop_runtime_config
 import inkdrop_qbittorrent_auth
 import inkdrop_download_client_routing
+import inkdrop_download_client_config
 
 
 def script_path(name: str, remote_path=None, *, env_var=None, fallback=None) -> Path:
@@ -636,23 +637,74 @@ def import_ready_batch_priority(*values):
     return 1
 
 
-def import_ready_broad_pack_key(path, *values):
+def import_ready_broad_pack_key(path, *values, pending_key=None):
     if import_ready_is_weekly_pack(path, *values):
         return ""
     pieces = []
+    parent_name = ""
     try:
         source = Path(str(path or ""))
+        parent_name = str(source.parent.name or "").strip()
         pieces.extend([source.parent.name, source.name])
     except (TypeError, ValueError):
         pass
     pieces.extend(str(value or "") for value in values if value is not None)
     if not import_ready_is_broad_pack(*pieces):
         return ""
-    return norm(" ".join(piece for piece in pieces if piece))[:160]
+    # The per-batch cap this key drives throttles how many children of ONE
+    # physical pack transfer get processed together. source.name (each
+    # child's own filename) and the caller's per-child values (matched
+    # issue title/query) differ for every child in the same pack, so
+    # folding them into the returned key made it effectively unique per
+    # child and the cap never actually engaged -- every child got counted
+    # under its own key, never hit INKDROP_IMPORT_READY_MAX_PER_BROAD_PACK_PER_BATCH,
+    # and the whole pack processed unthrottled in one batch. pending_key is
+    # the durable per-download-job identity every child of one pack already
+    # shares in download_reconciliation; fall back to the shared parent
+    # folder when the caller doesn't have one.
+    identity = str(pending_key or "").strip() or parent_name
+    if not identity:
+        return ""
+    return norm(identity)[:160]
+
+
+def pending_durable_identity(record):
+    """A durable identity for the one physical transfer `record` describes,
+    independent of its title/query text. Mirrors
+    inkdrop_completed_import.pending_record_identity() -- not imported from
+    there to avoid a cross-module import cycle, but must stay in sync with it,
+    since both read the same pending-imports.jsonl ledger and must agree on
+    which lines describe the same physical download. Prefers the explicit
+    pending_artifact_id written by record_pending_import(); for records
+    written before that field existed, it is recomputed from the same
+    client_id/client_hash/nzo_id/download_url_hash fields those records
+    already carried.
+    """
+    record = record if isinstance(record, dict) else {}
+    explicit = str(record.get("pending_artifact_id") or "").strip()
+    if explicit:
+        return explicit
+    client_id = str(record.get("client_id") or record.get("client_hash") or record.get("nzo_id") or "").strip()
+    download_url_hash = str(
+        record.get("download_url_hash") or record.get("downloadUrlHash") or record.get("url_hash") or ""
+    ).strip()
+    if not client_id and not download_url_hash:
+        return ""
+    basis = "|".join((
+        str(record.get("protocol") or "").strip().lower(),
+        str(record.get("download_client") or "").strip().lower(),
+        client_id,
+        download_url_hash,
+    ))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 def pending_key(record):
-    return norm(record.get("title") or record.get("query"))
+    # A durable identity keys two records to the same physical download only
+    # when they actually share one -- unlike the title/query fallback, which
+    # collapsed every download that happened to share a title or query,
+    # including genuinely distinct target IDs sent under the same alias.
+    return pending_durable_identity(record) or norm(record.get("title") or record.get("query"))
 
 
 def lifecycle_sample(records, limit=10):
@@ -1347,6 +1399,11 @@ def load_pending_latest():
                 continue
             if record.get("type") != "comics":
                 continue
+            # A quarantine entry records an ambiguous match attempt, not a new
+            # fact about the download -- it must never overwrite the "sent"
+            # record it was quarantined instead of acting on.
+            if record.get("event") == "pending_import_status_quarantined":
+                continue
             key = pending_key(record)
             if not key:
                 continue
@@ -1798,7 +1855,7 @@ def replay_managed_destination_evidence(source_path, dest_path, reason=None):
     }
 
 
-def qbit_archive_paths(session, host, torrent_hash, save_path, require_complete=True):
+def qbit_archive_paths(session, host, torrent_hash, save_path, require_complete=True, *, instance_id=None, db_path=None):
     paths = []
     if not torrent_hash:
         return paths
@@ -1824,7 +1881,9 @@ def qbit_archive_paths(session, host, torrent_hash, save_path, require_complete=
             continue
         if Path(name).name.startswith("."):
             continue
-        candidate = qbit_host_path(qbit_base + "/" + name.lstrip("/"))
+        candidate = download_client_host_path(
+            qbit_base + "/" + name.lstrip("/"), download_client_instance_id=instance_id, db_path=db_path
+        )
         if not candidate or not is_archive_path(candidate) or is_internal_segment_path(candidate):
             continue
         try:
@@ -1837,10 +1896,51 @@ def qbit_archive_paths(session, host, torrent_hash, save_path, require_complete=
     return paths
 
 
-def qbit_items():
-    cfg = qbit_settings()
-    if not cfg:
-        return []
+def _qbit_source_dedupe_key(cfg):
+    return (
+        str(cfg.get("host") or "").strip().rstrip("/").lower(),
+        str(cfg.get("api_key") or "").strip(),
+        str(cfg.get("user") or "").strip().lower(),
+    )
+
+
+def qbit_instance_configs(db_path):
+    """Enumerate enabled qBittorrent download-client instances beyond the legacy singleton.
+
+    Materializes each through the same inkdrop_download_client_routing code
+    dispatch uses, so reconciliation sees the identical host/credentials a
+    real acquisition would have used -- not a second, independently-resolved
+    copy that can silently disagree. Returns (instance_id, cfg, error) tuples;
+    cfg is None when an enabled instance can't be materialized, so the caller
+    can surface that as unavailable instead of quietly skipping it.
+    """
+    results = []
+    try:
+        listing = inkdrop_download_client_config.list_instances(db_path)
+    except Exception:
+        return results
+    for row in listing.get("instances") or []:
+        if str(row.get("client_type") or "").strip().lower() != "qbittorrent" or not row.get("enabled"):
+            continue
+        instance_id = row.get("id")
+        try:
+            materialized = inkdrop_download_client_routing.materialize_instance_settings(db_path, instance_id, "comics")
+            settings = materialized.get("settings") or {}
+            host = str(settings.get("host") or settings.get("base_url") or "").strip().rstrip("/")
+            if host and not host.startswith(("http://", "https://")):
+                host = "http://" + host
+            api_key = str(settings.get("api_key") or "").strip()
+            user = str(settings.get("user") or settings.get("username") or "").strip()
+            password = str(settings.get("pass") or settings.get("password") or "").strip()
+            if not host or not (api_key or (user and password)):
+                raise ValueError("qBittorrent instance is missing a host or credentials")
+            results.append((instance_id, {"host": host, "user": user, "pass": password, "api_key": api_key}, None))
+        except Exception as exc:
+            results.append((instance_id, None, str(exc)))
+    return results
+
+
+def _qbit_poll_source(cfg, *, instance_id=None, db_path=None):
     try:
         session = requests.Session()
         inkdrop_qbittorrent_auth.authenticate_settings(session, cfg, timeout=15)
@@ -1861,9 +1961,14 @@ def qbit_items():
             if progress < 0.999 and any(token in state_lower for token in ("stopped", "paused")):
                 client_state = "stopped_downloading"
             torrent_hash = torrent.get("hash")
-            archive_paths = qbit_archive_paths(session, cfg["host"], torrent_hash, torrent.get("save_path"))
+            archive_paths = qbit_archive_paths(
+                session, cfg["host"], torrent_hash, torrent.get("save_path"), instance_id=instance_id, db_path=db_path
+            )
             incomplete_archive_paths = (
-                qbit_archive_paths(session, cfg["host"], torrent_hash, torrent.get("save_path"), require_complete=False)
+                qbit_archive_paths(
+                    session, cfg["host"], torrent_hash, torrent.get("save_path"), require_complete=False,
+                    instance_id=instance_id, db_path=db_path,
+                )
                 if progress < 0.999
                 else []
             )
@@ -1871,6 +1976,7 @@ def qbit_items():
             out.append(
                 {
                     "client": "qbit",
+                    "download_client_instance_id": instance_id,
                     "name": torrent.get("name"),
                     "hash": torrent_hash,
                     "category": category,
@@ -1898,7 +2004,37 @@ def qbit_items():
         write_qbit_file_list_cache()
         return out
     except Exception as exc:
-        return [{"client": "qbit", "error": str(exc), "client_state": "client_unavailable"}]
+        return [{
+            "client": "qbit",
+            "download_client_instance_id": instance_id,
+            "error": str(exc),
+            "client_state": "client_unavailable",
+        }]
+
+
+def qbit_items(db_path=None):
+    db_path = db_path or INKDROP_STATE_DB
+    seen = set()
+    items = []
+    legacy_cfg = qbit_settings()
+    if legacy_cfg:
+        seen.add(_qbit_source_dedupe_key(legacy_cfg))
+        items.extend(_qbit_poll_source(legacy_cfg, instance_id=None, db_path=db_path))
+    for instance_id, cfg, error in qbit_instance_configs(db_path):
+        if cfg is None:
+            items.append({
+                "client": "qbit",
+                "download_client_instance_id": instance_id,
+                "error": error,
+                "client_state": "client_unavailable",
+            })
+            continue
+        key = _qbit_source_dedupe_key(cfg)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.extend(_qbit_poll_source(cfg, instance_id=instance_id, db_path=db_path))
+    return items
 
 
 def sab_settings():
@@ -6808,7 +6944,9 @@ def ready_import_records(max_files):
                     if "locked" not in str(exc).lower():
                         raise
                 continue
-            broad_pack_key = import_ready_broad_pack_key(path, pending_key, row[6], row[7], row[8], row[9])
+            broad_pack_key = import_ready_broad_pack_key(
+                path, pending_key, row[6], row[7], row[8], row[9], pending_key=pending_key
+            )
             if (
                 broad_pack_key
                 and broad_pack_counts[broad_pack_key] >= INKDROP_IMPORT_READY_MAX_PER_BROAD_PACK_PER_BATCH

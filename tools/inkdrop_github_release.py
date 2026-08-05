@@ -25,12 +25,41 @@ from tools import inkdrop_closed_alpha_packet
 
 DEFAULT_CONTRACT = ROOT / "docs" / "inkdrop" / "releases" / "current.json"
 SCHEMA = "inkdrop.github_release.v1"
-VALIDATION_SCHEMA = "inkdrop.qa_image_validation.v1"
+VALIDATION_SCHEMA = "inkdrop.qa_image_validation.v2"
 VERIFIED_START = "<!-- inkdrop-verified-qa:start -->"
 VERIFIED_END = "<!-- inkdrop-verified-qa:end -->"
 TAG_READ_ATTEMPTS = 6
 TAG_READ_DELAY_SECONDS = 1.0
 DEFAULT_IMAGE_REPOSITORY = "ghcr.io/{owner}/inkdrop"
+INKDROP_VERSION_PATTERN = re.compile(
+    r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    r"(?:-(?P<prerelease>[0-9A-Za-z][0-9A-Za-z.-]*))?"
+)
+
+
+def release_image_tags(version, prerelease):
+    value = str(version or "").strip()
+    match = INKDROP_VERSION_PATTERN.fullmatch(value)
+    if not match:
+        raise ValueError("release version cannot be converted to image tags")
+    prerelease_value = match.group("prerelease")
+    # Versions are the bare number now (0.1.06) while the GitHub release stays
+    # marked prerelease through closed alpha, so the tag ladder follows the
+    # version's own shape. The only forbidden pairing is publishing a
+    # suffixed version as a stable release.
+    if prerelease_value and not prerelease:
+        raise ValueError("a prerelease-suffixed version cannot publish stable image tags")
+
+    major = match.group("major")
+    minor = match.group("minor")
+    if not prerelease_value:
+        return [value, f"{major}.{minor}", major, "latest"]
+
+    channel = prerelease_value.split(".", 1)[0].lower()
+    tags = [value, f"{major}.{minor}-{channel}", f"{major}-{channel}", channel]
+    if channel == "beta":
+        tags.append("latest")
+    return tags
 
 
 def resolve_image_repository(repository, image_repository=None):
@@ -86,6 +115,7 @@ def load_contract(path=DEFAULT_CONTRACT, root=ROOT):
         "notes_path": str(notes_path.relative_to(root)).replace("\\", "/"),
         "notes": notes,
         "prerelease": True,
+        "image_tags": release_image_tags(version, prerelease=True),
         "previous_state_schema_version": previous_state_schema_version,
     }
 
@@ -230,6 +260,8 @@ def load_verified_evidence(candidate_path, validation_path, contract, repository
         "candidate_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
         "previous_state_schema_version": contract["previous_state_schema_version"],
         "target_state_schema_version": int(candidate.get("state_schema_version") or 0),
+        "release_image_tags": contract["image_tags"],
+        "platforms": ["linux/amd64", "linux/arm64"],
     }
     validation_mismatches = {
         key: {"expected": value, "actual": validation.get(key)}
@@ -238,6 +270,42 @@ def load_verified_evidence(candidate_path, validation_path, contract, repository
     }
     if validation_mismatches:
         raise RuntimeError(f"QA image validation evidence mismatch: {validation_mismatches}")
+    required_checks = {
+        "candidate_identity",
+        "image_platforms",
+        "platform_runtime",
+        "oci_labels",
+        "strict_preflight",
+        "container_health",
+        "public_http",
+    }
+    checks = validation.get("checks")
+    if (
+        not isinstance(checks, list)
+        or not all(isinstance(check, str) for check in checks)
+        or not required_checks.issubset(set(checks))
+    ):
+        raise RuntimeError("QA image validation evidence is missing required checks")
+    runtime_entries = validation.get("platform_runtime")
+    if not isinstance(runtime_entries, list):
+        raise RuntimeError("QA image validation evidence is missing platform runtime results")
+    if len(runtime_entries) != 2:
+        raise RuntimeError("QA image validation evidence has incomplete platform runtime results")
+    runtime_by_platform = {
+        str(entry.get("platform") or ""): entry
+        for entry in runtime_entries
+        if isinstance(entry, dict)
+    }
+    expected_machines = {
+        "linux/amd64": {"amd64", "x86_64"},
+        "linux/arm64": {"arm64", "aarch64"},
+    }
+    if set(runtime_by_platform) != set(expected_machines):
+        raise RuntimeError("QA image validation evidence has incomplete platform runtime results")
+    for platform_name, allowed_machines in expected_machines.items():
+        entry = runtime_by_platform[platform_name]
+        if entry.get("passed") is not True or str(entry.get("machine") or "").lower() not in allowed_machines:
+            raise RuntimeError(f"QA image validation evidence failed runtime proof for {platform_name}")
     block = "\n".join([
         VERIFIED_START,
         "### Verified QA build",
@@ -401,6 +469,7 @@ def append_github_output(path, contract):
     with Path(path).open("a", encoding="utf-8", newline="\n") as handle:
         for key in ("version", "tag", "name", "notes_path", "previous_state_schema_version"):
             handle.write(f"{key}={contract[key]}\n")
+        handle.write(f"image_tags_json={json.dumps(contract['image_tags'], separators=(',', ':'))}\n")
 
 
 def main(argv=None):

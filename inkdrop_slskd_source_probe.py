@@ -43,6 +43,11 @@ try:
 except Exception:
     inkdrop_candidate_matching = None
 
+try:
+    import inkdrop_artifact_acceptance
+except Exception:
+    inkdrop_artifact_acceptance = None
+
 
 CONFIG_DIR = inkdrop_runtime_config.config_dir()
 STATE_DIR = inkdrop_runtime_config.state_dir()
@@ -2552,18 +2557,29 @@ def queue_source_review_item(row):
         "autopilot_state": row.get("state") or "queued",
         "ts": row.get("last_attempt_at") or row.get("source_ladder_attempted_at") or now(),
     }
-    item.update(queue_source_explicit_unit_context(item))
     series_id = str(row.get("series_id") or "").strip()
     if not series_id:
         provider = str(row.get("metadata_provider") or row.get("series_source") or "").strip().lower()
         metadata_id = str(row.get("metadata_id") or row.get("comicvine_id") or "").strip()
         if provider == "comicvine" and metadata_id.isdigit() and int(metadata_id) > 0:
             series_id = f"comicvine:{metadata_id}"
+    if series_id:
+        item["series_id"] = series_id
     if series_id and inkdrop_state:
         try:
             import inkdrop_source_worker_coordinator as source_coordinator
 
             singleton_context = source_coordinator._singleton_issue_context(INKDROP_STATE_DB, series_id)
+            # Legacy queue JSON can predate durable media classification.  The
+            # exact series row is authoritative for that missing field; never
+            # replace a queue value and never hydrate from a merely similar
+            # title or provider id.
+            if (
+                not str(item.get("media_type") or "").strip()
+                and str(singleton_context.get("singleton_series_id") or "").strip() == series_id
+                and str(singleton_context.get("media_type") or "").strip()
+            ):
+                item["media_type"] = str(singleton_context.get("media_type") or "").strip()
             authoritative_title = str(singleton_context.get("singleton_series_title") or "").strip()
             row_issue_provider = str(row.get("issue_metadata_provider") or "").strip().lower()
             row_issue_metadata_id = str(row.get("issue_metadata_id") or "").strip()
@@ -2588,6 +2604,7 @@ def queue_source_review_item(row):
             # Proof is authority from the durable DB. If it cannot be read,
             # leave the ordinary strict unit gate in place.
             pass
+    item.update(queue_source_explicit_unit_context(item))
     if item.get("collected_singleton_proof"):
         try:
             import inkdrop_manual_search
@@ -2895,6 +2912,18 @@ def has_subtitle_separator(value):
     return len(split_title_and_subtitle(value)) >= 2
 
 
+def safe_bare_subtitle_query(value):
+    """Keep a subtitle-only search anchored by at least one word.
+
+    A numeric subtitle is useful as part of the complete series title, but it
+    is not a safe standalone discovery query.  For example, ComicVine's real
+    ``The Wicked + The Divine: 1831`` title used to add ``1831`` (and then
+    ``1831 comics``/``1831 complete``) to the bounded SLSKD search plan.
+    """
+
+    return any(character.isalpha() for character in str(value or ""))
+
+
 def title_variants(series):
     raw = str(series or "").strip()
     if not raw:
@@ -2918,14 +2947,16 @@ def title_variants(series):
             if len(parts) >= 2:
                 variants.append(" ".join(parts))
                 variants.append(f"{parts[0]} {parts[-1]}")
-                variants.append(parts[-1])
+                if safe_bare_subtitle_query(parts[-1]):
+                    variants.append(parts[-1])
     if has_subtitle_separator(raw):
         parts = [without_edition_phrases(part) for part in split_title_and_subtitle(raw)]
         parts = [part for part in parts if part]
         if len(parts) >= 2:
             variants.append(" ".join(parts))
             variants.append(f"{parts[0]} {parts[-1]}")
-            variants.append(parts[-1])
+            if safe_bare_subtitle_query(parts[-1]):
+                variants.append(parts[-1])
     variants.extend(numeric_word_title_variants(brandless))
     variants.extend(numeric_word_title_variants(no_punctuation))
     variants.append(re.sub(r"\bnickelodeon\b", " ", no_punctuation, flags=re.I))
@@ -2940,12 +2971,22 @@ def creator_possessive_title_variants(title):
     if not text:
         return []
     match = re.match(
-        r"^(?:[A-Z][\w.\-]+(?:\s+[A-Z][\w.\-]+){0,3})['’]s\s+(.+)$",
+        r"^([A-Z][\w.\-]+(?:\s+[A-Z][\w.\-]+){1,3})['’]s\s+(.+)$",
         text,
     )
     if not match:
         return []
-    remainder = display_clean(match.group(1))
+    creator_prefix = display_clean(match.group(1))
+    prefix_words = re.findall(r"[a-z0-9]+", creator_prefix.lower())
+    # This is a deliberately narrow creator-credit transform, not a generic
+    # possessive-title transform.  A one-token prefix is commonly the title's
+    # actual subject (Assassin's Creed, Hell's Paradise, Marvel's Voices), and
+    # an article-led phrase such as The Sandman's Universe is likewise title
+    # identity rather than a credited person's name.  Promoting the remainder
+    # in either case wastes the bounded SLSKD query plan on a false alias.
+    if len(prefix_words) < 2 or prefix_words[0] in {"a", "an", "the"}:
+        return []
+    remainder = display_clean(match.group(2))
     if not remainder:
         return []
     words = re.findall(r"[a-z0-9]+", remainder.lower())
@@ -6163,24 +6204,34 @@ def leaf_title_conflict(filename, item, title_details):
     if len(prefix) < 1:
         return ""
     title_word_list = list(title_details.get("title_words") or [])
-    if title_word_list and ordered_title_start(prefix, title_word_list) == 0:
+    target_connectors = title_connector_words(
+        title_details.get("title_variant") or (item or {}).get("series") or (item or {}).get("query")
+    )
+    if title_word_list and ordered_title_start(prefix, title_word_list, connectors=target_connectors) == 0:
         return ""
     if set(prefix) & title_words:
         return "filename title appears to be a related different series/subseries: " + " ".join(prefix[:5])
     return "filename title appears to be a different series: " + " ".join(prefix[:5])
 
 
-def ordered_title_start(segment_words, title_words):
+def ordered_title_start(segment_words, title_words, connectors=()):
     segment_words = [str(word or "") for word in segment_words or [] if str(word or "")]
     title_words = [str(word or "") for word in title_words or [] if str(word or "")]
     if not segment_words or not title_words:
         return None
+    # A connector the target title itself owns ("of" in "East of West", "Yona
+    # of the Dawn") must be as skippable here as it is in title_match's own
+    # phrase check, or this helper can never locate the title's start
+    # position in such a filename -- silently disabling both callers'
+    # different-series/subseries conflict checks for every connector-bearing
+    # title.
+    skip_words = STOP_WORDS | set(connectors or ())
     for start in range(len(segment_words)):
         index = start
         if segment_words[index] == "the" and (not title_words or title_words[0] != "the"):
             index += 1
         for word in title_words:
-            while index < len(segment_words) and segment_words[index] in STOP_WORDS:
+            while index < len(segment_words) and segment_words[index] in skip_words:
                 index += 1
             if index >= len(segment_words) or not title_word_present(word, {segment_words[index]}):
                 break
@@ -6195,7 +6246,10 @@ def title_prefix_subseries_conflict(filename, item, title_details):
     if len(title_words) < 2:
         return ""
     leaf_words = normalize(filename_stem(filename_leaf(filename))).split()
-    start = ordered_title_start(leaf_words, title_words)
+    target_connectors = title_connector_words(
+        title_details.get("title_variant") or (item or {}).get("series") or (item or {}).get("query")
+    )
+    start = ordered_title_start(leaf_words, title_words, connectors=target_connectors)
     if start is None or start <= 0:
         return ""
     prefix_words = leaf_words[:start]
@@ -6222,6 +6276,28 @@ def title_prefix_subseries_conflict(filename, item, title_details):
         return ""
     bridge_words = {"after", "before", "featuring", "presents", "versus", "vs"}
     if set(prefix) & bridge_words:
+        return "candidate appears to be a different titled series/subseries: " + " ".join(prefix[:5])
+    # A labeled lead-in separated from the matched phrase by a real subtitle
+    # separator -- "Marc Spector - Moon Knight 006", "Vertigo: Preacher 01"
+    # -- is a known, legitimate release convention (alter-ego name, imprint
+    # line) and must not be confused with an unrelated title that merely
+    # happens to contain the wanted phrase as a substring ("Zombie Commandos
+    # from Hell! 02" for a "From Hell" target, where "from hell" is just an
+    # idiom baked into a different comic's actual name). Anything without a
+    # separator between the lead-in and the phrase is one continuous title
+    # that is not the wanted series, regardless of which words compose it.
+    raw_stem = filename_stem(filename_leaf(filename))
+    gap_words = STOP_WORDS | set(target_connectors or ())
+    gap_alt = "|".join(sorted((re.escape(word) for word in gap_words), key=len, reverse=True))
+    gap = rf"[\W_]+(?:(?:{gap_alt})[\W_]+)*" if gap_alt else r"[\W_]+"
+    phrase_pattern = re.compile(
+        r"(?<!\w)" + gap.join(re.escape(word) for word in title_words) + r"(?!\w)",
+        flags=re.I,
+    )
+    phrase_match = phrase_pattern.search(raw_stem)
+    raw_prefix = raw_stem[:phrase_match.start()] if phrase_match else ""
+    labeled_lead_in = bool(raw_prefix and SPACED_SEPARATOR_RE.search(raw_prefix))
+    if not labeled_lead_in:
         return "candidate appears to be a different titled series/subseries: " + " ".join(prefix[:5])
     return ""
 
@@ -8102,6 +8178,58 @@ def persisted_slskd_transfer_locator_digests(external_id):
     return digests
 
 
+def canonical_slskd_transfer_owner_task(owner_tasks):
+    """Pick the single canonical owner among duplicate task rows that all
+    claim the same completed SLSKD transfer for the same exact Wanted unit.
+
+    Preference order: a task with a durable exact-unit-key binding already
+    established, then a task already further along (import-ready/importing/
+    verified) over one still sitting in an early wait state, then simply the
+    earliest task -- the first writer created the real reservation; a later
+    waiting-record projection reconstructed a second attempt instead of
+    transitioning the original by reservation_id. Callers must confirm every
+    row shares the same queue/exact-unit before calling this; it never
+    resolves cross-unit ambiguity, which stays fenced as manual review.
+    """
+    tasks = [task for task in (owner_tasks or []) if isinstance(task, dict)]
+    if not tasks:
+        return None
+    if len(tasks) == 1:
+        return tasks[0]
+
+    def as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def has_exact_unit_key(task):
+        raw = task.get("raw_json")
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (TypeError, ValueError):
+            payload = {}
+        return bool(str((payload or {}).get("exact_unit_key") or "").strip())
+
+    progressed_statuses = {
+        "preview_importable", "ready_import", "staged_file_ready", "completed_in_client",
+        "import_busy", "verification_pending", "imported_not_resolved",
+        "resolved", "already_verified", "verified", "folder_verified",
+        "library_visible", "kavita_verified", "queue_verified", "queue_satisfied",
+    }
+
+    def sort_key(task):
+        status = str(task.get("status") or "").strip().lower()
+        return (
+            0 if has_exact_unit_key(task) else 1,
+            0 if status in progressed_statuses else 1,
+            as_float(task.get("started_at")) or as_float(task.get("updated_at")),
+            str(task.get("id") or ""),
+        )
+
+    return sorted(tasks, key=sort_key)[0]
+
+
 def reconcile_slskd_transfer_identity_tasks(*, observed_at=None, transfer_rows=None):
     """Bind unresolved handoffs to live transfers or retire proven misses."""
     if inkdrop_state is None or not INKDROP_STATE_DB:
@@ -8186,6 +8314,24 @@ def reconcile_slskd_transfer_identity_tasks(*, observed_at=None, transfer_rows=N
         tasks_by_external_id.setdefault(str(task.get("external_id") or "").strip(), []).append(task)
     for external_id, owner_tasks in tasks_by_external_id.items():
         matching_rows = id_rows.get(external_id) or []
+        retired_siblings = []
+        if len(owner_tasks) > 1 and len(matching_rows) == 1:
+            # Multiple task rows claiming one completed physical transfer is
+            # not automatically a real collision -- a reservation task plus a
+            # later waiting-record projection routinely duplicate the same
+            # transfer for the same exact Wanted unit. Only canonicalize when
+            # every owner row shares one queue; a genuine cross-unit pack
+            # fan-out must still fail closed to manual review below.
+            queue_ids = {str(task.get("queue_id") or "").strip() for task in owner_tasks}
+            if len(queue_ids) == 1 and next(iter(queue_ids)):
+                canonical_owner = canonical_slskd_transfer_owner_task(owner_tasks)
+                if canonical_owner is not None:
+                    canonical_id = str(canonical_owner.get("id") or "")
+                    retired_siblings = [
+                        task for task in owner_tasks
+                        if str(task.get("id") or "") != canonical_id
+                    ]
+                    owner_tasks = [canonical_owner]
         if len(owner_tasks) != 1 or len(matching_rows) != 1:
             if matching_rows and any(slskd_transfer_completed(row) for row in matching_rows):
                 completed_ambiguous += 1
@@ -8208,6 +8354,15 @@ def reconcile_slskd_transfer_identity_tasks(*, observed_at=None, transfer_rows=N
                 if len(persisted_locator_digests) == 1 else None
             ),
         )
+        if transition.get("ok") and retired_siblings:
+            for sibling in retired_siblings:
+                inkdrop_state.retire_duplicate_slskd_owner_task(
+                    INKDROP_STATE_DB,
+                    sibling.get("id"),
+                    owner_tasks[0].get("id"),
+                    external_id,
+                    observed_at,
+                )
         completed_recovered += int(bool(transition.get("ok") and not transition.get("idempotent")))
         completed_unchanged += int(not transition.get("ok") or bool(transition.get("idempotent")))
     recovered = 0
@@ -10461,7 +10616,21 @@ def weak_staged_filename_guard(filename, item):
         lower,
     )
     if _re.search(r"^\s*\d{1,4}[\s_.-]+[A-Za-z]", stem) and not strong_unit:
-        return "weak_filename_unit_evidence"
+        trusted_aliases = []
+        series_alias = item_series_title(item)
+        if series_alias:
+            trusted_aliases.append(series_alias)
+        for extra_alias in item.get("aliases") or []:
+            if extra_alias:
+                trusted_aliases.append(extra_alias)
+        trusted_prefix_safe = bool(
+            inkdrop_artifact_acceptance
+            and inkdrop_artifact_acceptance.trusted_numeric_prefix_import_is_safe(
+                stem, trusted_aliases, item.get("issue")
+            )
+        )
+        if not trusted_prefix_safe:
+            return "weak_filename_unit_evidence"
 
     if collection_target and _re.search(r"\b(?:part|pt|chapter|chap|ch|issue)\.?\s*0*\d+\b", lower):
         return "single_part_file_does_not_satisfy_collection_target"
@@ -11077,6 +11246,24 @@ def series_directory_matches_item(directory, item):
     return normalize(leaf) in allowed
 
 
+def directory_leaf_near_miss_for_item(directory, item):
+    """True when the directory's own leaf name shares title words with
+    `item` but does not exactly match it (series_directory_matches_item
+    already said no). That partial overlap -- "All Star Superman Red Son",
+    "All Star Superman (Unrelated Subtitle)", an edition qualifier the
+    organizational-suffix allowlist does not recognize -- is a related-but-
+    unverified work, not neutral evidence: it must keep blocking this item
+    exactly as it always has. A genuinely neutral directory (a weekly-pack
+    name, an uploader's own folder, a bare date stamp) shares no words with
+    the title at all and is unaffected by this check.
+    """
+    leaf = str(directory or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    title_words = set(normalize(item_series_title(item or {})).split())
+    if not leaf or not title_words:
+        return False
+    return bool(set(normalize(leaf).split()) & title_words)
+
+
 def slskd_series_directory_observations(responses, max_files=None, items=None):
     """Return bounded, unlocked, individually safe directory evidence."""
 
@@ -11144,11 +11331,46 @@ def slskd_series_directory_observations(responses, max_files=None, items=None):
             item for item in active_items
             if series_directory_matches_item(observation.get("directory"), item)
         ]
+        # A neutral/multi-series directory (a weekly pack, an uploader's
+        # whole library, a publisher dump) matches no single series by its
+        # parent name -- that is zero identity evidence, not a reason to
+        # discard every file inside it. Individual leaves can still prove
+        # themselves: only look for that when the parent match found
+        # nothing, so an exact-parent directory's behavior is unchanged.
+        #
+        # Require at least two distinct active items independently proven
+        # this way before treating the directory as neutral at all -- a
+        # lone self-identifying file sitting in an otherwise-unrelated- or
+        # wrong-looking folder (a mislabel, a stray file, a related-but-
+        # different work) is exactly the single-item ambiguity this module's
+        # existing near-miss/wrong-parent gates exist to refuse, and does
+        # not carry the real multi-series signature this bypass is for. A
+        # genuine weekly-pack/multi-upload directory produces that signal
+        # naturally: several different wanted series, each proven from its
+        # own filename.
+        leaf_matched_items = []
         if active_items and not parent_items:
+            for item in active_items:
+                if directory_leaf_near_miss_for_item(observation.get("directory"), item):
+                    continue
+                for row in deduped:
+                    identity_filename, _reason, parent_dependent = series_run_leaf_identity_filename(row, item)
+                    if identity_filename and not parent_dependent:
+                        leaf_matched_items.append(item)
+                        break
+            if len(leaf_matched_items) < 2:
+                leaf_matched_items = []
+        candidate_items = parent_items or leaf_matched_items
+        if active_items and not candidate_items:
             continue
+        observation["series_directory_neutral_parent"] = not parent_items
+        observation["neutral_bypass_review_ids"] = (
+            {str(item.get("review_id") or review_id_for(item)) for item in leaf_matched_items}
+            if not parent_items else set()
+        )
         coverage = set()
         for row in deduped:
-            for item in parent_items:
+            for item in candidate_items:
                 rid = str(item.get("review_id") or review_id_for(item))
                 if rid in coverage:
                     continue
@@ -11279,16 +11501,26 @@ def explicit_leaf_publisher_conflict(leaf, item):
 
 
 def series_run_leaf_identity_filename(file_row, item):
-    """Build bounded identity text only after the leaf proves its exact unit."""
+    """Build bounded identity text only after the leaf proves its exact unit.
+
+    Returns (identity_filename, reason, parent_dependent). parent_dependent
+    is True only for the final fallback, where the leaf carries no title
+    text of its own and the wanted series title is borrowed to complete it --
+    safe only when the caller has independently validated that the directory
+    parent is this exact series (a bare "001.cbz" means nothing on its own).
+    Every other return path proves full series-title identity from the leaf
+    text itself and is therefore safe to trust even in a directory whose
+    parent name matches no active series at all.
+    """
 
     filename = str((file_row or {}).get("filename") or "")
     leaf = filename_leaf(filename)
     identity_leaf = compact_series_issue_leaf(leaf, item)
     if not identity_leaf:
-        return "", "file has no archive leaf identity"
+        return "", "file has no archive leaf identity", False
     publisher_conflict = explicit_leaf_publisher_conflict(identity_leaf, item)
     if publisher_conflict:
-        return "", publisher_conflict
+        return "", publisher_conflict, False
 
     if inkdrop_candidate_matching:
         compatibility_leaf = filename_without_exact_issue_titles(identity_leaf, item=item)
@@ -11307,14 +11539,14 @@ def series_run_leaf_identity_filename(file_row, item):
             return "", (
                 "leaf unit identity is not compatible with the wanted row: "
                 + ", ".join(codes[:3])
-            )
+            ), False
         if not compatibility.get("positive_evidence"):
-            return "", "leaf does not prove the exact wanted unit"
+            return "", "leaf does not prove the exact wanted unit", False
     else:
         leaf_number = issue_number_match(identity_leaf, item)
         leaf_volume = book_volume_number_match(identity_leaf, item)
         if not (leaf_number.get("matched") or leaf_volume.get("matched")):
-            return "", "leaf does not prove the exact wanted unit"
+            return "", "leaf does not prove the exact wanted unit", False
 
     target_years = set()
     for key in ("issue_year", "publication_year", "release_year"):
@@ -11331,21 +11563,46 @@ def series_run_leaf_identity_filename(file_row, item):
         return "", (
             "leaf year " + ", ".join(sorted(leaf_years))
             + " does not match wanted year " + ", ".join(sorted(target_years))
-        )
+        ), False
 
     if series_identity_match(identity_leaf, item).get("matched"):
-        return identity_leaf, "leaf contains exact series and unit identity"
+        return identity_leaf, "leaf contains exact series and unit identity", False
     prefix = concrete_leaf_title_prefix_words(identity_leaf)
     if prefix:
-        return "", "leaf title appears to identify a different series: " + " ".join(prefix[:5])
+        return "", "leaf title appears to identify a different series: " + " ".join(prefix[:5]), False
     series = display_clean(item_series_title(item or {}))
-    return f"{series} {identity_leaf}".strip(), "validated parent supplied missing series title"
+    return f"{series} {identity_leaf}".strip(), "validated parent supplied missing series title", True
 
 
 def series_run_candidate_for_item(file_row, item, observation):
     filename = str((file_row or {}).get("filename") or "")
-    if not series_directory_matches_item((observation or {}).get("directory"), item):
-        return None, "directory parent does not exactly match the wanted series metadata"
+    directory_matches = series_directory_matches_item((observation or {}).get("directory"), item)
+    # A neutral/multi-series directory (a weekly pack, an uploader's whole
+    # library, a publisher dump) proves nothing about any file inside it --
+    # the parent is zero identity evidence there. Still allow a leaf through
+    # when its OWN filename independently proves the complete wanted series
+    # title plus a typed unit. This must be checked before the
+    # directory-parent gate returns early, or a self-identifying file such
+    # as "Alpha Adventures 001.cbz" sitting in a "Weekly Comics 2026-08-04"
+    # folder never gets a chance to prove itself.
+    #
+    # Eligibility for this bypass is decided once, at observation build time
+    # (slskd_series_directory_observations), and trusted here via the
+    # precomputed neutral_bypass_review_ids set rather than recomputed --
+    # that is what requires the real multi-series signal (at least two
+    # distinct active items independently proven in the same directory)
+    # instead of letting a single self-identifying file in an arbitrary or
+    # wrong-looking folder (a mislabel, a stray file, an unrelated same-
+    # prefix work) slip through alone. An observation that never went
+    # through that builder (a hand-built or legacy caller) carries no such
+    # set and safely gets no bypass at all.
+    if not directory_matches:
+        rid = str((item or {}).get("review_id") or review_id_for(item or {}))
+        if rid not in ((observation or {}).get("neutral_bypass_review_ids") or ()):
+            return None, "directory parent does not exactly match the wanted series metadata"
+        identity_filename, identity_reason, parent_dependent = series_run_leaf_identity_filename(file_row, item)
+        if not identity_filename or parent_dependent:
+            return None, "directory parent does not exactly match the wanted series metadata"
     if extension_for(filename) not in AUTO_GRAB_EXTENSIONS:
         return None, "unsupported or pack archive extension"
     malformed_reason = malformed_unit_syntax_reason(
@@ -11357,7 +11614,8 @@ def series_run_candidate_for_item(file_row, item, observation):
         return None, malformed_reason
     # A generic parent folder such as "Complete" or "Volume 01" describes
     # organization, not the individual archive. Pack/range policy belongs to
-    # the candidate basename after the directory cohort has been validated.
+    # the candidate basename after the directory cohort -- or the leaf's own
+    # title -- has been validated.
     candidate_leaf = filename.replace("\\", "/").rsplit("/", 1)[-1]
     is_pack, pack_reason = filename_has_pack_or_range(
         candidate_leaf,
@@ -11366,7 +11624,7 @@ def series_run_candidate_for_item(file_row, item, observation):
     )
     if is_pack:
         return None, f"pack/range is not an individual handoff: {pack_reason}"
-    identity_filename, identity_reason = series_run_leaf_identity_filename(file_row, item)
+    identity_filename, identity_reason, _parent_dependent = series_run_leaf_identity_filename(file_row, item)
     if not identity_filename:
         return None, identity_reason
     policy_filename = filename_without_exact_issue_titles(identity_filename, item=item)
@@ -11376,7 +11634,8 @@ def series_run_candidate_for_item(file_row, item, observation):
     candidate = dict(file_row or {})
     candidate.update({
         "series_directory_handoff": True,
-        "series_directory_exact_series": True,
+        "series_directory_exact_series": bool(directory_matches),
+        "series_directory_neutral_parent": not directory_matches,
         "series_directory_file_count": int((observation or {}).get("file_count") or 0),
         "series_directory_identity_filename": identity_filename,
     })
@@ -11456,16 +11715,32 @@ def apply_series_directory_opportunities(entries, items, cache, *, deadline=None
     skipped = summary["skipped_reason_counts"]
     ranked_observations = []
     for observation in deduped_observations:
+        parent_matched_items = [
+            item for item in active_items
+            if series_directory_matches_item(observation.get("directory"), item)
+        ]
+        if parent_matched_items:
+            directory_items = parent_matched_items
+        else:
+            # Neutral/multi-series directory: the parent proves nothing, but
+            # do not fall back to a full Cartesian scan of every active item
+            # either. neutral_bypass_review_ids was already computed once, at
+            # observation build time, from the real multi-item leaf-identity
+            # signal (see slskd_series_directory_observations) -- reuse it
+            # rather than re-deriving a weaker heuristic here.
+            neutral_review_ids = (observation or {}).get("neutral_bypass_review_ids") or ()
+            directory_items = [
+                item for item in active_items
+                if str(item.get("review_id") or review_id_for(item)) in neutral_review_ids
+            ]
         safe_by_review = {}
         for file_row in observation.get("files") or []:
             if deadline is not None and seconds_remaining(deadline) <= 0:
                 summary["deadline_exhausted"] = True
                 skipped["series-run evaluation deadline exhausted"] = skipped.get("series-run evaluation deadline exhausted", 0) + 1
                 break
-            for item in active_items:
+            for item in directory_items:
                 rid = str(item.get("review_id") or review_id_for(item))
-                if not series_directory_matches_item(observation.get("directory"), item):
-                    continue
                 summary["evaluated_issue_count"] += 1
                 candidate, reason = series_run_candidate_for_item(file_row, item, observation)
                 if not candidate:
@@ -11579,6 +11854,21 @@ def apply_series_directory_opportunities(entries, items, cache, *, deadline=None
     return summary
 
 
+def item_series_identity_key(item):
+    """A cohort key that never blends two distinct series sharing a display
+    title. Prefers the stable series id InkDrop's own catalog assigned;
+    falls back to normalized title only for a row with no stable id at all
+    (an ad-hoc watch/query row), which carries the same pre-existing,
+    narrower blending risk that already existed for that edge case and is
+    not what this function is responsible for closing.
+    """
+    item = item if isinstance(item, dict) else {}
+    stable = str(item.get("series_id") or item.get("seriesIdentity") or item.get("queue_identity") or "").strip()
+    if stable:
+        return "id:" + stable
+    return "title:" + normalize(item_series_title(item))
+
+
 def series_directory_completeness(observation, active_items):
     """How much of a series' currently open wanted range this directory alone covers.
 
@@ -11588,43 +11878,61 @@ def series_directory_completeness(observation, active_items):
     bar only when it covers both a meaningful absolute count and share of the
     series' open run, so a folder with a couple of stray matches never reads
     as "the pack."
+
+    The numerator and denominator are both scoped to the same stable series
+    identity (item_series_identity_key), not display title -- two distinct
+    series that happen to share a title (a 2007 run and an unrelated 2025
+    run of "Same Title") must never blend into one completeness ratio. A
+    directory that is genuinely complete for one of them must not be diluted
+    by the other's separate open issues, and must not credit the other's
+    issues as "covered" either.
     """
 
     directory = (observation or {}).get("directory")
     matched_items = [item for item in active_items if series_directory_matches_item(directory, item)]
     if not matched_items:
         return {"eligible": False, "covered": {}, "reason": "directory does not match any active wanted series"}
-    series_keys = {normalize(item_series_title(item)) for item in matched_items}
-    series_active_total = sum(
-        1 for item in active_items if normalize(item_series_title(item)) in series_keys
-    )
-    covered = {}
-    for file_row in observation.get("files") or []:
-        for item in matched_items:
-            rid = str(item.get("review_id") or review_id_for(item))
-            if rid in covered:
-                continue
-            candidate, _reason = series_run_candidate_for_item(file_row, item, observation)
-            if candidate:
-                covered[rid] = (item, candidate)
-    coverage_count = len(covered)
-    ratio_pct = (100.0 * coverage_count / series_active_total) if series_active_total else 0.0
-    eligible = (
-        coverage_count >= SERIES_PACK_COMPLETE_MIN_COVERAGE
-        and ratio_pct >= SERIES_PACK_COMPLETE_MIN_RATIO_PCT
-    )
-    reason = "" if eligible else (
-        f"coverage {coverage_count}/{series_active_total} ({ratio_pct:.0f}%) below the "
-        f"{SERIES_PACK_COMPLETE_MIN_COVERAGE}-issue/{SERIES_PACK_COMPLETE_MIN_RATIO_PCT:.0f}% pack floor"
-    )
-    return {
-        "eligible": eligible,
-        "covered": covered,
-        "series_active_total": series_active_total,
-        "coverage_count": coverage_count,
-        "ratio_pct": round(ratio_pct, 1),
-        "reason": reason,
-    }
+    # The directory's parent name only proves a display-title match, which
+    # can span more than one distinct stable series (a same-title reboot).
+    # Score each stable identity independently -- one physical directory
+    # realistically belongs to one real edition's files, so return whichever
+    # identity this directory actually covers best rather than blending
+    # their separate open-issue counts into one denominator.
+    groups = {}
+    for item in matched_items:
+        groups.setdefault(item_series_identity_key(item), []).append(item)
+    results = []
+    for series_key, group_items in groups.items():
+        series_active_total = sum(1 for item in active_items if item_series_identity_key(item) == series_key)
+        covered = {}
+        for file_row in observation.get("files") or []:
+            for item in group_items:
+                rid = str(item.get("review_id") or review_id_for(item))
+                if rid in covered:
+                    continue
+                candidate, _reason = series_run_candidate_for_item(file_row, item, observation)
+                if candidate:
+                    covered[rid] = (item, candidate)
+        coverage_count = len(covered)
+        ratio_pct = (100.0 * coverage_count / series_active_total) if series_active_total else 0.0
+        eligible = (
+            coverage_count >= SERIES_PACK_COMPLETE_MIN_COVERAGE
+            and ratio_pct >= SERIES_PACK_COMPLETE_MIN_RATIO_PCT
+        )
+        reason = "" if eligible else (
+            f"coverage {coverage_count}/{series_active_total} ({ratio_pct:.0f}%) below the "
+            f"{SERIES_PACK_COMPLETE_MIN_COVERAGE}-issue/{SERIES_PACK_COMPLETE_MIN_RATIO_PCT:.0f}% pack floor"
+        )
+        results.append({
+            "eligible": eligible,
+            "covered": covered,
+            "series_active_total": series_active_total,
+            "coverage_count": coverage_count,
+            "ratio_pct": round(ratio_pct, 1),
+            "reason": reason,
+        })
+    results.sort(key=lambda row: (row["eligible"], row["coverage_count"], row["ratio_pct"]), reverse=True)
+    return results[0]
 
 
 def apply_series_pack_complete_opportunities(items, cache, *, observations=None, entries=None, deadline=None):
@@ -13043,10 +13351,30 @@ def run(args):
             load_queue_source_review_items(limit=max(args.max_total * 4, 300)),
         )
         all_items = items
+    review_id_unreachable = False
     if review_id_filter:
         scoped = [item for item in items if str(item.get("review_id") or "") == review_id_filter]
         if not scoped:
             scoped = [item for item in all_items if str(item.get("review_id") or "") == review_id_filter]
+        if not scoped:
+            # The default load is a window over the head of the queue, not the
+            # whole backlog. A row asked for by id is almost always outside that
+            # window -- targeting a specific row is what you do when the normal
+            # rotation is not reaching it -- and the pass then reported success
+            # having probed nothing. Re-load scoped to the row's own series so
+            # the requested row is actually reachable.
+            cached_entry = cache.get(review_id_filter) if isinstance(cache, dict) else None
+            cached_series = str((cached_entry or {}).get("series") or "").strip()
+            if cached_series:
+                all_items = combine_source_review_items(
+                    all_items,
+                    load_source_review_items(limit=2000, series=cached_series),
+                    load_queue_source_review_items(limit=2000, series=cached_series),
+                )
+                scoped = [
+                    item for item in all_items
+                    if str(item.get("review_id") or "") == review_id_filter
+                ]
         if not scoped:
             alias_item = current_queue_item_for_cached_review_id(review_id_filter, all_items, cache)
             if alias_item:
@@ -13058,6 +13386,9 @@ def run(args):
                     series=alias_item.get("series"),
                     issue=alias_item.get("issue"),
                 )
+        if not scoped:
+            review_id_unreachable = True
+            log("review_filter_row_not_found", review_id=review_id_filter)
         items = scoped
     cache, refreshed_cached_verdict_count, skipped_cached_verdict_count = refresh_cache_candidate_verdicts(
         cache,
@@ -13071,6 +13402,16 @@ def run(args):
             deferred=skipped_cached_verdict_count,
             budget_seconds=round(verdict_refresh_budget_seconds(probe_budget_seconds), 1),
         )
+    # Reconciliation is the only way a verdict scored by superseded matching code
+    # ever gets corrected, and it is deliberately rationed to a slice of the pass.
+    # The pass's own cache write is at the very end, past every search: a pass the
+    # parent kills on its timeout used to throw the reconciled verdicts away and
+    # start over next time, so the same rows stayed stale for weeks while being
+    # marked stale on every pass. Bank the work as soon as it is done. Measured at
+    # 0.36s against the live 20MB cache -- 0.8% of a 45s probe budget. A dry run
+    # still writes nothing.
+    if refreshed_cached_verdict_count and not args.dry_run:
+        write_json(CACHE_FILE, cache)
     active_scope_items = items if (args.series or review_id_filter) else all_items
     active_review_ids = {str(item.get("review_id") or "") for item in active_scope_items}
     for item in all_items:
@@ -13116,6 +13457,7 @@ def run(args):
             "probe_budget_seconds": probe_budget_seconds,
             "probe_elapsed_seconds": round(now() - started_at, 1),
             "review_id_filter": review_id_filter,
+            "review_id_unreachable": review_id_unreachable,
             "selected_count": len(selected),
             "selected_review_ids": sorted(selected_review_ids),
             "queue_backed_selected_count": queue_backed_selected_count,
@@ -13418,6 +13760,7 @@ def run(args):
         "probe_budget_exhausted": budget_exhausted,
         "probe_budget_exhausted_count": budget_exhausted_count,
         "review_id_filter": review_id_filter,
+        "review_id_unreachable": review_id_unreachable,
         "selected_count": len(selected),
         "selected_review_ids": sorted(selected_review_ids),
         "queue_backed_selected_count": queue_backed_selected_count,

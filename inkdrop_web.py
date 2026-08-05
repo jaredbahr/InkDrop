@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import faulthandler
+import gzip
 import hashlib
 import hmac
 import importlib.util
@@ -22,6 +23,7 @@ import inkdrop_auth_contracts
 import inkdrop_backup_restore
 import inkdrop_portability_export
 import inkdrop_log_export
+import inkdrop_support_bundle
 import inkdrop_activity
 import inkdrop_deferred_sync
 import inkdrop_manual_search
@@ -36,6 +38,8 @@ import inkdrop_archive_conversion
 import inkdrop_notifications
 import inkdrop_notification_store
 import inkdrop_release_calendar
+import inkdrop_opds
+import inkdrop_slskd_root_health
 from inkdrop_transfer import normalize_transfer_status
 import json
 import os
@@ -79,652 +83,7 @@ except Exception:
     inkdrop_source_worker_http = None
 
 
-def env_value(name, default):
-    value = os.environ.get(name)
-    if value in (None, ""):
-        return default
-    return value
-
-
-def env_bool(name, default=False):
-    value = os.environ.get(name)
-    if value in (None, ""):
-        return bool(default)
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
-
-
-HOST = inkdrop_runtime_config.web_host()
-PORT = inkdrop_runtime_config.web_port(strict=False)
-WEB_RUNTIME_STARTED_AT = time.time()
-MANUAL_SEARCH_THREADS = {}
-MANUAL_SEARCH_THREADS_LOCK = threading.Lock()
-ARCHIVE_CONVERSION_TASKS = {}
-ARCHIVE_CONVERSION_TASKS_LOCK = threading.Lock()
-
-
-def script_path(name: str, remote_path=None, *, env_var=None, fallback=None) -> Path:
-    local = Path(__file__).resolve().with_name(name)
-    if local.exists():
-        return local
-    if env_var:
-        configured = os.environ.get(env_var)
-        if configured:
-            return Path(configured)
-    if remote_path:
-        return Path(remote_path)
-    if fallback is not None:
-        return Path(fallback)
-    return local
-
-
-def python_command() -> str:
-    return os.environ.get("PYTHON_BIN") or sys.executable or "python3"
-
-
-ACQUIRE_SCRIPT = script_path("inkdrop_missing_acquire.py", env_var="INKDROP_ACQUIRE_SCRIPT")
-ACQUIRE_COMMAND_SCRIPT = script_path(
-    "inkdrop_acquire_adapter.py",
-    env_var="INKDROP_ACQUIRE_COMMAND_SCRIPT",
-    fallback=ACQUIRE_SCRIPT,
-)
-IMPORT_SCRIPT = script_path("inkdrop_completed_import.py", env_var="INKDROP_IMPORT_SCRIPT")
-RECONCILE_SCRIPT = script_path("inkdrop_reconcile_imports.py", env_var="INKDROP_RECONCILE_SCRIPT")
-PACK_IMPORT_SCRIPT = script_path("inkdrop_pack_import.py", env_var="INKDROP_PACK_IMPORT_SCRIPT")
-MANGA_CHAPTER_ARTIFACT_REPAIR_SCRIPT = script_path(
-    "inkdrop_manga_chapter_artifact_repair.py",
-    env_var="INKDROP_MANGA_CHAPTER_ARTIFACT_REPAIR_SCRIPT",
-)
-MIXED_MANGA_UNIT_REPAIR_SCRIPT = script_path(
-    "inkdrop_mixed_manga_unit_repair.py",
-    env_var="INKDROP_MIXED_MANGA_UNIT_REPAIR_SCRIPT",
-)
-READER_FRONTEND_ORPHAN_CLEANUP_SCRIPT = script_path(
-    "inkdrop_reader_frontend_orphan_cleanup.py",
-    env_var="INKDROP_READER_FRONTEND_ORPHAN_CLEANUP_SCRIPT",
-)
-MISSING_ACQUIRE_SCRIPT = script_path("inkdrop_missing_acquire.py", env_var="INKDROP_MISSING_ACQUIRE_SCRIPT")
-MISSING_ACQUIRE_MODULE_SCRIPT = script_path("inkdrop_missing_acquire.py", fallback=MISSING_ACQUIRE_SCRIPT)
-SAB_RESCUE_SCRIPT = script_path("sab_rescue_server.py", env_var="INKDROP_SAB_RESCUE_SCRIPT")
-RSS_DISCOVERY_SCRIPT = script_path(
-    "inkdrop_rss_discovery.py",
-    env_var="INKDROP_RSS_DISCOVERY_SCRIPT",
-)
-COMICSCODES_DISCOVERY_SCRIPT = script_path(
-    "inkdrop_comicscodes_discovery.py",
-    env_var="INKDROP_COMICSCODES_DISCOVERY_SCRIPT",
-)
-SLSKD_SOURCE_PROBE_SCRIPT = script_path("inkdrop_slskd_source_probe.py", env_var="INKDROP_SLSKD_SOURCE_PROBE_SCRIPT")
-SERIES_AUTOPILOT_SCRIPT = script_path("inkdrop_series_autopilot.py", env_var="INKDROP_SERIES_AUTOPILOT_SCRIPT")
-STATE_DIR = inkdrop_runtime_config.state_dir()
-LOCK_DIR = inkdrop_runtime_config.lock_dir()
-LOCK_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR = inkdrop_runtime_config.log_dir()
-CACHE_DIR = inkdrop_runtime_config.cache_dir()
-BACKUP_DIR = inkdrop_runtime_config.backup_dir()
-STAGING_DIR = inkdrop_runtime_config.staging_dir()
-MANUAL_INBOX_DIR = inkdrop_runtime_config.manual_inbox_dir()
-QUARANTINE_DIR = inkdrop_runtime_config.quarantine_dir()
-ACQUIRE_LOG, LEGACY_ACQUIRE_LOG = inkdrop_runtime_config.compatible_log_paths(
-    "inkdrop-acquire.log", "kavita-acquire.log"
-)
-IMPORT_LOG, LEGACY_IMPORT_LOG = inkdrop_runtime_config.compatible_log_paths(
-    "inkdrop-import.log", "kavita-import.log"
-)
-IMPORT_STATUS_FILE = STATE_DIR / "import-status.json"
-IMPORT_LOCK = LOCK_DIR / "inkdrop-comics-import.lock"
-IMPORT_LOCK_BUSY_CODE = 75
-RECONCILE_STATUS_FILE = STATE_DIR / "import-reconcile-status.json"
-IMPORTED_DB = STATE_DIR / "imported-files.sqlite3"
-IMPORTED_DB_BUSY_TIMEOUT_MS = 8000
-WATCHES_FILE = STATE_DIR / "watches.json"
-WATCH_LOG, LEGACY_WATCH_LOG = inkdrop_runtime_config.compatible_log_paths(
-    "inkdrop-watch.log", "kavita-watch.log"
-)
-MANUAL_REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
-FRESH_SWEEP_LOG = LOG_DIR / "fresh-release-sweep.log"
-HOT_SWEEP_LOG = LOG_DIR / "hot-release-sweep.log"
-MISSING_ACQUIRE_LOG = LOG_DIR / "missing-acquire-cron.log"
-RSS_DISCOVERY_LOG = LOG_DIR / "rss-discovery.log"
-RSS_DISCOVERY_STATUS_FILE = STATE_DIR / "rss-discovery-status.json"
-RSS_DISCOVERY_STATUS_STALE_MINUTES = 90
-COMICSCODES_DISCOVERY_LOG = LOG_DIR / "comicscodes-discovery.log"
-COMICSCODES_DISCOVERY_STATUS_FILE = STATE_DIR / "comicscodes-discovery-status.json"
-# A gated source's health snapshot (rss/comicscodes) is read from its own
-# discovery status file, and a blocking state (backoff/watch/etc.) stops the
-# autopilot ladder from ever invoking that discovery script again -- which is
-# also the only thing that refreshes the status file. If the last refresh
-# predates this, the block has outlived its own longest legitimate backoff
-# (12h) and is a stale artifact rather than a live condition, so it's
-# reported as unknown instead of a blocking state to let the ladder retry
-# and find out. Confirmed live 2026-08-02: comics.codes answered normally
-# (HTTP 200, real feed) while its recorded health was still "backoff" from a
-# check 33 days earlier.
-SOURCE_HEALTH_GATE_RETRY_AFTER_MINUTES = 16 * 60
-SLSKD_SOURCE_PROBE_STATUS_FILE = STATE_DIR / "slskd-source-probe-status.json"
-SLSKD_SOURCE_PROBE_CACHE_FILE = STATE_DIR / "slskd-source-probe-cache.json"
-SLSKD_SOURCE_PROBE_LOG = LOG_DIR / "slskd-source-probe.log"
-SLSKD_SOURCE_PROBE_LOCK = LOCK_DIR / "inkdrop-slskd-source-probe.lock"
-SLSKD_CONFIG = Path(env_value("INKDROP_SLSKD_CONFIG", "/config/slskd/slskd.yml"))
-SLSKD_API_BASE_URL = env_value("INKDROP_SLSKD_API_BASE_URL", "")
-SLSKD_WEB_URL = env_value("INKDROP_SLSKD_WEB_URL", SLSKD_API_BASE_URL.rsplit("/api/", 1)[0])
-SERIES_AUTOPILOT_STATUS_FILE = STATE_DIR / "series-autopilot-status.json"
-SERIES_AUTOPILOT_QUEUE_FILE = STATE_DIR / "series-autopilot-queue.json"
-MISSING_RECOVERY_CONTROL_FILE = STATE_DIR / "missing-recovery-control.json"
-SERIES_AUTOPILOT_LOG = LOG_DIR / "series-autopilot.log"
-SERIES_AUTOPILOT_QUEUE_SCHEMA_VERSION = 2
-SERIES_AUTOPILOT_DEFAULT_SOURCE_ORDER = ["local", "prowlarr", "rss", "slskd"]
-SERIES_AUTOPILOT_SOURCE_ORDER = list(SERIES_AUTOPILOT_DEFAULT_SOURCE_ORDER)
-SERIES_AUTOPILOT_VALID_SOURCES = set(SERIES_AUTOPILOT_DEFAULT_SOURCE_ORDER) | {"mangadex"}
-SERIES_AUTOPILOT_RECOVERY_STEPS = ["failed_retry"]
-
-
-def slskd_config_candidates():
-    candidates = []
-    explicit = os.environ.get("INKDROP_SLSKD_CONFIG")
-    if explicit:
-        candidates.append(Path(explicit))
-    candidates.append(SLSKD_CONFIG)
-    try:
-        config_dir = inkdrop_runtime_config.config_dir()
-        candidates.append(config_dir / "slskd" / "slskd.yml")
-        candidates.append(config_dir.parent / "slskd" / "slskd.yml")
-    except Exception:
-        pass
-    candidates.append(STATE_DIR / "slskd" / "slskd.yml")
-    candidates.append(STATE_DIR.parent / "slskd" / "slskd.yml")
-    out = []
-    seen = set()
-    for candidate in candidates:
-        try:
-            key = str(candidate.expanduser())
-        except Exception:
-            key = str(candidate)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(Path(key))
-    return out
-
-
-def read_slskd_config_text():
-    for candidate in slskd_config_candidates():
-        try:
-            return candidate.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-    return ""
-SERIES_QUEUE_RUNNER_STATUS_FILE = STATE_DIR / "series-queue-runner-status.json"
-MANAGED_LIBRARY_AUDIT_LAST_FILE = STATE_DIR / "managed-library-audit-last.json"
-SERIES_QUEUE_RUNNER_LOG = LOG_DIR / "series-queue-runner.log"
-SERIES_QUEUE_RUNNER_IMPORT_LOG = LOG_DIR / "series-queue-runner-import.log"
-INKDROP_STATE_SYNC_LOG = LOG_DIR / "inkdrop-state-sync.log"
-INKDROP_STATE_SYNC_LOCK = LOCK_DIR / "inkdrop-state-sync.lock"
-INKDROP_STATE_SYNC_STALE_SECONDS = int(env_value("INKDROP_STATE_SYNC_STALE_SECONDS", "900"))
-INKDROP_MANUAL_STATE_SYNC_ENABLED = env_bool("INKDROP_MANUAL_STATE_SYNC_ENABLED", False)
-INKDROP_STATE_DB = STATE_DIR / inkdrop_state.STATE_DB_NAME
-MANUAL_SOURCE_AUTORESOLVE_SCRIPT = script_path(
-    "inkdrop_manual_source_autoresolve.py",
-    env_var="INKDROP_MANUAL_SOURCE_AUTORESOLVE_SCRIPT",
-)
-MANUAL_SOURCE_AUTORESOLVE_STATUS_FILE = STATE_DIR / "manual-source-autoresolve-status.json"
-MANUAL_SOURCE_QUEUE_SYNC_FILE = STATE_DIR / "manual-source-queue-sync-pending.json"
-MISSING_ACQUIRE_CACHE_FILE = STATE_DIR / "missing-acquire-cache.json"
-MANUAL_REVIEW_ACTIONS_FILE = STATE_DIR / "manual-review-actions.json"
-PACK_REVIEW_STATE_FILE = STATE_DIR / "pack-review-state.json"
-PENDING_PACKS_LOG = STATE_DIR / "pending-pack-imports.jsonl"
-PACK_IMPORT_LOG = LOG_DIR / "pack-import.log"
-PACK_AUTO_IMPORT_STATUS_FILE = STATE_DIR / "pack-auto-import-status.json"
-PACK_BAD_ARCHIVE_HISTORY_FILE = STATE_DIR / "pack-bad-archive-history.json"
-RSS_ALIASES_FILE = STATE_DIR / "rss-aliases.json"
-RSS_BAD_MATCHES_FILE = STATE_DIR / "rss-bad-matches.json"
-UNMATCHED_ACTION_LOG = STATE_DIR / "unmatched-download-actions.jsonl"
-GUARDED_DISCOVERY_SOURCES = {"rss_discovery", "comicscodes_discovery"}
-PACK_REVIEW_REASONS = {"pack_candidate_requires_review", "rss_pack_requires_review"}
-PACK_IMPORT_REVIEW_REASONS = {"pack_import_verification_failed", "pack_import_bad_archive"}
-PACK_ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
-MANUAL_SOURCE_REVIEW_REASONS = {
-    "no_safe_source",
-    "no_exact_result",
-    "no_safe_alternate_found",
-    "prowlarr_search_error",
-    "manga_no_safe_result",
-    "download_client_send_failed",
-    "failed_download_duplicate_nzb",
-}
-AUTOPILOT_SOFT_REVIEW_REASONS = PACK_REVIEW_REASONS | PACK_IMPORT_REVIEW_REASONS | MANUAL_SOURCE_REVIEW_REASONS | {"ambiguous_results"}
-AUTOPILOT_HARD_REVIEW_REASONS = {
-    "unsafe_or_missing_target_folder",
-    "import_verification_failed",
-}
-AUTOPILOT_HIDE_REVIEW_STATES = {"queued", "searching", "downloading", "importing", "verified"}
-PACK_AUTO_IMPORT_COOLDOWN_SECONDS = 10 * 60
-PACK_AUTO_IMPORT_IN_PROGRESS_SECONDS = 2 * 60 * 60
-PACK_AUTO_IMPORT_POLL_SECONDS = 120
-PACK_FINISHED_ACTIVITY_SECONDS = 6 * 60 * 60
-PACK_BAD_ARCHIVE_AUTO_BLOCK_MIN = 3
-PACK_BAD_ARCHIVE_HISTORY_CACHE = {"mtime": None, "paths": {}, "titles": {}}
-SERIES_QUEUE_RUNNER_START_DELAY_SECONDS = 20
-SERIES_QUEUE_RUNNER_POLL_SECONDS = 60
-SERIES_QUEUE_RUNNER_AUTOPILOT_MIN_SECONDS = 45
-SERIES_QUEUE_RUNNER_RESOLVER_MIN_SECONDS = 10 * 60
-SERIES_QUEUE_RUNNER_DOWNLOAD_CLIENT_MIN_SECONDS = 120
-SERIES_QUEUE_RUNNER_IMPORT_MIN_SECONDS = 180
-SERIES_QUEUE_RUNNER_DEFERRED_SYNC_MIN_SECONDS = 300
-SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED = str(os.environ.get("INKDROP_QUEUE_RUNNER_AUTOPILOT_ENABLED", "0") or "0").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-    "disabled",
-}
-try:
-    SERIES_QUEUE_RUNNER_IMPORT_PRIORITY_READY_IMPORTS = max(
-        1,
-        int(os.environ.get("INKDROP_QUEUE_RUNNER_IMPORT_PRIORITY_READY_IMPORTS", "1") or "1"),
-    )
-except (TypeError, ValueError):
-    SERIES_QUEUE_RUNNER_IMPORT_PRIORITY_READY_IMPORTS = 1
-INKDROP_STATE_IMPORT_READY_STATUSES = (
-    "completed_in_client",
-    "staged_file_ready",
-    "ready_import",
-    "preview_importable",
-    "ready_to_import",
-)
-SERIES_AUTOPILOT_WORKER_MAX_SERIES = 10
-SERIES_AUTOPILOT_LOCK_NOTICE_SECONDS = 3 * 60
-SERIES_AUTOPILOT_LOCK_PRESSURE_SECONDS = 8 * 60
-SERIES_AUTOPILOT_LOCK_KERNEL_WAIT_SECONDS = 10 * 60
-STATUS_CACHE_TTL_SECONDS = 15
-STATUS_CACHE = {"ts": 0.0, "data": None}
-STATUS_CACHE_LOCK = threading.Lock()
-STATUS_COMPUTE_LOCK = threading.Lock()
-DOWNLOAD_CLIENT_STATUS_CACHE = inkdrop_client_status.ClientStatusCache(
-    ttl_seconds=max(5, int(env_value("INKDROP_CLIENT_STATUS_CACHE_SECONDS", "15") or 15)),
-    stale_seconds=max(30, int(env_value("INKDROP_CLIENT_STATUS_STALE_SECONDS", "120") or 120)),
-)
-try:
-    STATE_ENDPOINT_CONCURRENCY = max(1, min(int(os.environ.get("INKDROP_STATE_ENDPOINT_CONCURRENCY", "2") or "2"), 8))
-except (TypeError, ValueError):
-    STATE_ENDPOINT_CONCURRENCY = 2
-try:
-    WEB_SOCKET_TIMEOUT_SECONDS = max(
-        5.0,
-        min(float(os.environ.get("INKDROP_WEB_SOCKET_TIMEOUT_SECONDS", "30") or "30"), 300.0),
-    )
-except (TypeError, ValueError):
-    WEB_SOCKET_TIMEOUT_SECONDS = 30.0
-STATE_ENDPOINT_SEMAPHORE = threading.BoundedSemaphore(STATE_ENDPOINT_CONCURRENCY)
-# Log any request that takes longer than this. Low enough to catch what a
-# person would call slow, high enough that a healthy install stays quiet.
-# Both neighbouring constants wrap their parse; this one did not. A typo in
-# INKDROP_SLOW_REQUEST_LOG_SECONDS raised ValueError at import time and took
-# the entire web process down before it could serve anything -- an operator
-# mistuning a diagnostic threshold should not be able to stop the app.
-try:
-    SLOW_REQUEST_LOG_SECONDS = max(
-        0.2,
-        min(float(os.environ.get("INKDROP_SLOW_REQUEST_LOG_SECONDS") or "1.5"), 600.0),
-    )
-except (TypeError, ValueError):
-    SLOW_REQUEST_LOG_SECONDS = 1.5
-ACTIVE_WEB_REQUESTS = {}
-ACTIVE_WEB_REQUESTS_LOCK = threading.Lock()
-DEBUG_ACTIVE_REQUESTS_ENABLED = str(os.environ.get("INKDROP_DEBUG_ACTIVE_REQUESTS") or "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
-
-def install_web_stack_dump_signal():
-    try:
-        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
-        return True
-    except Exception:
-        return False
-
-
-WEB_STACK_DUMP_SIGNAL_INSTALLED = install_web_stack_dump_signal()
-COMICVINE_WATCHES_CACHE = {"ts": 0.0, "payload": None}
-COMICVINE_WATCHES_CACHE_LOCK = threading.Lock()
-COMICVINE_WATCHES_CACHE_TTL_SECONDS = 10
-SYSTEM_DISK_WARN_USED_PERCENT = 90.0
-SYSTEM_DISK_CRITICAL_USED_PERCENT = 95.0
-SYSTEM_DISK_WARN_FREE_GIB = 20.0
-SYSTEM_DISK_CRITICAL_FREE_GIB = 5.0
-SYSTEM_LOG_WARN_MIB = 256.0
-SYSTEM_LOG_CRITICAL_MIB = 1024.0
-SYSTEM_HEALTH_LOG_LIMIT = 8
-SERIES_AUTOPILOT_LOCK_PATH = LOCK_DIR / "inkdrop-series-autopilot.lock"
-SERIES_AUTOPILOT_STATUS_REPAIR_STALE_SECONDS = 3 * 60
-SERIES_AUTOPILOT_STATUS_REPAIR_COOLDOWN_SECONDS = 60
-SERIES_AUTOPILOT_STATUS_REPAIR_ANNOTATE_SECONDS = 5
-SERIES_AUTOPILOT_STATUS_REPAIR_TIMEOUT_SECONDS = 15
-SERIES_AUTOPILOT_STATUS_REPAIR_CACHE = {"last_attempt": 0.0}
-COMPLETION_STALE_AUDIT_CACHE = {"ts": 0.0, "data": None}
-COMPLETION_STALE_AUDIT_CACHE_TTL_SECONDS = 300
-COMPLETION_STALE_AUDIT_CACHE_LOCK = threading.Lock()
-KAVITA_COMPLETED_IMPORT_MODULE = None
-MANGA_CHAPTER_ARTIFACT_REPAIR_MODULE = None
-MIXED_MANGA_UNIT_REPAIR_MODULE = None
-READER_FRONTEND_ORPHAN_CLEANUP_MODULE = None
-MANUAL_REVIEW_NATIVE_SYNC_TTL_SECONDS = 30
-# How long an operator-facing review exception may stay invisible.
-MANUAL_REVIEW_RECONCILE_INTERVAL_SECONDS = 60
-MANUAL_REVIEW_NATIVE_SYNC_CACHE = {"signature": None, "ts": 0.0, "result": None}
-MANUAL_REVIEW_NATIVE_SYNC_LOCK = threading.Lock()
-SERIES_AUTOPILOT_WORKER_MAX_ISSUES = 12
-
-
-def web_runtime_status_fields():
-    return {
-        "runtime_pid": os.getpid(),
-        "runtime_started_at": WEB_RUNTIME_STARTED_AT,
-        "runtime_started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(WEB_RUNTIME_STARTED_AT)),
-        "runtime_uptime_seconds": round(max(0.0, time.time() - WEB_RUNTIME_STARTED_AT), 3),
-    }
-
-
-def attach_web_runtime_status(payload):
-    out = dict(payload or {})
-    out.update(web_runtime_status_fields())
-    return out
-
-
-try:
-    SERIES_AUTOPILOT_BACKGROUND_MAX_SERIES = max(
-        1,
-        min(int(os.environ.get("INKDROP_AUTOPILOT_BACKGROUND_MAX_SERIES", "12") or "12"), 20),
-    )
-except (TypeError, ValueError):
-    SERIES_AUTOPILOT_BACKGROUND_MAX_SERIES = 12
-try:
-    SERIES_AUTOPILOT_BACKGROUND_MAX_ISSUES = max(
-        1,
-        min(int(os.environ.get("INKDROP_AUTOPILOT_BACKGROUND_MAX_ISSUES", "16") or "16"), 50),
-    )
-except (TypeError, ValueError):
-    SERIES_AUTOPILOT_BACKGROUND_MAX_ISSUES = 16
-SERIES_AUTOPILOT_BACKGROUND_TIMEOUT = os.environ.get("INKDROP_AUTOPILOT_BACKGROUND_TIMEOUT", "30m") or "30m"
-SERIES_QUEUE_RUNNER_TIMEOUT_KILL_AFTER = "30s"
-try:
-    SERIES_AUTOPILOT_MAX_RUN_SECONDS = max(
-        120,
-        min(int(os.environ.get("INKDROP_AUTOPILOT_MAX_RUN_SECONDS", str(15 * 60)) or str(15 * 60)), 30 * 60),
-    )
-except (TypeError, ValueError):
-    SERIES_AUTOPILOT_MAX_RUN_SECONDS = 15 * 60
-SERIES_AUTOPILOT_WEB_TRIGGER_LOCK_WAIT_SECONDS = 0
-try:
-    SERIES_AUTOPILOT_MISSING_MAX_PER_SERIES = max(
-        1,
-        min(int(os.environ.get("INKDROP_AUTOPILOT_MISSING_MAX_PER_SERIES", "10") or "10"), 25),
-    )
-except (TypeError, ValueError):
-    SERIES_AUTOPILOT_MISSING_MAX_PER_SERIES = 10
-try:
-    SERIES_AUTOPILOT_MISSING_MAX_TOTAL = max(
-        5,
-        min(int(os.environ.get("INKDROP_AUTOPILOT_MISSING_MAX_TOTAL", "80") or "80"), 120),
-    )
-except (TypeError, ValueError):
-    SERIES_AUTOPILOT_MISSING_MAX_TOTAL = 80
-SERIES_AUTOPILOT_PROWLARR_LIMIT = 20
-SERIES_AUTOPILOT_PROWLARR_MAX_QUERIES_PER_ISSUE = 6
-SERIES_AUTOPILOT_PROWLARR_SEARCH_TIMEOUT = 12
-SERIES_AUTOPILOT_PROWLARR_COMMAND_TIMEOUT = 60
-SERIES_AUTOPILOT_PROWLARR_SEARCH_BUDGET_SECONDS = 45
-SERIES_AUTOPILOT_PROWLARR_PROVIDER_TIMEOUT_WINDOW_SECONDS = 1800
-SERIES_AUTOPILOT_PROWLARR_PROVIDER_TIMEOUT_THRESHOLD = 3
-SERIES_AUTOPILOT_PROWLARR_PROVIDER_TIMEOUT_COOLDOWN_SECONDS = 1800
-SERIES_AUTOPILOT_PROWLARR_PROVIDER_FETCH_FAILURE_WINDOW_SECONDS = 1800
-SERIES_AUTOPILOT_PROWLARR_PROVIDER_FETCH_FAILURE_THRESHOLD = 2
-SERIES_AUTOPILOT_PROWLARR_PROVIDER_FETCH_FAILURE_COOLDOWN_SECONDS = 1800
-SERIES_AUTOPILOT_PROWLARR_NO_RESULT_COOLDOWN_HOURS = 0.33
-SERIES_AUTOPILOT_RSS_SOURCE_WORKER_HTTP_TIMEOUT_SECONDS = 12
-SERIES_AUTOPILOT_RSS_PROVIDER_TIMEOUT_WINDOW_SECONDS = 1800
-SERIES_AUTOPILOT_RSS_PROVIDER_TIMEOUT_THRESHOLD = 3
-SERIES_AUTOPILOT_RSS_PROVIDER_TIMEOUT_COOLDOWN_SECONDS = 1800
-SERIES_AUTOPILOT_RSS_PROVIDER_FETCH_FAILURE_WINDOW_SECONDS = 1800
-SERIES_AUTOPILOT_RSS_PROVIDER_FETCH_FAILURE_THRESHOLD = 2
-SERIES_AUTOPILOT_RSS_PROVIDER_FETCH_FAILURE_COOLDOWN_SECONDS = 1800
-SERIES_AUTOPILOT_FAILED_RETRY_COMMAND_TIMEOUT = 60
-SERIES_AUTOPILOT_SOURCE_LOCK_WAIT_SECONDS = 5
-SERIES_AUTOPILOT_DISCOVERY_LIMIT = 24
-SERIES_AUTOPILOT_DISCOVERY_MAX_AUTO = 6
-SERIES_AUTOPILOT_DISCOVERY_MAX_PER_SERIES = 3
-SERIES_AUTOPILOT_SLSKD_MAX_TOTAL = 20
-SERIES_AUTOPILOT_SLSKD_MAX_PER_SERIES = 12
-SERIES_AUTOPILOT_SLSKD_WAIT_SECONDS = 8
-SERIES_AUTOPILOT_SLSKD_MAX_QUERIES = 5
-SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX = 8
-SERIES_AUTOPILOT_SLSKD_PROBE_BUDGET_SECONDS = 300
-SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS = 0.0
-SERIES_AUTOPILOT_RETRY_SECONDS = 1800
-MANGA_UNIT_MODELS = {
-    "volume",
-    "chapter",
-    "pack",
-    "mixed_volume_preferred",
-    "mixed_chapter_preferred",
-    "unknown/manual",
-}
-MANGA_UNIT_POLICY_TO_MODEL = {
-    "volume_only": "volume",
-    "chapter_native": "chapter",
-    "pack_only": "pack",
-    "mixed_allowed": "mixed_volume_preferred",
-    "mixed_volume_preferred": "mixed_volume_preferred",
-    "mixed_chapter_preferred": "mixed_chapter_preferred",
-    "manual_review": "unknown/manual",
-    "unknown_manual": "unknown/manual",
-    "unknown/manual": "unknown/manual",
-}
-MANGA_UNIT_MODEL_TO_POLICY = {
-    "volume": "volume_only",
-    "chapter": "chapter_native",
-    "pack": "pack_only",
-    "mixed_volume_preferred": "mixed_allowed",
-    "mixed_chapter_preferred": "mixed_allowed",
-    "unknown/manual": "manual_review",
-}
-MANGA_UNIT_POLICY_LABELS = {
-    "volume_only": "Volume only",
-    "chapter_native": "Chapter native",
-    "pack_only": "Pack only",
-    "mixed_allowed": "Volumes and chapters",
-    "mixed_volume_preferred": "Volumes and chapters",
-    "mixed_chapter_preferred": "Chapters and volumes",
-    "manual_review": "Manual review",
-}
-
-
-def normalize_manga_unit_model(value):
-    raw = str(value or "unknown/manual").strip().lower().replace("-", "_").replace(" ", "_")
-    if raw in MANGA_UNIT_POLICY_TO_MODEL:
-        return MANGA_UNIT_POLICY_TO_MODEL[raw]
-    raw = raw.replace("unknown_manual", "unknown/manual")
-    return raw if raw in MANGA_UNIT_MODELS else "unknown/manual"
-
-
-def manga_unit_policy_for_model(model):
-    return MANGA_UNIT_MODEL_TO_POLICY.get(normalize_manga_unit_model(model), "manual_review")
-
-
-def manga_unit_policy_label(policy_or_model):
-    policy = (
-        str(policy_or_model or "").strip().lower().replace("-", "_").replace(" ", "_")
-        if str(policy_or_model or "").strip().lower().replace("-", "_").replace(" ", "_") in MANGA_UNIT_POLICY_TO_MODEL
-        else manga_unit_policy_for_model(policy_or_model)
-    )
-    return MANGA_UNIT_POLICY_LABELS.get(policy, policy.replace("_", " ").title())
-MANGA_PUBLISHER_HINTS = {
-    "shueisha",
-    "hakusensha",
-    "kodansha",
-    "viz",
-    "yen press",
-    "seven seas",
-    "dark horse manga",
-    "tokyopop",
-    "square enix",
-}
-MANGA_TITLE_HINTS = {"berserk", "chainsaw man", "one piece", "onepiece", "fire punch", "firepunch", "vagabond"}
-MANUAL_INBOX_EXTS = {".cbz", ".cbr", ".pdf", ".epub"}
-COMIC_SERIES_FILE = STATE_DIR / "comic-series-watches.json"
-KAVITA_API = env_value("INKDROP_KAVITA_URL", "")
-KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
-KOMGA_API = env_value("INKDROP_KOMGA_URL", "")
-INKDROP_LOGO_MARK_FILE = Path(__file__).resolve().with_name("inkdrop-logo-mark.png")
-INKDROP_UI_CSS_FILE = Path(__file__).resolve().parent / "web" / "static" / "css" / "inkdrop.css"
-INKDROP_AUTH_BACKDROP_FILE = Path(__file__).resolve().parent / "web" / "static" / "img" / "inkdrop-auth-backdrop.webp"
-INKDROP_UI_JS_DIR = Path(__file__).resolve().parent / "web" / "static" / "js"
-INKDROP_UI_JS_ASSETS = frozenset(
-    {
-        "inkdrop-operational-preferences.js",
-        "inkdrop-operational-table-controls.js",
-        "inkdrop-operational-query-controls.js",
-        "inkdrop-operational-row-controls.js",
-        "inkdrop-transfer-telemetry.js",
-        "inkdrop-version-about.js",
-        "inkdrop-activity-ui.js",
-        "inkdrop-operational-bootstrap.js",
-        "inkdrop-api.js",
-        "inkdrop-manual-search.js",
-        "inkdrop-auth-ui.js",
-        "inkdrop-download-clients-ui.js",
-        "inkdrop-missing-recovery.js",
-    }
-)
-try:
-    INKDROP_UI_CSS_VERSION = hashlib.sha256(INKDROP_UI_CSS_FILE.read_bytes()).hexdigest()[:12]
-except OSError:
-    INKDROP_UI_CSS_VERSION = "missing"
-try:
-    INKDROP_UI_JS_VERSION = hashlib.sha256(
-        b"".join((INKDROP_UI_JS_DIR / name).read_bytes() for name in sorted(INKDROP_UI_JS_ASSETS))
-    ).hexdigest()[:12]
-except OSError:
-    INKDROP_UI_JS_VERSION = "missing"
-COVER_CACHE_DIR = CACHE_DIR / "cover-cache"
-COVER_PROXY_ALLOWED_HOSTS = {
-    "comicvine.gamespot.com",
-    "www.comicvine.gamespot.com",
-    "uploads.mangadex.org",
-}
-COVER_PROXY_MAX_BYTES = 8 * 1024 * 1024
-COVER_PROXY_TIMEOUT_SECONDS = 20
-COVER_PROXY_CACHE_SECONDS = 60 * 60
-COVER_PROXY_STALE_REVALIDATE_SECONDS = 24 * 60 * 60
-COVER_PROXY_CONTENT_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-}
-COMIC_ROOT = Path(env_value("INKDROP_COMIC_ROOT", "/library/comics"))
-MANGA_ROOT = Path(env_value("INKDROP_MANGA_ROOT", "/library/manga"))
-KAVITA_COMIC_ROOT = env_value("INKDROP_KAVITA_COMIC_ROOT", "/data/comics")
-KAVITA_MANGA_ROOT = env_value("INKDROP_KAVITA_MANGA_ROOT", "/data/manga")
-MANUAL_COMICS_INBOX = Path(env_value("INKDROP_MANUAL_COMICS_INBOX", str(MANUAL_INBOX_DIR / "comics")))
-MANUAL_EBOOKS_INBOX = Path(env_value("INKDROP_MANUAL_EBOOKS_INBOX", str(MANUAL_INBOX_DIR / "ebooks")))
-SLSKD_DOWNLOAD_ROOT = Path(env_value("INKDROP_SLSKD_DOWNLOAD_ROOT", str(STAGING_DIR / "slskd")))
-SLSKD_INCOMPLETE_ROOT = SLSKD_DOWNLOAD_ROOT / "incomplete"
-UNMATCHED_LOCAL_ROOTS = (
-    Path(env_value("INKDROP_UNMATCHED_DOWNLOAD_ROOT", str(STAGING_DIR / "downloads" / "comics"))),
-    Path(env_value("INKDROP_DIRECT_DOWNLOAD_ROOT", str(STAGING_DIR / "direct" / "comics"))),
-    MANUAL_COMICS_INBOX,
-    Path(env_value("INKDROP_SUWAYOMI_STAGING_ROOT", str(STAGING_DIR / "suwayomi"))),
-)
-UNMATCHED_QUARANTINE_ALLOWED_ROOTS = (
-    Path(env_value("INKDROP_UNMATCHED_DOWNLOAD_ROOT", str(STAGING_DIR / "downloads" / "comics"))),
-    MANUAL_COMICS_INBOX,
-    Path(env_value("INKDROP_SUWAYOMI_STAGING_ROOT", str(STAGING_DIR / "suwayomi"))),
-)
-UNMATCHED_QUARANTINE_ROOT = Path(env_value("INKDROP_UNMATCHED_QUARANTINE_ROOT", str(QUARANTINE_DIR / "unmatched")))
-COMICVINE_API = "https://comicvine.gamespot.com/api"
-MANGADEX_API = "https://api.mangadex.org"
-MANGADEX_SITE_URL = "https://mangadex.org/title"
-MANGADEX_COVER_URL = "https://uploads.mangadex.org/covers"
-SAB_COMIC_CATEGORIES = {"comics", "manga", "mylar", "kapowarr"}
-COMICVINE_USER_AGENT = env_value("INKDROP_COMICVINE_USER_AGENT", "InkDrop/0.1 (+metadata lookup)")
-MANGADEX_USER_AGENT = "InkDrop/0.1 (+metadata lookup)"
-# MangaDex's own API default is safe + suggestive + erotica; it excludes only
-# pornographic. InkDrop defaulted to safe + suggestive, which is stricter than
-# upstream and silently so: the rating filter is applied in the request, so an
-# excluded title is not down-ranked or flagged, it simply does not exist as far as
-# the user can tell. Berserk is rated erotica on MangaDex, so searching for it
-# returned nothing at all -- reported by a tester on 2026-08-01, and it is 8,959
-# titles wide, not one book.
-#
-# Mature content is still handled, just at the right layer: mangadex_search_result
-# scores erotica and pornographic at -35, so it ranks below an equally-matching
-# safe title instead of vanishing. That penalty was dead code for erotica while
-# the request filter removed those rows first. Pornographic stays excluded by
-# default, and the whole list remains user-configurable.
-MANGADEX_DEFAULT_CONTENT_RATINGS = ("safe", "suggestive", "erotica")
-# Smaller than the narrowest relevance tier gap in mangadex_result_score (12).
-MANGADEX_MATURE_RATING_PENALTY = 8
-
-COMICVINE_ENGLISH_PUBLISHER_HINTS = {
-    "abrams",
-    "archie",
-    "boom studios",
-    "dark horse",
-    "dark horse comics",
-    "dark horse manga",
-    "dc",
-    "dc comics",
-    "denpa",
-    "drawn and quarterly",
-    "dynamite entertainment",
-    "fantagraphics",
-    "first second",
-    "idw publishing",
-    "image",
-    "image comics",
-    "kodansha comics",
-    "marvel",
-    "marvel comics",
-    "oni press",
-    "seven seas",
-    "seven seas entertainment",
-    "square enix manga",
-    "titan comics",
-    "vertical",
-    "viz",
-    "viz media",
-    "yen press",
-}
-COMICVINE_NON_ENGLISH_PUBLISHER_HINTS = {
-    "carlsen",
-    "delcourt",
-    "egmont",
-    "glenat",
-    "hakusensha",
-    "ivrea",
-    "kana",
-    "kaze",
-    "norma editorial",
-    "ecc ediciones",
-    "panini comics",
-    "panini verlag",
-    "pika edition",
-    "planeta",
-    "planeta deagostini",
-    "shogakukan",
-    "shueisha",
-    "star comics",
-    "tong li publishing",
-}
-MAX_AUTO_GRABS_PER_SCAN = 3
-MAX_AUTO_GRABS_PER_WATCH = 1
-
-
-def watch_auto_grab_enabled(watch):
-    return bool((watch or {}).get("autoGrab", True))
+from inkdrop_web_config import *  # noqa: F401,F403 -- re-exports every name below for inkdrop_web.NAME callers
 
 
 HTML = r"""<!doctype html>
@@ -752,6 +111,11 @@ HTML = r"""<!doctype html>
   <script src="/static/js/inkdrop-auth-ui.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
   <script src="/static/js/inkdrop-download-clients-ui.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
   <script src="/static/js/inkdrop-missing-recovery.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
+  <!-- Built by web/frontend (Vite); defines window.InkDropReact. A checkout
+       that hasn't run the frontend build 404s here harmlessly -- every call
+       site guards with window.InkDropReact?. and falls back to the existing
+       vanilla rendering path. -->
+  <script src="/static/dist/inkdrop-react.js?v=__INKDROP_UI_REACT_VERSION__" defer></script>
 </head>
 <body>
   <div id="inkdropAuthRoot" class="inkdrop-auth-root" aria-live="polite"></div>
@@ -854,6 +218,7 @@ HTML = r"""<!doctype html>
         <div class="arr-page-actions" id="inkdropPageActions"></div>
       </div>
     </section>
+    <section class="arr-page-alert-banner" id="inkdropPageAlertBanner" hidden></section>
 
     <section class="notice" id="packReviewBanner" hidden></section>
 
@@ -878,7 +243,8 @@ HTML = r"""<!doctype html>
       </div>
     </details>
 
-    <section class="card source-health" id="inkdropCore" data-arr-page="series wanted queue activity history manual_review" hidden>
+    <div class="op-detail-dock" id="opDetailDock">
+    <section class="card source-health" id="inkdropCore" data-arr-page="series wanted queue activity history manual_review source_memory" hidden>
       <div class="section-title core-shell-title" hidden aria-hidden="true">
         <div>
           <h2>InkDrop Core</h2>
@@ -947,6 +313,62 @@ HTML = r"""<!doctype html>
         <div class="core-list" id="inkdropSectionRows"></div>
       </div>
     </section>
+    <section class="series-remove-modal manual-review-decision-modal" id="manualReviewDecisionModal" role="dialog" aria-modal="true" aria-labelledby="manualReviewDecisionTitle" aria-describedby="manualReviewDecisionCopy" hidden>
+      <div class="series-remove-dialog manual-review-decision-dialog" id="manualReviewDecisionDialog">
+        <div class="series-remove-head">
+          <div class="manual-review-decision-heading">
+            <h3 id="manualReviewDecisionTitle">Review Manual Decision</h3>
+            <span class="mini" id="manualReviewDecisionSubtitle"></span>
+          </div>
+          <button class="series-remove-close" id="manualReviewDecisionClose" type="button" aria-label="Close Manual Review decision panel" onclick="closeManualReviewDecisionModal()">&times;</button>
+        </div>
+        <div class="series-remove-body manual-review-decision-body">
+          <div class="series-remove-alert warn" id="manualReviewDecisionAlert">
+            <strong id="manualReviewDecisionProblem">Needs Review</strong>
+            <span id="manualReviewDecisionCopy">Review the candidate before InkDrop imports it.</span>
+          </div>
+          <div class="manual-review-evidence-columns" id="manualReviewDecisionEvidence">
+            <div class="manual-review-evidence-column">
+              <h4>Expected</h4>
+              <div class="manual-review-decision-grid" id="manualReviewDecisionExpectedFacts"></div>
+            </div>
+            <div class="manual-review-evidence-column">
+              <h4>Candidate</h4>
+              <div class="manual-review-decision-grid" id="manualReviewDecisionCandidateFacts"></div>
+            </div>
+          </div>
+          <div class="manual-review-decision-note" id="manualReviewDecisionSafety"></div>
+          <details class="manual-review-decision-advanced" id="manualReviewDecisionAdvanced">
+            <summary>Advanced</summary>
+            <div class="manual-review-decision-actions-secondary" id="manualReviewDecisionAdvancedActions"></div>
+          </details>
+        </div>
+        <div class="series-remove-foot manual-review-decision-actions" id="manualReviewDecisionActions">
+          <button type="button" onclick="closeManualReviewDecisionModal()">Close</button>
+        </div>
+        <div class="manual-review-decision-nav" id="manualReviewDecisionNav" hidden>
+          <button type="button" id="manualReviewDecisionPrev" onclick="stepManualReviewDecision(-1)">&lsaquo; Previous</button>
+          <span id="manualReviewDecisionNavPosition"></span>
+          <button type="button" id="manualReviewDecisionNext" onclick="stepManualReviewDecision(1)">Next &rsaquo;</button>
+        </div>
+      </div>
+    </section>
+    <section class="series-remove-modal source-memory-detail-panel" id="sourceMemoryDetailPanel" role="dialog" aria-modal="true" aria-labelledby="sourceMemoryDetailTitle" hidden>
+      <div class="series-remove-dialog source-memory-detail-dialog" id="sourceMemoryDetailDialog">
+        <div class="series-remove-head">
+          <div>
+            <h3 id="sourceMemoryDetailTitle">Blocked candidate</h3>
+            <span class="mini" id="sourceMemoryDetailSubtitle"></span>
+          </div>
+          <button class="series-remove-close" id="sourceMemoryDetailClose" type="button" aria-label="Close blocklist detail panel" onclick="closeSourceMemoryDetailPanel()">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="manual-review-decision-grid" id="sourceMemoryDetailFacts"></div>
+        </div>
+        <div class="series-remove-foot manual-review-decision-actions" id="sourceMemoryDetailActions"></div>
+      </div>
+    </section>
+    </div>
 
     <details class="card source-health settings-drawer" id="inkdropSettings" data-arr-page="settings" data-settings-page-shell="index" hidden open>
       <summary>
@@ -1421,25 +843,6 @@ HTML = r"""<!doctype html>
         </div>
       </div>
     </section>
-    <section class="series-remove-modal manual-review-decision-modal" id="manualReviewDecisionModal" role="dialog" aria-modal="true" aria-labelledby="manualReviewDecisionTitle" aria-describedby="manualReviewDecisionCopy" hidden>
-      <div class="series-remove-dialog manual-review-decision-dialog" id="manualReviewDecisionDialog">
-        <div class="series-remove-head">
-          <h3 id="manualReviewDecisionTitle">Review Manual Decision</h3>
-          <button class="series-remove-close" id="manualReviewDecisionClose" type="button" aria-label="Close Manual Review decision panel" onclick="closeManualReviewDecisionModal()">&times;</button>
-        </div>
-        <div class="series-remove-body manual-review-decision-body">
-          <div class="series-remove-alert warn" id="manualReviewDecisionAlert">
-            <strong id="manualReviewDecisionProblem">Needs Review</strong>
-            <span id="manualReviewDecisionCopy">Review the candidate before InkDrop imports it.</span>
-          </div>
-          <div class="manual-review-decision-grid" id="manualReviewDecisionFacts"></div>
-          <div class="manual-review-decision-note" id="manualReviewDecisionSafety"></div>
-        </div>
-        <div class="series-remove-foot manual-review-decision-actions" id="manualReviewDecisionActions">
-          <button type="button" onclick="closeManualReviewDecisionModal()">Close</button>
-        </div>
-      </div>
-    </section>
     <section class="series-remove-modal inkdrop-text-modal" id="inkdropTextModal" role="dialog" aria-modal="true" aria-labelledby="inkdropTextTitle" aria-describedby="inkdropTextCopy" hidden>
       <div class="series-remove-dialog" id="inkdropTextDialog">
         <div class="series-remove-head">
@@ -1489,6 +892,8 @@ HTML = r"""<!doctype html>
     const INKDROP_SETTINGS_CACHE_MAX_AGE_MS = 30 * 60 * 1000;
     let duplicateSeriesWorkloadCache = new Map();
     let duplicateSeriesWorkloadCacheAt = 0;
+    let duplicateSeriesWorkloadFetchInFlight = null;
+    let manualReviewLoadSeq = 0;
     let settingsDisclosureState = {};
     const settingsSearchPriorGroupState = new Map();
     const settingsSearchPriorShellActiveGroup = {has: false, value: undefined};
@@ -1516,6 +921,11 @@ HTML = r"""<!doctype html>
     let inkdropWantedFilter = "active";
     let inkdropWantedStage = null;
     let inkdropWantedStageLabel = "";
+    // Free-text "series or issue" filter, keyed per view. Client-side only --
+    // it narrows whatever page of rows already loaded rather than issuing a
+    // new server query, so it stays instant but only searches what's on
+    // screen (same tradeoff the existing stage/status filters make).
+    const inkdropTableTextFilter = {};
     let inkdropSeriesFilter = "all";
     const SERIES_VIEW_MODE_KEY = "inkdrop.seriesViewMode";
     const SERIES_SORT_KEY = "inkdrop.seriesSort";
@@ -1741,7 +1151,7 @@ HTML = r"""<!doctype html>
       const activityCount = activityItems.length + Number(activeActivities?.size || 0);
       const activityRunning = runningActivityCount(activityItems) + Number(activeActivities?.size || 0);
       const activityNeedsUser = activityItems.filter(item => activityStateTone(item) === "bad").length;
-      const stat = (label, value, tone="", force=false) => ({label, value, tone, force});
+      const stat = (label, value, tone="", force=false, icon="") => ({label, value, tone, force, icon});
       const models = {
         series: {
           tone: "",
@@ -1763,35 +1173,48 @@ HTML = r"""<!doctype html>
           tone: wantedCount ? "warn" : "good",
           eyebrow: "Automatic Backlog",
           title: "Wanted",
-          description: "Missing comics and manga grouped by status. Use this to inspect backlog pressure.",
+          description: "Missing issues InkDrop is working to find.",
           stats: [
-            stat("wanted", wantedCount, "warn", true),
-            stat("open", Number(wanted.wanted || 0), "warn"),
-            stat("needs user", manualCount, "bad"),
+            stat("missing", wantedCount, "", true, "search"),
+            stat("searching", Number(wanted.in_progress || 0), "", true, "refresh"),
+            stat("downloading", Number(state.download_task_active_items || 0), "warn", true, "cloud-download"),
+            stat("needs attention", manualCount, manualCount ? "bad" : "good", true, "alert"),
           ],
-          actions: [
-            mastheadAction("Open Backlog", {section: "wanted", filter: "missing", tone: "warn"}),
-            mastheadAction("Waiting", {section: "wanted", filter: "provider_wait", tone: "warn"}),
-            mastheadAction("Needs Review", {section: "manual_review", filter: "actionable", tone: "bad"}),
-          ],
+          // No masthead actions here on purpose -- Open Backlog/Waiting/Needs
+          // Review used to duplicate the filter tabs InkDrop already renders
+          // in the table controls just below (renderArrTableViewStrip), so
+          // the same three destinations were clickable twice, ~40px apart.
+          actions: [],
         },
         queue: {
           tone: queueCount ? "warn" : "good",
           eyebrow: "Operations",
           title: "Queue",
-          description: "Searches, downloads, imports, and waits use the shared lifecycle labels. Human decisions show as Needs Review.",
+          description: "Downloads and imports in progress.",
           stats: [
-            stat("active", queueCount, "warn", true),
-            stat("waiting", Number(state.queue_backlog_provider_wait_items || state.queue_backlog_source_limited_items || 0), "warn"),
-            stat("no candidate", Number(state.queue_backlog_source_coverage_items || state.queue_backlog_no_candidate_items || 0), "warn"),
-            stat("needs user", manualCount, "bad"),
+            stat("working now", queueCount, "", true, "refresh"),
+            stat("downloading", Number((state.queue_by_active_state || state.queue_by_state || {}).downloading || 0), "", true, "cloud-download"),
+            // Importing broken out from the combined download_task_active_items
+            // count -- queue_by_active_state already carries it split out, so
+            // this needed no backend change, just reading the field that was
+            // already there instead of the pre-aggregated total.
+            stat("importing", Number((state.queue_by_active_state || state.queue_by_state || {}).importing || 0), "good", true, "upload"),
+            stat("waiting", Number(state.queue_backlog_provider_wait_items || state.queue_backlog_source_limited_items || 0), "warn", true, "clock"),
           ],
-          actions: [
-            mastheadAction("Work", {section: "queue", filter: "work", tone: "warn"}),
-            mastheadAction("Waiting", {section: "queue", filter: "provider_wait", tone: "warn"}),
-            mastheadAction("No Candidate", {section: "queue", filter: "no_candidate", tone: "warn"}),
-            mastheadAction("Exceptions", {section: "queue", filter: "exceptions", tone: "bad"}),
-          ],
+          banner: {
+            count: manualCount,
+            tone: "bad",
+            title: manualCount === 1 ? "1 download needs attention" : `${compactNumber(manualCount)} downloads need attention`,
+            detail: "Open the failed items to retry, block the release, or choose another source.",
+            actionLabel: "Review problems",
+            section: "manual_review",
+            filter: "actionable",
+          },
+          // No masthead actions here on purpose -- Work/Waiting/No
+          // Candidate/Exceptions duplicated the filter tabs InkDrop already
+          // renders in the table controls just below (renderArrTableViewStrip),
+          // same redundancy fixed on Wanted.
+          actions: [],
         },
         activity: {
           tone: activityNeedsUser ? "bad" : activityRunning ? "warn" : "",
@@ -1805,19 +1228,20 @@ HTML = r"""<!doctype html>
           tone: "",
           eyebrow: "Download & Import Lifecycle",
           title: "History",
-          description: "Download, import, and verification lifecycle outcomes for completed and failed work.",
+          description: "What InkDrop did, when it happened, and how it ended.",
           stats: [
-            stat("events", historyCount, "", true),
-            stat("imports", inkdropStateSectionCount(state, "imports", Number(state.import_results || 0)), "good"),
-            stat("downloads", inkdropStateSectionCount(state, "download_tasks", Number(state.download_task_active_items || 0) + Number(state.download_task_problem_items || 0)), "warn"),
+            stat("events", historyCount, "", true, "clock"),
+            stat("imports", inkdropStateSectionCount(state, "imports", Number(state.import_results || 0)), "good", true, "check"),
+            stat("downloads", inkdropStateSectionCount(state, "download_tasks", Number(state.download_task_active_items || 0) + Number(state.download_task_problem_items || 0)), "", true, "cloud-download"),
+            stat("needs review", manualCount, manualCount ? "bad" : "good", true, "alert"),
           ],
-          actions: [
-            mastheadAction("Lifecycle", {section: "history", filter: "activity"}),
-            mastheadAction("Reader Sync", {section: "history", filter: "reader_sync"}),
-            mastheadAction("Imports", {section: "history", filter: "imports", tone: "good"}),
-            mastheadAction("Exceptions", {section: "history", filter: "exceptions", tone: "bad"}),
-            mastheadAction("Diagnostics", {section: "history", filter: "all"}),
-          ],
+          // No masthead actions here on purpose -- Lifecycle/Imports/
+          // Exceptions/Diagnostics all routed to filters the History table's
+          // own filter strip (renderArrTableViewStrip: All activity/Imports/
+          // Reader sync/Problems) already exposes, same redundancy fixed on
+          // Wanted and Queue. Reader Sync's destination is still reachable
+          // there too.
+          actions: [],
         },
         manual_review: {
           tone: manualCount ? "bad" : "good",
@@ -1825,16 +1249,18 @@ HTML = r"""<!doctype html>
           title: "Manual Review",
           description: "Exception handling for unsafe, ambiguous, or blocked decisions only. Waiting rows stay in Queue and Wanted.",
           stats: [
-            stat("needs decision", manualCount, "bad", true),
-            stat("unmatched", Number(unmatchedSummaryData?.count || 0), "warn"),
-            stat("SAB failures", Number(sabFailureSummaryData?.count || 0), "warn"),
+            stat("needs decision", manualCount, "bad", true, "alert"),
+            stat("unmatched", Number(unmatchedSummaryData?.count || 0), "warn", false, "search"),
+            stat("SAB failures", Number(sabFailureSummaryData?.count || 0), "warn", false, "x"),
           ],
-          actions: [
-            mastheadAction("Needs Decision", {section: "manual_review", filter: "actionable", tone: "bad"}),
-            mastheadAction("Waiting", {section: "manual_review", filter: "parked", tone: "warn"}),
-            mastheadAction("Unmatched", {target: "unmatchedDownloads", tone: "warn"}),
-            mastheadAction("SAB", {target: "sabComicFailures", tone: "warn"}),
-          ],
+          // No masthead actions here on purpose, matching Wanted/Queue/
+          // History/Blocklist. Needs Decision duplicated the "All" bucket
+          // filter button already below (renderManualReviewFilters); Waiting
+          // duplicated its parked-rows detail text; Unmatched and SAB are
+          // in-page sections on this same page (#unmatchedDownloads,
+          // #sabComicFailures further down), not separate destinations, so
+          // nothing becomes unreachable by dropping the shortcut.
+          actions: [],
         },
         settings: {
           tone: "",
@@ -1939,15 +1365,12 @@ HTML = r"""<!doctype html>
           // Those cards are the canonical count; a header chip that duplicates
           // them can only agree or lie.
           stats: [],
-          // One tone across the three, so they read as one set of filters
-          // rather than three unrelated buttons. They used to be green, amber
-          // and grey, which implied a severity ranking that does not exist --
-          // these just narrow the same list.
-          actions: [
-            mastheadAction("All Blocked", {section: "source_memory", filter: "all"}),
-            mastheadAction("Recent", {section: "source_memory", filter: "recent"}),
-            mastheadAction("SLSKD", {section: "source_memory", filter: "slskd"}),
-          ],
+          // No masthead actions either, as of the icon-badge pass: All
+          // Blocked/Recent/SLSKD duplicated the Blocked/Recent/SLSKD filter
+          // cards immediately below (sectionWorkbenchCard's source_memory
+          // branch) -- same redundant-buttons pattern fixed on Wanted,
+          // Queue, and History.
+          actions: [],
         },
         queue_diagnostics: {
           tone: "warn",
@@ -2007,11 +1430,21 @@ HTML = r"""<!doctype html>
           if (!item.force && !numeric) continue;
           const chip = document.createElement("div");
           chip.className = `arr-page-stat ${item.tone || ""}`;
+          if (item.icon) {
+            const iconEl = document.createElement("span");
+            iconEl.className = "arr-page-stat-icon";
+            iconEl.dataset.icon = item.icon;
+            iconEl.setAttribute("aria-hidden", "true");
+            chip.appendChild(iconEl);
+          }
+          const body = document.createElement("div");
+          body.className = "arr-page-stat-body";
           const strong = document.createElement("strong");
           strong.textContent = typeof item.value === "string" ? item.value : compactNumber(numeric);
           const span = document.createElement("span");
           span.textContent = item.label || "";
-          chip.append(strong, span);
+          body.append(strong, span);
+          chip.appendChild(body);
           stats.appendChild(chip);
         }
       }
@@ -2036,16 +1469,45 @@ HTML = r"""<!doctype html>
         }
         scrubGeneratedShortcutChrome(actions);
       }
+      const banner = $("inkdropPageAlertBanner");
+      if (banner) {
+        const spec = model.banner;
+        if (spec && Number(spec.count || 0) > 0) {
+          banner.className = `arr-page-alert-banner ${spec.tone || "bad"}`;
+          banner.innerHTML = "";
+          const text = document.createElement("div");
+          text.className = "arr-page-alert-banner-text";
+          const title = document.createElement("strong");
+          title.textContent = spec.title || "";
+          const detail = document.createElement("span");
+          detail.textContent = spec.detail || "";
+          text.append(title, detail);
+          banner.appendChild(text);
+          if (spec.actionLabel) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = spec.actionLabel;
+            btn.onclick = () => openInkdropFilteredSection(spec.section || activeInkdropViewSection, spec.filter || "all");
+            banner.appendChild(btn);
+          }
+          banner.hidden = false;
+        } else {
+          banner.hidden = true;
+          banner.innerHTML = "";
+        }
+      }
     }
 
     function setInkdropPrimarySection(section) {
       const viewKey = String(section || "").trim().toLowerCase() || "series";
       const key = primaryPageForSection(viewKey);
       const previousView = activeInkdropViewSection || activeInkdropPrimarySection || "";
+      window.InkDropMissingRecovery?.deactivate?.(viewKey);
       activeInkdropPrimarySection = key;
       activeInkdropViewSection = viewKey;
       if (!inkdropLoadableSections.has(viewKey)) inkdropSectionRequestSeq += 1;
       if (viewKey !== "settings") inkdropSettingsRequestSeq += 1;
+      if (viewKey !== "manual_review") manualReviewLoadSeq += 1;
       document.body.dataset.inkdropSection = key;
       document.body.dataset.inkdropView = viewKey;
       clearInactiveInkdropRouteSurfaces(viewKey, previousView);
@@ -2849,29 +2311,40 @@ HTML = r"""<!doctype html>
       return groups;
     }
 
-    async function getDuplicateSeriesWorkloadMap() {
+    async function getDuplicateSeriesWorkloadMap(options={}) {
       const ttlMs = 120000;
-      if (duplicateSeriesWorkloadCache && duplicateSeriesWorkloadCache.size && Date.now() - duplicateSeriesWorkloadCacheAt < ttlMs) {
+      if (duplicateSeriesWorkloadCache && duplicateSeriesWorkloadCacheAt && Date.now() - duplicateSeriesWorkloadCacheAt < ttlMs) {
         return duplicateSeriesWorkloadCache;
       }
+      if (duplicateSeriesWorkloadFetchInFlight) return duplicateSeriesWorkloadFetchInFlight;
+      duplicateSeriesWorkloadFetchInFlight = (async () => {
+        try {
+          const payload = await getJsonWithTimeout(
+            "/api/inkdrop-state/series?series_filter=duplicate_titles&limit=200&summary=compact&rows=compact",
+            options?.timeoutMs || 12000,
+            "Duplicate series review"
+          );
+          const rows = payload?.rows || payload?.state?.rows || payload?.series || [];
+          const normalizedRows = Array.isArray(rows) ? rows : [];
+          duplicateSeriesWorkloadCache = buildDuplicateSeriesWorkloadRows(normalizedRows);
+          duplicateSeriesWorkloadCacheAt = Date.now();
+        } catch (err) {
+          if (!duplicateSeriesWorkloadCache) duplicateSeriesWorkloadCache = new Map();
+        }
+        return duplicateSeriesWorkloadCache;
+      })();
       try {
-        const response = await fetch("/api/inkdrop-state/series?series_filter=duplicate_titles&limit=200&summary=compact&rows=compact");
-        const payload = await response.json();
-        const rows = payload?.rows || payload?.state?.rows || payload?.series || [];
-        const normalizedRows = Array.isArray(rows) ? rows : [];
-        duplicateSeriesWorkloadCache = buildDuplicateSeriesWorkloadRows(normalizedRows);
-        duplicateSeriesWorkloadCacheAt = Date.now();
-      } catch (err) {
-        if (!duplicateSeriesWorkloadCache) duplicateSeriesWorkloadCache = new Map();
+        return await duplicateSeriesWorkloadFetchInFlight;
+      } finally {
+        duplicateSeriesWorkloadFetchInFlight = null;
       }
-      return duplicateSeriesWorkloadCache;
     }
 
-    async function resolveDuplicateSeriesWorkload(series) {
+    async function resolveDuplicateSeriesWorkload(series, options={}) {
       if (!series) return null;
       const seriesKey = compactUiKey(series);
       if (!seriesKey) return null;
-      const map = await getDuplicateSeriesWorkloadMap();
+      const map = await getDuplicateSeriesWorkloadMap(options);
       let exact = null;
       let partial = null;
       for (const group of map.values()) {
@@ -6774,6 +6247,7 @@ HTML = r"""<!doctype html>
         "/api/inkdrop-settings/backup/export": "Exporting portable settings",
         "/api/inkdrop-settings/portability/export": "Exporting settings and series list",
         "/api/system/logs/download": "Downloading application logs",
+        "/api/system/support-bundle/download": "Building support bundle",
         "/api/library-adoption/plan": "Scanning folder for existing issues",
         "/api/library-adoption/apply": "Registering adopted issues",
         "/api/inkdrop-library/convert-archives/plan": "Checking which comics need converting to CBZ",
@@ -6793,6 +6267,7 @@ HTML = r"""<!doctype html>
         "/api/manual-source/clear-waiting": "Clearing waiting state",
         "/api/manual-review/resolve-noop": "Resolving review noise",
         "/api/manual-review/approve": "Approving review item",
+        "/api/manual-review/approve-local-file": "Importing approved file",
         "/api/manual-review/approve-pack": "Approving pack",
         "/api/manual-review/ignore": "Ignoring review item",
         "/api/manual-review/bad-match": "Marking bad match",
@@ -6855,11 +6330,16 @@ HTML = r"""<!doctype html>
       if (path === "/api/comicvine/search" || path === "/api/mangadex/search") return route("seriesSearchSection");
       if (path === "/api/comicvine/add") return route({section: "queue", filter: "active", label: "Queue · Active"});
       if (path.startsWith("/api/comicvine/")) return route({section: "series", filter: "active", label: "Series · Active"});
-      if (path.startsWith("/api/series-autopilot/")) return route({section: "queue", filter: "work", label: "Queue · Work"});
-      if (path === "/api/inkdrop-state/series/run") return route({section: "queue", filter: "active", label: "Queue · Active"});
+      // These four all commonly land a row in "queued" state, which both the
+      // "active" (downloading/importing) and "work" (+searching) filters
+      // exclude -- the user would follow the link to a list showing none of
+      // what they just queued. "all" is always correct regardless of which
+      // state the accepted row(s) land in.
+      if (path.startsWith("/api/series-autopilot/")) return route({section: "queue", filter: "all", label: "Queue · All"});
+      if (path === "/api/inkdrop-state/series/run") return route({section: "queue", filter: "all", label: "Queue · All"});
       if (path === "/api/inkdrop-state/series/remove") return route({section: "series", filter: "removed", label: "Series · Removed"});
-      if (path === "/api/inkdrop-state/wanted/run") return route({section: "queue", filter: "active", label: "Queue · Active"});
-      if (path === "/api/inkdrop-state/queue/run") return route({section: "queue", filter: "work", label: "Queue · Work"});
+      if (path === "/api/inkdrop-state/wanted/run") return route({section: "queue", filter: "all", label: "Queue · All"});
+      if (path === "/api/inkdrop-state/queue/run") return route({section: "queue", filter: "all", label: "Queue · All"});
       if (path === "/api/inkdrop-state/readiness-repair/apply") return route({section: "queue", filter: "active", label: "Queue · Active"});
       if (path === "/api/inkdrop-state/adapter-merge/apply") return route({section: "sources", filter: "adapter_merge_plan", label: "Sources · Adapter Plan"});
       if (path.startsWith("/api/inkdrop-state/kapowarr-adapter-drain/") || path.startsWith("/api/inkdrop-state/kapowarr_adapter_drain/") || path.startsWith("/api/inkdrop-state/adapter-shadow-drain/")) return route({section: "sources", filter: "kapowarr_adapter_drain_plan", label: "Sources · Adapter Drain Plan"});
@@ -6876,7 +6356,7 @@ HTML = r"""<!doctype html>
       if (path === "/api/manual-source/import-detected") return route(payload?.dryRun ? manualSourceActivityRoute("ready_import") : manualSourceActivityRoute("importing"));
       if (path === "/api/manual-source/mark-waiting") return route(manualSourceActivityRoute(payload?.dryRun ? "candidates" : "waiting"));
       if (path === "/api/manual-source/clear-waiting") return route(manualSourceActivityRoute("candidates"));
-      if (path === "/api/missing/fresh" || path === "/api/missing/process" || path === "/api/missing/recheck") return route({section: "queue", filter: "work", label: "Queue · Work"});
+      if (path === "/api/missing/fresh" || path === "/api/missing/process" || path === "/api/missing/recheck") return route({section: "queue", filter: "all", label: "Queue · All"});
       if (path.startsWith("/api/missing/")) return route({section: "queue", filter: "active", label: "Queue · Active"});
       if (path.startsWith("/api/manual-review/")) return route({section: "manual_review", filter: "actionable", label: "Manual Review · Decisions"});
       if (path.startsWith("/api/pack-review/")) return route({section: "manual_review", filter: "actionable", label: "Manual Review · Decisions"});
@@ -6899,6 +6379,8 @@ HTML = r"""<!doctype html>
         const data = await window.InkDropApi.request(path, {
           method: "POST",
           body: payload || {},
+          ...(options?.responseType ? {responseType: options.responseType} : {}),
+          ...(options?.headers ? {headers: options.headers} : {}),
           ...(controller ? {signal: controller.signal} : {}),
         });
         toastRouteTarget = target;
@@ -7841,6 +7323,19 @@ HTML = r"""<!doctype html>
       return body;
     }
 
+    function humanizeSystemLoadIssueDetail(text) {
+      const raw = String(text || "").trim();
+      const separatorIndex = raw.indexOf(": ");
+      if (separatorIndex === -1) return raw;
+      const prefix = raw.slice(0, separatorIndex);
+      const rest = raw.slice(separatorIndex + 2);
+      // A raw backend error code (e.g. "authentication_required") slips through
+      // unformatted here because callers throw `data.error` verbatim -- humanize
+      // just the bare-token case, leave already-written messages alone.
+      if (/^[a-z][a-z0-9_]*$/.test(rest)) return `${prefix}: ${coreStateLabel(rest)}.`;
+      return raw;
+    }
+
     function renderInkdropSystemPage(payload={}) {
       hideActivityDockForActivityPage();
       setInkdropCoreOverviewOpen(false);
@@ -7957,10 +7452,17 @@ HTML = r"""<!doctype html>
           const healthRows = [
             ["System", systemHealth.state || systemHealth.status, systemHealth.detail],
           ];
+          for (const pathCheck of (Array.isArray(systemHealth.path_checks) ? systemHealth.path_checks : [])) {
+            if (pathCheck.state === "critical") healthRows.push([
+              pathCheck.label || "SLSKD path",
+              pathCheck.state || pathCheck.status,
+              [pathCheck.detail, pathCheck.next_action].filter(Boolean).join(" "),
+            ]);
+          }
           if (sourceProblems || sourceHealth.state || sourceHealth.status || sourceHealth.label || sourceHealth.detail) {
             healthRows.push(["Providers", sourceHealth.state || sourceHealth.status || sourceHealth.label, sourceHealth.detail]);
           }
-          healthRows.push(...errors.map(err => ["Endpoint", "watch", err]));
+          healthRows.push(...errors.map(err => ["Endpoint", "watch", humanizeSystemLoadIssueDetail(err)]));
           for (const item of healthRows) {
             const line = document.createElement("div");
             const tone = systemToneFromState(item[1]);
@@ -7975,10 +7477,13 @@ HTML = r"""<!doctype html>
               actions.className = "system-health-actions";
               const primary = document.createElement("button");
               primary.type = "button";
-              primary.textContent = item[0] === "Providers" ? "Open source settings" : "Open Tasks";
-              primary.onclick = item[0] === "Providers"
-                ? () => openInkdropSettingsArea("automation")
-                : () => openSystemArea("tasks");
+              const isSlskdPath = String(item[0] || "").startsWith("SLSKD ");
+              primary.textContent = isSlskdPath ? "Open path settings" : (item[0] === "Providers" ? "Open source settings" : "Open Tasks");
+              primary.onclick = isSlskdPath
+                ? () => openInkdropSettingsArea("paths")
+                : item[0] === "Providers"
+                  ? () => openInkdropSettingsArea("automation")
+                  : () => openSystemArea("tasks");
               const logs = document.createElement("button");
               logs.type = "button";
               logs.textContent = "Open Logs";
@@ -8435,35 +7940,88 @@ HTML = r"""<!doctype html>
       }
 
       if (systemAreaIncludesSection(activeArea, "logs")) {
+        if (inkdropUserIsAdministrator()) {
+          const supportBody = appendSystemSection(grid, "Support Bundle", "Administrator access");
+          const supportDescription = document.createElement("p");
+          supportDescription.id = "inkdropSupportBundleDescription";
+          supportDescription.className = "mini";
+          supportDescription.textContent = "Download a ZIP with recent InkDrop logs, version and build details, service health, and a redacted configuration summary. Passwords, API keys, session or recovery tokens, and library files are excluded. Logs can still contain titles and file paths, so review the ZIP before sharing.";
+          const supportActions = document.createElement("div");
+          supportActions.className = "workflow-actions";
+          const downloadSupportButton = document.createElement("button");
+          downloadSupportButton.type = "button";
+          downloadSupportButton.className = "system-download-support-bundle";
+          downloadSupportButton.textContent = "Download support bundle";
+          downloadSupportButton.setAttribute("aria-describedby", supportDescription.id);
+          const supportStatus = document.createElement("div");
+          supportStatus.className = "mini system-support-bundle-status";
+          supportStatus.setAttribute("role", "status");
+          supportStatus.setAttribute("aria-live", "polite");
+          downloadSupportButton.onclick = async () => {
+            downloadSupportButton.disabled = true;
+            supportStatus.textContent = "Building support bundle…";
+            try {
+              const data = await api("/api/system/support-bundle/download", {}, {
+                timeoutMs: 60000,
+                responseType: "blob",
+                headers: {Accept: "application/zip"},
+              });
+              if (!(data?.blob instanceof Blob) || data.blob.size < 1 || String(data.content_type || "").split(";", 1)[0].trim().toLowerCase() !== "application/zip") {
+                throw new Error("InkDrop returned an invalid support bundle.");
+              }
+              const url = URL.createObjectURL(data.blob);
+              const link = document.createElement("a");
+              link.href = url;
+              link.download = data.filename || "inkdrop-support-bundle.zip";
+              link.hidden = true;
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+              window.setTimeout(() => URL.revokeObjectURL(url), 0);
+              supportStatus.textContent = "Support bundle downloaded. Review the ZIP before sharing it.";
+            } catch (error) {
+              const message = error?.message || "Could not download the support bundle.";
+              supportStatus.textContent = `Support bundle could not be downloaded: ${message}`;
+              toast(message, false, "inkdropSystem");
+            } finally {
+              downloadSupportButton.disabled = false;
+            }
+          };
+          supportActions.appendChild(downloadSupportButton);
+          supportBody.append(supportDescription, supportActions, supportStatus);
+        }
+
         const logsBody = appendSystemSection(grid, "Log Files", "size on disk");
-        const downloadLogsButton = document.createElement("button");
-        downloadLogsButton.type = "button";
-        downloadLogsButton.className = "system-download-logs";
-        downloadLogsButton.textContent = "Download logs";
-        downloadLogsButton.onclick = async () => {
-          downloadLogsButton.disabled = true;
-          const originalText = downloadLogsButton.textContent;
-          downloadLogsButton.textContent = "Building log archive…";
-          try {
-            const data = await api("/api/system/logs/download", {}, {timeoutMs: 30000});
-            const binary = atob(data.content_base64 || "");
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const blob = new Blob([bytes], {type: "application/zip"});
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = data.filename || "inkdrop-logs.zip";
-            link.click();
-            URL.revokeObjectURL(url);
-          } catch (error) {
-            toast(error?.message || "Could not download logs.", false, "inkdropSectionPanel");
-          } finally {
-            downloadLogsButton.disabled = false;
-            downloadLogsButton.textContent = originalText;
-          }
-        };
-        logsBody.appendChild(downloadLogsButton);
+        if (inkdropUserIsAdministrator()) {
+          const downloadLogsButton = document.createElement("button");
+          downloadLogsButton.type = "button";
+          downloadLogsButton.className = "system-download-logs";
+          downloadLogsButton.textContent = "Download logs only";
+          downloadLogsButton.onclick = async () => {
+            downloadLogsButton.disabled = true;
+            const originalText = downloadLogsButton.textContent;
+            downloadLogsButton.textContent = "Building log archive…";
+            try {
+              const data = await api("/api/system/logs/download", {}, {timeoutMs: 30000});
+              const binary = atob(data.content_base64 || "");
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              const blob = new Blob([bytes], {type: "application/zip"});
+              const url = URL.createObjectURL(blob);
+              const link = document.createElement("a");
+              link.href = url;
+              link.download = data.filename || "inkdrop-logs.zip";
+              link.click();
+              URL.revokeObjectURL(url);
+            } catch (error) {
+              toast(error?.message || "Could not download logs.", false, "inkdropSectionPanel");
+            } finally {
+              downloadLogsButton.disabled = false;
+              downloadLogsButton.textContent = originalText;
+            }
+          };
+          logsBody.appendChild(downloadLogsButton);
+        }
         const logs = Array.isArray(systemHealth.logs) ? systemHealth.logs : [];
         if (!logs.length) {
           appendSystemEmpty(logsBody, "No log health rows are available yet.");
@@ -8500,7 +8058,7 @@ HTML = r"""<!doctype html>
         const productVersion = window.InkDropVersionAbout?.productVersionLabel?.(version) || technicalVersion;
         const releaseStage = window.InkDropVersionAbout?.releaseStageLabel?.(version) || version.release_channel || version.channel || "dev";
         appendSystemTableRow(about, ["Version", productVersion, "Product version"], {columns: 3});
-        appendSystemTableRow(about, ["Build ID", technicalVersion, "Machine-readable SemVer"], {columns: 3});
+        appendSystemTableRow(about, ["Build ID", technicalVersion, "InkDrop release identifier"], {columns: 3});
         if (version.qa_build_number !== undefined && version.qa_build_number !== null && String(version.qa_build_number).trim()) {
           appendSystemTableRow(about, ["QA Build", String(version.qa_build_number), "QA candidate build number"], {columns: 3});
         }
@@ -10403,15 +9961,9 @@ HTML = r"""<!doctype html>
       return {needsReview, activeTransfer, packReview, preservedArtifactRecovery, progress};
     }
 
-    function operationalRowScanSummary(view, row={}, model={}, lane=null) {
-      const viewName = String(view || "");
-      if (!["queue", "wanted"].includes(viewName)) return null;
-      const laneKey = String(lane?.key || "");
-      const label = lane?.label || coreStateLabel(model?.state || row?.state || row?.status || "");
-      const automation = row?.automation_status || {};
-      const cause = row?.automation_cause || automation?.cause || {};
+    function operationalRowSourceLabel(row={}) {
       const task = row?.download_task && typeof row.download_task === "object" ? row.download_task : {};
-      let source = sourceBucketLabel(
+      const source = sourceBucketLabel(
         row?.next_concrete_source_label
         || row?.next_source_label
         || row?.display_source
@@ -10426,7 +9978,17 @@ HTML = r"""<!doctype html>
         || row?.source_provider_id
         || ""
       );
-      if (source.toLowerCase() === "source") source = "";
+      return source.toLowerCase() === "source" ? "" : source;
+    }
+
+    function operationalRowScanSummary(view, row={}, model={}, lane=null) {
+      const viewName = String(view || "");
+      if (!["queue", "wanted"].includes(viewName)) return null;
+      const laneKey = String(lane?.key || "");
+      const label = lane?.label || coreStateLabel(model?.state || row?.state || row?.status || "");
+      const automation = row?.automation_status || {};
+      const cause = row?.automation_cause || automation?.cause || {};
+      const source = operationalRowSourceLabel(row);
       const reason = cause?.label || row?.wait_reason_label || row?.reason_label || "";
       const textFor = (primary, secondary="") => ({
         primary,
@@ -10453,7 +10015,10 @@ HTML = r"""<!doctype html>
           if (progress?.label) return textFor(progress.label, progress.determinate ? transferProgressText(progress.percent) : (progress.meta || "Transfer/import is active."));
           return textFor("Working now", source ? `Using ${source}.` : "Searching, downloading, importing, or verifying.");
         }
-        if (laneKey === "queue-provider-wait") return textFor("Waiting on source", reason || "Provider/source is cooling down or unavailable; InkDrop retries automatically.");
+        // Wording matches this lane's badge (inkdropRowBucketBadgeModel) exactly
+        // -- these used to disagree ("Waiting on provider" badge next to a
+        // "Waiting on source" scan-summary), which read as contradictory.
+        if (laneKey === "queue-provider-wait") return textFor("Waiting on provider", reason || "Provider/source is cooling down or unavailable; InkDrop retries automatically.");
         if (laneKey === "queue-no-candidate") return textFor("No safe match", "InkDrop will keep searching until a valid candidate appears.");
         if (laneKey === "queue-retry") return textFor("Retry later", reason || "Automatic retry/backoff is scheduled.");
         if (laneKey === "queue-covered") return textFor("Covered", "Already satisfied or verified.");
@@ -10461,7 +10026,7 @@ HTML = r"""<!doctype html>
       }
       if (laneKey === "wanted-needs-user") return textFor("Needs review", "Open Manual Review for the decision.");
       if (laneKey === "wanted-moving") return textFor("Queued", "Already moving in Queue.");
-      if (laneKey === "wanted-provider-wait") return textFor("Waiting on source", reason || "Provider/source wait; InkDrop retries automatically.");
+      if (laneKey === "wanted-provider-wait") return textFor("Waiting on provider", reason || "Provider/source wait; InkDrop retries automatically.");
       if (laneKey === "wanted-no-candidate") return textFor("No safe match", "No acceptable candidate yet.");
       if (laneKey === "wanted-retry") return textFor("Retry later", reason || "Automatic retry/backoff is scheduled.");
       if (laneKey === "wanted-covered") return textFor("Covered", "InkDrop already has this one and has checked it.");
@@ -11356,7 +10921,14 @@ HTML = r"""<!doctype html>
       const text = String(value || "").toLowerCase();
       if (["verified", "satisfied", "imported", "clear", "configured", "native", "healthy"].includes(text)) return "good";
       if (["failed", "blocked", "needs_you", "manual_exception"].includes(text)) return "bad";
-      if (["queued", "searching", "downloading", "importing", "staged_or_importing", "verifying", "active", "in_progress", "wanted", "adapter", "tracking", "watch", "guarded", "provider_wait", "source_wait", "provider_limited", "retry_due", "retry_scheduled", "retry_backoff", "retry_later", "no_candidate", "searched_no_candidates", "waiting", "source_coverage", "failed_candidate", "failed_candidate_retry", "candidate_recovery", "recovering", "waiting_scan", "verification_wait"].includes(text)) return "warn";
+      // Active work in progress (a transfer or search actually running right
+      // now) gets its own accent/blue tone, not the same amber "warn" as a
+      // genuinely idle row -- the exact fix already applied to Queue/Wanted's
+      // lane pills (see inkdropTableRowLaneModel's "auto" comment) extended
+      // to this generic badge, which Issues/Sources/Source Attempts/Download
+      // Tasks/Imports still use and had the identical muddy-amber problem.
+      if (["searching", "downloading", "importing", "staged_or_importing", "verifying", "active", "in_progress", "source_ladder"].includes(text)) return "auto";
+      if (["queued", "wanted", "adapter", "tracking", "watch", "guarded", "provider_wait", "source_wait", "provider_limited", "retry_due", "retry_scheduled", "retry_backoff", "retry_later", "no_candidate", "searched_no_candidates", "waiting", "source_coverage", "failed_candidate", "failed_candidate_retry", "candidate_recovery", "recovering", "waiting_scan", "verification_wait"].includes(text)) return "warn";
       return "";
     }
 
@@ -11391,6 +10963,17 @@ HTML = r"""<!doctype html>
         source_ladder: "Source Ladder",
         visible: "Visible",
         hidden: "Hidden Sources",
+        // Unmapped input falls through to coreStateLabel(), which lowercases
+        // then re-capitalizes only each word's first letter -- fine for plain
+        // words, but it mangles brand names with internal capitals ("MangaDex"
+        // -> "Mangadex", "ComicVine" -> "Comicvine"). Confirmed live: a Manual
+        // Review row's MangaDex source rendered as "Mangadex" before this.
+        mangadex: "MangaDex",
+        comicvine: "ComicVine",
+        cv: "ComicVine",
+        kapowarr: "Kapowarr",
+        kavita: "Kavita",
+        komga: "Komga",
       };
       return labels[key] || coreStateLabel(key || "source");
     }
@@ -11632,7 +11215,9 @@ HTML = r"""<!doctype html>
       );
       const speed = task?.download_speed || task?.speed || row?.download_speed || row?.speed || "";
       const eta = task?.eta || task?.time_left || row?.eta || row?.time_left || "";
-      const meta = [source, speed, eta].filter(Boolean).join(" · ");
+      // Source is already named in `label` ("... via {source}") -- don't repeat
+      // it a second time in meta right underneath.
+      const meta = [speed, eta].filter(Boolean).join(" · ");
       return {
         percent,
         label: source ? `${stage} via ${source}` : stage,
@@ -11989,19 +11574,41 @@ HTML = r"""<!doctype html>
       "imports",
     ]);
 
+    // The mockups split Source into its own column for every view where a row
+    // maps to one concrete source/provider. "series" is deliberately excluded:
+    // it never reaches this renderer (view === "series" always routes to
+    // renderInkdropSeriesLibraryTable(), its own bespoke table with a
+    // different column set), and it already shows its metadata source as a
+    // per-row provider badge next to the title. "sources" is excluded too:
+    // its rows ARE source/provider records (column 1 already is "Provider /
+    // source"), so a second Source column would just repeat the row's own
+    // identity. "queue_diagnostics" is excluded as well -- its rows are
+    // aggregate diagnostic buckets, not per-item source facts. See
+    // inkdropOperatorColumnRoles().
+    const SPLIT_SOURCE_COLUMN_VIEWS = new Set([
+      "wanted", "queue", "history", "source_memory",
+      "manual_review", "issues", "source_attempts", "download_tasks", "imports",
+    ]);
+
+    function inkdropOperatorColumnRoles(view) {
+      return SPLIT_SOURCE_COLUMN_VIEWS.has(String(view || ""))
+        ? ["item", "state", "source", "detail", "actions"]
+        : ["item", "state", "detail", "actions"];
+    }
+
     function inkdropOperatorTableColumns(view) {
       if (view === "series") return ["Series", "Library state", "Wanted / queue", "Actions"];
-      if (view === "issues") return ["Issue", "Issue state", "Coverage / activity", "Actions"];
-      if (view === "wanted") return ["Series / Issue", "Status", "Next Step / Source", "Actions"];
-      if (view === "queue") return ["Series / Issue", "Status", "Progress / Source", "Actions"];
+      if (view === "issues") return ["Issue", "Issue state", "Source", "Coverage / activity", "Actions"];
+      if (view === "wanted") return ["Series / Issue", "Current stage", "Source", "Next action", "Actions"];
+      if (view === "queue") return ["Series / Issue", "Status", "Source", "Progress", "Actions"];
       if (view === "queue_diagnostics") return ["Diagnostic", "Status", "Impact", "Actions"];
-      if (view === "manual_review") return ["Series / Issue", "Reason", "Next Step", "Actions"];
+      if (view === "manual_review") return ["Series / Issue", "Reason", "Source", "Next Step", "Actions"];
       if (view === "sources") return ["Provider / source", "Health / role", "Queue impact / recent activity", "Actions"];
-      if (view === "source_attempts") return ["Attempt", "Result", "Source evidence", "Actions"];
-      if (view === "source_memory") return ["Series / Issue", "Blocked reason", "Source title / provider", "Actions"];
-      if (view === "download_tasks") return ["Transfer", "Download state", "Client / import detail", "Actions"];
-      if (view === "imports") return ["Import", "Import state", "Verification / path", "Actions"];
-      if (view === "history") return ["Event / Series", "Result", "Source / Date", "Actions"];
+      if (view === "source_attempts") return ["Attempt", "Result", "Source", "Evidence", "Actions"];
+      if (view === "source_memory") return ["Series / Issue", "Blocked reason", "Source", "Release candidate", "Actions"];
+      if (view === "download_tasks") return ["Transfer", "Download state", "Source", "Import detail", "Actions"];
+      if (view === "imports") return ["Import", "Import state", "Source", "Verification / path", "Actions"];
+      if (view === "history") return ["Event / Series", "Result", "Source", "Details", "Actions"];
       return ["Series / Issue", "Status", "Source / Progress", "Actions"];
     }
 
@@ -12240,7 +11847,10 @@ HTML = r"""<!doctype html>
           return lane("queue-attention", "Needs review", "Open Manual Review; retry will likely repeat until the candidate is approved, rejected, skipped, or repaired.", "bad");
         }
         if (hasFlag(["transfer/import", "running now"]) || hasState(["downloading", "importing", "import_ready", "staged_or_importing", "verifying", "download_started", "searching", "active", "in_progress", "source_ladder"])) {
-          return lane("queue-work", "Active work", "Searching, downloading, or importing now.", "warn");
+          // "auto" (accent/blue), not "warn" -- same fix as Wanted's Queued
+          // lane. Active work in progress read identically to a genuinely
+          // idle waiting/retry row.
+          return lane("queue-work", "Active work", "Searching, downloading, or importing now.", "auto");
         }
         if (hasFlag(["waiting on provider", "provider wait"]) || hasState(["provider_wait", "source_wait", "provider_limited", "waiting"])) {
           return lane("queue-provider-wait", "Waiting on provider", "Automatic wait for source/provider health, limits, availability, or cooldown.", "warn");
@@ -12265,7 +11875,15 @@ HTML = r"""<!doctype html>
           return lane("wanted-covered", "Covered", "Import or verification already covers it.", "good");
         }
         if (hasFlag(["transfer/import", "running now"]) || hasState(["downloading", "importing", "import_ready", "staged_or_importing", "verifying", "download_started", "searching", "active", "in_progress", "source_ladder"])) {
-          return lane("wanted-moving", "Queued", "In Queue.", "warn");
+          // "auto" is this pill family's accent/blue tone (see
+          // 05-settings-providers.css's compact .section-table-lane-pill.auto
+          // rule and 16-redesign-tables.css's base .core-state rule), not
+          // "warn" amber. Active work already in Queue read identically to
+          // genuinely-idle Missing/Waiting rows -- the same amber pill for
+          // "nothing is happening" and "InkDrop is downloading this right
+          // now" was the single biggest source of the "muddy, same-toned"
+          // complaint against this page.
+          return lane("wanted-moving", "Queued", "In Queue.", "auto");
         }
         if (hasFlag(["waiting on provider", "provider wait"]) || hasState(["provider_wait", "source_wait", "provider_limited", "waiting"])) {
           return lane("wanted-provider-wait", "Waiting on provider", "Automatic wait for source/provider health, limits, availability, or cooldown.", "warn");
@@ -12406,7 +12024,7 @@ HTML = r"""<!doctype html>
       return ["queue", "wanted", "manual_review"].includes(String(view || ""));
     }
 
-    function renderInkdropRowStateStack(parent, view, model={}, lane=null, flags=[]) {
+    function renderInkdropRowStateStack(parent, view, model={}, lane=null, flags=[], laneHeaderVisible=false) {
       if (!parent) return;
       const stack = document.createElement("div");
       stack.className = "section-table-state-stack";
@@ -12428,7 +12046,16 @@ HTML = r"""<!doctype html>
         stack.appendChild(state);
       };
       if (inkdropOperationalLaneOnlyView(view)) {
-        if (!appendLanePill()) appendCoreState();
+        // When rows are grouped under a rendered lane header (default sort,
+        // not a custom column sort), the header already says e.g. "Waiting
+        // on provider" once for the whole group -- repeating the identical
+        // string as this row's own pill said the same thing twice, in two
+        // different visual styles, right next to each other. Only render
+        // the per-row pill when there's no header already saying it (a
+        // custom sort interleaves lanes, so nothing groups them visually).
+        if (!(laneHeaderVisible && lane?.label)) {
+          if (!appendLanePill()) appendCoreState();
+        }
         parent.appendChild(stack);
         return;
       }
@@ -13445,6 +13072,18 @@ HTML = r"""<!doctype html>
       if (key === "manual_review") {
         return [];
       }
+      if (key === "history") {
+        const activity = count("activity");
+        const imports = count("imports");
+        const readerSync = count("reader_sync");
+        const problems = count("exceptions");
+        return [
+          arrTableQuickViewItem("All activity", "history", "activity", {count: activity, title: "Everything InkDrop has logged recently"}),
+          arrTableQuickViewItem("Imports", "history", "imports", {count: imports, tone: "good", title: "Copy, scan, and verify events"}),
+          arrTableQuickViewItem("Reader sync", "history", "reader_sync", {count: readerSync, title: "Library-visibility verification against Kavita/Komga"}),
+          arrTableQuickViewItem("Problems", "history", "exceptions", {count: problems, tone: problems ? "bad" : "", title: "Manual review and failed states"}),
+        ];
+      }
       return [];
     }
 
@@ -13688,7 +13327,7 @@ HTML = r"""<!doctype html>
 
     function renderInkdropArrTableControls(parent, view, rows=[], viewPayload={}) {
       const key = String(view || "");
-      if (!["queue", "wanted", "manual_review", "source_memory"].includes(key) || !parent) return null;
+      if (!["queue", "wanted", "manual_review", "source_memory", "history"].includes(key) || !parent) return null;
       const bar = document.createElement("div");
       bar.className = `arr-table-controlbar arr-table-controlbar-${key}`;
       bar.dataset.arrTableControls = key;
@@ -13732,6 +13371,21 @@ HTML = r"""<!doctype html>
 
       const right = document.createElement("div");
       right.className = "arr-table-controlbar-right";
+      if (key === "wanted" || key === "queue" || key === "source_memory" || key === "manual_review") {
+        const placeholder = key === "queue" ? "Filter queue" : key === "source_memory" ? "Search blocked releases" : key === "manual_review" ? "Filter decisions" : "Filter by series or issue";
+        const search = document.createElement("input");
+        search.type = "search";
+        search.className = "arr-table-text-filter";
+        search.placeholder = placeholder;
+        search.value = inkdropTableTextFilter[key] || "";
+        search.setAttribute("aria-label", placeholder);
+        let debounce = 0;
+        search.addEventListener("input", () => {
+          window.clearTimeout(debounce);
+          debounce = window.setTimeout(() => setInkdropTableTextFilter(key, search.value), 250);
+        });
+        right.appendChild(search);
+      }
       if (key === "wanted" || key === "manual_review") {
         appendArrTableMenu(right, "Options", arrTableOptionMenuItems(key, viewPayload));
         appendArrTableMenu(right, "View", arrTableViewMenuItems(key, viewPayload));
@@ -13743,7 +13397,7 @@ HTML = r"""<!doctype html>
       }
       appendArrTableMenu(right, "Filter", arrTableFilterMenuItems(key, viewPayload));
       bar.append(left, right);
-      if (key === "wanted" || key === "manual_review") renderArrTableViewStrip(bar, key, viewPayload);
+      if (key === "wanted" || key === "manual_review" || key === "history") renderArrTableViewStrip(bar, key, viewPayload);
       parent.appendChild(bar);
       return bar;
     }
@@ -14687,6 +14341,23 @@ HTML = r"""<!doctype html>
       needs_attention: ["Needs Review", "Failed", "Blocked"],
     };
 
+    function inkdropTableRowMatchesText(row, text) {
+      if (!text) return true;
+      const haystack = [row?.series, row?.title, row?.name, row?.issue_number ? `#${row.issue_number}` : ""]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(text);
+    }
+
+    function setInkdropTableTextFilter(view, value) {
+      const key = String(view || "");
+      const next = String(value || "").trim().toLowerCase();
+      if ((inkdropTableTextFilter[key] || "") === next) return;
+      inkdropTableTextFilter[key] = next;
+      loadInkdropSection(key, null, {scroll: "none", keepExisting: true});
+    }
+
     function wantedRowMatchesStage(row, stageKey) {
       const targets = WANTED_STAGE_STATUS_TARGETS[stageKey];
       if (!targets) return true;
@@ -14734,6 +14405,10 @@ HTML = r"""<!doctype html>
       if (String(view || "") === "wanted" && inkdropWantedStage) {
         rows = (rows || []).filter(row => wantedRowMatchesStage(row, inkdropWantedStage));
       }
+      const activeTextFilter = inkdropTableTextFilter[String(view || "")] || "";
+      if (activeTextFilter) {
+        rows = (rows || []).filter(row => inkdropTableRowMatchesText(row, activeTextFilter));
+      }
       renderWantedStageFilterChip(parent, view);
       if (String(view || "") === "sources") {
         const requestedSourceFilter = String(inkdropProviderFilter || "").toLowerCase();
@@ -14753,35 +14428,6 @@ HTML = r"""<!doctype html>
         });
       }
       const controls = renderInkdropArrTableControls(parent, view, rows, viewPayload);
-      // The vocabulary strip is a glossary of eight spans, not controls, but it
-      // renders as an evenly spaced uppercase row that reads exactly like a tab
-      // bar -- so it invites clicks that do nothing. Queue already states the
-      // same eight states in the lane cards directly above, with counts and
-      // real filtering; History rows are finished events, not lifecycle states;
-      // and a blocked candidate is never "Searching" or "Importing". Left on
-      // the views where it still earns its space.
-      if (["wanted", "imports", "manual_review", "activity"].includes(String(view || ""))) {
-        const vocabulary = document.createElement("div");
-        vocabulary.className = "lifecycle-vocabulary";
-        vocabulary.dataset.lifecycleVocabulary = "public";
-        vocabulary.setAttribute("aria-label", "InkDrop lifecycle vocabulary");
-        for (const [label, detail] of [
-          ["Waiting", "No action needed unless the row says otherwise."],
-          ["Searching", "InkDrop is looking for a safe match."],
-          ["Downloading", "A transfer is in progress."],
-          ["Importing", "InkDrop is copying and verifying files."],
-          ["Complete", "Managed-folder evidence is complete; reader visibility is a separate fact."],
-          ["Failed", "Open the row for the failure and retry action."],
-          ["Blocked", "A rule or prerequisite prevents progress."],
-          ["Needs Review", "A person must choose an action in Manual Review."],
-        ]) {
-          const chip = document.createElement("span");
-          chip.textContent = label;
-          chip.title = detail;
-          vocabulary.appendChild(chip);
-        }
-        parent.appendChild(vocabulary);
-      }
       if (String(view || "") !== "queue") renderQueueCauseStrip(parent, view, rows, viewPayload);
       renderWantedCauseStrip(parent, view, rows, viewPayload);
       renderManualReviewCauseStrip(parent, view, rows, viewPayload);
@@ -14795,7 +14441,8 @@ HTML = r"""<!doctype html>
       const operationalTable = ["queue", "wanted", "manual_review"].includes(String(view || ""));
       const tablePrefs = operationalTable ? inkdropArrTablePrefsForView(view) : null;
       const selectableTable = ["wanted", "manual_review"].includes(String(view || "")) || (!operationalTable && !["history", "source_memory"].includes(String(view || "")));
-      const columnRoles = ["item", "state", "detail", "actions"];
+      const columnRoles = inkdropOperatorColumnRoles(view);
+      const showsSourceColumn = columnRoles.includes("source");
       const table = document.createElement("div");
       table.className = `section-table section-table-${view}`;
       const tableSort = inkdropArrTableSortForView(view);
@@ -14857,8 +14504,25 @@ HTML = r"""<!doctype html>
         if (!prepared.lane?.key) continue;
         laneCounts.set(prepared.lane.key, Number(laneCounts.get(prepared.lane.key) || 0) + 1);
       }
+      // Lane headers label whole sections, but endpoint order interleaves
+      // series by status, so rendering in that order flips lanes back and
+      // forth and a previous-row comparison redraws the same header at every
+      // flip. Regroup into one contiguous run per lane (first-appearance
+      // order, stable within each lane) so each header renders exactly once.
+      // arrRowIndex below stays an index into preparedRows, so selection is
+      // unaffected by the changed DOM order.
+      let laneOrderedRows = preparedRows;
+      if (!customTableSort && preparedRows.some(prepared => prepared.lane?.key)) {
+        const laneGroups = new Map();
+        for (const prepared of preparedRows) {
+          const groupKey = prepared.lane?.key || "";
+          if (!laneGroups.has(groupKey)) laneGroups.set(groupKey, []);
+          laneGroups.get(groupKey).push(prepared);
+        }
+        laneOrderedRows = [...laneGroups.values()].flat();
+      }
       let previousLaneKey = "";
-      for (const prepared of preparedRows) {
+      for (const prepared of laneOrderedRows) {
         const {sourceRow, model, flags, actionabilityTone, lane, actions} = prepared;
         if (!customTableSort && lane?.key && lane.key !== previousLaneKey) {
           renderInkdropTableLaneHeader(table, lane, laneCounts.get(lane.key) || 0);
@@ -14958,12 +14622,29 @@ HTML = r"""<!doctype html>
         stateCell.className = "section-table-state section-table-col-state";
         stateCell.dataset.columnRole = "state";
         if (["queue", "wanted", "manual_review"].includes(view)) {
-          renderInkdropRowStateStack(stateCell, view, model, lane, flags);
+          renderInkdropRowStateStack(stateCell, view, model, lane, flags, !customTableSort);
         } else {
           const state = document.createElement("span");
           state.className = `core-state ${coreStateTone(model.state) || ""}`;
           state.textContent = coreStateLabel(model.state);
           stateCell.appendChild(state);
+        }
+        let sourceCell = null;
+        if (showsSourceColumn) {
+          sourceCell = document.createElement("div");
+          sourceCell.className = "section-table-source section-table-col-source";
+          sourceCell.dataset.columnRole = "source";
+          // manual_review rows share Queue's row shape (a manual review item
+          // is a parked/blocked queue exception), so the same field-priority
+          // fallback that already works for Queue/Wanted applies unchanged.
+          const sourceLabel = ["queue", "wanted", "manual_review"].includes(view) ? operationalRowSourceLabel(sourceRow) : (model.source || "");
+          if (sourceLabel) {
+            const sourceText = document.createElement("span");
+            sourceText.textContent = sourceLabel;
+            sourceCell.appendChild(sourceText);
+          } else {
+            sourceCell.classList.add("section-table-source-empty");
+          }
         }
         const compactRowDetail = usesCompactOperatorRowDetails(view);
         const detail = document.createElement("div");
@@ -14971,8 +14652,15 @@ HTML = r"""<!doctype html>
         detail.dataset.columnRole = "detail";
         if (compactRowDetail) {
           if (view === "manual_review") renderManualReviewInlineDecision(detail, sourceRow);
-          if (view === "queue") renderQueueRowProgress(detail, sourceRow, model, {compact: true});
-          renderInkdropOperationalScanSummary(detail, view, sourceRow, model, lane);
+          // Only the "queue-work" lane's own scan-summary text is derived from
+          // queueRowProgressModel -- every other lane (provider-wait, retry, ...)
+          // states its own reason. Showing the raw-telemetry progress box there
+          // too let stale "downloading" telemetry contradict that lane's real
+          // status (e.g. "Downloading via SLSKD" next to a "Waiting on provider"
+          // badge), so the two boxes are kept mutually exclusive per lane.
+          const queueRowActivelyWorking = view === "queue" && String(lane?.key || "") === "queue-work";
+          if (queueRowActivelyWorking) renderQueueRowProgress(detail, sourceRow, model, {compact: true});
+          if (!queueRowActivelyWorking) renderInkdropOperationalScanSummary(detail, view, sourceRow, model, lane);
           if (!suppressInlineOperationalMicroSummary(view)) renderInkdropRowMicroSummary(detail, view, sourceRow, model);
           if (view !== "manual_review") renderInkdropCompactRowDetail(detail, view, sourceRow, model);
         } else {
@@ -14993,7 +14681,9 @@ HTML = r"""<!doctype html>
           quietEmpty: view === "history",
         });
         if (selectCell) line.append(selectCell);
-        line.append(item, stateCell, detail, actionBox);
+        line.append(item, stateCell);
+        if (sourceCell) line.append(sourceCell);
+        line.append(detail, actionBox);
         table.appendChild(line);
       }
       if (selectableTable) bindInkdropTableSelection(table, controls);
@@ -15452,7 +15142,7 @@ HTML = r"""<!doctype html>
       const activeQueue = Number(row?.active_queue_count || 0);
       const providerWait = Number(row?.provider_wait_count || 0);
       const wanted = Number(row?.wanted_count || 0);
-      const issueWord = (count) => `${compactNumber(count)} row${count === 1 ? "" : "s"}`;
+      const issueWord = (count) => `${compactNumber(count)} issue${count === 1 ? "" : "s"}`;
       if (needsYou) {
         return {
           label: "Needs user",
@@ -16851,7 +16541,12 @@ HTML = r"""<!doctype html>
         source_checked: "Checked",
       };
       if (labels[lower]) return labels[lower];
-      return text.replace(/[_-]+/g, " ").replace(/\b\w/g, ch => ch.toUpperCase());
+      const acronymWords = new Set(["slskd", "sab", "sabnzbd", "nzb", "rss", "cbr", "cbz"]);
+      return text
+        .replace(/[_-]+/g, " ")
+        .split(" ")
+        .map(word => (acronymWords.has(word.toLowerCase()) ? word.toUpperCase() : word.charAt(0).toUpperCase() + word.slice(1)))
+        .join(" ");
     }
 
     function providerStatusStateKey(status, fallback="") {
@@ -17841,6 +17536,32 @@ HTML = r"""<!doctype html>
       return parts.join(" · ");
     }
 
+    function manualReviewUnitTypeLabel(text) {
+      const t = String(text || "").toLowerCase();
+      if (/\bchapter\b|\bch\.?\s?\d/.test(t)) return "Manga chapter";
+      if (/\bvol(ume)?\.?\s?\d/.test(t)) return "Volume";
+      if (/\bissue\b|#\d/.test(t)) return "Comic issue";
+      return "";
+    }
+
+    function manualReviewExpectedTypeCopy(row={}) {
+      return manualReviewUnitTypeLabel(manualReviewIssueCopy(row))
+        || (row?.chapter_number ? "Manga chapter" : row?.issue_number ? "Comic issue" : "");
+    }
+
+    function manualReviewCandidateTypeCopy(row={}) {
+      return manualReviewUnitTypeLabel(manualReviewCandidateCopy(row))
+        || manualReviewUnitTypeLabel(row?.reason || row?.review_reason || "");
+    }
+
+    function manualReviewCandidateConfidenceCopy(row={}) {
+      const status = row?.english_confidence?.status;
+      if (status) return String(status).replace(/_/g, " ").replace(/^./, c => c.toUpperCase());
+      const seeders = row?.candidate?.seeders;
+      if (seeders !== undefined && seeders !== null && seeders !== "") return `${seeders} seeder${Number(seeders) === 1 ? "" : "s"}`;
+      return "";
+    }
+
     function manualReviewDetailBits(row={}, destinationBit="") {
       const bits = [];
       const retryOnly = manualReviewRetryOnlyState(row);
@@ -17972,19 +17693,51 @@ HTML = r"""<!doctype html>
     function manualReviewDecisionActions(item={}) {
       const canApprove = Boolean(item.can_approve && (item.source === "rss_discovery" || item.source === "comicscodes_discovery"));
       const canApprovePack = Boolean(item.can_approve_pack);
+      const canApproveLocalFile = Boolean(item.can_approve_local_file);
       const canReject = reviewAllowsMatchTools(item);
       const canAlias = manualReviewAllowsAliasAction(item);
-      return [
+      const expectedType = manualReviewExpectedTypeCopy(item);
+      const approveEndpoint = canApprovePack
+        ? "/api/manual-review/approve-pack"
+        : canApproveLocalFile
+        ? "/api/manual-review/approve-local-file"
+        : "/api/manual-review/approve";
+      const primary = [
         {
-          label: "Approve Import",
+          label: expectedType ? `Use as ${expectedType.toLowerCase()}` : "Use this candidate",
           role: "primary",
           tone: "good",
-          title: "Use this candidate for the wanted issue/chapter.",
-          help: "Import this candidate for the wanted issue/chapter.",
-          disabled: !(canApprove || canApprovePack),
-          disabledReason: "Backend has not marked this candidate safe to import.",
-          onClick: () => reviewAction(canApprovePack ? "/api/manual-review/approve-pack" : "/api/manual-review/approve", {review_id: item.review_id}),
+          title: canApproveLocalFile
+            ? "Import this already-downloaded file for the wanted issue/chapter."
+            : "Use this candidate for the wanted issue/chapter.",
+          help: canApproveLocalFile
+            ? "Skip automated confidence checks and import this exact file now."
+            : "Import this candidate for the wanted issue/chapter.",
+          disabled: !(canApprove || canApprovePack || canApproveLocalFile),
+          disabledReason: item.local_file_missing
+            ? "The staged file is no longer on disk; it may have moved or been cleaned up."
+            : "Backend has not marked this candidate safe to import.",
+          onClick: () => reviewAction(approveEndpoint, {review_id: item.review_id}),
         },
+        {
+          label: "Choose another match",
+          role: "primary",
+          title: "Inspect provider results and explicitly grab a safe candidate.",
+          help: "Compare accepted and rejected provider results for this item.",
+          disabled: !(rowLinkedEntities(item).issue_id || rowLinkedEntities(item).unit_id),
+          disabledReason: "This decision does not include a canonical issue or unit identity.",
+          onClick: () => openManualSearchForRow(item),
+        },
+        {
+          label: "Ignore result",
+          role: "attention",
+          tone: "warn",
+          title: "Hide this wanted item from Manual Review after confirmation. Files are not deleted.",
+          help: "Hide this Manual Review row after confirmation. No files are deleted.",
+          onClick: () => manualReviewIgnoreWithConfirm(item),
+        },
+      ];
+      const advanced = [
         {
           label: "Reject & Keep Searching",
           role: "attention",
@@ -17994,23 +17747,6 @@ HTML = r"""<!doctype html>
           disabled: !canReject,
           disabledReason: "Reject endpoint is not available for this row.",
           onClick: () => reviewAction("/api/manual-review/bad-match", {review_id: item.review_id}),
-        },
-        {
-          label: "Ignore Wanted Item",
-          role: "attention",
-          tone: "warn",
-          title: "Hide this wanted item from Manual Review after confirmation. Files are not deleted.",
-          help: "Hide this Manual Review row after confirmation. No files are deleted.",
-          onClick: () => manualReviewIgnoreWithConfirm(item),
-        },
-        {
-          label: "Manual Search",
-          role: "primary",
-          title: "Inspect provider results and explicitly grab a safe candidate.",
-          help: "Compare accepted and rejected provider results for this item.",
-          disabled: !(rowLinkedEntities(item).issue_id || rowLinkedEntities(item).unit_id),
-          disabledReason: "This decision does not include a canonical issue or unit identity.",
-          onClick: () => openManualSearchForRow(item),
         },
         {
           label: "Add Alias / Fix Match",
@@ -18034,57 +17770,186 @@ HTML = r"""<!doctype html>
           onClick: () => openLinkedInkdropSection("series", item),
         },
       ];
+      return {primary, advanced};
     }
+
+    function manualReviewDecisionRows() {
+      return Array.isArray(activeInkdropSectionPayload?.rows) ? activeInkdropSectionPayload.rows : [];
+    }
+
+    function manualReviewDecisionIndex(item={}) {
+      const reviewId = String(item?.review_id || "").trim();
+      if (!reviewId) return -1;
+      return manualReviewDecisionRows().findIndex(row => String(row?.review_id || "").trim() === reviewId);
+    }
+
+    function stepManualReviewDecision(direction) {
+      const rows = manualReviewDecisionRows();
+      const index = manualReviewDecisionIndex(selectedManualReviewRow || {});
+      if (index === -1 || !rows.length) return;
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= rows.length) return;
+      const nextItem = manualReviewActionRow(rows[nextIndex]);
+      if (nextItem) openManualReviewDecisionModal(nextItem);
+    }
+
+    let selectedManualReviewRow = null;
 
     function openManualReviewDecisionModal(row={}) {
       const item = manualReviewActionRow(row) || row || {};
+      selectedManualReviewRow = item;
       const modal = $("manualReviewDecisionModal");
       if (!modal) return;
       const title = $("manualReviewDecisionTitle");
+      const subtitle = $("manualReviewDecisionSubtitle");
       const problem = $("manualReviewDecisionProblem");
       const copy = $("manualReviewDecisionCopy");
-      const facts = $("manualReviewDecisionFacts");
+      const expectedFacts = $("manualReviewDecisionExpectedFacts");
+      const candidateFacts = $("manualReviewDecisionCandidateFacts");
       const safety = $("manualReviewDecisionSafety");
       const actions = $("manualReviewDecisionActions");
+      const advancedActions = $("manualReviewDecisionAdvancedActions");
+      const nav = $("manualReviewDecisionNav");
+      const navPosition = $("manualReviewDecisionNavPosition");
+      const navPrev = $("manualReviewDecisionPrev");
+      const navNext = $("manualReviewDecisionNext");
       const subject = item.series || item.title || item.query || "Manual Review item";
-      if (title) title.textContent = `Review: ${subject}`;
+      if (title) title.textContent = subject;
+      if (subtitle) subtitle.textContent = [manualReviewExpectedTypeCopy(item), formatAgeFromSeconds(item.activity_at || item.updated_at) ? `waiting ${formatAgeFromSeconds(item.activity_at || item.updated_at)}` : ""].filter(Boolean).join(" · ");
       if (problem) problem.textContent = manualReviewProblemCopy(item);
       if (copy) copy.textContent = manualReviewRecommendedCopy(item);
-      if (facts) {
-        facts.innerHTML = "";
-        appendManualReviewDecisionFact(facts, "Series", item.series || item.matched_series || subject);
-        appendManualReviewDecisionFact(facts, "Wanted issue", manualReviewIssueCopy(item) || item.issue || item.query);
-        appendManualReviewDecisionFact(facts, "Candidate", manualReviewCandidateCopy(item));
-        appendManualReviewDecisionFact(facts, "Provider / source", manualReviewSourceCopy(item));
-        appendManualReviewDecisionFact(facts, "Match evidence", item.activity_summary || manualReviewReasonLabel(item));
-        appendManualReviewDecisionFact(facts, "Why it needs a decision", manualReviewProblemCopy(item));
-        appendManualReviewDecisionFact(facts, "No action taken", "InkDrop keeps this row in Manual Review and does not import the candidate from this decision lane.");
+      if (expectedFacts) {
+        expectedFacts.innerHTML = "";
+        appendManualReviewDecisionFact(expectedFacts, "Series", item.series || item.matched_series || subject);
+        appendManualReviewDecisionFact(expectedFacts, "Type", manualReviewExpectedTypeCopy(item));
+        appendManualReviewDecisionFact(expectedFacts, "Issue", manualReviewIssueCopy(item) || item.issue || item.query);
+      }
+      if (candidateFacts) {
+        candidateFacts.innerHTML = "";
+        appendManualReviewDecisionFact(candidateFacts, "Release", manualReviewCandidateCopy(item));
+        appendManualReviewDecisionFact(candidateFacts, "Type", manualReviewCandidateTypeCopy(item));
+        appendManualReviewDecisionFact(candidateFacts, "Source", manualReviewSourceCopy(item));
+        appendManualReviewDecisionFact(candidateFacts, "Confidence", manualReviewCandidateConfidenceCopy(item));
       }
       if (safety) safety.textContent = "Approve only if this file is the correct issue/chapter. Reject keeps InkDrop searching. Ignore hides this wanted item from Manual Review without deleting files.";
+      const {primary, advanced} = manualReviewDecisionActions(item);
       if (actions) {
         actions.innerHTML = "";
-        for (const action of manualReviewDecisionActions(item)) actions.appendChild(manualReviewActionButton(action));
+        for (const action of primary) actions.appendChild(manualReviewActionButton(action));
         const close = document.createElement("button");
         close.type = "button";
         close.textContent = "Close";
         close.onclick = () => closeManualReviewDecisionModal();
         actions.appendChild(close);
       }
+      if (advancedActions) {
+        advancedActions.innerHTML = "";
+        for (const action of advanced) advancedActions.appendChild(manualReviewActionButton(action));
+      }
+      const rows = manualReviewDecisionRows();
+      const index = manualReviewDecisionIndex(item);
+      if (nav) nav.hidden = !(rows.length && index !== -1);
+      if (navPosition) navPosition.textContent = rows.length && index !== -1 ? `${index + 1} of ${rows.length}` : "";
+      if (navPrev) navPrev.disabled = index <= 0;
+      if (navNext) navNext.disabled = index === -1 || index >= rows.length - 1;
       modal.hidden = false;
       modal.onclick = event => {
         if (event.target === modal) closeManualReviewDecisionModal();
       };
       document.body.dataset.manualReviewDecisionModalOpen = "true";
+      for (const line of document.querySelectorAll('body[data-inkdrop-view="manual_review"] .section-table-row')) {
+        const rowId = line.querySelector("[data-arr-row-id]")?.dataset.arrRowId || "";
+        line.classList.toggle("selected-detail-row", Boolean(rowId) && rowId === String(item.id || item.review_id || ""));
+      }
       window.setTimeout(() => actions?.querySelector("button:not(:disabled)")?.focus(), 0);
     }
 
     function closeManualReviewDecisionModal() {
+      selectedManualReviewRow = null;
       const modal = $("manualReviewDecisionModal");
       if (modal) {
         modal.hidden = true;
         modal.onclick = null;
       }
       document.body.dataset.manualReviewDecisionModalOpen = "false";
+      for (const line of document.querySelectorAll('body[data-inkdrop-view="manual_review"] .section-table-row.selected-detail-row')) {
+        line.classList.remove("selected-detail-row");
+      }
+    }
+
+    // Bridge for the React-owned Manual Review table (web/frontend) to reach
+    // this modal without porting its Approve/Ignore/Alias/pack logic --
+    // that logic stays here, closure-scoped, same as before. The modal's own
+    // reviewAction()/manualReviewIgnoreWithConfirm() already call
+    // loadInkdropSection("manual_review", ...) on completion, which
+    // re-mounts the React table with fresh rows -- no extra refresh wiring
+    // needed on the bridge itself.
+    window.InkDropManualReview = Object.freeze({
+      openDecisionModal(row) {
+        openManualReviewDecisionModal(row || {});
+      },
+    });
+
+    let selectedSourceMemoryRow = null;
+
+    function openSourceMemoryDetailPanel(row={}) {
+      selectedSourceMemoryRow = row;
+      const panel = $("sourceMemoryDetailPanel");
+      if (!panel) return;
+      const linked = row.linked_entities || {};
+      const title = $("sourceMemoryDetailTitle");
+      const subtitle = $("sourceMemoryDetailSubtitle");
+      const facts = $("sourceMemoryDetailFacts");
+      const actions = $("sourceMemoryDetailActions");
+      if (title) title.textContent = linked.display_title || linked.series || row.series || "Blocked candidate";
+      if (subtitle) subtitle.textContent = row.title || row.normalized_title || "";
+      if (facts) {
+        facts.innerHTML = "";
+        appendManualReviewDecisionFact(facts, "Attempts", row.failure_count ? compactNumber(row.failure_count) : "1");
+        appendManualReviewDecisionFact(facts, "Last tried", formatAgeFromSeconds(row.activity_at || row.last_seen_at) || "Unknown");
+        appendManualReviewDecisionFact(facts, "Source", row.source_label || row.provider || row.source || "Unknown");
+        appendManualReviewDecisionFact(facts, "Reason", coreStateLabel(row.reason || row.state || "") || "Not recorded");
+        appendManualReviewDecisionFact(facts, "Release candidate", row.title || row.normalized_title || "Unknown");
+        if (row.path_checked) appendManualReviewDecisionFact(facts, "Path checked", row.path_checked);
+      }
+      if (actions) {
+        actions.innerHTML = "";
+        const allow = document.createElement("button");
+        allow.type = "button";
+        allow.textContent = "Allow & Retry";
+        allow.title = "Remove this exact release from Blocklist and retry its linked wanted item";
+        allow.onclick = () => allowBlocklistCandidate(row);
+        actions.appendChild(allow);
+        if (row.source_attempt_filter) {
+          const attempts = document.createElement("button");
+          attempts.type = "button";
+          attempts.textContent = "Attempts";
+          attempts.onclick = () => {
+            inkdropSourceAttemptFilter = row.source_attempt_filter || "acquisition";
+            loadInkdropSection("source_attempts");
+          };
+          actions.appendChild(attempts);
+        }
+        const close = document.createElement("button");
+        close.type = "button";
+        close.textContent = "Close";
+        close.onclick = () => closeSourceMemoryDetailPanel();
+        actions.appendChild(close);
+      }
+      panel.hidden = false;
+      for (const line of document.querySelectorAll('body[data-inkdrop-view="source_memory"] .section-table-row')) {
+        const rowId = line.querySelector("[data-arr-row-id]")?.dataset.arrRowId || "";
+        line.classList.toggle("selected-detail-row", Boolean(rowId) && rowId === String(row.id || ""));
+      }
+    }
+
+    function closeSourceMemoryDetailPanel() {
+      selectedSourceMemoryRow = null;
+      const panel = $("sourceMemoryDetailPanel");
+      if (panel) panel.hidden = true;
+      for (const line of document.querySelectorAll('body[data-inkdrop-view="source_memory"] .section-table-row.selected-detail-row')) {
+        line.classList.remove("selected-detail-row");
+      }
     }
 
     function manualReviewCompactRowActions(row={}) {
@@ -18107,15 +17972,9 @@ HTML = r"""<!doctype html>
           title: "Hide this wanted item from Manual Review after confirmation. Files are not deleted.",
           onClick: () => manualReviewIgnoreWithConfirm(item),
         });
-        actions.push({
-          label: "Series Page",
-          compactLabel: "Series",
-          role: "navigate",
-          title: "Open the dedicated series detail page.",
-          disabled: !rowLinkedEntities(item).series_id,
-          disabledReason: "This review row does not include a linked series id.",
-          onClick: () => openLinkedInkdropSection("series", item),
-        });
+        // Series/Issues links are appended by inkdropLinkedEntityActions() below
+        // (inkdropOperatorRowActions' generic tail) -- pushing "Series Page" here
+        // too used to duplicate it into "Series | Series | Issues".
       } else if (row.id) {
         actions.push({
           label: row.state === "downloading" || row.state === "importing" ? "Refresh" : retryOnly ? "Retry now" : "Retry",
@@ -18256,6 +18115,13 @@ HTML = r"""<!doctype html>
         return {
           title: `${row.series || "Unknown"}${issue}`,
           detail: bits.join(" · "),
+          // Prefer the live acquisition source (matches Wanted/Queue) while a
+          // search/download is in progress; fall back to the cataloging
+          // source for issues with no current acquisition activity.
+          // seriesArtProviderLabel (not sourceBucketLabel) because it knows
+          // the ComicVine/MangaDex casing -- sourceBucketLabel has no entry
+          // for either and would lowercase-then-recapitalize into "Comicvine".
+          source: operationalRowSourceLabel(row) || seriesArtProviderLabel({metadata_provider: row.series_source || row.metadata_provider}),
           state: row.display_state || row.state || row.queue_state || row.wanted_status || "known",
           actions: row.wanted_id && row.wanted_status !== "satisfied"
             ? [{
@@ -18536,12 +18402,16 @@ HTML = r"""<!doctype html>
         const age = formatAgeFromSeconds(row.activity_at || row.last_seen_at);
         const linked = row.linked_entities || {};
         const bits = [
-          row.title ? `Source: ${row.title}` : "",
-          row.source_label || row.provider || row.source || "",
+          row.title ? `Release: ${row.title}` : "",
           row.failure_count ? `${compactNumber(row.failure_count)} blocked attempt${Number(row.failure_count) === 1 ? "" : "s"}` : "",
           age,
         ].filter(Boolean);
         const actions = [];
+        actions.push({
+          label: "Inspect",
+          title: "Open this candidate's full detail in the side panel",
+          onClick: () => openSourceMemoryDetailPanel(row),
+        });
         actions.push({
           label: "Allow & Retry",
           title: "Remove this exact release from Blocklist and retry its linked wanted item",
@@ -18560,6 +18430,7 @@ HTML = r"""<!doctype html>
         return {
           title: linked.display_title || linked.series || row.series || "Unlinked item",
           detail: bits.join(" · "),
+          source: row.source_label || row.provider || row.source || "",
           state: row.reason || row.state || "source_memory",
           actions,
         };
@@ -18580,6 +18451,13 @@ HTML = r"""<!doctype html>
         return {
           title: `${row.series || "Unknown"}${issue}`,
           detail: bits.join(" · "),
+          // row.provider isn't safe here: for SLSKD rows it's a redacted peer
+          // username ("[redacted]"), and for local/client-side rows it's the
+          // release title, not a provider name. operationalRowSourceLabel is
+          // the same field-priority chain Queue/Wanted already use, working
+          // off the machine-key fields (provider_id, current_source, source)
+          // instead of the unreliable display one.
+          source: operationalRowSourceLabel(row),
           state: row.status || row.source || "source",
         };
       }
@@ -18607,6 +18485,13 @@ HTML = r"""<!doctype html>
         return {
           title: `${row.series || row.title || "Unknown"}${issue}`,
           detail: bits.join(" · "),
+          // Same reasoning as source_attempts above -- row.provider is
+          // sometimes a redacted peer username or the release title, not a
+          // provider name (confirmed against live download_tasks rows: it
+          // held "[redacted]" for an SLSKD row and a release title for a
+          // client-side row). Route through the same field-priority chain
+          // Queue/Wanted's Source column already trusts instead.
+          source: operationalRowSourceLabel(row),
           state: providerStatus?.state || row.state || row.status || "download",
           actions: downloadTaskProblemActions(row),
         };
@@ -18634,6 +18519,7 @@ HTML = r"""<!doctype html>
         return {
           title: `${row.series || "Unknown"}${issue}`,
           detail: bits.join(" · "),
+          source: operationalRowSourceLabel(row),
           state: row.verified ? "verified" : row.operator_phase || row.display_phase || row.status || "imported",
         };
       }
@@ -18643,6 +18529,7 @@ HTML = r"""<!doctype html>
       return {
         title: kind ? `${kind} · ${seriesTitle}` : seriesTitle,
         detail: inkdropHistoryResultText(row),
+        source: sourceBucketLabel(row.display_source || row.source || row.provider_id || row.provider_key || ""),
         state: row.status || row.event_type || "history",
       };
     }
@@ -19301,11 +19188,27 @@ HTML = r"""<!doctype html>
       box.hidden = false;
     }
 
-    function sectionWorkbenchCard(parent, label, value, detail, tone, onClick) {
+    function sectionWorkbenchCard(parent, label, value, detail, tone, onClick, icon="") {
       if (!parent) return;
       const card = document.createElement("button");
       card.type = "button";
       card.className = `section-workbench-card ${tone || ""}`;
+      // Icon is an extra leading sibling, not a wrapper around title/count/
+      // detail -- this card is a shared component used by ~10 other views'
+      // filter cards (Queue, Wanted, source_attempts, imports, ...), all of
+      // which rely on its plain 3-child grid layout. Adding a wrapper would
+      // have changed auto-placement for all of them; call sites that don't
+      // pass `icon` get byte-identical output to before.
+      if (icon) {
+        const iconEl = document.createElement("span");
+        // arr-page-stat-icon: reuses the page-masthead stat cards' existing
+        // data-icon mask registry (15-redesign-shell.css) instead of a
+        // second copy of the same SVG data URIs.
+        iconEl.className = "section-workbench-card-icon arr-page-stat-icon";
+        iconEl.dataset.icon = icon;
+        iconEl.setAttribute("aria-hidden", "true");
+        card.appendChild(iconEl);
+      }
       const title = document.createElement("span");
       title.textContent = label;
       const count = document.createElement("strong");
@@ -19415,23 +19318,16 @@ HTML = r"""<!doctype html>
         return;
       }
       if (view === "history") {
-        const historyCard = (label, value, detail, tone="") => {
-          const facet = sectionFilterRow(viewPayload, value);
-          sectionWorkbenchCard(
-            box,
-            label,
-            facetCountText(facet),
-            facet?.sampled === true ? "sampled recent events; open for full history" : detail,
-            tone,
-            () => openInkdropFilteredSection("history", value)
-          );
-        };
-        historyCard("Activity", "activity", "recent automation events");
-        historyCard("Sources", "sources", "provider and source events");
-        historyCard("Downloads", "downloads", "client and transfer history");
-        historyCard("Imports", "imports", "copy, scan, and verify events", "good");
-        historyCard("Exceptions", "exceptions", "manual review and failed states", "bad");
-        sectionWorkbenchCard(box, "All history", Number(viewPayload?.total_count || 0), "full event trail", "", () => openInkdropFilteredSection("history", "all"));
+        const outcomeSummary = viewPayload?.outcome_summary || {};
+        const outcomeDetail = (base) => outcomeSummary.sampled
+          ? `${base} (from ${compactNumber(outcomeSummary.sample_size || 0)} recent events)`
+          : base;
+        const failedCount = Number(outcomeSummary.failed || 0);
+        const needsReviewCount = Number(outcomeSummary.needs_review || 0);
+        sectionWorkbenchCard(box, "Completed", Number(outcomeSummary.completed || 0), outcomeDetail("finished successfully"), "good", null, "check");
+        sectionWorkbenchCard(box, "Failed", failedCount, outcomeDetail("ran into a problem"), failedCount ? "bad" : "", null, "x");
+        sectionWorkbenchCard(box, "Retried", Number(outcomeSummary.retried || 0), outcomeDetail("automatic retry scheduled"), "warn", null, "refresh");
+        sectionWorkbenchCard(box, "Needs review", needsReviewCount, outcomeDetail("waiting on a manual decision"), needsReviewCount ? "bad" : "", null, "eye");
         box.hidden = false;
         return;
       }
@@ -19506,10 +19402,10 @@ HTML = r"""<!doctype html>
         const memory = summary.source_memory_summary || summary || {};
         const remembered = Number(memory.bad_source_candidates ?? summary.bad_source_candidates ?? viewPayload?.total_count ?? 0);
         const recent = Number(memory.bad_source_candidates_recent ?? summary.bad_source_candidates_recent ?? filterCount("recent"));
-        sectionWorkbenchCard(box, "Remembered", remembered, "bad candidates avoided automatically", "good", () => openInkdropFilteredSection("source_memory", "all"));
-        sectionWorkbenchCard(box, "Recent", recent, "new source-memory entries", recent ? "warn" : "", () => openInkdropFilteredSection("source_memory", "recent"));
-        sectionWorkbenchCard(box, "SLSKD", filterCount("slskd"), "guarded Soulseek candidates", "", () => openInkdropFilteredSection("source_memory", "slskd"));
-        sectionWorkbenchCard(box, "Prowlarr", filterCount("prowlarr"), "guarded indexer candidates", "", () => openInkdropFilteredSection("source_memory", "prowlarr"));
+        sectionWorkbenchCard(box, "Blocked", remembered, "Active blocked candidates", "bad", () => openInkdropFilteredSection("source_memory", "all"), "x");
+        sectionWorkbenchCard(box, "Recent", recent, "Newly blocked candidates", recent ? "warn" : "", () => openInkdropFilteredSection("source_memory", "recent"), "calendar");
+        sectionWorkbenchCard(box, "SLSKD", filterCount("slskd"), "From indexer", "", () => openInkdropFilteredSection("source_memory", "slskd"), "shield");
+        sectionWorkbenchCard(box, "Prowlarr", filterCount("prowlarr"), "From indexer", "", () => openInkdropFilteredSection("source_memory", "prowlarr"), "refresh");
         box.hidden = false;
         return;
       }
@@ -19551,7 +19447,14 @@ HTML = r"""<!doctype html>
       const key = String(view || "");
       const value = String(filter || "").toLowerCase();
       if (key === "queue") {
-        if (["active", "work", "running", "searching"].includes(value)) return "Active";
+        // "active" (downloading/importing only) and "work" (that plus
+        // searching/source_wait) are genuinely different, broader-vs-narrower
+        // populations -- collapsing both to "Active" is why the masthead's
+        // "Working now" card and this list's own header used to read the same
+        // word over two different counts.
+        if (value === "active") return "Active";
+        if (["work", "running"].includes(value)) return "In Progress";
+        if (value === "searching") return "Searching";
         if (["downloading", "importing", "transfer_import"].includes(value)) return "Download / Import";
         if (value === "queued") return "Queued automatic";
         if (value === "retry_due") return "Retry later";
@@ -19705,7 +19608,7 @@ HTML = r"""<!doctype html>
           laneBoardFilterSum(viewPayload, ["exceptions", "needs_you", "failed", "blocked", "language_blocked"])
         );
         return [
-          laneBoardCard("Working now", running, "work", "Searching sources right now", running ? "warn" : "", {filters: ["active", "work", "searching"]}),
+          laneBoardCard("Working now", running, "work", "Searching, downloading, or importing right now", running ? "warn" : "", {filters: ["work", "searching"]}),
           laneBoardCard("Transfers / imports", transferring, "downloading", "Fresh transfer or import work; open Queue for the exact stage", transferring ? "warn" : "", {filters: ["downloading", "importing"]}),
           laneBoardCard("Will retry", retryLater, "retry_due", "InkDrop is waiting for its next automatic retry", retryLater ? "warn" : "", {filters: ["retry_due", "retry_later", "retry_scheduled", "recovering", "waiting"]}),
           laneBoardCard("Waiting on source", providerWait, "provider_wait", "Waiting on source health, limits, or availability", providerWait ? "warn" : "", {filters: ["provider_wait", "provider_limited"]}),
@@ -20011,7 +19914,9 @@ HTML = r"""<!doctype html>
       const value = String(filter || "").toLowerCase();
       if (key === "queue") {
         if (["exceptions", "needs_you", "failed", "blocked"].includes(value)) return "Queue · Needs action";
-        if (["active", "work", "running", "searching"].includes(value)) return "Queue · Active";
+        if (value === "active") return "Queue · Active";
+        if (["work", "running"].includes(value)) return "Queue · In Progress";
+        if (value === "searching") return "Queue · Searching";
         if (["downloading", "importing", "transfer_import"].includes(value)) return "Queue · Download / Import";
         if (value === "queued") return "Queue · Queued automatic";
         if (["provider_wait", "source_wait", "provider_limited", "source_limited"].includes(value)) return "Queue · Waiting";
@@ -21476,6 +21381,12 @@ HTML = r"""<!doctype html>
       const meta = $("inkdropSectionMeta");
       const rowsBox = $("inkdropSectionRows");
       if (!panel || !title || !rowsBox) return;
+      // A React-mounted view (see web/frontend) owns rowsBox's contents
+      // itself, including its own empty state and pagination -- unmount
+      // unconditionally before deciding what renders next so a stale root
+      // from the previous section never lingers attached to a DOM node about
+      // to be reused for vanilla markup (or a different React section).
+      window.InkDropReact?.unmount(rowsBox);
       delete panel.dataset.refreshing;
       const view = viewPayload?.view || "";
       title.textContent = inkdropSectionTitle(view);
@@ -21576,6 +21487,16 @@ HTML = r"""<!doctype html>
         refreshWorkerActivities();
       }
       rowsBox.innerHTML = "";
+      if (window.InkDropReact?.hasSection(view) && window.InkDropReact.mount(view, rowsBox, viewPayload)) {
+        // The migrated section owns its own empty state and pagination, so
+        // none of the row-sorting/empty-state/table-building/load-more logic
+        // below applies -- same early-return shape the "series" branch below
+        // already uses for its own alternate render paths.
+        scrubGeneratedShortcutChrome(panel);
+        panel.hidden = false;
+        window.mountInkdropOperationalAssets?.(panel);
+        return;
+      }
       const sourceRows = Array.isArray(viewPayload?.rows) ? viewPayload.rows : [];
       let rows;
       try {
@@ -21729,7 +21650,11 @@ HTML = r"""<!doctype html>
     async function runWantedSearchAll() {
       try {
         const data = await api("/api/missing/process", {});
-        toast(processSummaryText(data.result || data) || "Wanted search sweep queued.", true, {section: "queue", filter: "work", label: "Queue · Active"});
+        // A search sweep commonly lands rows in "queued" state, which the
+        // "work"/"active" filters both exclude -- routing there showed the
+        // user a list with none of what they just queued. "all" is always
+        // correct regardless of which state(s) the accepted rows landed in.
+        toast(processSummaryText(data.result || data) || "Wanted search sweep queued.", true, {section: "queue", filter: "all", label: "Queue · All"});
         await loadInkdropSection("wanted", null);
         loadInkdropCore(false);
         refreshStatus();
@@ -21761,7 +21686,7 @@ HTML = r"""<!doctype html>
       await loadInkdropSection("wanted", null);
       loadInkdropCore(false);
       refreshStatus();
-      toast(`Selected Wanted search complete: ${queued} queued${failed ? `, ${failed} failed` : ""}.`, failed < rows.length, {section: "queue", filter: "work", label: "Queue · Active"});
+      toast(`Selected Wanted search complete: ${queued} queued${failed ? `, ${failed} failed` : ""}.`, failed < rows.length, {section: "queue", filter: "all", label: "Queue · All"});
     }
 
     async function runWantedSearch(row, options={}) {
@@ -21783,7 +21708,7 @@ HTML = r"""<!doctype html>
           series_id: wantedFocus.series_id,
           issue_id: wantedFocus.issue_id,
         });
-        const target = routeWithFocus({section: "queue", filter: "active", label: "Queue · Active"}, queueFocus);
+        const target = routeWithFocus({section: "queue", filter: "all", label: "Queue · All"}, queueFocus);
         const dbQueued = Number(result.dbQueue?.queued || (result.dbQueue?.queue_id ? 1 : 0));
         const queued = result.queue?.created || result.queue?.updated || result.queue?.resurrected || dbQueued || 0;
         if (!options?.quiet) toast(`${series}: search queued${queued ? ` (${queued} row${queued === 1 ? "" : "s"})` : ""}.`, true, target);
@@ -21816,7 +21741,7 @@ HTML = r"""<!doctype html>
           wanted_id: firstQueue.wanted_id,
           series_id: seriesFocus.series_id,
         });
-        const target = routeWithFocus({section: "queue", filter: "active", label: "Queue · Active"}, queueFocus);
+        const target = routeWithFocus({section: "queue", filter: "all", label: "Queue · All"}, queueFocus);
         const dbQueued = Number(result.dbQueue?.queued || (result.dbQueue?.queue_id ? 1 : 0));
         const queued = result.queue?.created || result.queue?.updated || result.queue?.resurrected || dbQueued || 0;
         toast(`${series}: series search queued${queued ? ` (${queued} row${queued === 1 ? "" : "s"})` : ""}.`, true, target);
@@ -22499,7 +22424,10 @@ HTML = r"""<!doctype html>
           series_id: queueRow.series_id || row.series_id,
           issue_id: queueRow.issue_id || row.issue_id,
         });
-        const target = routeWithFocus({section: "queue", filter: "work", label: "Queue · Work"}, queueFocus);
+        // A retry can land the row back in "queued" state awaiting its turn,
+        // which the "work" filter excludes -- "all" is always correct
+        // regardless of which state the retried row lands in.
+        const target = routeWithFocus({section: "queue", filter: "all", label: "Queue · All"}, queueFocus);
         toast(`${series}: ${result.action || "queue retry requested"}.`, true, target);
         await loadInkdropSection(reloadView || "queue", queueFocus);
         loadInkdropCore(false);
@@ -25788,170 +25716,350 @@ HTML = r"""<!doctype html>
       return channelId === "discord" ? "Discord" : channelId === "pushover" ? "Pushover" : channelId;
     }
 
-    function appendNotificationsEventMatrix(parent, config, onSaved) {
-      appendSettingsFormSectionTitle(parent, "Event triggers");
+    const NOTIFICATION_CHANNEL_SECRET_KEYS = {
+      discord: ["discord_webhook_url"],
+      pushover: ["pushover_api_token", "pushover_user_key"],
+    };
+
+    // One compact row per channel (on/off, event count, series scope) instead of a
+    // shared event-trigger matrix plus a separate per-channel series-filter block --
+    // both of those, plus the enable toggle and secret field that used to live on a
+    // completely separate provider card above, now live together in one modal per
+    // channel (see openNotificationsChannelModal). Everything about "what does
+    // Discord do" is one click away instead of scattered across two page sections.
+    function appendNotificationsChannelRows(parent, config, providerRecord, onSaved) {
+      appendSettingsFormSectionTitle(parent, "Channels");
       const intro = document.createElement("p");
       intro.className = "setting-description";
-      intro.textContent = "Choose which events each channel should notify on. A channel with no events checked stays completely silent, even if it's enabled and configured above.";
+      intro.textContent = "On/off, webhook or token, events, and series scope all live together in each channel's own dialog.";
       parent.appendChild(intro);
 
-      const channelsById = Object.fromEntries((config.channels || []).map((c) => [c.id, c]));
-      const table = document.createElement("table");
-      table.className = "notifications-matrix";
-      const thead = document.createElement("thead");
-      const headRow = document.createElement("tr");
-      headRow.appendChild(document.createElement("th"));
+      const totalEvents = (config.event_types || []).length;
       for (const channel of config.channels || []) {
-        const th = document.createElement("th");
-        th.textContent = notificationChannelLabel(channel.id);
-        if (!channel.enabled) {
-          const note = document.createElement("div");
-          note.className = "setting-description";
-          note.textContent = "Not enabled above";
-          th.appendChild(note);
-        }
-        headRow.appendChild(th);
-      }
-      thead.appendChild(headRow);
-      const tbody = document.createElement("tbody");
-      const checkboxes = {};
-      for (const eventType of config.event_types || []) {
-        const row = document.createElement("tr");
-        const labelCell = document.createElement("td");
-        labelCell.textContent = eventType.label;
-        row.appendChild(labelCell);
-        for (const channel of config.channels || []) {
-          const cell = document.createElement("td");
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.checked = (channel.events || []).includes(eventType.id);
-          cell.appendChild(input);
-          row.appendChild(cell);
-          checkboxes[`${channel.id}:${eventType.id}`] = input;
-        }
-        tbody.appendChild(row);
-      }
-      table.append(thead, tbody);
-      parent.appendChild(table);
+        const row = document.createElement("div");
+        row.className = "settings-provider-form-row notifications-channel-row";
+        const label = document.createElement("div");
+        label.className = "settings-provider-form-label";
+        const nameLine = document.createElement("div");
+        const badge = document.createElement("span");
+        badge.className = `status-badge ${channel.enabled ? "good" : "warn"}`;
+        badge.textContent = channel.enabled ? "On" : "Off";
+        nameLine.append(document.createTextNode(`${notificationChannelLabel(channel.id)} `), badge);
+        const summary = document.createElement("span");
+        summary.className = "setting-description";
+        const scopeText = (channel.series_filter || []).length
+          ? `${channel.series_filter.length} series`
+          : "All series";
+        summary.textContent = `${(channel.events || []).length}/${totalEvents} events · ${scopeText}`;
+        label.append(nameLine, summary);
 
-      const saveRow = document.createElement("div");
-      saveRow.className = "settings-form-row";
+        const controls = document.createElement("div");
+        controls.className = "settings-provider-form-control";
+        const configureButton = document.createElement("button");
+        configureButton.type = "button";
+        configureButton.textContent = "Configure";
+        configureButton.onclick = () => openNotificationsChannelModal(channel, config, providerRecord, onSaved);
+        const testButton = document.createElement("button");
+        testButton.type = "button";
+        testButton.textContent = "Send Test";
+        testButton.title = "Sends a real test message right now to every channel that has a token/webhook saved (not just this one).";
+        testButton.onclick = () => testProviderSettings("notifications");
+        controls.append(configureButton, testButton);
+
+        row.append(label, controls);
+        parent.appendChild(row);
+      }
+    }
+
+    function ensureNotificationsChannelModal() {
+      let modal = $("notificationsChannelModal");
+      if (modal) return modal;
+      modal = document.createElement("section");
+      modal.id = "notificationsChannelModal";
+      modal.className = "series-remove-modal notifications-channel-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-labelledby", "notificationsChannelModalTitle");
+      modal.hidden = true;
+      const dialog = document.createElement("div");
+      dialog.className = "series-remove-dialog";
+      const head = document.createElement("div");
+      head.className = "series-remove-head";
+      const title = document.createElement("h3");
+      title.id = "notificationsChannelModalTitle";
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "series-remove-close";
+      closeButton.setAttribute("aria-label", "Close channel settings");
+      closeButton.textContent = "×";
+      closeButton.onclick = () => closeNotificationsChannelModal();
+      head.append(title, closeButton);
+      const body = document.createElement("div");
+      body.id = "notificationsChannelModalBody";
+      body.className = "series-remove-body";
+      dialog.append(head, body);
+      modal.appendChild(dialog);
+      modal.onclick = event => {
+        if (event.target === modal) closeNotificationsChannelModal();
+      };
+      document.body.appendChild(modal);
+      return modal;
+    }
+
+    function openNotificationsChannelModal(channel, config, providerRecord, onSaved) {
+      const modal = ensureNotificationsChannelModal();
+      const title = $("notificationsChannelModalTitle");
+      if (title) title.textContent = `Configure ${notificationChannelLabel(channel.id)}`;
+      const body = $("notificationsChannelModalBody");
+      body.replaceChildren();
+      buildNotificationsChannelModalBody(body, channel, config, providerRecord, async () => {
+        closeNotificationsChannelModal();
+        if (onSaved) await onSaved();
+      });
+      modal.hidden = false;
+      document.body.dataset.notificationsChannelModalOpen = "true";
+      if (!modal._escHandler) {
+        modal._escHandler = event => {
+          if (event.key === "Escape") closeNotificationsChannelModal();
+        };
+        document.addEventListener("keydown", modal._escHandler);
+      }
+    }
+
+    function closeNotificationsChannelModal() {
+      const modal = $("notificationsChannelModal");
+      if (!modal) return;
+      modal.hidden = true;
+      document.body.dataset.notificationsChannelModalOpen = "false";
+    }
+
+    function buildNotificationsChannelModalBody(body, channel, config, providerRecord, onSavedAndClose) {
+      const providerSettings = (providerRecord && providerRecord.settings) || {};
+      const fieldSchema = (providerRecord && (providerRecord.field_schema || providerSettings.field_schema)) || {};
+      const savedSecrets = (providerRecord && providerRecord.has_secret_values) || {};
+      const secretKeys = NOTIFICATION_CHANNEL_SECRET_KEYS[channel.id] || [];
+
+      const enabledKey = `${channel.id}_enabled`;
+      const enabledInput = settingInputControl(providerSettings[enabledKey] !== false, {kind: "boolean"});
+      appendProviderSettingRow(body, `Send ${notificationChannelLabel(channel.id)} alerts`, enabledInput, {toggleText: "Enabled"});
+
+      const secretInputs = {};
+      for (const key of secretKeys) {
+        const schema = fieldSchema[key] || {};
+        const input = document.createElement("input");
+        input.type = "password";
+        input.placeholder = schema.placeholder || (savedSecrets[key]?.configured ? "Saved; leave blank to keep" : "Not set");
+        input.name = `provider-secret-notifications-${key}`;
+        input.autocomplete = "off";
+        if (schema.help) input.title = schema.help;
+        appendProviderSettingRow(body, schema.label || key.replace(/_/g, " "), input, {key, description: schema.help || ""});
+        secretInputs[key] = input;
+      }
+
+      appendSettingsFormSectionTitle(body, "Notify on");
+      const eventsIntro = document.createElement("p");
+      eventsIntro.className = "setting-description";
+      eventsIntro.textContent = "No events checked means this channel stays completely silent, even if it's enabled above.";
+      body.appendChild(eventsIntro);
+      const eventsWrap = document.createElement("div");
+      eventsWrap.className = "settings-form-row";
+      const eventInputs = {};
+      const eventsSet = new Set(channel.events || []);
+      for (const eventType of config.event_types || []) {
+        const eventLabel = document.createElement("label");
+        eventLabel.className = "checkline";
+        const eventInput = document.createElement("input");
+        eventInput.type = "checkbox";
+        eventInput.checked = eventsSet.has(eventType.id);
+        eventLabel.append(eventInput, document.createTextNode(` ${eventType.label}`));
+        eventsWrap.appendChild(eventLabel);
+        eventInputs[eventType.id] = eventInput;
+      }
+      body.appendChild(eventsWrap);
+
+      appendSettingsFormSectionTitle(body, "Series filter");
+      const filterIntro = document.createElement("p");
+      filterIntro.className = "setting-description";
+      filterIntro.textContent = "By default this channel gets events for every series.";
+      body.appendChild(filterIntro);
+      const scopeRow = document.createElement("div");
+      scopeRow.className = "settings-form-row";
+      const allLabel = document.createElement("label");
+      allLabel.className = "checkline";
+      const allRadio = document.createElement("input");
+      allRadio.type = "radio";
+      allRadio.name = `notif-scope-${channel.id}`;
+      allRadio.checked = !(channel.series_filter || []).length;
+      allLabel.append(allRadio, document.createTextNode(" All series"));
+      const specificLabel = document.createElement("label");
+      specificLabel.className = "checkline";
+      const specificRadio = document.createElement("input");
+      specificRadio.type = "radio";
+      specificRadio.name = `notif-scope-${channel.id}`;
+      specificRadio.checked = !!(channel.series_filter || []).length;
+      specificLabel.append(specificRadio, document.createTextNode(" Specific series"));
+      scopeRow.append(allLabel, specificLabel);
+      body.appendChild(scopeRow);
+
+      const pickerWrap = document.createElement("div");
+      pickerWrap.className = "notifications-series-picker";
+      pickerWrap.hidden = !specificRadio.checked;
+      const search = document.createElement("input");
+      search.type = "search";
+      search.placeholder = "Search series…";
+      const list = document.createElement("div");
+      list.className = "notifications-series-list";
+      const selected = new Set(channel.series_filter || []);
+      const optionRows = [];
+      for (const series of config.series_options || []) {
+        const seriesRow = document.createElement("label");
+        seriesRow.className = "checkline";
+        const seriesInput = document.createElement("input");
+        seriesInput.type = "checkbox";
+        seriesInput.checked = selected.has(series.id);
+        seriesInput.onchange = () => {
+          if (seriesInput.checked) selected.add(series.id);
+          else selected.delete(series.id);
+        };
+        seriesRow.append(seriesInput, document.createTextNode(` ${series.title}`));
+        list.appendChild(seriesRow);
+        optionRows.push({title: series.title.toLowerCase(), row: seriesRow});
+      }
+      search.oninput = () => {
+        const q = search.value.trim().toLowerCase();
+        for (const {title, row} of optionRows) {
+          row.style.display = !q || title.includes(q) ? "" : "none";
+        }
+      };
+      pickerWrap.append(search, list);
+      body.appendChild(pickerWrap);
+      allRadio.onchange = () => { pickerWrap.hidden = true; };
+      specificRadio.onchange = () => { pickerWrap.hidden = false; };
+
+      const actionsRow = document.createElement("div");
+      actionsRow.className = "settings-form-row";
+      const testButton = document.createElement("button");
+      testButton.type = "button";
+      testButton.textContent = "Send Test Notification";
+      testButton.title = "Sends a real test message right now to every channel that has a token/webhook saved (not just this one).";
+      testButton.onclick = () => testProviderSettings("notifications", {reload: false});
       const saveButton = document.createElement("button");
       saveButton.type = "button";
       saveButton.className = "primary";
-      saveButton.textContent = "Save event triggers";
-      saveRow.appendChild(saveButton);
-      parent.appendChild(saveRow);
+      saveButton.textContent = "Save";
+      actionsRow.append(testButton, saveButton);
+      body.appendChild(actionsRow);
 
       saveButton.onclick = async () => {
         saveButton.disabled = true;
         saveButton.textContent = "Saving…";
         try {
-          for (const channel of config.channels || []) {
-            const events = (config.event_types || [])
-              .map((e) => e.id)
-              .filter((eventId) => checkboxes[`${channel.id}:${eventId}`]?.checked);
-            await api("/api/notifications/channel/save", {id: channel.id, events});
+          // The whole "notifications" provider row keeps one shared enabled flag
+          // (a leftover of the old single combined card), but with per-channel
+          // toggles now the only on/off control a user sees, that row-level flag
+          // stays true from here on -- each channel's own toggle is what actually
+          // decides whether it fires.
+          const patchSettings = {[enabledKey]: !!enabledInput.checked};
+          for (const key of secretKeys) {
+            const value = String(secretInputs[key]?.value || "");
+            if (value.trim()) patchSettings[key] = value;
           }
-          toast("Event triggers saved.", true, "inkdropSettings");
-          if (onSaved) await onSaved();
+          await api("/api/inkdrop-settings/provider/update", {id: "notifications", enabled: true, settings: patchSettings});
+          const events = (config.event_types || []).map(e => e.id).filter(id => eventInputs[id]?.checked);
+          const seriesFilter = allRadio.checked ? [] : Array.from(selected);
+          await api("/api/notifications/channel/save", {id: channel.id, events, series_filter: seriesFilter});
+          toast(`${notificationChannelLabel(channel.id)} saved.`, true, "inkdropSettings");
+          await onSavedAndClose();
         } catch (error) {
-          toast(error?.message || "Could not save event triggers.", false, "inkdropSettings");
+          toast(error?.message || "Could not save channel settings.", false, "inkdropSettings");
         } finally {
           saveButton.disabled = false;
-          saveButton.textContent = "Save event triggers";
+          saveButton.textContent = "Save";
         }
       };
     }
 
-    function appendNotificationsSeriesFilter(parent, config, onSaved) {
-      appendSettingsFormSectionTitle(parent, "Series filter");
-      const intro = document.createElement("p");
-      intro.className = "setting-description";
-      intro.textContent = "By default every channel gets events for every series. Scope a channel to specific series if you only want alerts for part of your library on that channel.";
-      parent.appendChild(intro);
+    function appendNotificationsQuietHoursSummary(parent, config, onSaved) {
+      appendSettingsFormSectionTitle(parent, "Quiet hours & limits");
+      const settings = config.settings || {};
+      const row = document.createElement("div");
+      row.className = "settings-provider-form-row";
+      const label = document.createElement("div");
+      label.className = "settings-provider-form-label";
+      const quietText = settings.quiet_hours_enabled
+        ? `Quiet hours ${settings.quiet_hours_start || "22:00"}–${settings.quiet_hours_end || "07:00"}`
+        : "Quiet hours off";
+      label.textContent = `${quietText} · ${settings.rate_limit_max_per_hour ?? 20}/hr max · ${settings.retry_max_attempts ?? 5} retries · ${settings.history_retention_days ?? 30}d history`;
+      const controls = document.createElement("div");
+      controls.className = "settings-provider-form-control";
+      const editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.textContent = "Edit";
+      editButton.onclick = () => openNotificationsLimitsModal(config, onSaved);
+      controls.appendChild(editButton);
+      row.append(label, controls);
+      parent.appendChild(row);
+    }
 
-      const seriesOptions = config.series_options || [];
-      for (const channel of config.channels || []) {
-        const wrap = document.createElement("div");
-        wrap.className = "notifications-filter-channel";
-        const heading = document.createElement("strong");
-        heading.textContent = notificationChannelLabel(channel.id);
-        wrap.appendChild(heading);
+    function ensureNotificationsLimitsModal() {
+      let modal = $("notificationsLimitsModal");
+      if (modal) return modal;
+      modal = document.createElement("section");
+      modal.id = "notificationsLimitsModal";
+      modal.className = "series-remove-modal notifications-limits-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-labelledby", "notificationsLimitsModalTitle");
+      modal.hidden = true;
+      const dialog = document.createElement("div");
+      dialog.className = "series-remove-dialog";
+      const head = document.createElement("div");
+      head.className = "series-remove-head";
+      const title = document.createElement("h3");
+      title.id = "notificationsLimitsModalTitle";
+      title.textContent = "Quiet hours & limits";
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "series-remove-close";
+      closeButton.setAttribute("aria-label", "Close quiet hours and limits");
+      closeButton.textContent = "×";
+      closeButton.onclick = () => closeNotificationsLimitsModal();
+      head.append(title, closeButton);
+      const body = document.createElement("div");
+      body.id = "notificationsLimitsModalBody";
+      body.className = "series-remove-body";
+      dialog.append(head, body);
+      modal.appendChild(dialog);
+      modal.onclick = event => {
+        if (event.target === modal) closeNotificationsLimitsModal();
+      };
+      document.body.appendChild(modal);
+      return modal;
+    }
 
-        const scopeRow = document.createElement("div");
-        scopeRow.className = "settings-form-row";
-        const allLabel = document.createElement("label");
-        allLabel.className = "checkline";
-        const allRadio = document.createElement("input");
-        allRadio.type = "radio";
-        allRadio.name = `notif-scope-${channel.id}`;
-        allRadio.checked = !(channel.series_filter || []).length;
-        allLabel.append(allRadio, document.createTextNode(" All series"));
-        const specificLabel = document.createElement("label");
-        specificLabel.className = "checkline";
-        const specificRadio = document.createElement("input");
-        specificRadio.type = "radio";
-        specificRadio.name = `notif-scope-${channel.id}`;
-        specificRadio.checked = !!(channel.series_filter || []).length;
-        specificLabel.append(specificRadio, document.createTextNode(" Specific series"));
-        scopeRow.append(allLabel, specificLabel);
-        wrap.appendChild(scopeRow);
-
-        const pickerWrap = document.createElement("div");
-        pickerWrap.className = "notifications-series-picker";
-        pickerWrap.hidden = !specificRadio.checked;
-        const search = document.createElement("input");
-        search.type = "search";
-        search.placeholder = "Search series…";
-        const list = document.createElement("div");
-        list.className = "notifications-series-list";
-        const selected = new Set(channel.series_filter || []);
-        const optionRows = [];
-        for (const series of seriesOptions) {
-          const row = document.createElement("label");
-          row.className = "checkline";
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.checked = selected.has(series.id);
-          input.onchange = () => {
-            if (input.checked) selected.add(series.id);
-            else selected.delete(series.id);
-          };
-          row.append(input, document.createTextNode(` ${series.title}`));
-          list.appendChild(row);
-          optionRows.push({title: series.title.toLowerCase(), row});
-        }
-        search.oninput = () => {
-          const q = search.value.trim().toLowerCase();
-          for (const {title, row} of optionRows) {
-            row.style.display = !q || title.includes(q) ? "" : "none";
-          }
+    function openNotificationsLimitsModal(config, onSaved) {
+      const modal = ensureNotificationsLimitsModal();
+      const body = $("notificationsLimitsModalBody");
+      body.replaceChildren();
+      appendNotificationsQuietHours(body, config, async () => {
+        closeNotificationsLimitsModal();
+        if (onSaved) await onSaved();
+      });
+      modal.hidden = false;
+      document.body.dataset.notificationsLimitsModalOpen = "true";
+      if (!modal._escHandler) {
+        modal._escHandler = event => {
+          if (event.key === "Escape") closeNotificationsLimitsModal();
         };
-        pickerWrap.append(search, list);
-        wrap.appendChild(pickerWrap);
-        allRadio.onchange = () => { pickerWrap.hidden = true; };
-        specificRadio.onchange = () => { pickerWrap.hidden = false; };
-
-        const saveButton = document.createElement("button");
-        saveButton.type = "button";
-        saveButton.textContent = `Save ${notificationChannelLabel(channel.id)} filter`;
-        saveButton.onclick = async () => {
-          saveButton.disabled = true;
-          try {
-            const seriesFilter = allRadio.checked ? [] : Array.from(selected);
-            await api("/api/notifications/channel/save", {id: channel.id, series_filter: seriesFilter});
-            toast(`${notificationChannelLabel(channel.id)} filter saved.`, true, "inkdropSettings");
-            if (onSaved) await onSaved();
-          } catch (error) {
-            toast(error?.message || "Could not save series filter.", false, "inkdropSettings");
-          } finally {
-            saveButton.disabled = false;
-          }
-        };
-        wrap.appendChild(saveButton);
-        parent.appendChild(wrap);
+        document.addEventListener("keydown", modal._escHandler);
       }
+    }
+
+    function closeNotificationsLimitsModal() {
+      const modal = $("notificationsLimitsModal");
+      if (!modal) return;
+      modal.hidden = true;
+      document.body.dataset.notificationsLimitsModalOpen = "false";
     }
 
     function appendNotificationsQuietHours(parent, config, onSaved) {
@@ -26025,6 +26133,7 @@ HTML = r"""<!doctype html>
       dedupInput.value = settings.dedup_window_seconds ?? 3600;
       appendProviderSettingRow(parent, "Dedup window (seconds)", dedupInput, {description: "The same event for the same item won't notify twice within this window."});
 
+      appendSettingsFormSectionTitle(parent, "Retries");
       const retryAttemptsInput = document.createElement("input");
       retryAttemptsInput.type = "number";
       retryAttemptsInput.min = "0";
@@ -26039,6 +26148,7 @@ HTML = r"""<!doctype html>
       retryBackoffInput.value = settings.retry_backoff_seconds ?? 300;
       appendProviderSettingRow(parent, "Retry backoff (seconds)", retryBackoffInput, {description: "Wait time before the first retry; it doubles after each further attempt."});
 
+      appendSettingsFormSectionTitle(parent, "History");
       const retentionInput = document.createElement("input");
       retentionInput.type = "number";
       retentionInput.min = "1";
@@ -26085,6 +26195,10 @@ HTML = r"""<!doctype html>
 
     function appendNotificationsHistory(parent) {
       appendSettingsFormSectionTitle(parent, "Delivery history");
+      const intro = document.createElement("p");
+      intro.className = "setting-description";
+      intro.textContent = "Click a row for the full subject, message, and error detail.";
+      parent.appendChild(intro);
       const status = document.createElement("p");
       status.className = "setting-description";
       status.setAttribute("role", "status");
@@ -26093,7 +26207,7 @@ HTML = r"""<!doctype html>
       const table = document.createElement("table");
       table.className = "notifications-history-table";
       const thead = document.createElement("thead");
-      thead.innerHTML = "<tr><th>When</th><th>Event</th><th>Channel</th><th>Subject</th><th>Status</th><th>Detail</th></tr>";
+      thead.innerHTML = "<tr><th>When</th><th>Event</th><th>Channel</th><th>Status</th></tr>";
       const tbody = document.createElement("tbody");
       table.append(thead, tbody);
       table.hidden = true;
@@ -26122,19 +26236,26 @@ HTML = r"""<!doctype html>
           table.hidden = false;
           for (const row of rows) {
             const tr = document.createElement("tr");
+            tr.className = "notifications-history-row";
+            tr.tabIndex = 0;
+            tr.setAttribute("role", "button");
+            tr.title = "View details";
             const when = document.createElement("td");
             when.textContent = row.created_at ? new Date(row.created_at * 1000).toLocaleString() : "";
             const eventCell = document.createElement("td");
             eventCell.textContent = row.event_type;
             const channelCell = document.createElement("td");
             channelCell.textContent = notificationChannelLabel(row.channel_id);
-            const subjectCell = document.createElement("td");
-            subjectCell.textContent = row.subject || "";
             const statusCell = document.createElement("td");
             statusCell.appendChild(notificationStatusBadge(row));
-            const detailCell = document.createElement("td");
-            detailCell.textContent = row.error_detail || "";
-            tr.append(when, eventCell, channelCell, subjectCell, statusCell, detailCell);
+            tr.append(when, eventCell, channelCell, statusCell);
+            tr.onclick = () => openNotificationsDeliveryDetailModal(row);
+            tr.onkeydown = event => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                openNotificationsDeliveryDetailModal(row);
+              }
+            };
             tbody.appendChild(tr);
             oldestSeen = row.created_at;
           }
@@ -26149,10 +26270,92 @@ HTML = r"""<!doctype html>
       loadPage();
     }
 
-    async function appendNotificationsSettingsPanel(parent) {
+    function ensureNotificationsDeliveryDetailModal() {
+      let modal = $("notificationsDeliveryDetailModal");
+      if (modal) return modal;
+      modal = document.createElement("section");
+      modal.id = "notificationsDeliveryDetailModal";
+      modal.className = "series-remove-modal notifications-delivery-detail-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-labelledby", "notificationsDeliveryDetailTitle");
+      modal.hidden = true;
+      const dialog = document.createElement("div");
+      dialog.className = "series-remove-dialog";
+      const head = document.createElement("div");
+      head.className = "series-remove-head";
+      const title = document.createElement("h3");
+      title.id = "notificationsDeliveryDetailTitle";
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "series-remove-close";
+      closeButton.setAttribute("aria-label", "Close notification detail");
+      closeButton.textContent = "×";
+      closeButton.onclick = () => closeNotificationsDeliveryDetailModal();
+      head.append(title, closeButton);
+      const body = document.createElement("div");
+      body.id = "notificationsDeliveryDetailBody";
+      body.className = "series-remove-body";
+      dialog.append(head, body);
+      modal.appendChild(dialog);
+      modal.onclick = event => {
+        if (event.target === modal) closeNotificationsDeliveryDetailModal();
+      };
+      document.body.appendChild(modal);
+      return modal;
+    }
+
+    function openNotificationsDeliveryDetailModal(row) {
+      const modal = ensureNotificationsDeliveryDetailModal();
+      const title = $("notificationsDeliveryDetailTitle");
+      if (title) title.textContent = row.subject || "Notification detail";
+      const body = $("notificationsDeliveryDetailBody");
+      body.replaceChildren();
+      const statusText = row.status + (row.queue_reason ? ` (${NOTIFICATION_QUEUE_REASON_LABEL[row.queue_reason] || row.queue_reason})` : "");
+      const fields = [
+        ["When", row.created_at ? new Date(row.created_at * 1000).toLocaleString() : ""],
+        ["Event", row.event_type],
+        ["Channel", notificationChannelLabel(row.channel_id)],
+        ["Subject", row.subject || ""],
+        ["Message", row.message || ""],
+        ["Status", statusText],
+        ["Attempt", row.max_attempts ? `${row.attempt} of ${row.max_attempts}` : ""],
+        ["Detail", row.error_detail || ""],
+      ];
+      for (const [label, value] of fields) {
+        if (!value) continue;
+        const fieldRow = document.createElement("div");
+        fieldRow.className = "settings-provider-form-row";
+        const labelEl = document.createElement("div");
+        labelEl.className = "settings-provider-form-label";
+        labelEl.textContent = label;
+        const valueEl = document.createElement("div");
+        valueEl.className = "settings-provider-form-control";
+        valueEl.textContent = value;
+        fieldRow.append(labelEl, valueEl);
+        body.appendChild(fieldRow);
+      }
+      modal.hidden = false;
+      document.body.dataset.notificationsDeliveryDetailModalOpen = "true";
+      if (!modal._escHandler) {
+        modal._escHandler = event => {
+          if (event.key === "Escape") closeNotificationsDeliveryDetailModal();
+        };
+        document.addEventListener("keydown", modal._escHandler);
+      }
+    }
+
+    function closeNotificationsDeliveryDetailModal() {
+      const modal = $("notificationsDeliveryDetailModal");
+      if (!modal) return;
+      modal.hidden = true;
+      document.body.dataset.notificationsDeliveryDetailModalOpen = "false";
+    }
+
+    async function appendNotificationsSettingsPanel(parent, providerRecord) {
       appendSettingsFormSectionTitle(parent, "Notifications");
       const intro = document.createElement("p");
-      intro.textContent = "Fine-tune what Discord and Pushover actually notify you about. Turn a channel on/off and set its webhook or token on the Notifications card in this Connect section -- everything here controls what that channel does once it's on.";
+      intro.textContent = "Fine-tune what Discord and Pushover actually notify you about.";
       parent.appendChild(intro);
 
       const status = document.createElement("p");
@@ -26175,9 +26378,8 @@ HTML = r"""<!doctype html>
         status.remove();
         body.replaceChildren();
         const config = data.config || {};
-        appendNotificationsEventMatrix(body, config, render);
-        appendNotificationsSeriesFilter(body, config, render);
-        appendNotificationsQuietHours(body, config, render);
+        appendNotificationsChannelRows(body, config, providerRecord, render);
+        appendNotificationsQuietHoursSummary(body, config, render);
         appendNotificationsHistory(body);
       };
       await render();
@@ -26929,6 +27131,10 @@ HTML = r"""<!doctype html>
       if (health.ready_imports !== undefined) add("Ready to import", compactNumber(health.ready_imports), Number(health.ready_imports) ? "good" : "");
       if (health.failed_downloads !== undefined) add("Failed", compactNumber(health.failed_downloads), Number(health.failed_downloads) ? "bad" : "");
       if (health.soulseek_connected !== undefined) add("Soulseek", health.soulseek_connected && health.soulseek_logged_in ? "Connected and logged in" : "Not ready", health.soulseek_connected && health.soulseek_logged_in ? "good" : "bad");
+      const rootChecks = Array.isArray(health.root_checks) ? health.root_checks : [];
+      for (const root of rootChecks) {
+        add(root.label || "SLSKD path", root.status || root.state || "unknown", root.state === "healthy" ? "good" : (root.state === "critical" ? "bad" : ""));
+      }
       if (activity.last_status) add("Last activity", coreStateLabel(activity.last_status), providerActivityTone(activity.last_status));
       const box = document.createElement("div");
       box.className = "download-client-operational-summary";
@@ -26949,6 +27155,23 @@ HTML = r"""<!doctype html>
           item.append(label, value);
           box.appendChild(item);
         }
+      }
+      const rootProblems = provider.enabled ? rootChecks.filter(root => root.state === "critical") : [];
+      for (const root of rootProblems) {
+        const warning = document.createElement("div");
+        warning.className = "system-health-line bad";
+        warning.setAttribute("role", "status");
+        warning.setAttribute("aria-live", "polite");
+        const title = document.createElement("strong");
+        title.textContent = `${root.label || "SLSKD path"}: ${root.path || "not configured"}`;
+        const detail = document.createElement("span");
+        detail.textContent = [root.detail, root.next_action].filter(Boolean).join(" ");
+        const action = document.createElement("button");
+        action.type = "button";
+        action.textContent = "Open path settings";
+        action.onclick = () => openInkdropSettingsArea("paths");
+        warning.append(title, detail, action);
+        box.appendChild(warning);
       }
       parent.appendChild(box);
       return box;
@@ -27648,11 +27871,22 @@ HTML = r"""<!doctype html>
           settingsProviderHideDefault(provider)
           || (group.key === "prowlarr" && settingsIndexerHideDefault(provider))
         );
+        // Notifications gets its own compact channel-row + modal UI (below) instead of
+        // the generic provider tile every other library adapter gets here -- one on/off
+        // toggle, webhook/token field, and Test button per provider card doesn't fit a
+        // provider with two independently-configurable channels, each with its own
+        // event triggers and series filter. Pull its raw record out before filtering so
+        // appendNotificationsSettingsPanel still has field_schema/secret_fields/settings
+        // to build the per-channel modal fields from.
+        const notificationsProviderRecord = group.key === "libraries"
+          ? configurableProviders.find(provider => String(provider.id || "").toLowerCase() === "notifications") || null
+          : null;
         const visibleProviders = group.key === "automation"
           ? configurableProviders.filter(provider => sourceProviderIsConfiguredIntegration(provider))
           : configurableProviders.filter(provider =>
               !settingsProviderHideDefault(provider)
               && !(group.key === "prowlarr" && settingsIndexerHideDefault(provider))
+              && !(group.key === "libraries" && String(provider.id || "").toLowerCase() === "notifications")
             );
         const linkedAppSettings = filterLinkedAppSettingsForProviders(appSettingsByArea.get(group.key)?.rows || [], configurableProviders);
         const areaCount = visibleProviders.length + availableSourceProviders.length + linkedAppSettings.length + hiddenSourceProviders.length + hiddenSettingsProviders.length;
@@ -27670,7 +27904,7 @@ HTML = r"""<!doctype html>
         }
         if (group.key === "libraries") {
           appendLibraryAdaptersLens(providerTarget, visibleProviders, appSettings);
-          appendNotificationsSettingsPanel(providerTarget);
+          appendNotificationsSettingsPanel(providerTarget, notificationsProviderRecord);
         }
         if (group.key === "comicvine") {
           appendSettingsPluginGrid(providerTarget, "Metadata Files", [
@@ -28743,13 +28977,23 @@ HTML = r"""<!doctype html>
 
     function openWorkflowDisclosure(el) {
       if (!el) return null;
-      if (String(el.tagName || "").toUpperCase() === "DETAILS") {
-        el.open = true;
-        return el;
+      const start = String(el.tagName || "").toUpperCase() === "DETAILS" ? el : (el.closest?.("details") || null);
+      if (!start) return null;
+      // Manual Review nests Support tools' <details> inside another <details>
+      // (#manualReviewSupportTools > #manualReviewPanel). Opening only the
+      // nearest one left the outer Support tools disclosure closed, so the
+      // content this scrolled to and highlighted was never actually visible.
+      // Walk every ancestor <details> and open outermost-first.
+      const chain = [start];
+      let node = start;
+      while (node.parentElement) {
+        const ancestor = node.parentElement.closest("details");
+        if (!ancestor || ancestor === node) break;
+        chain.push(ancestor);
+        node = ancestor;
       }
-      const drawer = el.closest?.("details") || null;
-      if (drawer) drawer.open = true;
-      return drawer;
+      for (let i = chain.length - 1; i >= 0; i--) chain[i].open = true;
+      return start;
     }
 
     async function openSeriesReview(series) {
@@ -29003,8 +29247,10 @@ HTML = r"""<!doctype html>
             source.slskd_api_detail || "",
             source.slskd_checked_count
               ? `Searched ${source.slskd_checked_count}, found ${countOf(source.slskd_candidate_count, "candidate")}, ${source.slskd_no_candidate_count || 0} came back empty`
+              : source.slskd_manual_refresh_count
+              ? `Refreshed ${countOf(source.slskd_manual_refresh_count, "waiting candidate")} since the last full search pass`
               : "No searches run yet",
-            source.slskd_checked_count ? checkedAgo(source.slskd_age_minutes) : "",
+            (source.slskd_checked_count || source.slskd_manual_refresh_count) ? checkedAgo(source.slskd_age_minutes) : "",
           ),
         },
         {
@@ -29037,15 +29283,22 @@ HTML = r"""<!doctype html>
       body.innerHTML = "";
       for (const item of items) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td class="title"></td>
-          <td>${item.indexer || ""}<div class="mini">${item.indexerId || ""}</div></td>
-          <td>${item.protocol || ""}</td>
-          <td>${size(item.size)}</td>
-          <td>${item.seeders ?? ""}</td>
-          <td class="actions stack"></td>
-        `;
-        tr.children[0].textContent = item.title || "";
+        const cell = (value, className = "") => {
+          const td = document.createElement("td");
+          td.className = className;
+          td.textContent = value == null ? "" : String(value);
+          return td;
+        };
+        const title = cell(item.title || "", "title");
+        const indexer = cell(item.indexer || "");
+        const indexerId = document.createElement("div");
+        indexerId.className = "mini";
+        indexerId.textContent = item.indexerId || "";
+        indexer.appendChild(indexerId);
+        const protocol = cell(item.protocol || "");
+        const resultSize = cell(size(item.size));
+        const seeders = cell(item.seeders ?? "");
+        const actions = cell("", "actions stack");
         const dry = document.createElement("button");
         dry.textContent = "Dry Run";
         dry.onclick = () => grab(item, true);
@@ -29056,7 +29309,8 @@ HTML = r"""<!doctype html>
         const trackBtn = document.createElement("button");
         trackBtn.textContent = "Track Series";
         trackBtn.onclick = () => trackSeries(item);
-        tr.children[5].append(dry, trackBtn, grabBtn);
+        actions.append(dry, trackBtn, grabBtn);
+        tr.append(title, indexer, protocol, resultSize, seeders, actions);
         body.appendChild(tr);
       }
     }
@@ -31037,7 +31291,7 @@ HTML = r"""<!doctype html>
       const focus = seriesFocusFromAddContext(result, item, options?.watch || {});
       const counts = seriesOperationCounts(result);
       if (options?.preferQueue !== false && counts.queued > 0) {
-        return routeWithFocus({section: "queue", filter: "active", label: "Queue · Active"}, focus);
+        return routeWithFocus({section: "queue", filter: "all", label: "Queue · All"}, focus);
       }
       if (counts.wanted > 0) {
         return routeWithFocus({section: "wanted", filter: "missing", label: "Wanted · Open Backlog"}, focus);
@@ -33661,14 +33915,23 @@ HTML = r"""<!doctype html>
       }
     }
 
-    async function loadManualReview(filterSeries=null) {
+    async function loadManualReview(filterSeries=null, options={}) {
+      const loadSeq = ++manualReviewLoadSeq;
+      const staleResult = () => ({visibleCount: 0, totalCount: 0, stale: true, filterSeries});
       try {
-        const res = await fetch("/api/manual-review", {cache: "no-store"});
-        const data = await res.json();
+        const data = await getJsonWithTimeout(
+          "/api/manual-review",
+          options?.timeoutMs || 12000,
+          "Manual Review"
+        );
+        if (loadSeq !== manualReviewLoadSeq) return staleResult();
         const body = $("manualReview");
-        if (!filterSeries) renderPackReviewBanner(data.pack_state || null);
         let items = data.items || [];
-        const duplicateWorkload = filterSeries ? await resolveDuplicateSeriesWorkload(filterSeries) : null;
+        const duplicateWorkload = filterSeries
+          ? await resolveDuplicateSeriesWorkload(filterSeries, options)
+          : null;
+        if (loadSeq !== manualReviewLoadSeq) return staleResult();
+        if (!filterSeries) renderPackReviewBanner(data.pack_state || null);
         const allItems = items;
         const slskdProbe = data.slskd_probe || {};
         const counts = manualReviewBucketCounts(allItems);
@@ -34010,6 +34273,7 @@ HTML = r"""<!doctype html>
           body.appendChild(detailTr);
         }
       } catch (err) {
+        if (loadSeq !== manualReviewLoadSeq) return staleResult();
         $("manualReview").innerHTML = `<div class="mini">Could not load Manual Review.</div>`;
         return {visibleCount: 0, totalCount: 0, error: err.message || String(err), filterSeries};
       }
@@ -34919,8 +35183,13 @@ HTML = r"""<!doctype html>
         openInkdropRouteFromHash().catch(err => console.warn("InkDrop initial route load failed", err));
       } else {
         loadInkdropSection("series");
-        scheduleInkdropCoreRefresh(6000);
       }
+      // Masthead stats (Events/Imports/Downloads on History, etc.) read from
+      // state.sections, which only loadInkdropCore() populates -- deep-linking
+      // or refreshing directly into a non-default route used to skip this
+      // entirely, leaving those cards stuck at 0 until the 2-minute interval
+      // below first fired.
+      scheduleInkdropCoreRefresh(6000);
       setInterval(refreshStatus, 60000);
       setInterval(() => scheduleInkdropCoreRefresh(1000), 120000);
     }
@@ -34947,6 +35216,7 @@ HTML = r"""<!doctype html>
 """
 HTML = HTML.replace("__INKDROP_UI_CSS_VERSION__", INKDROP_UI_CSS_VERSION)
 HTML = HTML.replace("__INKDROP_UI_JS_VERSION__", INKDROP_UI_JS_VERSION)
+HTML = HTML.replace("__INKDROP_UI_REACT_VERSION__", INKDROP_UI_REACT_VERSION)
 
 
 def command_env(extra=None):
@@ -35314,7 +35584,21 @@ def inkdrop_auth_api_key(headers):
     return ""
 
 
-def inkdrop_auth_principal(headers, db_path=INKDROP_STATE_DB, environ=None, *, remote_addr=None, mark_api_key_used=False):
+def inkdrop_auth_basic_password(headers):
+    auth_header = str(headers.get("Authorization") or "").strip() if headers else ""
+    if not auth_header.lower().startswith("basic "):
+        return ""
+    try:
+        decoded = base64.b64decode(auth_header.split(None, 1)[1], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if ":" not in decoded:
+        return ""
+    _username, password = decoded.split(":", 1)
+    return password.strip()
+
+
+def inkdrop_auth_principal(headers, db_path=INKDROP_STATE_DB, environ=None, *, remote_addr=None, mark_api_key_used=False, allow_basic_reader_key=False):
     config = inkdrop_auth.resolve_config(db_path, environ=environ)
     external = inkdrop_auth.external_principal(headers, remote_addr, config)
     if external:
@@ -35324,7 +35608,7 @@ def inkdrop_auth_principal(headers, db_path=INKDROP_STATE_DB, environ=None, *, r
             user_agent=str((headers or {}).get("User-Agent") or ""),
         )
         return external
-    api_key = inkdrop_auth_api_key(headers)
+    api_key = inkdrop_auth_api_key(headers) or (inkdrop_auth_basic_password(headers) if allow_basic_reader_key else "")
     if api_key and config.get("api_keys_enabled"):
         verified = inkdrop_auth.verify_api_key(db_path, api_key, mark_used=mark_api_key_used)
         if verified:
@@ -38501,10 +38785,29 @@ def stripped_edition_title(title):
     return clean_query_text(text)
 
 
+def issue_release_year(issue):
+    issue = issue if isinstance(issue, dict) else {}
+    for key in (
+        "date", "release_date", "releaseDate", "issue_date",
+        "store_date", "storeDate", "cover_date", "coverDate",
+        "publishAt", "publishedAt", "readableAt",
+    ):
+        match = re.search(r"\b((?:19|20)\d{2})\b", str(issue.get(key) or ""))
+        if match:
+            return match.group(1)
+    return ""
+
+
 def issue_search_query(watch, issue):
     number = issue.get("issueNumber") or ""
     name = watch.get("name") or ""
-    year = watch.get("year")
+    # An issue's own cover/store date, not the series' launch year -- a
+    # long-running series' issue numbers span decades, so "{name} {year}"
+    # built from watch["year"] is only ever right for issues published in
+    # the series' debut year. Every later issue got a query indexers can
+    # never satisfy (real DOGnzb/Prowlarr example: "Spawn 100 1992" for an
+    # issue that shipped in 2000).
+    year = issue_release_year(issue) or watch.get("year")
     if str(number).strip() in {"1", "1.0"} and edition_like_title(name):
         return stripped_edition_title(name) or clean_query_text(name)
     if year:
@@ -38522,7 +38825,7 @@ def manual_review(reason, payload):
 def fallback_issue_queries(watch, issue):
     number = str(issue.get("issueNumber") or "").strip()
     name = watch.get("name") or ""
-    year = watch.get("year")
+    year = issue_release_year(issue) or watch.get("year")
     values = [issue.get("searchQuery"), issue_search_query(watch, issue)]
     if number:
         values.append(f"{name} {number}")
@@ -42777,8 +43080,9 @@ def inkdrop_log_health_items(log_dir=None, explicit_paths=None, limit=SYSTEM_HEA
 
 
 def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=None):
+    runtime_paths = inkdrop_runtime_paths()
+    slskd_settings = slskd_provider_runtime_settings()
     if disk_targets is None:
-        runtime_paths = inkdrop_runtime_paths()
         disk_targets = [
             ("local_root", Path("/"), "Local root"),
             ("inkdrop_state", STATE_DIR, "InkDrop state"),
@@ -42788,12 +43092,22 @@ def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=No
     disks = [disk_health_item(key, path, label) for key, path, label in disk_targets]
     logs = inkdrop_log_health_items(log_dir=log_dir, explicit_paths=explicit_log_paths, limit=None)
     visible_logs = logs[:SYSTEM_HEALTH_LOG_LIMIT]
+    slskd_paths = inkdrop_slskd_root_health.slskd_root_reachability(
+        slskd_settings.get("download_root") or runtime_paths.get("slskd_download_root") or SLSKD_DOWNLOAD_ROOT,
+        slskd_settings.get("incomplete_root") or runtime_paths.get("slskd_incomplete_root") or SLSKD_INCOMPLETE_ROOT,
+        enabled=slskd_settings.get("enabled", False),
+        configured=slskd_settings.get("configured", False),
+    )
+    path_checks = slskd_paths["roots"]
     disk_problem_count = sum(1 for item in disks if system_health_severity(item.get("state")) >= 2)
     log_problem_count = sum(1 for item in logs if system_health_severity(item.get("state")) >= 2)
+    path_problem_count = int(slskd_paths.get("problem_count") or 0)
     severity = 0
     for item in disks:
         severity = max(severity, system_health_severity(item.get("state")))
     for item in logs:
+        severity = max(severity, system_health_severity(item.get("state")))
+    for item in path_checks:
         severity = max(severity, system_health_severity(item.get("state")))
     state = system_health_state_from_severity(severity)
     local = next((item for item in disks if item.get("key") == "local_root"), disks[0] if disks else {})
@@ -42812,6 +43126,8 @@ def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=No
             f"{log_problem_count} log file{'s' if log_problem_count != 1 else ''} "
             f"{'have' if log_problem_count != 1 else 'has'} grown large"
         )
+    if path_problem_count:
+        detail_bits.append(f"{path_problem_count} SLSKD download path{'s' if path_problem_count != 1 else ''} cannot be read and written by InkDrop")
     if not detail_bits:
         detail_bits.append("Disk space and log sizes look fine")
     # status stays an uppercase token: statusTone(), sourceTone() and
@@ -42834,9 +43150,11 @@ def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=No
         "status": status,
         "label": label,
         "detail": ". ".join(detail_bits) + ".",
-        "problem_count": disk_problem_count + log_problem_count,
+        "problem_count": disk_problem_count + log_problem_count + path_problem_count,
         "disk_problem_count": disk_problem_count,
         "log_problem_count": log_problem_count,
+        "path_problem_count": path_problem_count,
+        "path_checks": path_checks,
         "disks": disks,
         "logs": visible_logs,
         "log_count": len(logs),
@@ -42860,6 +43178,61 @@ def operator_storage_metrics():
         ("slskd_download_root", runtime_paths.get("slskd_download_root") or SLSKD_DOWNLOAD_ROOT, "SLSKD download root"),
     ]
     return [inkdrop_operator_contracts.storage_metric(key, path, label) for key, path, label in targets]
+
+
+def support_bundle_system_health_summary():
+    runtime_paths = inkdrop_runtime_paths()
+    disk_targets = [
+        ("local_root", Path("/"), "Local root"),
+        ("inkdrop_state", STATE_DIR, "InkDrop state"),
+        ("comic_root", runtime_paths.get("comic_root") or COMIC_ROOT, "Comic root"),
+        ("manga_root", runtime_paths.get("manga_root") or MANGA_ROOT, "Manga root"),
+        (
+            "manual_comics_inbox",
+            runtime_paths.get("manual_comics_inbox") or MANUAL_COMICS_INBOX,
+            "Manual comics inbox",
+        ),
+        (
+            "slskd_download_root",
+            runtime_paths.get("slskd_download_root") or SLSKD_DOWNLOAD_ROOT,
+            "SLSKD download root",
+        ),
+    ]
+    disks = [disk_health_item(key, path, label) for key, path, label in disk_targets]
+    workers = []
+    now = time.time()
+    for key, label, status_path in (
+        ("web", "Web", None),
+        ("series_autopilot", "Series worker", SERIES_AUTOPILOT_STATUS_FILE),
+        ("queue_runner", "Queue runner", SERIES_QUEUE_RUNNER_STATUS_FILE),
+        ("slskd_probe", "SLSKD probe", SLSKD_SOURCE_PROBE_STATUS_FILE),
+        ("import_reconcile", "Import reconciliation", RECONCILE_STATUS_FILE),
+    ):
+        if status_path is None:
+            workers.append({"key": key, "label": label, "state": "running", "age_seconds": 0})
+            continue
+        try:
+            age_seconds = round(now - Path(status_path).stat().st_mtime, 1)
+            state = "running" if age_seconds <= 900 else "stale"
+        except OSError:
+            age_seconds = None
+            state = "unknown"
+        workers.append({"key": key, "label": label, "state": state, "age_seconds": age_seconds})
+    disk_problem_count = sum(
+        1 for item in disks if system_health_severity(item.get("state")) >= 2
+    )
+    return {
+        "schema": "inkdrop.support_system_health.v1",
+        "status": "healthy" if not disk_problem_count else "attention",
+        "disk_problem_count": disk_problem_count,
+        "disks": disks,
+        "workers": workers,
+        "container": {
+            "status": "unavailable",
+            "restart_count": None,
+            "reason": "Container runtime status is not available to InkDrop.",
+        },
+    }
 
 
 def operator_system_health_summary():
@@ -43309,7 +43682,12 @@ def slskd_provider_runtime_settings():
         except Exception:
             config = {}
     settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
-    base_url = str(config.get("base_url") or settings.get("base_url") or SLSKD_API_BASE_URL).strip().rstrip("/")
+    environment_base_url = str(os.environ.get("INKDROP_SLSKD_API_BASE_URL") or SLSKD_API_BASE_URL or "").strip()
+    environment_api_key = str(os.environ.get("INKDROP_SLSKD_API_KEY") or "").strip()
+    config_text = read_slskd_config_text()
+    config_key_match = re.search(r"^\s*key:\s*([^\s#]+)", config_text, flags=re.M) if config_text else None
+    file_api_key = config_key_match.group(1) if config_key_match else ""
+    base_url = str(config.get("base_url") or settings.get("base_url") or environment_base_url).strip().rstrip("/")
     if not base_url:
         base_url = SLSKD_API_BASE_URL
     if not base_url.startswith(("http://", "https://")):
@@ -43319,10 +43697,12 @@ def slskd_provider_runtime_settings():
     paths = inkdrop_runtime_paths()
     download_root = str(settings.get("download_root") or paths["slskd_download_root"])
     incomplete_root = str(settings.get("incomplete_root") or paths["slskd_incomplete_root"])
+    api_key = str(settings.get("api_key") or environment_api_key or file_api_key).strip()
     return {
+        "configured": bool(config) or bool(base_url and api_key),
         "enabled": bool(config.get("enabled", True)),
         "base_url": base_url,
-        "api_key": str(settings.get("api_key") or "").strip(),
+        "api_key": api_key,
         "download_root": download_root,
         "incomplete_root": incomplete_root,
     }
@@ -43394,10 +43774,22 @@ def slskd_soulseek_health_state(server_fields):
 
 def slskd_api_health(timeout=2.5):
     settings = slskd_provider_runtime_settings()
+    root_health = inkdrop_slskd_root_health.slskd_root_reachability(
+        settings.get("download_root"), settings.get("incomplete_root"),
+        enabled=settings.get("enabled", False), configured=settings.get("configured", False)
+    )
     def with_paths(**values):
         values.setdefault("base_url", settings.get("base_url"))
         values.setdefault("download_root", settings.get("download_root"))
         values.setdefault("incomplete_root", settings.get("incomplete_root"))
+        values.setdefault("root_health", root_health)
+        values.setdefault("root_checks", root_health.get("roots"))
+        values.setdefault("root_problem_count", root_health.get("problem_count"))
+        if settings.get("enabled", True) and not root_health.get("ok"):
+            existing = str(values.get("detail") or "").rstrip(".")
+            values["state"] = "unavailable"
+            values["label"] = root_health.get("label")
+            values["detail"] = f"{existing}. {root_health.get('detail')}" if existing else root_health.get("detail")
         return values
 
     if not settings.get("enabled", True):
@@ -44324,6 +44716,20 @@ def source_health_summary(
             "label": status_value or "configured",
             "detail": "This is what the worker last reported. Run Test provider to check SLSKD right now.",
         }
+        settings = slskd_provider_runtime_settings()
+        root_health = inkdrop_slskd_root_health.slskd_root_reachability(
+            settings.get("download_root"), settings.get("incomplete_root"),
+            enabled=settings.get("enabled", False), configured=settings.get("configured", False)
+        )
+        slskd_health.update({
+            "download_root": settings.get("download_root"),
+            "incomplete_root": settings.get("incomplete_root"),
+            "root_health": root_health,
+            "root_checks": root_health.get("roots"),
+            "root_problem_count": root_health.get("problem_count"),
+        })
+        if settings.get("enabled", True) and not root_health.get("ok"):
+            slskd_health.update(state="unavailable", label=root_health.get("label"), detail=root_health.get("detail"))
     if live_download_clients:
         qbit_health = qbittorrent_api_health(timeout=2.5)
         sab_health = sabnzbd_api_health(timeout=2.5)
@@ -44404,6 +44810,22 @@ def source_health_summary(
     slskd_candidates = int(slskd_probe_status.get("raw_candidate_count") or slskd_probe_status.get("candidate_count") or 0)
     slskd_no_candidates = int(slskd_probe_status.get("raw_no_candidate_count") or 0)
     slskd_auto_started = int(((slskd_probe_status.get("auto_grab") or {}) if isinstance(slskd_probe_status.get("auto_grab"), dict) else {}).get("started_count") or 0)
+    # manual_source_autoresolve writes into this same status file on its own
+    # cadence (candidate_count/detected_file_count/this count) without
+    # touching status/state/finished_at, which only the periodic queue-scan
+    # probe pass sets. So a probe pass that timed out hours ago can leave
+    # "status": "timeout" sitting here indefinitely while real work (refreshing
+    # Manual Source Waiting candidates) keeps completing right on top of it --
+    # generated_at (which every writer bumps) moving past finished_at (which
+    # only the probe pass writes) is the tell that a newer pass has real
+    # activity the stale timeout/checked_count no longer reflects.
+    slskd_manual_refresh_count = int(slskd_probe_status.get("manual_source_autoresolve_refresh_count") or 0)
+    try:
+        slskd_refreshed_since_timeout = slskd_manual_refresh_count > 0 and float(
+            slskd_probe_status.get("generated_at") or 0
+        ) > float(slskd_probe_status.get("finished_at") or 0)
+    except (TypeError, ValueError):
+        slskd_refreshed_since_timeout = False
     if slskd_health.get("state") in {"unavailable", "watch", "disabled"}:
         slskd_label = slskd_health.get("label") or slskd_health.get("state")
     elif slskd_status_value == "finished":
@@ -44415,6 +44837,8 @@ def source_health_summary(
             slskd_label = "OK quiet"
         else:
             slskd_label = "idle"
+    elif slskd_status_value in {"timeout", "error"} and slskd_refreshed_since_timeout:
+        slskd_label = "retrying waiting candidates"
     else:
         slskd_label = slskd_status_value
 
@@ -44456,6 +44880,9 @@ def source_health_summary(
         "slskd_version": slskd_health.get("version"),
         "slskd_download_root": slskd_health.get("download_root"),
         "slskd_incomplete_root": slskd_health.get("incomplete_root"),
+        "slskd_root_health": slskd_health.get("root_health"),
+        "slskd_root_checks": slskd_health.get("root_checks"),
+        "slskd_root_problem_count": slskd_health.get("root_problem_count"),
         "slskd_api_latency_ms": slskd_health.get("latency_ms"),
         "slskd_server_latency_ms": slskd_health.get("server_latency_ms"),
         "slskd_server_error": slskd_health.get("server_error"),
@@ -44468,6 +44895,7 @@ def source_health_summary(
         "slskd_candidate_count": slskd_candidates,
         "slskd_no_candidate_count": slskd_no_candidates,
         "slskd_auto_started_count": slskd_auto_started,
+        "slskd_manual_refresh_count": slskd_manual_refresh_count,
         "slskd_age_minutes": age(SLSKD_SOURCE_PROBE_STATUS_FILE),
         "downloader_status": downloader_status,
         "qbittorrent_api_state": qbit_health.get("state"),
@@ -44598,7 +45026,18 @@ def source_health_provider_snapshot(source_health):
             "torrentleech_coverage_detail": source_health.get("prowlarr_torrentleech_coverage_detail"),
         },
         "rss": {
-            "state": "unknown" if rss_gate_stale else (
+            # A status file that's merely gone stale (no request in
+            # RSS_DISCOVERY_STATUS_STALE_MINUTES) is not evidence RSS is
+            # unhealthy -- it's evidence a probe is due. Mapping that to the
+            # blocking "watch" state used to self-lock RSS for the 14.5
+            # hours between the 90-minute staleness mark and the 16-hour
+            # gate below, since "watch" also blocks the source-worker call
+            # that would refresh the file. Only an explicit non-OK status the
+            # runner itself reported stays "watch"; age alone is "unknown",
+            # which the acquisition ladder does not gate on.
+            "state": "unknown" if (
+                rss_gate_stale or str(source_health.get("rss_status") or "") == "not reporting recently"
+            ) else (
                 "healthy" if str(source_health.get("rss_status") or "").lower().startswith("ok") else "watch"
             ),
             "label": "retrying; last check is over 16h old" if rss_gate_stale else (source_health.get("rss_status") or "unknown"),
@@ -44633,6 +45072,9 @@ def source_health_provider_snapshot(source_health):
             "soulseek_transitioning": source_health.get("slskd_soulseek_transitioning"),
             "server_state": source_health.get("slskd_server_state"),
             "soulseek_address": source_health.get("slskd_soulseek_address"),
+            "root_health": source_health.get("slskd_root_health"),
+            "root_checks": source_health.get("slskd_root_checks"),
+            "root_problem_count": source_health.get("slskd_root_problem_count"),
         },
         "sabnzbd": {
             "state": source_health.get("sabnzbd_api_state") or "configured",
@@ -47116,6 +47558,44 @@ def ensure_wanted_watch_queued(row):
     return watch, queue_update
 
 
+def record_user_search_priority(queue_id, *, series=None, wanted_id=None, reason="wanted_search_click"):
+    """Bump a queue row to the front of the next series-autopilot pass.
+
+    A user clicking Search/Manual Search wants results now, not whenever this
+    row's normal turn in the fairness/starvation rotation comes up (see
+    inkdrop_series_autopilot.due_series). Keyed by queue_id so repeat clicks on
+    the same row just refresh the timestamp instead of piling up duplicate
+    entries; entries expire on their own (read side drops anything older than
+    USER_SEARCH_PRIORITY_MAX_AGE_SECONDS) so a request that never got a pass to
+    land on does not linger forever.
+    """
+    queue_id = str(queue_id or "").strip()
+    if not queue_id:
+        return False
+    now = time.time()
+    data = read_json_file(USER_SEARCH_PRIORITY_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    cutoff = now - USER_SEARCH_PRIORITY_MAX_AGE_SECONDS
+    data = {
+        key: value
+        for key, value in data.items()
+        if isinstance(value, dict) and float(value.get("requested_at") or 0) > cutoff
+    }
+    data[queue_id] = {
+        "requested_at": now,
+        "requested_at_iso": series_queue_now_iso(now),
+        "reason": reason,
+        "series": series,
+        "wanted_id": wanted_id,
+    }
+    if len(data) > USER_SEARCH_PRIORITY_MAX_ENTRIES:
+        ordered = sorted(data.items(), key=lambda pair: float(pair[1].get("requested_at") or 0), reverse=True)
+        data = dict(ordered[:USER_SEARCH_PRIORITY_MAX_ENTRIES])
+    write_json_file(USER_SEARCH_PRIORITY_FILE, data)
+    return True
+
+
 def run_inkdrop_wanted_search(payload):
     wanted_id = str((payload or {}).get("id") or "").strip()
     wanted = inkdrop_state.wanted_item(INKDROP_STATE_DB, wanted_id)
@@ -47135,6 +47615,8 @@ def run_inkdrop_wanted_search(payload):
     )
     if not db_queue.get("ok"):
         raise ValueError(db_queue.get("reason") or db_queue.get("error") or "wanted search queue failed")
+    if db_queue.get("queue_id"):
+        record_user_search_priority(db_queue["queue_id"], series=series, wanted_id=wanted_id)
     watch, queue_update = ensure_wanted_watch_queued(wanted)
     history = db_queue.get("history")
     trigger = launch_series_autopilot(
@@ -47696,6 +48178,8 @@ def runtime_provider_settings():
             "source_allowed_hosts": ["getcomics.org", "www.getcomics.org"],
             "direct_allowed_hosts": ["getcomics.org", "www.getcomics.org", "pixeldrain.com", "www.pixeldrain.com"],
             "allowed_shared_file_hosts": ["pixeldrain"],
+            "download_root": str(STAGING_DIR / "rss"),
+            "incomplete_root": str(STAGING_DIR / "rss" / "incomplete"),
             "default_limit": SERIES_AUTOPILOT_DISCOVERY_LIMIT,
             "max_auto": SERIES_AUTOPILOT_DISCOVERY_MAX_AUTO,
             "max_per_series": SERIES_AUTOPILOT_DISCOVERY_MAX_PER_SERIES,
@@ -47715,6 +48199,8 @@ def runtime_provider_settings():
                 "source_allowed_hosts",
                 "direct_allowed_hosts",
                 "allowed_shared_file_hosts",
+                "download_root",
+                "incomplete_root",
                 "default_limit",
                 "max_auto",
                 "max_per_series",
@@ -47747,6 +48233,8 @@ def runtime_provider_settings():
                 "https://comics.codes/all-manga-list/",
             ],
             "user_agent": "InkDrop-ComicsCodes-Discovery/1.0 (+guarded slow candidate discovery)",
+            "download_root": str(STAGING_DIR / "comicscodes"),
+            "incomplete_root": str(STAGING_DIR / "comicscodes" / "incomplete"),
             "default_limit": SERIES_AUTOPILOT_DISCOVERY_LIMIT,
             "max_auto": SERIES_AUTOPILOT_DISCOVERY_MAX_AUTO,
             "max_per_series": SERIES_AUTOPILOT_DISCOVERY_MAX_PER_SERIES,
@@ -47755,6 +48243,8 @@ def runtime_provider_settings():
                 "source_urls",
                 "list_urls",
                 "user_agent",
+                "download_root",
+                "incomplete_root",
                 "default_limit",
                 "max_auto",
                 "max_per_series",
@@ -48054,6 +48544,14 @@ def runtime_provider_settings():
                 "label": "SLSKD Never-Started Timeout",
                 "value": 24,
                 "description": "Release an SLSKD download that has been waiting this many hours without a transfer ever beginning -- the peer went away, the slot never opened, or InkDrop restarted mid-wait. Separate from the Active Stall Threshold above, which only covers a transfer that started and then stopped progressing; nothing else ages these out. Range: 1–336 hours; default: 24.",
+                "source": "runtime",
+            },
+            {
+                "key": "automation.queue_watchdog_slskd_queued_wait_hours",
+                "scope": "automation",
+                "label": "SLSKD Queued-Transfer Wait Threshold",
+                "value": 48,
+                "description": "Give up on an SLSKD transfer that reached a peer's queue (or our own) but hasn't started moving bytes yet after this many hours. Busy uploaders routinely take a long time to open a slot, so this is intentionally patient -- separate from the Active Stall Threshold above, which only covers a transfer that already started and then stopped. Range: 1–336 hours; default: 48.",
                 "source": "runtime",
             },
             {
@@ -48732,8 +49230,14 @@ COMMON_PROVIDER_FIELD_SCHEMA = {
     "username": {"label": "Username"},
     "password": {"label": "Password", "kind": "secret", "placeholder": "Saved; leave blank to keep"},
     "base_url": {"label": "Base URL"},
-    "download_root": {"label": "Download Root"},
-    "incomplete_root": {"label": "Incomplete Root"},
+    "download_root": {
+        "label": "Download Root",
+        "help": "Where finished downloads land once complete. Defaults to a provider-specific folder under InkDrop's staging directory; point it at a different path to use another disk or share.",
+    },
+    "incomplete_root": {
+        "label": "Incomplete Root",
+        "help": "Where downloads write while still in progress. InkDrop never treats a file here as ready to import -- only a file that has landed in Download Root counts.",
+    },
     "comic_root": {
         "label": "Comic Root",
         "help": "Path InkDrop's own container sees (e.g. /library/comics). A Windows UNC path (\\\\server\\share) won't work here -- mount the network share into the container via Docker Compose first, then point this at that container-side path.",
@@ -52667,11 +53171,32 @@ def mark_manual_source_import_resolved(review_id, item, detected, result):
     return record
 
 
+# Must stay in sync with inkdrop_missing_acquire.WEEKLY_COMICS_PACK_RE --
+# not imported from there to avoid a cross-module import cycle, but both
+# copies feed the same pack_handled_key_for_item identity hash below and
+# must classify the same pack titles the same way, or the two modules
+# compute different hashes for the same physical pack (see
+# pack_handled_key_for_item's own docstring-equivalent comment).
+WEB_WEEKLY_COMICS_PACK_RE = re.compile(
+    r"\b(?:weekly[\W_]+comics?[\W_]+pack|comics?[\W_]+weekly[\W_]+releases|(?:dc|image|indie)[\W_]+week\+?)\b"
+    r"|\b\d{4}[\W_]+\d{2}[\W_]+\d{2}[\W_]+(?:dc|image|indie)?[\W_]*(?:week|weekly)\b",
+    re.I,
+)
+
+
 def pack_handled_key_for_item(item, candidate=None):
+    # series must be dropped for a broad/manifest multi-series pack, exactly
+    # like inkdrop_missing_acquire.pack_handled_key_for_item does -- item's
+    # own "series" reflects whichever single wanted item happened to trigger
+    # this check, not the whole pack. Including it here made the SAME
+    # physical weekly/multi-series pack hash differently depending on which
+    # series was being evaluated when the key was computed, so a pack
+    # approved through one series' context never suppressed it for another
+    # series the same pack also covers, and this module's hash never matched
+    # the worker's for the same pack either.
     candidate = candidate if isinstance(candidate, dict) else (item.get("candidate") if isinstance(item.get("candidate"), dict) else {})
     pack_info = item.get("pack_info") if isinstance(item.get("pack_info"), dict) else {}
     pack_match = item.get("pack_match") if isinstance(item.get("pack_match"), dict) else {}
-    series = normalize_key(item.get("series") or pack_match.get("series") or "")
     title = normalize_key(candidate.get("title") or item.get("title") or item.get("query") or "")
     range_text = normalize_key(
         pack_info.get("summary")
@@ -52683,6 +53208,14 @@ def pack_handled_key_for_item(item, candidate=None):
     )
     protocol = normalize_key(candidate.get("protocol") or item.get("protocol") or "")
     indexer = normalize_key(candidate.get("indexer") or candidate.get("indexerId") or item.get("indexer") or "")
+    broad_manifest_pack = bool(
+        WEB_WEEKLY_COMICS_PACK_RE.search(candidate.get("title") or item.get("title") or item.get("query") or "")
+        or (
+            pack_match.get("coverage_source") == "pack_contents_filename"
+            and pack_match.get("multi_series")
+        )
+    )
+    series = "" if broad_manifest_pack else normalize_key(item.get("series") or pack_match.get("series") or "")
     if not series and not title:
         return None
     raw = "|".join([series, title, range_text, protocol, indexer])
@@ -52869,6 +53402,21 @@ def record_pack_finished_history_event(review_id, item, status, reason=None, res
         800,
     )
     finish_reason = safe_optional_text(reason or result.get("pack_review_finish_reason") or status, 500)
+    # outcome/display_phase used to be hardcoded "productive"/"verified" for
+    # every pack finish, including finished_bad_archive_candidate,
+    # finished_import_error, and finished_supplemental_release_blocked --
+    # real failures recorded to history as successes. Derive them with the
+    # same classifier every other import-result history event in this app
+    # already uses, so a pack finish reads the same as any other import
+    # outcome instead of always claiming success.
+    pack_imported_count = result.get("imported_count")
+    pack_skipped_count = result.get("skipped_count") or result.get("skipped_existing_count")
+    pack_outcome = inkdrop_state.import_result_outcome(
+        status, imported_count=pack_imported_count, skipped_count=pack_skipped_count
+    )
+    pack_display_phase = inkdrop_state.import_result_display_phase(
+        status, imported_count=pack_imported_count, skipped_count=pack_skipped_count, outcome=pack_outcome
+    )
     raw = {
         "review_id": review_id,
         "series": series,
@@ -52878,8 +53426,8 @@ def record_pack_finished_history_event(review_id, item, status, reason=None, res
         "pack_path": pack_path,
         "result_status": result.get("status") or result.get("result_status"),
         "pack_review_finished": True,
-        "outcome": "productive",
-        "display_phase": "verified",
+        "outcome": pack_outcome,
+        "display_phase": pack_display_phase,
         "source": result.get("source") or "pack_import",
     }
     if result:
@@ -53026,6 +53574,23 @@ def rehydrate_candidate_download_url(item, candidate):
     return candidate
 
 
+def manual_review_local_source_path(source):
+    text = str(source or "").strip()
+    if not text or not os.path.isabs(text):
+        return None
+    try:
+        candidate = Path(text)
+    except (TypeError, ValueError):
+        return None
+    paths = inkdrop_runtime_paths()
+    allowed_roots = (paths["slskd_download_root"], paths["manual_comics_inbox"])
+    if not any(path_within(candidate, root) for root in allowed_roots):
+        return None
+    if path_within(candidate, paths["slskd_incomplete_root"]):
+        return None
+    return candidate
+
+
 def sanitize_review_item(item):
     out = dict(item)
     out["review_id"] = review_id_for(item)
@@ -53048,6 +53613,10 @@ def sanitize_review_item(item):
     out["is_pack_candidate"] = bool(out.get("reason") in PACK_REVIEW_REASONS or out.get("pack_info"))
     out["can_approve_pack"] = bool(out["is_pack_candidate"] and (retained_candidate.get("downloadUrl") or can_lookup_pack))
     out["download_source_lookup_required"] = bool(out["can_approve_pack"] and not retained_candidate.get("downloadUrl"))
+    local_source_path = None if (out["can_approve"] or out["can_approve_pack"]) else manual_review_local_source_path(out.get("source"))
+    out["can_approve_local_file"] = bool(local_source_path is not None and local_source_path.is_file())
+    if local_source_path is not None and not out["can_approve_local_file"]:
+        out["local_file_missing"] = True
     out["review_group"] = review_group_for_item(out)
     issue_metadata = issue_metadata_for_review_item(out)
     if issue_metadata.get("title"):
@@ -53891,11 +54460,64 @@ def approve_manual_review(payload):
         outcome = acquire.sab_add(candidate["downloadUrl"], title, dry_run=False)
     else:
         raise ValueError("unsupported candidate protocol")
-    acquire.record_pending_import(item.get("query") or title, "comics", candidate, outcome if isinstance(outcome, dict) else {})
+    acquire.record_pending_import(item.get("query") or title, "comics", candidate, outcome if isinstance(outcome, dict) else {}, target=item)
     actions = load_manual_review_actions()
     actions.setdefault("approved", []).append(review_id)
     save_manual_review_actions(actions)
     return {"review_id": review_id, "status": "approved_grabbed", "title": title, "outcome": outcome}
+
+
+def approve_manual_review_local_file(payload):
+    review_id = safe_query(payload.get("review_id"))
+    item = find_manual_review(review_id)
+    local_path = manual_review_local_source_path(item.get("source"))
+    if local_path is None:
+        raise ValueError("this review item has no locally staged file to import; open Review Details and search/grab manually if it is actually correct")
+    if not local_path.is_file():
+        raise ValueError("the staged file no longer exists on disk; it may have already been imported, moved, or cleaned up")
+    if not IMPORT_SCRIPT.exists():
+        raise RuntimeError("import worker is not installed")
+    # This bypasses the automated filename/content-confidence gates for this one
+    # explicit file (--human-approved), because a human already visually confirmed
+    # it against the wanted issue in the Manual Review decision modal. Hard checks
+    # (archive integrity, duplicate-hash) still run inside inkdrop_completed_import.py.
+    cmd = [
+        python_command(),
+        str(IMPORT_SCRIPT),
+        "--kind",
+        "comics",
+        "--source-file",
+        str(local_path),
+        "--all-series",
+        "--ignore-cutoff",
+        "--human-approved",
+        "--min-age-seconds",
+        "30",
+        "--no-wait-for-library-scan",
+    ]
+    import_cmd = with_import_lock(cmd, wait_seconds=60)
+    timeout_seconds = int(os.environ.get("INKDROP_MANUAL_REVIEW_IMPORT_TIMEOUT_SECONDS") or "600")
+    try:
+        output = run_command(import_cmd, timeout=timeout_seconds)
+        result = json.loads(output or "{}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("import timed out; check the import log and retry")
+    except RuntimeError as exc:
+        if is_import_lock_busy_error(exc):
+            raise RuntimeError("another import is running; try again shortly") from exc
+        raise
+    imported_rows = result.get("imported") if isinstance(result, dict) else None
+    imported_count = len(imported_rows) if isinstance(imported_rows, list) else int((result or {}).get("count") or 0)
+    if imported_count <= 0:
+        skipped_rows = result.get("skipped") if isinstance(result, dict) else None
+        skip_reason = ""
+        if isinstance(skipped_rows, list) and skipped_rows and isinstance(skipped_rows[0], dict):
+            skip_reason = skipped_rows[0].get("skip_reason") or skipped_rows[0].get("event") or ""
+        raise ValueError(f"import did not complete{f': {skip_reason}' if skip_reason else ''}; see the import log for detail")
+    actions = load_manual_review_actions()
+    actions.setdefault("approved", []).append(review_id)
+    save_manual_review_actions(actions)
+    return {"review_id": review_id, "status": "approved_imported", "source": str(local_path), "result": result}
 
 
 PACK_TERMINAL_STATUSES = {
@@ -54287,27 +54909,33 @@ def pack_local_candidates(title):
                 if score > 0:
                     scored.append((score + 500, str(candidate)))
     for root in roots:
-        if not root.exists():
-            continue
+        # os.scandir()'s DirEntry caches is_dir()/is_file() from the directory
+        # read itself instead of issuing a fresh stat() per candidate --
+        # Path.iterdir() + Path.is_dir()/is_file() was doing a real uncached
+        # stat() for every candidate and, again, for every file inside every
+        # directory candidate (up to 120 each), which is where this function's
+        # ~19,900 stat() calls on a real /api/manual-review request came from.
         try:
-            candidates = list(root.iterdir())
+            entries = list(os.scandir(root))
         except OSError:
-            candidates = []
-        for candidate in candidates:
+            entries = []
+        for entry in entries:
+            candidate = Path(entry.path)
             if any(part.startswith("_") for part in candidate.parts):
                 continue
-            name_norm = normalize_key(candidate.name)
+            name_norm = normalize_key(entry.name)
             if required and not all(word in name_norm for word in required):
                 continue
             child_norm = ""
             archive_count = 0
-            if candidate.is_dir():
+            candidate_is_dir = entry.is_dir()
+            if candidate_is_dir:
                 archive_names = []
                 try:
-                    for idx, child in enumerate(candidate.iterdir()):
+                    for idx, child in enumerate(os.scandir(candidate)):
                         if idx >= 120:
                             break
-                        if child.is_file() and child.suffix.lower() in {".cbz", ".cbr", ".pdf"}:
+                        if child.is_file() and Path(child.name).suffix.lower() in {".cbz", ".cbr", ".pdf"}:
                             archive_count += 1
                             if len(archive_names) < 40:
                                 archive_names.append(child.name)
@@ -54330,7 +54958,7 @@ def pack_local_candidates(title):
                     continue
                 # A directory full of matching archives is the pack. A child CBZ is
                 # only a fallback when no parent pack folder can be identified.
-                score = hits + (20 if candidate.is_dir() else 0) + (50 if candidate.is_dir() and archive_count > 1 else 0) + min(archive_count, 20)
+                score = hits + (20 if candidate_is_dir else 0) + (50 if candidate_is_dir and archive_count > 1 else 0) + min(archive_count, 20)
             if score < min_score:
                 continue
             scored.append((score, str(candidate)))
@@ -59443,13 +60071,48 @@ class Handler(BaseHTTPRequestHandler):
             and row_mode in inkdrop_state.COMPACT_ROW_MODES
         )
 
+    COMPRESSIBLE_CONTENT_TYPES = (
+        "text/css",
+        "application/javascript",
+        "text/html",
+        "application/json",
+        "text/plain",
+    )
+
     def send_bytes(self, body, content_type, status=200, headers=None):
         try:
+            headers = dict(headers or {})
+            base_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
+            compressible = base_content_type in self.COMPRESSIBLE_CONTENT_TYPES
+            etag = next((str(v) for k, v in headers.items() if str(k).strip().lower() == "etag"), None)
+            cache_control_header = next((v for k, v in headers.items() if str(k).strip().lower() == "cache-control"), None)
+            if status == 200 and etag:
+                if_none_match = str(self.headers.get("If-None-Match") or "").strip()
+                if if_none_match and if_none_match == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    if cache_control_header:
+                        self.send_header("Cache-Control", cache_control_header)
+                    if compressible:
+                        self.send_header("Vary", "Accept-Encoding")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    self.close_connection = True
+                    return
+            accept_encoding = str(self.headers.get("Accept-Encoding") or "").lower()
+            content_encoding = None
+            if compressible and status == 200 and len(body) > 256 and "gzip" in accept_encoding:
+                body = gzip.compress(body, compresslevel=6)
+                content_encoding = "gzip"
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if content_encoding:
+                self.send_header("Content-Encoding", content_encoding)
+            if compressible:
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Connection", "close")
-            explicit_cache_control = any(str(name).strip().lower() == "cache-control" for name in (headers or {}))
+            explicit_cache_control = any(str(name).strip().lower() == "cache-control" for name in headers)
             if str(content_type or "").startswith(("application/json", "text/html")) and not explicit_cache_control:
                 self.send_header("Cache-Control", "no-store, max-age=0")
                 self.send_header("Pragma", "no-cache")
@@ -59460,7 +60123,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
             self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
-            for name, value in (headers or {}).items():
+            for name, value in headers.items():
                 values = value if isinstance(value, (list, tuple)) else [value]
                 for item in values:
                     self.send_header(str(name), str(item))
@@ -59499,7 +60162,7 @@ class Handler(BaseHTTPRequestHandler):
             body,
             "text/css; charset=utf-8",
             headers={
-                "Cache-Control": "public, max-age=300, must-revalidate",
+                "Cache-Control": "public, max-age=31536000, immutable",
                 "ETag": f'"{INKDROP_UI_CSS_VERSION}"',
             },
         )
@@ -59532,7 +60195,30 @@ class Handler(BaseHTTPRequestHandler):
             body,
             "application/javascript; charset=utf-8",
             headers={
-                "Cache-Control": "public, max-age=300, must-revalidate",
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "ETag": f'"{hashlib.sha256(body).hexdigest()[:12]}"',
+            },
+        )
+
+    def send_ui_react_bundle(self, asset_name):
+        # Same shape as send_ui_javascript: a fixed allowlist (not an open
+        # directory read) under web/static/dist, the Vite build output for
+        # the React migration. Mirrors the existing static-asset contract so
+        # a migrated section's <script> tag is indistinguishable from any
+        # other static asset this app already serves.
+        if asset_name not in INKDROP_UI_REACT_ASSETS:
+            self.send_bytes(b"", "application/javascript; charset=utf-8", status=404)
+            return
+        try:
+            body = (INKDROP_UI_REACT_DIR / asset_name).read_bytes()
+        except OSError:
+            self.send_bytes(b"", "application/javascript; charset=utf-8", status=404)
+            return
+        self.send_bytes(
+            body,
+            "application/javascript; charset=utf-8",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
                 "ETag": f'"{hashlib.sha256(body).hexdigest()[:12]}"',
             },
         )
@@ -59591,6 +60277,7 @@ class Handler(BaseHTTPRequestHandler):
             INKDROP_STATE_DB,
             remote_addr=remote_addr,
             mark_api_key_used=True,
+            allow_basic_reader_key=path.startswith("/opds/"),
         )
         if principal:
             scope, admin_required = inkdrop_auth_required_scope(path, method)
@@ -59630,6 +60317,7 @@ class Handler(BaseHTTPRequestHandler):
                 "auth": status,
             },
             status=401,
+            headers={"WWW-Authenticate": 'Basic realm="InkDrop OPDS", charset="UTF-8"'} if path.startswith("/opds/") else None,
         )
         return False
 
@@ -59680,6 +60368,121 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.finish_request_trace()
 
+    def send_opds_head(self, content_type, length, *, status=200, headers=None):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(int(length)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            for name, value in (headers or {}).items():
+                self.send_header(str(name), str(value))
+            self.end_headers()
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.finish_request_trace()
+
+    def send_opds_file(self, item, *, head_only=False):
+        opened = inkdrop_opds.open_acquisition_file(item)
+        if opened is None:
+            if head_only:
+                self.send_opds_head("application/octet-stream", 0, status=404, headers={"Cache-Control": "private, no-store"})
+            else:
+                self.send_json({"ok": False, "error": "file_not_found"}, status=404)
+            return
+        handle, descriptor_stat = opened
+        try:
+            with handle:
+                size = int(descriptor_stat.st_size)
+                start, end, status = 0, size - 1, 200
+                range_header = str(self.headers.get("Range") or "").strip()
+                if range_header:
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+                    if (
+                        not match
+                        or (not match.group(1) and not match.group(2))
+                        or any(len(value) > 20 for value in match.groups() if value)
+                    ):
+                        self.send_bytes(b"", "application/octet-stream", status=416, headers={"Content-Range": f"bytes */{size}", "Cache-Control": "private, no-store"})
+                        return
+                    if match.group(1):
+                        start = int(match.group(1))
+                        end = int(match.group(2)) if match.group(2) else size - 1
+                    else:
+                        suffix = int(match.group(2))
+                        start = max(0, size - suffix)
+                        end = size - 1
+                    if start >= size or start > end:
+                        self.send_bytes(b"", "application/octet-stream", status=416, headers={"Content-Range": f"bytes */{size}", "Cache-Control": "private, no-store"})
+                        return
+                    end = min(end, size - 1)
+                    status = 206
+                length = end - start + 1
+                self.send_response(status)
+                self.send_header("Content-Type", item["content_type"])
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{inkdrop_opds.url_quote(item['filename'])}")
+                self.send_header("Accept-Ranges", "bytes")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if head_only:
+                    self.close_connection = True
+                    return
+                handle.seek(start)
+                remaining = length
+                while True:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        break
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.finish_request_trace()
+
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query or "")
+        self.begin_request_trace(path)
+        if not path.startswith("/opds/v1.2/"):
+            self.send_bytes(b"", "text/plain; charset=utf-8", status=405, headers={"Allow": "GET"})
+            return
+        if not self.ensure_authorized(path, "GET"):
+            return
+        if path == "/opds/v1.2/catalog.xml":
+            body = inkdrop_opds.root_catalog(INKDROP_STATE_DB, after=(query.get("after") or [""])[0], limit=(query.get("limit") or [inkdrop_opds.DEFAULT_PAGE_SIZE])[0])
+            self.send_opds_head("application/atom+xml;profile=opds-catalog;kind=navigation; charset=utf-8", len(body), headers={"Cache-Control": "private, max-age=30"})
+            return
+        if path.startswith("/opds/v1.2/series/") and path.endswith(".xml"):
+            series_id = unquote(path.removeprefix("/opds/v1.2/series/").removesuffix(".xml"))
+            body = inkdrop_opds.series_catalog(INKDROP_STATE_DB, series_id, after=(query.get("after") or [""])[0], limit=(query.get("limit") or [inkdrop_opds.DEFAULT_PAGE_SIZE])[0])
+            if body is None:
+                self.send_bytes(b"", "text/plain", status=404)
+            else:
+                self.send_opds_head("application/atom+xml;profile=opds-catalog;kind=acquisition; charset=utf-8", len(body), headers={"Cache-Control": "private, max-age=30"})
+            return
+        if path.startswith("/opds/v1.2/files/"):
+            media_id = unquote(path.removeprefix("/opds/v1.2/files/").split("/", 1)[0])
+            item = inkdrop_opds.acquisition_file(INKDROP_STATE_DB, media_id)
+            if item is None:
+                self.send_bytes(b"", "text/plain", status=404)
+            else:
+                self.send_opds_file(item, head_only=True)
+            return
+        self.send_bytes(b"", "text/plain", status=404)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -59716,6 +60519,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_auth_backdrop()
         elif path.startswith("/static/js/"):
             self.send_ui_javascript(path.removeprefix("/static/js/"))
+        elif path.startswith("/static/dist/"):
+            self.send_ui_react_bundle(path.removeprefix("/static/dist/"))
         elif path == "/api/inkdrop-debug/active-requests":
             if not DEBUG_ACTIVE_REQUESTS_ENABLED:
                 self.send_json(
@@ -59741,6 +60546,41 @@ class Handler(BaseHTTPRequestHandler):
             self.send_logo_mark()
         elif path == "/api/inkdrop-cover":
             self.send_inkdrop_cover(query)
+        elif path == "/opds/v1.2/catalog.xml":
+            body = inkdrop_opds.root_catalog(
+                INKDROP_STATE_DB,
+                after=(query.get("after") or [""])[0],
+                limit=(query.get("limit") or [inkdrop_opds.DEFAULT_PAGE_SIZE])[0],
+            )
+            self.send_bytes(
+                body,
+                "application/atom+xml;profile=opds-catalog;kind=navigation; charset=utf-8",
+                headers={"Cache-Control": "private, max-age=30"},
+            )
+        elif path.startswith("/opds/v1.2/series/") and path.endswith(".xml"):
+            series_id = unquote(path.removeprefix("/opds/v1.2/series/").removesuffix(".xml"))
+            body = inkdrop_opds.series_catalog(
+                INKDROP_STATE_DB,
+                series_id,
+                after=(query.get("after") or [""])[0],
+                limit=(query.get("limit") or [inkdrop_opds.DEFAULT_PAGE_SIZE])[0],
+            )
+            if body is None:
+                self.send_json({"ok": False, "error": "series_not_found"}, status=404)
+            else:
+                self.send_bytes(
+                    body,
+                    "application/atom+xml;profile=opds-catalog;kind=acquisition; charset=utf-8",
+                    headers={"Cache-Control": "private, max-age=30"},
+                )
+        elif path.startswith("/opds/v1.2/files/"):
+            remainder = path.removeprefix("/opds/v1.2/files/")
+            media_id = unquote(remainder.split("/", 1)[0])
+            item = inkdrop_opds.acquisition_file(INKDROP_STATE_DB, media_id)
+            if item is None:
+                self.send_json({"ok": False, "error": "file_not_found"}, status=404)
+            else:
+                self.send_opds_file(item)
         elif path == "/api/system/version":
             self.send_json(inkdrop_version.build_metadata())
         elif path == "/api/system/update-status":
@@ -60497,6 +61337,48 @@ class Handler(BaseHTTPRequestHandler):
                     "filename": filename,
                     "content_base64": base64.b64encode(payload).decode("ascii"),
                 }, headers={"Cache-Control": "no-store"})
+            elif path == "/api/system/support-bundle/download":
+                if not SUPPORT_BUNDLE_BUILD_SLOT.acquire(blocking=False):
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "error": "support_bundle_busy",
+                            "code": "rate_limited",
+                            "detail": "Another support bundle is already being built. Wait a moment, then retry.",
+                            "retry_after": 5,
+                        },
+                        status=429,
+                        headers={"Cache-Control": "no-store", "Retry-After": "5"},
+                    )
+                else:
+                    try:
+                        payload, manifest = inkdrop_support_bundle.build_support_bundle_bytes(
+                            state_db=INKDROP_STATE_DB,
+                            status_summary=bounded_status_state_summary(),
+                            system_health=support_bundle_system_health_summary(),
+                        )
+                        filename = inkdrop_support_bundle.support_bundle_filename(manifest["generated_at"])
+                        self.send_bytes(
+                            payload,
+                            "application/zip",
+                            headers={
+                                "Cache-Control": "no-store, max-age=0",
+                                "Pragma": "no-cache",
+                                "Content-Disposition": f'attachment; filename="{filename}"',
+                            },
+                        )
+                    except Exception:
+                        self.send_json(
+                            {
+                                "ok": False,
+                                "error": "support_bundle_build_failed",
+                                "detail": "InkDrop could not build the support bundle.",
+                            },
+                            status=500,
+                            headers={"Cache-Control": "no-store"},
+                        )
+                    finally:
+                        SUPPORT_BUNDLE_BUILD_SLOT.release()
             elif path == "/api/inkdrop-settings/portability/export":
                 document = inkdrop_portability_export.export_portability_document(INKDROP_STATE_DB)
                 filename = inkdrop_portability_export.portability_export_filename(document)
@@ -60755,6 +61637,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "result": clear_manual_source_waiting(data)})
             elif path == "/api/manual-review/approve":
                 self.send_json({"ok": True, "result": approve_manual_review(data)})
+            elif path == "/api/manual-review/approve-local-file":
+                self.send_json({"ok": True, "result": approve_manual_review_local_file(data)})
             elif path == "/api/manual-review/resolve-noop":
                 self.send_json({"ok": True, "result": resolve_noop_manual_reviews()})
             elif path == "/api/sab-comic-failures/learn":

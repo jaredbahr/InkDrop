@@ -867,10 +867,11 @@ def _insert_issue(
     metadata_provider="comicvine",
     metadata_id="1001",
     title="",
+    raw_json=None,
 ):
     con.execute(
-        "insert into issues(id,series_id,issue_number,normalized_number,title,metadata_provider,metadata_id) "
-        "values(?,?,?,?,?,?,?)",
+        "insert into issues(id,series_id,issue_number,normalized_number,title,metadata_provider,metadata_id,raw_json) "
+        "values(?,?,?,?,?,?,?,?)",
         (
             issue_id,
             series_id,
@@ -879,6 +880,7 @@ def _insert_issue(
             title,
             metadata_provider,
             metadata_id,
+            json.dumps(raw_json or {}),
         ),
     )
 
@@ -1148,6 +1150,81 @@ def coordinator_contract():
                 "insert into wanted_items(id,series_id,issue_id,status) values(?,?,?,?)",
                 ("wanted:duplicate-number", "comicvine:1201", "issue:duplicate-number:a", "wanted"),
             )
+
+            # Queue replay imported a Kapowarr issue ID as though it were a
+            # second ComicVine #1. The reciprocal raw IDs prove this is one
+            # issue identity, not a same-number variant.
+            _insert_series(
+                con,
+                "comicvine:1401",
+                None,
+                metadata_id="1401",
+                title="Replay Library Edition",
+            )
+            _insert_issue(
+                con,
+                "comicvine:1401",
+                "comicvine:1401:issue:14001",
+                1,
+                metadata_id="14001",
+                title="HC",
+                raw_json={"id": 14001, "kapowarrIssueId": 1401},
+            )
+            _insert_issue(
+                con,
+                "comicvine:1401",
+                "comicvine:1401:issue:1401",
+                1,
+                metadata_id="1401",
+                title="HC",
+                raw_json={"id": 1401, "kapowarrIssueId": 1401},
+            )
+            con.executemany(
+                "insert into wanted_items(id,series_id,issue_id,status) values(?,?,?,?)",
+                (
+                    ("wanted:replay:authoritative", "comicvine:1401", "comicvine:1401:issue:14001", "wanted"),
+                    ("wanted:replay:alias", "comicvine:1401", "comicvine:1401:issue:1401", "in_progress"),
+                ),
+            )
+            con.execute(
+                "insert into queue_items(id,wanted_id,series_id,issue_id,state,query,active) values(?,?,?,?,?,?,?)",
+                (
+                    "queue:replay:alias",
+                    "wanted:replay:alias",
+                    "comicvine:1401",
+                    "comicvine:1401:issue:1401",
+                    "searching",
+                    "Replay Library Edition",
+                    1,
+                ),
+            )
+
+            # Two authoritative rows pointing at the same replay row are
+            # ambiguous and must not be projected into a singleton.
+            _insert_series(con, "comicvine:1501", None, metadata_id="1501", title="Ambiguous Library Edition")
+            for issue_id, metadata_id in (("issue:ambiguous:a", "15001"), ("issue:ambiguous:b", "15002")):
+                _insert_issue(
+                    con,
+                    "comicvine:1501",
+                    issue_id,
+                    1,
+                    metadata_id=metadata_id,
+                    title="HC",
+                    raw_json={"id": int(metadata_id), "kapowarrIssueId": 1501},
+                )
+            _insert_issue(
+                con,
+                "comicvine:1501",
+                "issue:ambiguous:replay",
+                1,
+                metadata_id="1501",
+                title="HC",
+                raw_json={"id": 1501, "kapowarrIssueId": 1501},
+            )
+            con.execute(
+                "insert into wanted_items(id,series_id,issue_id,status) values(?,?,?,?)",
+                ("wanted:ambiguous", "comicvine:1501", "issue:ambiguous:replay", "wanted"),
+            )
             con.commit()
 
         queue = inkdrop_state.queue_item(db_path, "queue:singleton", read_only=True)
@@ -1205,6 +1282,63 @@ def coordinator_contract():
         duplicate_number = coordinator._singleton_issue_context(db_path, "comicvine:1201")
         require(duplicate_number.get("canonical_issue_one_row_count") == 2, duplicate_number)
         require(duplicate_number.get("canonical_issue_positive_metadata_id_count") == 2, duplicate_number)
+
+        replay_queue = inkdrop_state.queue_item(db_path, "queue:replay:alias", read_only=True)
+        replay = coordinator.wanted_item_from_queue(replay_queue, db_path=db_path)
+        require(replay.get("canonical_issue_one_row_count") == 1, replay)
+        require(replay.get("canonical_issue_one_row_count_before_replay_projection") == 2, replay)
+        require(replay.get("canonical_issue_positive_metadata_id_count") == 1, replay)
+        require(replay.get("comicvine_replay_alias_count") == 1, replay)
+        require(replay.get("singleton_issue_id") == "comicvine:1401:issue:14001", replay)
+        require(replay.get("singleton_issue_metadata_id") == "14001", replay)
+        require(replay.get("collected_singleton_wanted_count") == 1, replay)
+        require(replay.get("collected_singleton_wanted_count_before_replay_projection") == 2, replay)
+        require(replay.get("collected_singleton_proof") is True, replay)
+        require(replay.get("singleton_issue_proof") is True, replay)
+
+        with inkdrop_state.connect(db_path) as con:
+            con.execute(
+                "update series set raw_json=? where id=?",
+                (json.dumps({"metadata": {"count_of_issues": 2}}), "comicvine:1401"),
+            )
+            con.commit()
+        declared_multi_replay = coordinator.wanted_item_from_queue(replay_queue, db_path=db_path)
+        require(declared_multi_replay.get("metadata_issue_count") == 2, declared_multi_replay)
+        require(declared_multi_replay.get("collected_singleton_proof") is False, declared_multi_replay)
+        require(not declared_multi_replay.get("collected_singleton_title_aliases"), declared_multi_replay)
+        require(declared_multi_replay.get("singleton_issue_proof") is False, declared_multi_replay)
+        declared_multi_candidate = matching.candidate_compatibility(
+            {"title": "Replay Library Edition"},
+            declared_multi_replay,
+        )
+        require(
+            declared_multi_candidate.get("status") != "compatible",
+            f"declared multi-issue replay used a collected singleton exception: {declared_multi_candidate}",
+        )
+
+        ambiguous_replay = coordinator._singleton_issue_context(db_path, "comicvine:1501")
+        require(ambiguous_replay.get("comicvine_replay_alias_count") == 0, ambiguous_replay)
+        require(ambiguous_replay.get("canonical_issue_one_row_count") == 3, ambiguous_replay)
+        require(ambiguous_replay.get("singleton_issue_proof") is False, ambiguous_replay)
+        manual_authority = coordinator._explicit_comicvine_replay_aliases(
+            [
+                {
+                    "id": "issue:manual-authority",
+                    "metadata_provider": "manual",
+                    "metadata_id": "16001",
+                    "raw_issue_id": "16001",
+                    "raw_kapowarr_issue_id": "1601",
+                },
+                {
+                    "id": "issue:manual-authority-replay",
+                    "metadata_provider": "comicvine",
+                    "metadata_id": "1601",
+                    "raw_issue_id": "1601",
+                    "raw_kapowarr_issue_id": "1601",
+                },
+            ]
+        )
+        require(not manual_authority, f"non-ComicVine authority collapsed a replay row: {manual_authority}")
 
         multi = coordinator._singleton_issue_context(db_path, "comicvine:202")
         require(multi.get("canonical_issue_count") == 2, f"real #1/#2 identities collapsed: {multi}")

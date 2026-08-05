@@ -111,10 +111,13 @@ def require_slskd_base_url():
 
 
 SLSKD_WAITING_NO_TRANSFER_STALE_SECONDS = env_int("INKDROP_SLSKD_NO_TRANSFER_STALE_SECONDS", 30 * 60)
-SLSKD_WAITING_REMOTE_QUEUE_STALE_SECONDS = env_int("INKDROP_SLSKD_REMOTE_QUEUE_STALE_SECONDS", 10 * 60)
-SLSKD_WAITING_LOCAL_QUEUE_STALE_SECONDS = env_int("INKDROP_SLSKD_LOCAL_QUEUE_STALE_SECONDS", 8 * 60)
-SLSKD_WAITING_REMOTE_QUEUE_FALLBACK_STALE_SECONDS = env_int("INKDROP_SLSKD_REMOTE_QUEUE_FALLBACK_STALE_SECONDS", 5 * 60)
-SLSKD_WAITING_LOCAL_QUEUE_FALLBACK_STALE_SECONDS = env_int("INKDROP_SLSKD_LOCAL_QUEUE_FALLBACK_STALE_SECONDS", 4 * 60)
+# A transfer sitting in SLSKD's own remote/local queue hasn't started moving
+# bytes yet -- it's waiting on the peer (or our own client) to open a slot,
+# which routinely takes many hours on a busy uploader. The default/floor here
+# comes from slskd_queued_wait_stall_policy()/queue_watchdog_slskd_queued_wait_hours
+# (48h default); this constant is only the last-resort fallback when the
+# state DB is unreachable.
+SLSKD_WAITING_QUEUED_STALE_SECONDS = env_int("INKDROP_SLSKD_QUEUED_WAIT_STALE_SECONDS", 48 * 60 * 60)
 SLSKD_WAITING_REMOTE_QUEUE_ACTIVE_USER_STALE_SECONDS = env_int("INKDROP_SLSKD_REMOTE_QUEUE_ACTIVE_USER_STALE_SECONDS", 45 * 60)
 SLSKD_WAITING_ZERO_PROGRESS_STALE_SECONDS = env_int("INKDROP_SLSKD_ZERO_PROGRESS_STALE_SECONDS", 45 * 60)
 SLSKD_WAITING_UNKNOWN_STALE_SECONDS = env_int("INKDROP_SLSKD_UNKNOWN_STALE_SECONDS", 90 * 60)
@@ -1536,27 +1539,6 @@ def slskd_candidate_recovery_allowed(record, detected):
     return False
 
 
-def candidate_matches_waiting_record(candidate, record):
-    if not isinstance(candidate, dict) or not isinstance(record, dict):
-        return False
-    record_user = normalize_key(record.get("username") or "")
-    candidate_user = normalize_key(candidate.get("username") or "")
-    if record_user and candidate_user and record_user != candidate_user:
-        return False
-    record_values = {
-        filename_key(record.get("filename")),
-        filename_key(record.get("filename_leaf")),
-        filename_key(record.get("candidate_filename_leaf")),
-    }
-    candidate_values = {
-        filename_key(candidate.get("filename")),
-        filename_key(candidate.get("path")),
-        filename_key(candidate.get("filename_leaf")),
-        filename_key(candidate.get("remote_filename")),
-    }
-    return bool({value for value in record_values if value} & {value for value in candidate_values if value})
-
-
 def detected_row_from_path(probe, item, root, path, *, record=None, source="slskd_downloads", direct_transfer=False):
     try:
         stat = path.stat()
@@ -1613,40 +1595,6 @@ def detected_row_from_path(probe, item, root, path, *, record=None, source="slsk
         "targeted_waiting_match": True,
         "direct_transfer_match": bool(direct_transfer),
     }
-
-
-def candidate_can_be_retry_fallback(candidate):
-    if not isinstance(candidate, dict):
-        return False
-    auto_grab = candidate.get("auto_grab") if isinstance(candidate.get("auto_grab"), dict) else {}
-    if candidate.get("manual_source_bad_candidate") or auto_grab.get("previous_failure"):
-        return False
-    verdict = str(auto_grab.get("verdict") or "").strip()
-    if verdict == "blocked":
-        return False
-    if verdict == "auto_grab_safe" or auto_grab.get("autopick_eligible"):
-        return True
-    # The probe has a retry-fallback path for exact candidates that were not
-    # first choice. Count them here so we can fail over faster when they exist.
-    return verdict == "needs_review"
-
-
-def viable_cached_slskd_fallback_count(record):
-    review_id = str((record or {}).get("review_id") or "").strip()
-    if not review_id:
-        return 0
-    cache = read_json(PROBE_CACHE_FILE, {}) or {}
-    entry = cache.get(review_id) if isinstance(cache, dict) else None
-    if not isinstance(entry, dict):
-        return 0
-    count = 0
-    for candidate in entry.get("candidates") or []:
-        if not candidate_can_be_retry_fallback(candidate):
-            continue
-        if candidate_matches_waiting_record(candidate, record):
-            continue
-        count += 1
-    return count
 
 
 def targeted_waiting_detected_files(probe, item, record):
@@ -2792,7 +2740,10 @@ def repeat_bad_candidate_park_reason(known_bad):
     return None
 
 
-def repeat_bad_candidate_review_row(db_path, review_id, record, known_bad, park_reason):
+def repeat_bad_candidate_review_row(
+    db_path, review_id, record, known_bad, park_reason,
+    *, reason_key="repeat_bad_slskd_candidate", review_reason=None, next_action=None,
+):
     row = {
         "review_id": f"repeat_bad_candidate:{review_id}",
         "series": record.get("series"),
@@ -2800,12 +2751,12 @@ def repeat_bad_candidate_review_row(db_path, review_id, record, known_bad, park_
         "source": "slskd",
         "state": "needs_you",
         "manual_review_actionable": True,
-        "reason": "repeat_bad_slskd_candidate",
-        "review_reason": (
+        "reason": reason_key,
+        "review_reason": review_reason or (
             f"This SLSKD candidate has {park_reason}. "
             "It's stopped auto-retrying and needs a decision from you."
         ),
-        "next_action": "Review the SLSKD candidate and either supply a different source or clear/ignore this one.",
+        "next_action": next_action or "Review the SLSKD candidate and either supply a different source or clear/ignore this one.",
         "activity_summary": known_bad.get("detail") or known_bad.get("reason"),
         "candidate_reason": known_bad.get("reason"),
         "failure_count": known_bad.get("failure_count"),
@@ -2828,6 +2779,46 @@ def repeat_bad_candidate_review_row(db_path, review_id, record, known_bad, park_
     return row
 
 
+def missing_staged_file_repeat_park_row(probe, review_id, record):
+    """A transfer SLSKD reports complete but InkDrop can't stage has no
+    physical `detected` file to key the existing repeat-bad-candidate check
+    (waiting_candidate_known_bad) off of -- that check only ever sees a
+    candidate once a file is actually found on disk. Look the same peer/
+    filename identity up directly against the durable bad_source_candidates
+    memory instead, so a root/path misconfiguration that hides an
+    otherwise-real completed download from every reconciliation pass gets
+    capped at the same threshold repeat-bad candidates already use, rather
+    than cancelling and re-searching a genuinely completed transfer forever.
+    """
+    bad_match = getattr(probe, "bad_candidate_match", None)
+    if not callable(bad_match):
+        return None
+    candidate = {
+        "filename": record.get("filename") or record.get("filename_leaf"),
+        "filename_leaf": record.get("filename_leaf"),
+        "username": record.get("username"),
+    }
+    if not candidate["username"] or not (candidate["filename"] or candidate["filename_leaf"]):
+        return None
+    try:
+        known_bad = bad_match(review_id, candidate)
+    except Exception:
+        return None
+    park_reason = repeat_bad_candidate_park_reason(known_bad)
+    if not park_reason:
+        return None
+    return repeat_bad_candidate_review_row(
+        INKDROP_STATE_DB, review_id, record, known_bad, park_reason,
+        reason_key="slskd_transfer_missing_staged_file_repeat",
+        review_reason=(
+            "SLSKD keeps reporting this download as complete, but InkDrop can't find the file it "
+            f"staged (this candidate has {park_reason}). Check the SLSKD download path settings, "
+            "then clear or retry this candidate."
+        ),
+        next_action="Confirm the SLSKD download root matches where SLSKD actually saves completed files, then clear or retry this candidate.",
+    )
+
+
 def recover_failed_waiting_candidate(args, result, review_id, record, detected, reason, transfer=None):
     if not args.live:
         return None
@@ -2845,6 +2836,40 @@ def recover_failed_waiting_candidate(args, result, review_id, record, detected, 
         return None
     try:
         probe = load_probe_module(args.probe_script)
+    except Exception as exc:
+        log("manual_source_probe_load_failed", review_id=review_id, error=str(exc))
+        probe = None
+    if failure.get("reason") == "slskd_transfer_missing_staged_file" and probe is not None:
+        park_row = missing_staged_file_repeat_park_row(probe, review_id, record)
+        if park_row:
+            sync_summary = None
+            if inkdrop_state is not None:
+                try:
+                    sync_summary = inkdrop_state.sync_review_exceptions(
+                        INKDROP_STATE_DB, [park_row], origin="slskd_repeat_bad_candidate"
+                    )
+                except Exception as exc:
+                    sync_summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            log(
+                "manual_source_missing_stage_repeat_parked",
+                review_id=review_id,
+                series=(record or {}).get("series"),
+                issue=(record or {}).get("issue"),
+                failure_count=park_row.get("failure_count"),
+            )
+            auto_grab_audit(
+                "missing_stage_repeat_parked",
+                review_id=review_id,
+                series=(record or {}).get("series"),
+                issue=(record or {}).get("issue"),
+                failure_count=park_row.get("failure_count"),
+                first_seen_at=park_row.get("first_seen_at"),
+            )
+            result["missing_stage_repeat_parked_count"] = int(result.get("missing_stage_repeat_parked_count") or 0) + 1
+            return {"parked": True, "review_row": park_row, "sync": sync_summary}
+    try:
+        if probe is None:
+            probe = load_probe_module(args.probe_script)
         mark_terminal = getattr(probe, "record_auto_grab_terminal_attempt", None)
         if callable(mark_terminal):
             # The long-running series worker owns this lock while it searches.
@@ -3016,15 +3041,22 @@ def transfer_queued_locally(transfer):
 
 
 def slskd_stall_policy(db_path=None):
-    """Resolve the active zero-progress stall gate without changing queue waits."""
+    """Resolve the active zero-progress stall gate and the queued-wait stall gate."""
     enabled = True
     seconds = SLSKD_WAITING_ZERO_PROGRESS_STALE_SECONDS
     source = "environment" if str(os.environ.get("INKDROP_SLSKD_ZERO_PROGRESS_STALE_SECONDS") or "").strip() else "default"
+    queued_wait_seconds = SLSKD_WAITING_QUEUED_STALE_SECONDS
     path = Path(db_path or INKDROP_STATE_DB)
     if inkdrop_state is not None and path.exists():
         try:
             with inkdrop_state.connect_read(path) as con:
-                return inkdrop_state.slskd_active_stall_policy(con)
+                policy = dict(inkdrop_state.slskd_active_stall_policy(con))
+                queued_wait = inkdrop_state.slskd_queued_wait_stall_policy(con)
+                policy["queued_wait_seconds"] = queued_wait["seconds"]
+                policy["queued_wait_hours"] = queued_wait["hours"]
+                policy["queued_wait_source"] = queued_wait["source"]
+                policy["queued_wait_setting_key"] = queued_wait["setting_key"]
+                return policy
         except (OSError, TypeError, ValueError):
             pass
     seconds = max(SLSKD_STALL_MIN_MINUTES * 60, min(int(seconds), SLSKD_STALL_MAX_MINUTES * 60))
@@ -3038,6 +3070,7 @@ def slskd_stall_policy(db_path=None):
         "maximum_minutes": SLSKD_STALL_MAX_MINUTES,
         "applies_to": "active_zero_progress_transfers",
         "queued_waiting_excluded": True,
+        "queued_wait_seconds": queued_wait_seconds,
     }
 
 
@@ -3101,20 +3134,12 @@ def same_user_active_transfer_context(transfer, download_status):
     }
 
 
-def queued_transfer_stale_seconds(record, transfer, *, local=False):
+def queued_transfer_stale_seconds(transfer, stall_policy=None):
     same_candidate_progressing = int((transfer or {}).get("same_candidate_active_transfer_count") or 0) > 0
     if same_candidate_progressing:
         return SLSKD_WAITING_REMOTE_QUEUE_ACTIVE_USER_STALE_SECONDS
-    fallback_count = viable_cached_slskd_fallback_count(record)
-    if local:
-        base = SLSKD_WAITING_LOCAL_QUEUE_STALE_SECONDS
-        fallback = SLSKD_WAITING_LOCAL_QUEUE_FALLBACK_STALE_SECONDS
-    else:
-        base = SLSKD_WAITING_REMOTE_QUEUE_STALE_SECONDS
-        fallback = SLSKD_WAITING_REMOTE_QUEUE_FALLBACK_STALE_SECONDS
-    if fallback_count > 0:
-        return min(base, fallback)
-    return base
+    effective_stall = stall_policy if isinstance(stall_policy, dict) else slskd_stall_policy()
+    return int(effective_stall.get("queued_wait_seconds") or SLSKD_WAITING_QUEUED_STALE_SECONDS)
 
 
 def stale_waiting_failure_reason(record, transfer=None, stall_policy=None):
@@ -3129,20 +3154,19 @@ def stale_waiting_failure_reason(record, transfer=None, stall_policy=None):
         return ""
     transfer_age = transfer_age_seconds(transfer) or wait_age
     age = max(wait_age, transfer_age)
-    remote_queue_stale_seconds = queued_transfer_stale_seconds(record, transfer, local=False)
+    queue_stale_seconds = queued_transfer_stale_seconds(transfer, stall_policy)
     if (
         status == "transfer_in_progress"
         and transfer_queued_remotely(transfer)
         and transfer_zero_progress(transfer)
-        and age >= remote_queue_stale_seconds
+        and age >= queue_stale_seconds
     ):
         return f"SLSKD transfer queued remotely with no progress after {compact_duration(age)}"
-    local_queue_stale_seconds = queued_transfer_stale_seconds(record, transfer, local=True)
     if (
         status == "transfer_in_progress"
         and transfer_queued_locally(transfer)
         and transfer_zero_progress(transfer)
-        and age >= local_queue_stale_seconds
+        and age >= queue_stale_seconds
     ):
         return f"SLSKD transfer queued locally with no progress after {compact_duration(age)}"
     effective_stall = stall_policy if isinstance(stall_policy, dict) else slskd_stall_policy()
@@ -4165,7 +4189,7 @@ def finish_result_summary(result):
             zero_progress_count += 1
         if transfer_queued_remotely(transfer):
             remote_queue_count += 1
-            stale_seconds = queued_transfer_stale_seconds(row, transfer, local=False)
+            stale_seconds = queued_transfer_stale_seconds(transfer)
             remaining = max(0, int(stale_seconds - (transfer_age_seconds(transfer) or 0)))
             if remaining and (remote_queue_retry_seconds <= 0 or remaining < remote_queue_retry_seconds):
                 remote_queue_retry_seconds = remaining

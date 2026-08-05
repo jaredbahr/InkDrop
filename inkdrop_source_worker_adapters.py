@@ -207,7 +207,24 @@ def indexer_source_query(wanted_item=None):
         wanted_item.get("chapter"),
         wanted_item.get("number"),
     )
-    if query and number and str(number) not in query:
+    series = providers.normalized_query(
+        providers.first_text(
+            wanted_item.get("series_title"),
+            wanted_item.get("series"),
+        )
+    )
+    # A number that belongs to the series name is not evidence that the
+    # wanted issue is already present.  Substring checks collapsed titles such
+    # as "9-1-1" issue 1, "20th Century Boys" issue 20, and "300" issue 3 to
+    # the bare series query.  When the query came from the canonical series
+    # field, add the wanted number even if that same number appears in the
+    # title.  Explicit operator queries still return unchanged above.
+    query_is_numeric_series = bool(
+        series
+        and query.casefold() == series.casefold()
+        and _query_title_contains_number(series)
+    )
+    if query and number and (query_is_numeric_series or str(number) not in query):
         return providers.normalized_query(f"{query} {number}")
     return query
 
@@ -236,25 +253,46 @@ def _query_has_volume_number(query, volume_number):
     return bool(re.search(rf"(?i)\b(?:vol(?:ume)?\.?|v)\s*{volume_pattern}\b", query))
 
 
+def _query_title_contains_number(query):
+    return bool(re.search(r"\d", providers.normalized_query(query)))
+
+
 def _query_without_trailing_year(query):
     text = providers.normalized_query(query)
     return providers.normalized_query(re.sub(r"\s+(?:19|20)\d{2}$", "", text))
+
+
+_LEADING_CREATOR_POSSESSIVE_RE = re.compile(
+    r"^([A-Z][A-Za-z0-9.\-]*(?:\s+[A-Z][A-Za-z0-9.\-]*){1,4})['\u2019]s\s+(.+)$",
+)
 
 
 def _query_without_leading_creator_possessive(query):
     text = providers.normalized_query(query)
     if not text:
         return ""
-    match = re.match(
-        r"^([A-Z][A-Za-z0-9.\-]*(?:\s+[A-Z][A-Za-z0-9.\-]*){1,4})['\u2019]s\s+(.+)$",
-        text,
-    )
+    match = _LEADING_CREATOR_POSSESSIVE_RE.match(text)
     if not match:
         return ""
     tail = providers.normalized_query(match.group(2))
     if not tail or not re.search(r"[A-Za-z]", tail):
         return ""
     return tail
+
+
+def _leading_creator_possessive_name(query):
+    """The creator name a leading possessive strips, e.g. "Naoki Urasawa" from
+    "Naoki Urasawa's Monster". Used to validate a MangaDex work's real author/
+    artist relationships once title matching has already accepted a broad
+    alias -- see mangadex_manga_matches_wanted's expected-creator check.
+    """
+    text = providers.normalized_query(query)
+    if not text:
+        return ""
+    match = _LEADING_CREATOR_POSSESSIVE_RE.match(text)
+    if not match:
+        return ""
+    return providers.normalized_query(match.group(1))
 
 
 def _query_without_leading_article(query):
@@ -741,6 +779,20 @@ def indexer_source_queries(wanted_item=None, *, max_queries=3, policy=None, incl
         add(f"{series} Volume {primary_volume}", include_ascii=True)
         if len(values) >= limit:
             return values[:limit]
+
+    # Numeric series names make especially noisy bare indexer searches.  A
+    # production search for "300" returned dozens of unrelated issue-300
+    # releases while the wanted issue was absent from the first bounded slot.
+    # Put the exact issue-bearing form first for this title class, then retain
+    # the existing broad and padded fallbacks in the remaining slots.
+    if (
+        not is_volume_wanted
+        and not wanted_item.get("manual_search")
+        and series
+        and issue_variants
+        and _query_title_contains_number(series)
+    ):
+        add(f"{series} {issue_variants[0]}", include_ascii=True)
 
     if not wanted_item.get("manual_search"):
         collected_aliases = inkdrop_sources.collected_title_aliases(series)
@@ -1480,13 +1532,8 @@ def _mangadex_clean_query(value, wanted_item=None):
     return providers.normalized_query(text)
 
 
-def mangadex_series_queries(wanted_item=None, *, max_queries=3, policy=None):
+def mangadex_series_query_pool(wanted_item=None, *, policy=None):
     wanted_item = wanted_item if isinstance(wanted_item, dict) else {}
-    try:
-        limit = int(max_queries or 3)
-    except (TypeError, ValueError):
-        limit = 3
-    limit = max(1, min(limit, 6))
     values = []
     seen = set()
 
@@ -1539,7 +1586,24 @@ def mangadex_series_queries(wanted_item=None, *, max_queries=3, policy=None):
                 add(f"{stem} v{volume}", include_ascii=True)
             for volume in volume_variants[1:]:
                 add(f"{stem} v{volume}", include_ascii=True)
-    values = _prefer_ascii_folded_volume_queries(values, wanted_item)
+    return _prefer_ascii_folded_volume_queries(values, wanted_item)[:6]
+
+
+def mangadex_series_queries(wanted_item=None, *, max_queries=3, policy=None):
+    wanted_item = wanted_item if isinstance(wanted_item, dict) else {}
+    try:
+        limit = int(max_queries or 3)
+    except (TypeError, ValueError):
+        limit = 3
+    limit = max(1, min(limit, 6))
+    values = mangadex_series_query_pool(wanted_item, policy=policy)
+    try:
+        query_offset = int(wanted_item.get("_mangadex_query_offset") or 0)
+    except (TypeError, ValueError):
+        query_offset = 0
+    if values and query_offset:
+        query_offset %= len(values)
+        values = [*values[query_offset:], *values[:query_offset]]
     return values[:limit]
 
 
@@ -3350,38 +3414,75 @@ def html_search_requests(row, plan, wanted_item=None, limit=20):
     return requests
 
 
-def direct_file_html_search_requests(row, plan, wanted_item=None, limit=20):
-    query = source_query(wanted_item)
-    urls = _configured_search_urls(row, query, default_base=False, limit=limit)
+def _html_adapter_query_variants(row, wanted_item=None, *, provider_prefix=""):
+    policy = (row or {}).get("policy") if isinstance((row or {}).get("policy"), dict) else {}
+    prefix_key = f"{provider_prefix}_max_query_variants" if provider_prefix else ""
+    max_queries = providers.int_value(
+        (policy.get(prefix_key) if prefix_key else None)
+        or policy.get("html_max_query_variants")
+        or policy.get("max_query_variants"),
+        3,
+    )
+    return indexer_source_queries(
+        wanted_item,
+        max_queries=max_queries,
+        policy=policy,
+        include_series_fallback=False,
+    )
+
+
+def _html_adapter_search_requests(
+    row,
+    wanted_item,
+    *,
+    limit,
+    request_prefix,
+    purpose,
+    accept,
+    provider_prefix,
+    default_base=True,
+):
     requests = []
-    for index, url in enumerate(urls):
-        requests.append(
-            _request(
-                f"direct_file_html_search_{index}",
+    queries = _html_adapter_query_variants(row, wanted_item, provider_prefix=provider_prefix)
+    for query_index, query in enumerate(queries):
+        urls = _configured_search_urls(row, query, default_base=default_base, limit=limit)
+        for url in urls:
+            request = _request(
+                f"{request_prefix}_{len(requests)}",
                 "GET",
                 url,
-                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1"},
-                purpose="search_direct_file_html_source",
+                headers={"Accept": accept},
+                purpose=purpose,
             )
-        )
+            request["query_variant"] = query
+            request["query_variant_index"] = query_index
+            requests.append(request)
     return requests
+
+
+def direct_file_html_search_requests(row, plan, wanted_item=None, limit=20):
+    return _html_adapter_search_requests(
+        row,
+        wanted_item,
+        limit=limit,
+        request_prefix="direct_file_html_search",
+        purpose="search_direct_file_html_source",
+        accept="text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1",
+        provider_prefix="direct_file",
+        default_base=False,
+    )
 
 
 def direct_file_detail_search_requests(row, plan, wanted_item=None, limit=20):
-    query = source_query(wanted_item)
-    urls = _configured_search_urls(row, query, limit=limit)
-    requests = []
-    for index, url in enumerate(urls):
-        requests.append(
-            _request(
-                f"direct_file_detail_search_{index}",
-                "GET",
-                url,
-                headers={"Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1"},
-                purpose="search_direct_file_detail_source",
-            )
-        )
-    return requests
+    return _html_adapter_search_requests(
+        row,
+        wanted_item,
+        limit=limit,
+        request_prefix="direct_file_detail_search",
+        purpose="search_direct_file_detail_source",
+        accept="application/json,text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1",
+        provider_prefix="direct_file",
+    )
 
 
 def direct_file_detail_page_request(url, index, allowed_hosts=None):
@@ -3396,20 +3497,15 @@ def direct_file_detail_page_request(url, index, allowed_hosts=None):
 
 
 def direct_file_probe_search_requests(row, plan, wanted_item=None, limit=20):
-    query = source_query(wanted_item)
-    urls = _configured_search_urls(row, query, limit=limit)
-    requests = []
-    for index, url in enumerate(urls):
-        requests.append(
-            _request(
-                f"direct_file_probe_search_{index}",
-                "GET",
-                url,
-                headers={"Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1"},
-                purpose="search_direct_file_probe_source",
-            )
-        )
-    return requests
+    return _html_adapter_search_requests(
+        row,
+        wanted_item,
+        limit=limit,
+        request_prefix="direct_file_probe_search",
+        purpose="search_direct_file_probe_source",
+        accept="application/json,text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1",
+        provider_prefix="direct_file",
+    )
 
 
 def direct_file_probe_request(url, index, method="HEAD", allowed_hosts=None):
@@ -3472,37 +3568,27 @@ def reader_page_pack_chapter_page_request(url, index):
 
 
 def torrent_html_search_requests(row, plan, wanted_item=None, limit=20):
-    query = source_query(wanted_item)
-    urls = _configured_search_urls(row, query, limit=limit)
-    requests = []
-    for index, url in enumerate(urls):
-        requests.append(
-            _request(
-                f"torrent_html_search_{index}",
-                "GET",
-                url,
-                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1"},
-                purpose="search_torrent_html_source",
-            )
-        )
-    return requests
+    return _html_adapter_search_requests(
+        row,
+        wanted_item,
+        limit=limit,
+        request_prefix="torrent_html_search",
+        purpose="search_torrent_html_source",
+        accept="text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1",
+        provider_prefix="torrent_html",
+    )
 
 
 def torrent_detail_search_requests(row, plan, wanted_item=None, limit=20):
-    query = source_query(wanted_item)
-    urls = _configured_search_urls(row, query, limit=limit)
-    requests = []
-    for index, url in enumerate(urls):
-        requests.append(
-            _request(
-                f"torrent_detail_search_{index}",
-                "GET",
-                url,
-                headers={"Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1"},
-                purpose="search_torrent_detail_source",
-            )
-        )
-    return requests
+    return _html_adapter_search_requests(
+        row,
+        wanted_item,
+        limit=limit,
+        request_prefix="torrent_detail_search",
+        purpose="search_torrent_detail_source",
+        accept="application/json,text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.1",
+        provider_prefix="torrent_html",
+    )
 
 
 def torrent_detail_page_request(url, index):
@@ -3667,6 +3753,10 @@ def adapter_fetch_plan(row, plan, wanted_item=None, limit=20):
         if manga_id:
             out["requests"].append(mangadex_feed_request(manga_id, row, plan, wanted_item, limit=limit))
         else:
+            out["mangadex_query_pool"] = mangadex_series_query_pool(
+                wanted_item,
+                policy=_source_query_alias_policy(row),
+            )
             requests = mangadex_search_requests(row, plan, wanted_item, limit=limit)
             out["requests"].extend(requests)
             out["query_variants"] = [request.get("params", {}).get("title") for request in requests]
@@ -3806,18 +3896,21 @@ def adapter_fetch_plan(row, plan, wanted_item=None, limit=20):
     elif adapter_family == "direct_file_html_search":
         out["payload_mode"] = "multi_payload"
         out["requests"].extend(direct_file_html_search_requests(row, plan, wanted_item, limit=limit))
+        out["query_variants"] = list(dict.fromkeys(request.get("query_variant") for request in out["requests"] if request.get("query_variant")))
         if not out["requests"]:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_direct_file_search_url_templates"
     elif adapter_family == "direct_file_detail_search":
         out["payload_mode"] = "html_search_then_direct_file_pages"
         out["requests"].extend(direct_file_detail_search_requests(row, plan, wanted_item, limit=limit))
+        out["query_variants"] = list(dict.fromkeys(request.get("query_variant") for request in out["requests"] if request.get("query_variant")))
         if not out["requests"]:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_direct_file_detail_search_url_templates"
     elif adapter_family == "direct_file_probe_source":
         out["payload_mode"] = "html_search_then_direct_file_probes"
         out["requests"].extend(direct_file_probe_search_requests(row, plan, wanted_item, limit=limit))
+        out["query_variants"] = list(dict.fromkeys(request.get("query_variant") for request in out["requests"] if request.get("query_variant")))
         if not out["requests"]:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_direct_file_probe_search_url_templates"
@@ -3830,12 +3923,14 @@ def adapter_fetch_plan(row, plan, wanted_item=None, limit=20):
     elif adapter_family == "torrent_html_search":
         out["payload_mode"] = "multi_payload"
         out["requests"].extend(torrent_html_search_requests(row, plan, wanted_item, limit=limit))
+        out["query_variants"] = list(dict.fromkeys(request.get("query_variant") for request in out["requests"] if request.get("query_variant")))
         if not out["requests"]:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_torrent_html_search_url_templates"
     elif adapter_family == "torrent_detail_search":
         out["payload_mode"] = "html_search_then_torrent_detail_pages"
         out["requests"].extend(torrent_detail_search_requests(row, plan, wanted_item, limit=limit))
+        out["query_variants"] = list(dict.fromkeys(request.get("query_variant") for request in out["requests"] if request.get("query_variant")))
         if not out["requests"]:
             out["payload_mode"] = "configuration_required"
             out["reason"] = "missing_torrent_detail_search_url_templates"
@@ -5485,6 +5580,19 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
             )
             query = (search_request.get("params") or {}).get("title")
             match_wanted_item = dict(wanted_item or {})
+            # Stash the creator name a broad alias search strips (e.g. "Naoki
+            # Urasawa" from "Naoki Urasawa's Monster") before series_title/
+            # query below get overwritten with the query variant itself --
+            # mangadex_manga_matches_wanted uses this to reject a same-title
+            # work whose real MangaDex author/artist disagrees, even though
+            # the alias-driven title check alone would accept it.
+            expected_creator = ""
+            for identity_key in ("series_title", "series", "manga_title", "title"):
+                expected_creator = _leading_creator_possessive_name((wanted_item or {}).get(identity_key))
+                if expected_creator:
+                    break
+            if expected_creator:
+                match_wanted_item["_mangadex_expected_creator"] = expected_creator
             if query:
                 match_wanted_item["series_title"] = query
                 match_wanted_item["query"] = query

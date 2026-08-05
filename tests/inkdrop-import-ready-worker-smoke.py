@@ -5880,12 +5880,20 @@ def smoke_exact_manga_volume_plans_and_imports_volume_only_destination():
             "folder": str(series_dir),
             "target_source": "inkdrop_series",
         }
+        # A "Vol.N Ch.M" filename is normal chapter metadata, not a
+        # conflicting identity -- unsafe_comic_target_match_reason() no
+        # longer blocks it unconditionally on sight of both tokens. The
+        # target-aware unit decision (series unit-model policy, exact
+        # number/series agreement, duplicate/coverage) belongs to
+        # manga_import_guard() downstream, which still enforces volume-only
+        # protection -- see smoke_manga_mixed_unit_guard_decides_not_filename
+        # below for that coverage.
         conflicting_source_reason = inkdrop_completed_import.unsafe_comic_target_match_reason(
             source_dir / "Dorohedoro v06 c006.cbz",
             {**target, "query": "Dorohedoro Chapter 6", "issue_title": "Chapter 6", "manga_unit_policy": "mixed_allowed"},
         )
-        if conflicting_source_reason != "manga_source_conflicting_unit_identity":
-            fail(f"mixed volume/chapter source identity was not blocked: {conflicting_source_reason}")
+        if conflicting_source_reason == "manga_source_conflicting_unit_identity":
+            fail(f"mixed volume/chapter filename must reach manga_import_guard(), not be blocked on sight: {conflicting_source_reason}")
         patched = {
             name: getattr(inkdrop_completed_import, name)
             for name in (

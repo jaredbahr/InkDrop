@@ -67,6 +67,35 @@ SKIP = {
         "drives a real browser: needs playwright plus a live authenticated "
         "instance; run locally against a throwaway instance instead"
     ),
+    "inkdrop-manual-review-load-browser-smoke.py": (
+        "drives a real browser: needs playwright plus a live authenticated "
+        "instance; run locally against a throwaway instance instead"
+    ),
+    "inkdrop-blocklist-react-island-browser-smoke.py": (
+        "drives a real browser: needs playwright, a built web/frontend React "
+        "bundle, and a live authenticated instance; run locally against a "
+        "throwaway instance instead"
+    ),
+    "inkdrop-wanted-react-island-browser-smoke.py": (
+        "drives a real browser: needs playwright, a built web/frontend React "
+        "bundle, and a live authenticated instance; run locally against a "
+        "throwaway instance instead"
+    ),
+    "inkdrop-queue-react-island-browser-smoke.py": (
+        "drives a real browser: needs playwright, a built web/frontend React "
+        "bundle, and a live authenticated instance; run locally against a "
+        "throwaway instance instead"
+    ),
+    "inkdrop-history-react-island-browser-smoke.py": (
+        "drives a real browser: needs playwright, a built web/frontend React "
+        "bundle, and a live authenticated instance; run locally against a "
+        "throwaway instance instead"
+    ),
+    "inkdrop-manual-review-react-island-browser-smoke.py": (
+        "drives a real browser: needs playwright, a built web/frontend React "
+        "bundle, and a live authenticated instance; run locally against a "
+        "throwaway instance instead"
+    ),
     "inkdrop-public-docker-runtime-smoke.py": (
         "builds and boots the docker image; ~4 minutes when docker is present "
         "and the qa_image job already exercises the real container build"

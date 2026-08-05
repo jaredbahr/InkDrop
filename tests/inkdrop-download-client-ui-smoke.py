@@ -5,7 +5,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8")
+# inkdrop_web_config.py holds the static-asset registration constants that
+# used to live directly in inkdrop_web.py; the mount/asset contract below
+# spans both files.
+WEB = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8") + (ROOT / "inkdrop_web_config.py").read_text(encoding="utf-8")
 JS = (ROOT / "web/static/js/inkdrop-download-clients-ui.js").read_text(encoding="utf-8")
 CSS = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")
 FIXTURE = (ROOT / "web/tests/fixtures/download-clients-settings.html").read_text(encoding="utf-8")

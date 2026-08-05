@@ -7,6 +7,7 @@ on:
       - qa
     paths:
       - ".github/workflows/inkdrop-public-release.yml"
+      - ".github/workflows/inkdrop-beta-promotion.yml"
       - ".dockerignore"
       - ".gitignore"
       - ".env.example"
@@ -16,6 +17,7 @@ on:
       - "README.md"
       - "inkdrop-logo-mark.png"
       - "web/static/**"
+      - "web/frontend/**"
       - "web/tests/**"
       - "docs/inkdrop-source-candidate-catalog-20260702.json"
       - "docs/inkdrop/docker-first-install.md"
@@ -39,6 +41,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/inkdrop-public-release.yml"
+      - ".github/workflows/inkdrop-beta-promotion.yml"
       - ".dockerignore"
       - ".gitignore"
       - ".env.example"
@@ -48,6 +51,7 @@ on:
       - "README.md"
       - "inkdrop-logo-mark.png"
       - "web/static/**"
+      - "web/frontend/**"
       - "web/tests/**"
       - "docs/inkdrop-source-candidate-catalog-20260702.json"
       - "docs/inkdrop/docker-first-install.md"
@@ -95,6 +99,20 @@ jobs:
       - name: Install Python dependencies
         timeout-minutes: 5
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Build frontend
+        timeout-minutes: 5
+        working-directory: web/frontend
+        run: |
+          npm ci
+          npm run build
 
       - name: Run static public-release checks
         timeout-minutes: 15
@@ -252,6 +270,20 @@ jobs:
         timeout-minutes: 5
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Build frontend
+        timeout-minutes: 5
+        working-directory: web/frontend
+        run: |
+          npm ci
+          npm run build
+
       - name: Run full smoke suite
         timeout-minutes: 80
         env:
@@ -279,6 +311,7 @@ jobs:
       packages: write
     outputs:
       image_digest: ${{ steps.build.outputs.digest }}
+      image_tags_json: ${{ steps.release.outputs.image_tags_json }}
       short_sha: ${{ steps.build_meta.outputs.short_sha }}
       version: ${{ steps.release.outputs.version }}
       release_tag: ${{ steps.release.outputs.tag }}
@@ -296,6 +329,9 @@ jobs:
           echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
           echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -312,10 +348,13 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/${{ github.repository_owner }}/inkdrop-qa:sha-${{ steps.build_meta.outputs.short_sha }}
             ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa-${{ steps.build_meta.outputs.short_sha }}
             ghcr.io/${{ github.repository_owner }}/inkdrop-qa:qa
+          cache-from: type=gha,scope=inkdrop-qa
+          cache-to: type=gha,mode=max,scope=inkdrop-qa
           build-args: |
             INKDROP_VERSION=${{ steps.release.outputs.version }}
             INKDROP_COMMIT_SHA=${{ github.sha }}
@@ -393,6 +432,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU for cross-platform validation
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx for manifest validation
+        uses: docker/setup-buildx-action@v3
+
       - name: Download exact QA candidate manifest
         uses: actions/download-artifact@v4
         with:
@@ -427,6 +472,83 @@ jobs:
           if mismatches:
               raise SystemExit(f"QA candidate identity mismatch: {mismatches}")
           PY
+
+      - name: Validate published image platforms
+        env:
+          IMAGE_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa@${IMAGE_DIGEST}"
+          docker buildx imagetools inspect "$image" --raw > qa-image-index.json
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          payload = json.loads(Path("qa-image-index.json").read_text(encoding="utf-8"))
+          manifests = [
+              manifest
+              for manifest in payload.get("manifests") or []
+              if (manifest.get("platform") or {}).get("os") not in {None, "", "unknown"}
+          ]
+          platforms = [
+              (manifest.get("platform") or {}).get("os", "") + "/" +
+              (manifest.get("platform") or {}).get("architecture", "")
+              for manifest in manifests
+          ]
+          expected = ["linux/amd64", "linux/arm64"]
+          allowed_media_types = {
+              "application/vnd.docker.distribution.manifest.v2+json",
+              "application/vnd.oci.image.manifest.v1+json",
+          }
+          if sorted(platforms) != sorted(expected):
+              raise SystemExit(
+                  f"QA image platform mismatch: expected {sorted(expected)}, got {sorted(platforms)}"
+              )
+          for manifest in manifests:
+              digest = str(manifest.get("digest") or "")
+              media_type = str(manifest.get("mediaType") or "")
+              platform = manifest.get("platform") or {}
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  raise SystemExit(f"invalid platform manifest digest: {digest!r}")
+              if media_type not in allowed_media_types:
+                  raise SystemExit(f"invalid platform manifest media type: {media_type!r}")
+              if platform.get("architecture") == "arm64" and platform.get("variant") not in {None, "", "v8"}:
+                  raise SystemExit(f"unsupported arm64 variant: {platform.get('variant')!r}")
+          PY
+
+      - name: Prove both platform images can execute
+        env:
+          IMAGE_DIGEST: ${{ needs.qa_image.outputs.image_digest }}
+        run: |
+          # Run each platform through its own manifest digest from the validated
+          # index. The classic image store cannot hold two platforms behind one
+          # index digest, so running both from ${IMAGE_DIGEST} fails the second
+          # pull with "cannot overwrite digest".
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa"
+          : > qa-platform-runtime.jsonl
+          for platform in linux/amd64 linux/arm64; do
+            expected="${platform#linux/}"
+            digest=$(python - "$platform" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          wanted = sys.argv[1]
+          payload = json.loads(Path("qa-image-index.json").read_text(encoding="utf-8"))
+          for manifest in payload.get("manifests") or []:
+              platform = manifest.get("platform") or {}
+              if f"{platform.get('os')}/{platform.get('architecture')}" == wanted:
+                  print(manifest["digest"])
+                  break
+          else:
+              raise SystemExit(f"no platform manifest for {wanted}")
+          PY
+          )
+            docker run --rm --platform "$platform" --entrypoint python \
+              -e INKDROP_EXPECTED_ARCH="$expected" \
+              "$repo@$digest" -c 'import json, os, platform; actual = platform.machine().lower(); expected = os.environ["INKDROP_EXPECTED_ARCH"]; aliases = {"amd64": {"amd64", "x86_64"}, "arm64": {"arm64", "aarch64"}}; ok = actual in aliases[expected]; print(json.dumps({"platform": "linux/" + expected, "machine": actual, "passed": ok}, sort_keys=True)); raise SystemExit(0 if ok else 1)' \
+              >> qa-platform-runtime.jsonl
+          done
 
       - name: Pull and inspect exact image digest
         env:
@@ -536,6 +658,7 @@ jobs:
           EXPECTED_VERSION: ${{ needs.qa_image.outputs.version }}
           EXPECTED_TAG: ${{ needs.qa_image.outputs.release_tag }}
           PREVIOUS_STATE_SCHEMA_VERSION: ${{ needs.qa_image.outputs.previous_state_schema_version }}
+          EXPECTED_IMAGE_TAGS_JSON: ${{ needs.qa_image.outputs.image_tags_json }}
         run: |
           python - <<'PY'
           import hashlib
@@ -546,13 +669,26 @@ jobs:
 
           candidate_bytes = Path("qa-candidate.json").read_bytes()
           candidate = json.loads(candidate_bytes)
+          platform_index = json.loads(Path("qa-image-index.json").read_text(encoding="utf-8"))
+          platforms = sorted(
+              (manifest.get("platform") or {}).get("os", "") + "/" +
+              (manifest.get("platform") or {}).get("architecture", "")
+              for manifest in platform_index.get("manifests") or []
+              if (manifest.get("platform") or {}).get("os") not in {None, "", "unknown"}
+          )
+          runtime_platforms = [
+              json.loads(line)
+              for line in Path("qa-platform-runtime.jsonl").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
           digest = os.environ["EXPECTED_DIGEST"]
           payload = {
-              "schema": "inkdrop.qa_image_validation.v1",
+              "schema": "inkdrop.qa_image_validation.v2",
               "passed": True,
               "commit": os.environ["GITHUB_SHA"],
               "version": os.environ["EXPECTED_VERSION"],
               "release_tag": os.environ["EXPECTED_TAG"],
+              "release_image_tags": json.loads(os.environ["EXPECTED_IMAGE_TAGS_JSON"]),
               "image_digest": digest,
               "image_ref": f"ghcr.io/{os.environ['GITHUB_REPOSITORY_OWNER']}/inkdrop-qa@{digest}",
               "workflow_run_id": os.environ["GITHUB_RUN_ID"],
@@ -561,7 +697,9 @@ jobs:
               "validated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
               "previous_state_schema_version": int(os.environ["PREVIOUS_STATE_SCHEMA_VERSION"]),
               "target_state_schema_version": int(candidate["state_schema_version"]),
-              "checks": ["candidate_identity", "oci_labels", "strict_preflight", "container_health", "public_http"],
+              "platforms": platforms,
+              "platform_runtime": runtime_platforms,
+              "checks": ["candidate_identity", "image_platforms", "platform_runtime", "oci_labels", "strict_preflight", "container_health", "public_http"],
           }
           Path("qa-image-validation.json").write_text(
               json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -579,6 +717,8 @@ jobs:
           path: |
             qa-candidate.json
             qa-image-inspect.json
+            qa-image-index.json
+            qa-platform-runtime.jsonl
             qa-status.json
             qa-container.log
             qa-image-validation.json

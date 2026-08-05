@@ -456,6 +456,10 @@
     .core-state.good { color: var(--good); border-color: rgba(120, 217, 155, .35); }
     .core-state.warn { color: var(--warn); border-color: rgba(247, 201, 111, .45); }
     .core-state.bad { color: var(--bad); border-color: rgba(255, 125, 125, .45); }
+    /* Active work in progress (searching/downloading/importing) -- same
+       accent/blue used for the "auto" lane pill elsewhere, so a row that's
+       actively moving never reads as the same idle-amber as one that isn't. */
+    .core-state.auto { color: var(--accent); border-color: rgba(114, 210, 255, .4); }
     .core-actions {
       display: flex;
       justify-content: flex-end;
@@ -1196,6 +1200,15 @@
       align-items: center;
       min-width: 0;
     }
+    /* Wanted, Queue, History, and Blocklist pull Source out of the combined
+       detail column into its own track (inkdropOperatorColumnRoles() /
+       SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py). The actual per-view
+       grid-template-columns overrides live in 04-tables-rows.css (Wanted's
+       6-track rule with its row-select column, Queue/History/Blocklist's
+       5-track rule without one) -- that file already owned each of these
+       selectors before this column existed, so the new source track was
+       added there instead of here to keep one file per selector.
+       See .section-table-col-source below for the new cell's own styling. */
     .section-table-column-heading {
       min-width: 0;
       overflow: hidden;
@@ -1208,6 +1221,18 @@
     }
     .section-table-col-detail {
       align-self: stretch;
+    }
+    .section-table-col-source {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: var(--font-sm, 12px);
+      font-weight: 700;
+    }
+    .section-table-source-empty::before {
+      content: "\2013";
     }
     .section-table-select {
       display: flex;

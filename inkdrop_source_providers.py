@@ -9,7 +9,7 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import PurePosixPath
-from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import inkdrop_candidate_matching
 import inkdrop_sources
@@ -203,6 +203,74 @@ def content_type_base(value):
 def url_hash(value):
     text = str(value or "").strip()
     return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+
+PROWLARR_CREDENTIAL_QUERY_KEYS = {
+    "api-key", "api_key", "apikey", "auth", "key", "passkey", "rsskey", "token",
+}
+PROWLARR_CREDENTIAL_FIELD_KEYS = PROWLARR_CREDENTIAL_QUERY_KEYS | {
+    "access_token", "authorization", "cookie", "password", "passwd", "proxy-authorization",
+    "refresh_token", "secret", "set-cookie", "x-api-key", "x-auth-token",
+}
+
+
+def prowlarr_url_has_nested_credentials(value):
+    """Detect an invalid URL-valued proxy link that itself carries a secret."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except (TypeError, ValueError):
+        return False
+    for _key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        nested = str(item or "").strip()
+        if not nested.lower().startswith(("http://", "https://")):
+            continue
+        try:
+            nested_query = parse_qsl(urlparse(nested).query, keep_blank_values=True)
+        except (TypeError, ValueError):
+            continue
+        if any(str(key or "").strip().lower() in PROWLARR_CREDENTIAL_QUERY_KEYS for key, _ in nested_query):
+            return True
+    return False
+
+
+def credential_free_prowlarr_url(value):
+    """Remove reusable query credentials while preserving an operational locator."""
+    text = str(value or "").strip()
+    try:
+        parsed = urlparse(text)
+    except (TypeError, ValueError):
+        return text
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return text
+    query = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        if str(key or "").strip().lower() in PROWLARR_CREDENTIAL_QUERY_KEYS:
+            continue
+        nested = str(item or "").strip()
+        if nested.lower().startswith(("http://", "https://")):
+            item = credential_free_prowlarr_url(nested)
+        query.append((key, item))
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query), ""))
+
+
+def prowlarr_durable_payload(value):
+    """Return Prowlarr result data that is safe to persist and still replayable."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            name = str(key)
+            if name.strip().lower() in PROWLARR_CREDENTIAL_FIELD_KEYS:
+                out[name] = "[redacted]"
+            else:
+                out[name] = prowlarr_durable_payload(item)
+        return out
+    if isinstance(value, list):
+        return [prowlarr_durable_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [prowlarr_durable_payload(item) for item in value]
+    if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://")):
+        return credential_free_prowlarr_url(value)
+    return value
 
 
 def safe_filename_part(value, default="download"):
@@ -1540,13 +1608,46 @@ def direct_artifact_verdict(candidate, registry_row=None, headers=None, min_size
     return candidate
 
 
-def direct_download_task_seed(candidate, staging_root):
+def direct_download_provider_root(staging_root, provider_id, registry_row=None):
+    """Resolve where a direct-download provider's finished files land.
+
+    Defaults to ``<staging_root>/<provider_id>`` (the existing layout), but an
+    operator can point a provider at its own volume/path via the provider's
+    ``download_root`` setting -- mirroring how SLSKD's download/incomplete
+    roots are independently configurable.
+    """
+
+    provider_id = inkdrop_sources.provider_key(provider_id)
+    default_root = PurePosixPath(str(staging_root or "/tmp/inkdrop-direct-staging").replace("\\", "/"))
+    configured = str((registry_row or {}).get("download_root") or "").strip()
+    if configured:
+        return PurePosixPath(configured.replace("\\", "/"))
+    return default_root / provider_id if provider_id else default_root
+
+
+def direct_download_incomplete_root(download_root, registry_row=None):
+    """Resolve where a direct-download provider's in-progress ``.part`` files land.
+
+    Defaults to an ``incomplete`` subdirectory of the provider's download
+    root, same as SLSKD's default. An operator can override it independently
+    via the provider's ``incomplete_root`` setting.
+    """
+
+    configured = str((registry_row or {}).get("incomplete_root") or "").strip()
+    if configured:
+        return PurePosixPath(configured.replace("\\", "/"))
+    return PurePosixPath(str(download_root)) / "incomplete"
+
+
+def direct_download_task_seed(candidate, staging_root, *, registry_row=None):
     candidate = candidate if isinstance(candidate, dict) else {}
     ext = normalize_extension(candidate.get("extension") or candidate.get("download_url"))
     filename = safe_filename_part(candidate.get("title") or candidate.get("canonical_item_id")) + (ext or "")
     provider_id = inkdrop_sources.provider_key(candidate.get("provider_id"))
-    root = PurePosixPath(str(staging_root or "/tmp/inkdrop-direct-staging").replace("\\", "/"))
-    local_path = root / provider_id / filename
+    download_root = direct_download_provider_root(staging_root, provider_id, registry_row)
+    incomplete_root = direct_download_incomplete_root(download_root, registry_row)
+    local_path = download_root / filename
+    partial_path = incomplete_root / (filename + ".part")
     return {
         "source": provider_id,
         "provider": provider_id,
@@ -1560,7 +1661,7 @@ def direct_download_task_seed(candidate, staging_root):
         "state": "queued",
         "save_path": str(local_path.parent),
         "local_path": str(local_path),
-        "partial_path": str(local_path) + ".part",
+        "partial_path": str(partial_path),
         "size_bytes": candidate.get("size_bytes"),
         "progress": 0,
         "download_url_hash": candidate.get("download_url_hash"),
@@ -1703,7 +1804,7 @@ def direct_candidate_attempt_seed(candidate, registry_row=None, staging_root=Non
         },
     }
     if artifact_safe:
-        task = direct_download_task_seed(candidate, staging_root)
+        task = direct_download_task_seed(candidate, staging_root, registry_row=registry_row)
         attempt.update(
             {
                 "protocol": task["protocol"],
@@ -2309,6 +2410,9 @@ def _prowlarr_age_seconds(result):
 
 def prowlarr_candidate_from_result(result, registry_row=None, wanted_item=None):
     result = result if isinstance(result, dict) else {}
+    original_download_url = str(first_value(result.get("downloadUrl"), result.get("download_url"), result.get("download")) or "").strip()
+    nested_credentials_redacted = prowlarr_url_has_nested_credentials(original_download_url)
+    result = prowlarr_durable_payload(result)
     registry_row = registry_row if isinstance(registry_row, dict) else {}
     wanted_item = wanted_item if isinstance(wanted_item, dict) else {}
     policy = provider_policy(registry_row)
@@ -2371,6 +2475,8 @@ def prowlarr_candidate_from_result(result, registry_row=None, wanted_item=None):
         "download_url": download_url,
         "magnet_url": magnet_url,
         "download_url_hash": url_hash(download_url or magnet_url or info_hash or guid),
+        "prowlarr_locator_credentials_redacted": bool(download_url),
+        "prowlarr_nested_credentials_redacted": nested_credentials_redacted,
         "guid": guid,
         "info_hash": info_hash,
         "protocol": protocol,
@@ -2461,6 +2567,7 @@ def authorized_prowlarr_download_url(candidate, registry_row=None):
     expected_hash = first_text(candidate.get("download_url_hash"), candidate.get("downloadUrlHash"))
     if (
         not provider_id.startswith("prowlarr_")
+        or candidate.get("prowlarr_nested_credentials_redacted") is True
         or not download_url
         or not base_url
         or not expected_hash
@@ -2499,9 +2606,13 @@ def authorized_prowlarr_download_url(candidate, registry_row=None):
         def query_has_value(*keys):
             return any(value for key in keys for value in query.get(key, []) if value)
 
-        if not query_has_value("apikey"):
+        has_api_key = query_has_value("apikey", "api_key", "api-key")
+        credential_free = candidate.get("prowlarr_locator_credentials_redacted") is True
+        if not has_api_key and not credential_free:
             return ""
-        if not query_has_value("link", "file", "guid"):
+        if not query_has_value("link") or not query_has_value("file"):
+            return ""
+        if any(value.lower().startswith(("http://", "https://")) for value in query.get("link", [])):
             return ""
     except (TypeError, ValueError):
         return ""
@@ -3037,6 +3148,11 @@ def indexer_candidate_verdict(candidate, registry_row=None):
         "unsupported_client": candidate_signal("supported_client") is False,
     }
     block_reasons.extend(reason for reason, present in explicit_hard_blocks.items() if present)
+    if candidate.get("prowlarr_nested_credentials_redacted") is True:
+        # Prowlarr proxy links are opaque protected tokens. A URL-valued link
+        # with its own credential cannot be reconstructed safely from durable
+        # state, so fail closed and require a fresh provider result.
+        block_reasons.append("credential_bearing_locator_requires_refresh")
     concrete_url = first_text(
         candidate.get("magnet_url"), candidate.get("magnetUrl"),
         candidate.get("download_url"), candidate.get("downloadUrl"),
@@ -7012,6 +7128,28 @@ def mangadex_manga_title_values(manga_row):
     return out
 
 
+def mangadex_relationship_creator_tokens(manga_row):
+    """Normalized token sets for each real author/artist MangaDex attached to
+    this work (requires includes[]=author,artist on the search request,
+    which mangadex_search_request always sends). Native-script/parenthetical
+    name variants (e.g. "Lee Eun-Jae (이은재)") collapse cleanly since
+    normalize_title drops non-ASCII-alphanumeric runs as separators.
+    """
+    manga_row = manga_row if isinstance(manga_row, dict) else {}
+    relationships = manga_row.get("relationships") if isinstance(manga_row.get("relationships"), list) else []
+    out = []
+    seen = set()
+    for relationship in relationships:
+        if not isinstance(relationship, dict) or relationship.get("type") not in ("author", "artist"):
+            continue
+        name = (relationship.get("attributes") or {}).get("name") if isinstance(relationship.get("attributes"), dict) else None
+        tokens = frozenset(token for token in inkdrop_sources.normalize_title(name).split() if len(token) > 1)
+        if tokens and tokens not in seen:
+            seen.add(tokens)
+            out.append(tokens)
+    return out
+
+
 def mangadex_manga_matches_wanted(manga_row, wanted_item=None, *, policy=None):
     wanted_item = wanted_item if isinstance(wanted_item, dict) else {}
     query_values = [
@@ -7033,12 +7171,38 @@ def mangadex_manga_matches_wanted(manga_row, wanted_item=None, *, policy=None):
     token_sets = [tokens for tokens in token_sets if tokens]
     if not token_sets:
         return True
+    title_matches = False
     for title in mangadex_manga_title_values(manga_row):
         haystack_tokens = set(inkdrop_sources.normalize_title(title).split())
         for query_tokens in token_sets:
             if all(token in haystack_tokens for token in query_tokens):
-                return True
-    return False
+                title_matches = True
+                break
+        if title_matches:
+            break
+    if not title_matches:
+        return False
+    # A broad alias search (e.g. "Monster" for "Naoki Urasawa's Monster") can
+    # title-match a same-titled but unrelated work. When the wanted item's
+    # own canonical identity names a creator, require this candidate's real
+    # MangaDex author/artist to agree before accepting -- but only when both
+    # sides actually have creator evidence to compare. A candidate with no
+    # author/artist relationship data (metadata gap, not a real signal) or a
+    # wanted item with no extractable creator name is left to the existing
+    # title-only check, unchanged.
+    expected_creator_tokens = frozenset(
+        token for token in inkdrop_sources.normalize_title(wanted_item.get("_mangadex_expected_creator")).split()
+        if len(token) > 1
+    )
+    if not expected_creator_tokens:
+        return True
+    candidate_creator_token_sets = mangadex_relationship_creator_tokens(manga_row)
+    if not candidate_creator_token_sets:
+        return True
+    return any(
+        expected_creator_tokens & candidate_tokens
+        for candidate_tokens in candidate_creator_token_sets
+    )
 
 
 def _mangadex_chapter_rows(payload):

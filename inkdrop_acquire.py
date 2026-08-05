@@ -850,12 +850,53 @@ def first_scalar(value):
     return value if value not in (None, "") else None
 
 
-def record_pending_import(query, media_type, chosen, outcome):
+def pending_artifact_identity(protocol, download_client, client_id, download_url_hash):
+    """A durable identity for the one physical transfer this record describes,
+    independent of the title/query text used to find it. client_id is the
+    download client's own handle for the transfer (a torrent hash or SAB
+    nzo_id) -- already unique per physical download -- namespaced by
+    protocol/client so two clients can never collide on a numeric id.
+    download_url_hash is kept as a fallback for outcomes that don't surface a
+    client id. Returns "" when neither is available (nothing durable to key
+    on), which callers must treat as "no stable identity", not a match key.
+    """
+    handle = str(client_id or "").strip()
+    if not handle:
+        return ""
+    basis = "|".join((str(protocol or "").strip().lower(), str(download_client or "").strip().lower(), handle))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def pending_target_identity(target):
+    """Stable series/issue/queue/Wanted identity for the row this download was
+    sent for, when the caller has one in scope. Tolerant of the different key
+    spellings used across callers (queue rows, manual-review items, watch
+    entries) -- absent fields are simply omitted, never guessed."""
+    target = target if isinstance(target, dict) else {}
+    identity = {}
+    for out_key, in_keys in (
+        ("target_queue_id", ("queue_id", "queueId", "id")),
+        ("target_wanted_id", ("wanted_id", "wantedId")),
+        ("target_series_id", ("series_id", "seriesId", "native_series_id", "inkdrop_series_id")),
+        ("target_issue_id", ("issue_id", "issueId", "native_issue_id")),
+    ):
+        for in_key in in_keys:
+            value = str(target.get(in_key) or "").strip()
+            if value:
+                identity[out_key] = value
+                break
+    return identity
+
+
+def record_pending_import(query, media_type, chosen, outcome, target=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     outcome = outcome if isinstance(outcome, dict) else {}
     nzo_id = first_scalar(outcome.get("nzo_id") or outcome.get("nzo_ids"))
     client_hash = first_scalar(outcome.get("client_hash") or outcome.get("hash") or outcome.get("hashes"))
     client_id = first_scalar(outcome.get("client_id") or client_hash or nzo_id)
+    download_url_hash = result_download_url_hash(chosen)
+    protocol = chosen.get("protocol")
+    download_client = outcome.get("download_client")
     record = {
         "event": "pending_import",
         "created_at": __import__("time").time(),
@@ -864,17 +905,19 @@ def record_pending_import(query, media_type, chosen, outcome):
         "title": chosen.get("title"),
         "indexer": chosen.get("indexer"),
         "indexerId": chosen.get("indexerId"),
-        "protocol": chosen.get("protocol"),
-        "download_client": outcome.get("download_client"),
+        "protocol": protocol,
+        "download_client": download_client,
         "client_id": client_id,
         "client_hash": client_hash,
         "nzo_id": nzo_id,
-        "download_url_hash": result_download_url_hash(chosen),
+        "download_url_hash": download_url_hash,
         "size": chosen.get("size"),
         "category": outcome.get("category"),
         "save_path": outcome.get("save_path"),
         "status": "sent",
+        "pending_artifact_id": pending_artifact_identity(protocol, download_client, client_id, download_url_hash),
     }
+    record.update(pending_target_identity(target))
     with PENDING_IMPORTS_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
     return record
@@ -1035,12 +1078,25 @@ def qbit_existing_result(torrent, *, category, save_path, handoff_tag, settings_
 
 def prowlarr_download_url_for_client(download_url):
     text = str(download_url or "")
-    if not PROWLARR_PUBLIC_BASE_URL:
-        return text
-    for internal in PROWLARR_INTERNAL_BASE_URLS:
-        if text.startswith(internal + "/"):
-            return PROWLARR_PUBLIC_BASE_URL + text[len(internal):]
-    return text
+    mapped = text
+    if PROWLARR_PUBLIC_BASE_URL:
+        for internal in PROWLARR_INTERNAL_BASE_URLS:
+            if text.startswith(internal + "/"):
+                mapped = PROWLARR_PUBLIC_BASE_URL + text[len(internal):]
+                break
+    try:
+        validated = prowlarr_nzb_fetch_url(mapped)
+        parsed = urllib.parse.urlsplit(mapped)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if validated and not any(str(key).lower() in {"apikey", "api_key", "api-key"} for key, _ in query):
+            api_key = load_prowlarr_key()
+            query.append(("apikey", api_key))
+            return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), ""))
+    except RuntimeError:
+        # The normal client/fetch path reports configuration failures with its
+        # existing bounded error contract; never guess an authority here.
+        pass
+    return mapped
 
 
 def qbit_add(

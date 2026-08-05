@@ -15,6 +15,7 @@ import re
 import shutil
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 
 import inkdrop_state
@@ -37,6 +38,39 @@ GENERIC_FOLDER_NAMES = {
     "complete",
     "completed",
 }
+
+
+def _series_match_key(value):
+    """Build a Unicode-safe key for matching a folder to a wanted series.
+
+    Source folders commonly use an ASCII spelling even when library metadata
+    retains a diacritic (for example ``Nausicaa`` versus ``Nausicaä``).  The
+    shared legacy title normalizer removes the accented character entirely,
+    so the two otherwise identical titles cannot meet in the wanted index.
+    NFKD plus casefold keeps the base letter and also preserves non-Latin
+    letters instead of reducing an entire title to an empty key.
+    """
+
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    characters = []
+    last_base = ""
+    for character in text:
+        if unicodedata.combining(character):
+            # Latin diacritics should fold to their ASCII base so metadata
+            # ``ä`` matches a source folder's ``a``.  For scripts where the
+            # mark is part of the letter identity (for example Japanese
+            # dakuten), retain it and compose the key again below.
+            if last_base and not last_base.isascii():
+                characters.append(character)
+            continue
+        if character.isalnum():
+            characters.append(character)
+            last_base = character
+        else:
+            characters.append(" ")
+            last_base = ""
+    key = re.sub(r"\s+", " ", "".join(characters)).strip()
+    return unicodedata.normalize("NFC", key)
 
 
 def _json_loads(value, default=None):
@@ -379,7 +413,7 @@ def parse_managed_folder_file(path, root):
         "source_path": str(path),
         "relative_path": str(path.relative_to(root)) if str(path).startswith(str(root)) else path.name,
         "series": _best_series_guess(path, root),
-        "series_key": inkdrop_sources.normalize_title(_best_series_guess(path, root)),
+        "series_key": _series_match_key(_best_series_guess(path, root)),
         "volume": _number_text(volume_match.group(1)) if volume_match else "",
         "chapter": _number_text(chapter_match.group(1)) if chapter_match else "",
         "language": language,
@@ -513,7 +547,7 @@ def load_active_wanted_index(db_path, queue_ids=None):
         ]
         unit = _unit_from_query(row["query"], raw_values)
         number = _wanted_number(unit, row["issue_number"], row["query"], raw_values)
-        series_key = inkdrop_sources.normalize_title(row["series_title"])
+        series_key = _series_match_key(row["series_title"])
         if not series_key or not number:
             continue
         key = (series_key, unit, number)

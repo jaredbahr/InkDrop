@@ -4,7 +4,6 @@ set -euo pipefail
 STATE_DIR="${INKDROP_STATE_DIR:-/state}"
 LOG_DIR="${INKDROP_LOG_DIR:-$STATE_DIR/logs}"
 LOG="${INKDROP_SOURCE_WORKER_LOG:-$LOG_DIR/inkdrop-source-worker.log}"
-LOG_MAX_BYTES="${INKDROP_SOURCE_WORKER_LOG_MAX_BYTES:-26214400}"
 PYTHON="${INKDROP_SOURCE_WORKER_PYTHON:-python3}"
 SCRIPT="${INKDROP_SOURCE_WORKER_SCRIPT:-/app/inkdrop_source_worker_service.py}"
 LOCK_WAIT_SECONDS="${INKDROP_SOURCE_WORKER_LOCK_WAIT_SECONDS:-180}"
@@ -37,9 +36,6 @@ else
 fi
 
 mkdir -p "$(dirname -- "$LOG")" "$LOCK_DIR"
-if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX_BYTES" ]; then
-  mv "$LOG" "$LOG.1"
-fi
 
 finish_source_worker_log() {
   local rc="${1:-0}"

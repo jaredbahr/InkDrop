@@ -8,6 +8,7 @@ import os
 import sqlite3
 import tempfile
 import contextlib
+import zipfile
 from pathlib import Path
 
 import inkdrop_backup_restore
@@ -75,6 +76,7 @@ def main():
         require(preview["ok"], f"restore preview should succeed: {preview}")
         require(preview["dry_run"] is True, "preview should be dry-run")
         require(preview["would_restore"]["state_db"] is True, "preview should include state DB")
+        require(preview["database_validation"]["state_db"]["quick_check"] == "ok", "preview must validate state DB integrity")
         require(preview["path_warnings"], "preview should warn when source paths are not remapped")
         require(not restore_config.exists(), "dry-run restore must not create config dir")
         require(not restore_state.exists(), "dry-run restore must not create state dir")
@@ -92,6 +94,7 @@ def main():
         require(restored_db.exists(), "restored state DB should exist")
         with contextlib.closing(sqlite3.connect(restored_db)) as con:
             row = con.execute("select value_json from app_settings where key=?", ("path.comic_root",)).fetchone()
+            require(con.execute("pragma quick_check").fetchone()[0] == "ok", "restored DB must pass quick_check")
         require(row and json.loads(row[0]) == str(library), "restored DB should preserve state contents")
         config_export = json.loads((restore_config / "inkdrop-config-export.json").read_text(encoding="utf-8"))
         secret_refs = json.loads((restore_config / "inkdrop-secret-refs.json").read_text(encoding="utf-8"))
@@ -129,8 +132,52 @@ def main():
         )
         require("pre_restore_snapshots" not in preview_after_apply, "a dry-run preview must not create or report any snapshot")
 
+        # A syntactically valid ZIP containing arbitrary bytes used to pass
+        # preview and overwrite the live state database.  Both preview and
+        # apply must reject it without changing the existing target.
+        corrupt_archive = root / "corrupt-state.zip"
+        with zipfile.ZipFile(archive, "r") as source, zipfile.ZipFile(corrupt_archive, "w") as corrupt:
+            for info in source.infolist():
+                payload = source.read(info.filename)
+                if info.filename == inkdrop_backup_restore.STATE_DB_ARCHIVE_NAME:
+                    payload = b"not-a-sqlite-database"
+                corrupt.writestr(info, payload)
+        before_corrupt_apply = restored_db.read_bytes()
+        for corrupt_apply in (False, True):
+            try:
+                inkdrop_backup_restore.restore_backup_archive(
+                    corrupt_archive,
+                    target_config_dir=restore_config,
+                    target_state_dir=restore_state,
+                    apply=corrupt_apply,
+                    backup_dir=restore_backups,
+                )
+            except ValueError as exc:
+                require("valid SQLite database" in str(exc), "corrupt DB rejection should explain the failure")
+            else:
+                raise AssertionError(f"corrupt state DB should be rejected (apply={corrupt_apply})")
+            require(restored_db.read_bytes() == before_corrupt_apply, "rejected restore must preserve current state DB")
+        require(not list(restore_state.glob(".inkdrop-restore-*")), "rejected restore must clean staged files")
+
+        # An archive without application state is not a successful InkDrop
+        # backup, even when redacted configuration can still be exported.
+        missing_state_backups = root / "missing-state-backups"
+        try:
+            inkdrop_backup_restore.create_backup_archive(
+                config_dir=config,
+                state_db_path=root / "missing-state.sqlite3",
+                backup_dir=missing_state_backups,
+                environ=env,
+                label="missing-state",
+            )
+        except ValueError as exc:
+            require("state database backup failed" in str(exc), "missing DB failure should be explicit")
+        else:
+            raise AssertionError("backup without a state DB must not report success")
+        require(not list(missing_state_backups.glob("*.zip")), "failed backup must not publish an archive")
+        require(not list(missing_state_backups.glob(".inkdrop-backup-*.tmp")), "failed backup must clean temporary archive")
+
         traversal = root / "bad.zip"
-        import zipfile
 
         with zipfile.ZipFile(traversal, "w") as zf:
             zf.writestr("../escape.txt", "nope")

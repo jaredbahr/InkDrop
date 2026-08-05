@@ -69,6 +69,20 @@ def main():
         require(inkdrop_auth.verify_password("x", inkdrop_auth.password_hash("x", policy=saved)), "one character works only when configured")
         expect_code("password_empty", lambda: inkdrop_auth.password_hash("", policy=saved))
 
+        inkdrop_auth.bootstrap_admin(db, "shortadmin", "x")
+        legacy_hash = inkdrop_auth.password_hash("x", iterations=260_000, policy=saved)
+        auth_db = inkdrop_auth.auth_store_path(db)
+        with sqlite3.connect(auth_db) as con:
+            con.execute("update auth_users set password_hash=? where username='shortadmin'", (legacy_hash,))
+        require(inkdrop_auth.password_needs_rehash(legacy_hash), "fixture hash must require an iteration upgrade")
+        save_minimum(db, 128)
+        login_result = inkdrop_auth.login(db, "shortadmin", "x")
+        require(login_result["ok"], "a verified existing password must survive opportunistic rehash")
+        with sqlite3.connect(auth_db) as con:
+            upgraded_hash = con.execute("select password_hash from auth_users where username='shortadmin'").fetchone()[0]
+        require(inkdrop_auth.verify_password("x", upgraded_hash), "rehash must preserve the existing credential")
+        require(not inkdrop_auth.password_needs_rehash(upgraded_hash), "login must upgrade the legacy iteration count")
+
         with sqlite3.connect(db) as con:
             con.execute("delete from app_settings where key='auth.password_min_length'")
         inkdrop_auth.clear_config_cache()

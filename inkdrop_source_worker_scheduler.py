@@ -10,6 +10,7 @@ import contextlib
 import json
 import time
 
+import inkdrop_source_registry
 import inkdrop_source_worker_coordinator as coordinator
 import inkdrop_sources
 import inkdrop_state
@@ -27,6 +28,13 @@ def _borrowed_or_read_con(db_path, con=None):
 
 
 CONTRACT_VERSION = 1
+
+# Ordinary provider acquisition is only for a Wanted item that still wants
+# something. Once it's satisfied/ignored/suppressed/superseded, or the linked
+# row is gone, spending scheduler slots and provider calls on its queue row
+# just risks a duplicate download. Reuses inkdrop_state's own retirement
+# vocabulary instead of inventing a second list that can drift from it.
+WANTED_TERMINAL_STATUSES = inkdrop_state.WANTED_RETIRED_STATUSES
 
 ACTIVE_HANDOFF_STATES = {"queued", "downloading", "import_ready", "importing"}
 DEFAULT_ACTIVE_HANDOFF_STALE_SECONDS = 12 * 60 * 60
@@ -134,6 +142,11 @@ NON_TERMINAL_SOURCE_ATTEMPT_OUTCOMES = {
 
 NON_ATTEMPT_SOURCE_ATTEMPT_KINDS = {
     "source_runtime_budget_skipped",
+    # Routine queue-sync bookkeeping (inkdrop_state.queue_activity_attempt()), not a
+    # real provider call -- it inherits a real provider name via current_source, so
+    # without this exclusion it creates a false provider cooldown and inflates
+    # attempt/terminal-attempt history counts on every queue-sync pass.
+    "queue_activity",
 }
 
 NON_ATTEMPT_SOURCE_ATTEMPT_REASON_PREFIXES = (
@@ -245,8 +258,13 @@ def _queue_rows(
     now = time.time() if now is None else now
     queue_ids = [str(value).strip() for value in _list(queue_ids) if str(value or "").strip()]
     states = [str(value).strip() for value in _list(states) if str(value or "").strip()]
-    clauses = ["q.active=1"]
-    params = []
+    terminal_wanted_statuses = sorted(WANTED_TERMINAL_STATUSES)
+    clauses = [
+        "q.active=1",
+        "(q.wanted_id is null or (w.id is not null and lower(coalesce(w.status,'')) not in (%s)))"
+        % ",".join("?" for _ in terminal_wanted_statuses),
+    ]
+    params = list(terminal_wanted_statuses)
     if queue_ids:
         clauses.append("q.id in (%s)" % ",".join("?" for _ in queue_ids))
         params.extend(queue_ids)
@@ -1803,6 +1821,16 @@ def _classify_queue_plan(
 ):
     row = _dict(row)
     now = time.time() if now is None else now
+    wanted_id = row.get("wanted_id")
+    wanted_status = _lower(row.get("wanted_status"))
+    if wanted_id and (not wanted_status or wanted_status in WANTED_TERMINAL_STATUSES):
+        return {
+            "status": "terminal_wanted",
+            "blocker": f"linked Wanted item is {wanted_status or 'missing'}, not actionable",
+            "next_action": "Retire this queue row; ordinary acquisition does not run against a satisfied/retired Wanted item.",
+            "selected_jobs": [],
+            "wanted_status": wanted_status or None,
+        }
     jobs = list(jobs or [])
     cooled_jobs = list(cooled_jobs or [])
     attempt_cooldowns = attempt_cooldowns if isinstance(attempt_cooldowns, dict) else {}
@@ -2010,6 +2038,16 @@ def source_worker_queue_plan(
         provider_health_map = {}
         if inkdrop_state.table_exists(con, "history_events"):
             provider_health_map = inkdrop_state.latest_provider_health_map(con)
+        # settings_snapshot/registry are identical for every row in this pass
+        # (both depend only on the pass-wide provider_health_map above, not on
+        # any one queue row), so build them once instead of once per row --
+        # this used to be the dominant cost of planning a normal-sized pass.
+        settings_snapshot = inkdrop_state.settings_snapshot(db_path)
+        registry_rows = inkdrop_source_registry.registry_from_settings_snapshot(
+            settings_snapshot,
+            include_disabled=True,
+            provider_health_map=provider_health_map,
+        )
         hydrated_queue_items = coordinator.queue_items_by_id(db_path, row_queue_ids, con=con)
         singleton_contexts = coordinator.singleton_issue_contexts_by_series_id(
             db_path,
@@ -2039,6 +2077,8 @@ def source_worker_queue_plan(
                 job_limit=job_limit,
                 queue=hydrated_queue_items.get(queue_id),
                 provider_health_map=provider_health_map,
+                settings_snapshot=settings_snapshot,
+                registry_rows=registry_rows,
                 singleton_context=singleton_contexts.get(series_id),
                 con=con,
             )

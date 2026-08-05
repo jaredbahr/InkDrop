@@ -29,6 +29,17 @@ DOWNLOAD_TASK_SCAN_LIMIT = 500
 TASK_WATCH_PREFIX = "dt:"
 TASK_WATCH_RETENTION_SECONDS = 30 * 86400
 
+# A queue in one of these states (or inactive) has no automatic path left --
+# matches the same terminal-state vocabulary inkdrop_slskd_source_probe.py
+# already uses to decide which queues are still worth reconciling. Anything
+# else (searching, downloading, importing, retry-scheduled, etc.) means the
+# canonical unit can still complete through another source or candidate, so
+# a failed attempt there must not be announced as an item-level failure.
+QUEUE_TERMINAL_STATES = {
+    "verified", "satisfied", "superseded_duplicate", "removed",
+    "ignored", "inactive", "needs_you", "blocked",
+}
+
 HEALTH_CHECK_PROVIDERS = (
     ("comicvine", "ComicVine"),
     ("kavita", "Kavita"),
@@ -64,12 +75,20 @@ def scan_grabbed_and_download_failed(db_path):
     try:
         rows = con.execute(
             """
-            select dt.id, dt.series_id, dt.issue_id, dt.state, dt.retry_eligible,
+            select dt.id, dt.series_id, dt.issue_id, dt.queue_id, dt.state, dt.retry_eligible,
                    dt.failure_reason, dt.updated_at,
-                   s.title as series_title, i.issue_number, i.title as issue_title
+                   s.title as series_title, i.issue_number, i.title as issue_title,
+                   q.active as queue_active, q.state as queue_state, q.retry_after as queue_retry_after,
+                   (
+                       select count(*) from download_tasks sib
+                       where sib.queue_id = dt.queue_id
+                         and sib.id <> dt.id
+                         and sib.state in ('downloading', 'import_ready', 'importing', 'verified')
+                   ) as active_sibling_tasks
             from download_tasks dt
             left join series s on s.id = dt.series_id
             left join issues i on i.id = dt.issue_id
+            left join queue_items q on q.id = dt.queue_id
             where dt.state in ('downloading', 'failed') and dt.updated_at > ?
             order by dt.updated_at asc
             limit ?
@@ -99,9 +118,24 @@ def scan_grabbed_and_download_failed(db_path):
             store.set_watch_state(db_path, task_key, seen)
         elif row["state"] == "failed" and int(row["retry_eligible"] or 0) == 0:
             if seen.get("grabbed_announced") and not seen.get("failed_announced"):
+                queue_active = row["queue_active"]
+                queue_state = str(row["queue_state"] or "").strip().lower()
+                # A missing queue_items row (queue_active is None -- the join
+                # found nothing) means we can't prove the canonical unit is
+                # still retryable, so default to terminal wording rather than
+                # silently understating a real permanent failure.
+                queue_terminal = (
+                    queue_active is None
+                    or int(queue_active or 0) == 0
+                    or queue_state in QUEUE_TERMINAL_STATES
+                )
+                has_retry_scheduled = bool(row["queue_retry_after"])
+                has_active_sibling = int(row["active_sibling_tasks"] or 0) > 0
+                terminal = queue_terminal and not has_retry_scheduled and not has_active_sibling
                 inkdrop_notifications.notify_download_failed(
                     db_path, series=series_title, issue_label=issue_label, reason=row["failure_reason"],
                     series_id=row["series_id"], issue_id=row["issue_id"], task_id=row["id"],
+                    terminal=terminal,
                 )
                 fired["download_failed"] += 1
                 seen["failed_announced"] = True

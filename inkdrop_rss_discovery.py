@@ -548,7 +548,7 @@ def query_variants(missing, series_aliases):
     return queries
 
 
-def send(acquire, chosen, query, dry_run):
+def send(acquire, chosen, query, dry_run, target=None):
     title = chosen.get("title") or "unknown"
     if dry_run:
         return {"dry_run": True, "category": "comics"}
@@ -559,7 +559,7 @@ def send(acquire, chosen, query, dry_run):
         outcome = acquire.sab_add(url, title, dry_run=False)
     else:
         raise RuntimeError(f"unsupported protocol: {chosen.get('protocol')}")
-    acquire.record_pending_import(query, "comics", chosen, outcome if isinstance(outcome, dict) else {})
+    acquire.record_pending_import(query, "comics", chosen, outcome if isinstance(outcome, dict) else {}, target=target)
     return outcome
 
 
@@ -1110,7 +1110,7 @@ def discover_rss(args):
         )
         if is_high:
             try:
-                outcome = send(acquire, result, prowlarr["query"], args.dry_run)
+                outcome = send(acquire, result, prowlarr["query"], args.dry_run, target=row)
                 action = {
                     "series": series,
                     "issue": issue,
@@ -1175,7 +1175,7 @@ def discover_rss(args):
 def main():
     apply_rss_provider_settings()
     parser = argparse.ArgumentParser(description="Respectful RSS discovery for InkDrop")
-    parser.add_argument("--series", action="append", default=[], help="limit Kapowarr monitored series set")
+    parser.add_argument("--series", action="append", default=[], help="limit run to InkDrop's watched series set")
     parser.add_argument("--only", action="append", default=[], help="filter processed series by exact title")
     parser.add_argument("--fresh-days", type=float)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)

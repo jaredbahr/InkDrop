@@ -2317,7 +2317,12 @@ def assert_runtime_optional_root_failures_do_not_crash_web_startup():
 
 
 def assert_web_uses_runtime_config():
-    text = (Path(__file__).resolve().parents[1] / "inkdrop_web.py").read_text(encoding="utf-8")
+    # inkdrop_web_config.py holds the module-level runtime-config-backed
+    # constants (HOST/PORT/STATE_DIR/etc.) that used to live directly in
+    # inkdrop_web.py; every check below spans both files.
+    web_text = (Path(__file__).resolve().parents[1] / "inkdrop_web.py").read_text(encoding="utf-8")
+    config_text = (Path(__file__).resolve().parents[1] / "inkdrop_web_config.py").read_text(encoding="utf-8")
+    text = web_text + config_text
     require("import inkdrop_runtime_config" in text, "web runtime imports inkdrop_runtime_config")
     require("HOST = inkdrop_runtime_config.web_host()" in text, "web host is runtime-config-backed")
     require("PORT = inkdrop_runtime_config.web_port(strict=False)" in text, "web import should not crash on invalid port config")
@@ -2333,7 +2338,11 @@ def assert_web_uses_runtime_config():
     require('base_url=os.environ.get("INKDROP_PROWLARR_URL") or ""' in text, "runtime Prowlarr provider template should use configured URL")
     require('base_url=SLSKD_API_BASE_URL' in text, "runtime SLSKD provider template should use configured URL")
     require('runtimePath("slskd_web_url", "")' in text, "Open SLSKD actions should not default to localhost")
-    startup_defaults = "\n".join(text.splitlines()[:450])
+    # The startup-defaults region used to be inkdrop_web.py's own first ~450
+    # lines; it now lives in inkdrop_web_config.py instead, so scan that
+    # file's full content (it's constants/paths only, not the large embedded
+    # HTML/JS body) plus web_text's own leading lines for anything left there.
+    startup_defaults = "\n".join(web_text.splitlines()[:450]) + config_text
     for token in PRIVATE_TOKENS:
         require(token not in startup_defaults, f"web startup defaults contain private token {token}")
 
@@ -2349,7 +2358,7 @@ def assert_optional_adapter_defaults_are_explicit():
     reconcile = (root / "inkdrop_reconcile_imports.py").read_text(encoding="utf-8")
     require('KAVITA_API = os.environ.get("INKDROP_KAVITA_URL") or ""' in completed_import, "Kavita importer URL should be blank unless configured")
     require('KOMGA_API = os.environ.get("INKDROP_KOMGA_URL") or ""' in completed_import, "Komga importer URL should be blank unless configured")
-    require('"qBittorrent URL is not configured' in completed_import, "completed import qBittorrent checks should report missing URL clearly")
+    require('inkdrop_acquire.load_qbit_settings()' in completed_import, "completed import should delegate to the shared qBittorrent settings loader instead of duplicating it")
     require('DEFAULT_SLSKD_BASE_URL = os.environ.get("INKDROP_SLSKD_API_BASE_URL") or ""' in slskd_probe, "SLSKD probe URL should be blank unless configured")
     require('SLSKD_BASE_URL = os.environ.get("INKDROP_SLSKD_API_BASE_URL") or ""' in manual_autoresolve, "SLSKD autoresolver URL should be blank unless configured")
     require("SLSKD API base URL is not configured" in slskd_probe, "SLSKD probe should report missing URL clearly")

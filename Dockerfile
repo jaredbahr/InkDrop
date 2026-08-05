@@ -1,3 +1,17 @@
+# Built once, natively, and reused for every target platform below -- the
+# output is plain static JS/CSS with no architecture-specific code, so
+# running this stage under arm64 QEMU emulation as well would only double
+# build time for no benefit.
+FROM --platform=$BUILDPLATFORM node:20-slim AS frontend-builder
+
+WORKDIR /app/web/frontend
+
+COPY web/frontend/package.json web/frontend/package-lock.json ./
+RUN npm ci
+
+COPY web/frontend/ ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 ARG INKDROP_VERSION=dev
@@ -56,6 +70,7 @@ COPY inkdrop-logo-mark.png ./
 COPY web/static/css/inkdrop.css ./web/static/css/inkdrop.css
 COPY web/static/img/inkdrop-auth-backdrop.webp ./web/static/img/inkdrop-auth-backdrop.webp
 COPY web/static/js/ ./web/static/js/
+COPY --from=frontend-builder /app/web/static/dist ./web/static/dist
 COPY \
     inkdrop_acquire_adapter.py \
     inkdrop_archive_conversion.py \
@@ -84,6 +99,7 @@ COPY \
     inkdrop_client_status.py \
     inkdrop_effective_config.py \
     inkdrop_language.py \
+    inkdrop_log_retention.py \
     inkdrop_library_adoption.py \
     inkdrop_library_frontends.py \
     inkdrop_library_identity.py \
@@ -104,8 +120,10 @@ COPY \
     inkdrop_pack_import.py \
     inkdrop_page_pack_downloader.py \
     inkdrop_operator_contracts.py \
+    inkdrop_opds.py \
     inkdrop_folder_cleanup.py \
     inkdrop_log_export.py \
+    inkdrop_support_bundle.py \
     inkdrop_portability_export.py \
     inkdrop_process_lifecycle.py \
     inkdrop_preflight.py \
@@ -121,6 +139,7 @@ COPY \
     inkdrop_series_autopilot.py \
     inkdrop_service_inventory.py \
     inkdrop_slskd_source_probe.py \
+    inkdrop_slskd_root_health.py \
     inkdrop_slskd_staging_sweep.py \
     inkdrop_candidate_matching.py \
     inkdrop_source_catalog.py \
@@ -142,12 +161,14 @@ COPY \
     inkdrop_activity.py \
     inkdrop_staged_projection.py \
     inkdrop_deferred_sync.py \
+    inkdrop_credential_evidence_cleanup.py \
     inkdrop_issue_identity.py \
     inkdrop_state.py \
     inkdrop_state_maintenance.py \
     inkdrop_transfer.py \
     inkdrop_suwayomi_managed_folder.py \
     inkdrop_version.py \
+    inkdrop_web_config.py \
     inkdrop_web_state_views.py \
     inkdrop_web.py \
     ./

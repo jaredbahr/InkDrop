@@ -87,8 +87,15 @@ with tempfile.TemporaryDirectory() as temp_dir:
         require(settled == 1, f"a notification failure must not block settlement, got settled={settled}")
 
     # 3. append_manual_review (inkdrop_completed_import) calls notify_manual_review
-    #    when it actually persists a record.
-    with mock.patch.object(inkdrop_notifications, "notify_manual_review") as notify_mock:
+    #    when it actually persists a record. Points the write-time dedup store at
+    #    this run's temp dir -- it lives under the real STATE_DIR by default, so a
+    #    prior run on the same machine within the 6-hour dedup window would
+    #    otherwise suppress this notify and fail the assertion below.
+    review_file = Path(temp_dir) / "manual-review.jsonl"
+    dedup_file = Path(temp_dir) / "manual-review-dedup.json"
+    with mock.patch.object(inkdrop_notifications, "notify_manual_review") as notify_mock, \
+         mock.patch.object(inkdrop_completed_import, "REVIEW_FILE", review_file), \
+         mock.patch.object(inkdrop_completed_import, "MANUAL_REVIEW_DEDUP_FILE", dedup_file):
         inkdrop_completed_import.append_manual_review(
             "candidate_title_mismatch",
             {"series": "Court of Owls", "source": "slskd", "detail": "wrong edition"},
@@ -100,8 +107,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
     require(call_kwargs.get("series") == "Court of Owls", f"wrong series: {call_kwargs}")
 
     # 4. append_manual_review (inkdrop_pack_import) calls notify_manual_review
-    #    for a normal review reason...
-    with mock.patch.object(inkdrop_notifications, "notify_manual_review") as notify_mock:
+    #    for a normal review reason... Same real-STATE_DIR-by-default trap as
+    #    inkdrop_completed_import above -- pack_import writes MANUAL_REVIEW_FILE
+    #    unconditionally (no dedup gate), so an unpatched run just bloats the
+    #    real log on repeat invocations instead of failing outright.
+    pack_review_file = Path(temp_dir) / "manual-review.jsonl"
+    with mock.patch.object(inkdrop_notifications, "notify_manual_review") as notify_mock, \
+         mock.patch.object(inkdrop_pack_import, "MANUAL_REVIEW_FILE", pack_review_file):
         inkdrop_pack_import.append_manual_review(
             "pack_ambiguous_issue",
             {"series": "Gods Lie", "source": "prowlarr"},
@@ -111,7 +123,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
     # ...but NOT for the pack_import_bad_archive short-circuit that skips
     # persisting entirely (the notify call sits after the write, matching it).
-    with mock.patch.object(inkdrop_notifications, "notify_manual_review") as notify_mock:
+    with mock.patch.object(inkdrop_notifications, "notify_manual_review") as notify_mock, \
+         mock.patch.object(inkdrop_pack_import, "MANUAL_REVIEW_FILE", pack_review_file):
         inkdrop_pack_import.append_manual_review(
             "pack_import_bad_archive",
             {"series": "Gods Lie"},

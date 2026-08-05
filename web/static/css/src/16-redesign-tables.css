@@ -1,0 +1,252 @@
+/* Table row treatment for the five redesigned pages: filled status badges,
+   rounder cover thumbnails, circular icon actions, softer group headers.
+   The underlying row/lane-header/badge components already exist and are
+   shared app-wide (.section-table-row, .section-table-lane-header,
+   .core-state, .arr-table-icon-button) -- this restyles them in place
+   rather than introducing a parallel table system, scoped to the five
+   redesigned views so every other table (Series, Sources, Imports, etc.)
+   keeps its current look. */
+@media (min-width: 1100px) {
+  body[data-inkdrop-view="queue"] .section-table,
+  body[data-inkdrop-view="wanted"] .section-table,
+  body[data-inkdrop-view="history"] .section-table,
+  body[data-inkdrop-view="source_memory"] .section-table,
+  body[data-inkdrop-view="manual_review"] .section-table {
+    border-radius: 10px;
+    background: var(--panel);
+  }
+  body[data-inkdrop-view="queue"] .section-table-row,
+  body[data-inkdrop-view="wanted"] .section-table-row,
+  body[data-inkdrop-view="history"] .section-table-row,
+  body[data-inkdrop-view="source_memory"] .section-table-row,
+  body[data-inkdrop-view="manual_review"] .section-table-row {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+  body[data-inkdrop-view="queue"] .section-table-row:hover,
+  body[data-inkdrop-view="wanted"] .section-table-row:hover,
+  body[data-inkdrop-view="history"] .section-table-row:hover,
+  body[data-inkdrop-view="source_memory"] .section-table-row:hover,
+  body[data-inkdrop-view="manual_review"] .section-table-row:hover {
+    background: rgba(255, 255, 255, .025);
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header,
+  body[data-inkdrop-view="history"] .section-table-lane-header,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header {
+    padding: 9px 14px;
+    background: transparent;
+    font-weight: var(--weight-semibold, 700);
+  }
+  body[data-inkdrop-view="queue"] .series-art.table,
+  body[data-inkdrop-view="wanted"] .series-art.table,
+  body[data-inkdrop-view="history"] .series-art.table,
+  body[data-inkdrop-view="source_memory"] .series-art.table,
+  body[data-inkdrop-view="manual_review"] .series-art.table {
+    width: 40px;
+    border-radius: 6px;
+  }
+  /* Status badges: filled tone background instead of an outline, matching
+     the mockups' solid Downloading/Importing/Verified/Failed pills.
+     .section-table-lane-pill/-intent/-status-badge/-bucket-badge and
+     .core-state are the several existing pill components rows use depending
+     on view; .auto is that family's name for the accent/blue tone. */
+  body[data-inkdrop-view="queue"] .core-state,
+  body[data-inkdrop-view="wanted"] .core-state,
+  body[data-inkdrop-view="history"] .core-state,
+  body[data-inkdrop-view="source_memory"] .core-state,
+  body[data-inkdrop-view="manual_review"] .core-state,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill,
+  body[data-inkdrop-view="history"] .section-table-lane-pill,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill,
+  body[data-inkdrop-view="queue"] .section-table-intent,
+  body[data-inkdrop-view="wanted"] .section-table-intent,
+  body[data-inkdrop-view="history"] .section-table-intent,
+  body[data-inkdrop-view="source_memory"] .section-table-intent,
+  body[data-inkdrop-view="manual_review"] .section-table-intent,
+  body[data-inkdrop-view="queue"] .section-table-status-badge,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge,
+  body[data-inkdrop-view="history"] .section-table-status-badge,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge {
+    border-color: transparent;
+    background: rgba(114, 210, 255, .16);
+    color: var(--accent);
+    font-weight: var(--weight-semibold, 700);
+  }
+  body[data-inkdrop-view="queue"] .core-state.good,
+  body[data-inkdrop-view="wanted"] .core-state.good,
+  body[data-inkdrop-view="history"] .core-state.good,
+  body[data-inkdrop-view="source_memory"] .core-state.good,
+  body[data-inkdrop-view="manual_review"] .core-state.good,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge.good,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="history"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill.good,
+  body[data-inkdrop-view="queue"] .section-table-intent.good,
+  body[data-inkdrop-view="wanted"] .section-table-intent.good,
+  body[data-inkdrop-view="history"] .section-table-intent.good,
+  body[data-inkdrop-view="source_memory"] .section-table-intent.good,
+  body[data-inkdrop-view="manual_review"] .section-table-intent.good,
+  body[data-inkdrop-view="queue"] .section-table-status-badge.good,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge.good,
+  body[data-inkdrop-view="history"] .section-table-status-badge.good,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge.good,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge.good {
+    background: rgba(120, 217, 155, .16);
+    color: var(--good);
+  }
+  body[data-inkdrop-view="queue"] .core-state.warn,
+  body[data-inkdrop-view="wanted"] .core-state.warn,
+  body[data-inkdrop-view="history"] .core-state.warn,
+  body[data-inkdrop-view="source_memory"] .core-state.warn,
+  body[data-inkdrop-view="manual_review"] .core-state.warn,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge.warn,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="history"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill.warn,
+  body[data-inkdrop-view="queue"] .section-table-intent.warn,
+  body[data-inkdrop-view="wanted"] .section-table-intent.warn,
+  body[data-inkdrop-view="history"] .section-table-intent.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-intent.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-intent.warn,
+  body[data-inkdrop-view="queue"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="history"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge.warn,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge.warn {
+    background: rgba(247, 201, 111, .16);
+    color: var(--warn);
+  }
+  body[data-inkdrop-view="queue"] .core-state.bad,
+  body[data-inkdrop-view="wanted"] .core-state.bad,
+  body[data-inkdrop-view="history"] .core-state.bad,
+  body[data-inkdrop-view="source_memory"] .core-state.bad,
+  body[data-inkdrop-view="manual_review"] .core-state.bad,
+  body[data-inkdrop-view="queue"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="wanted"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="history"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-bucket-badge.bad,
+  body[data-inkdrop-view="queue"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="wanted"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="history"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-pill.bad,
+  body[data-inkdrop-view="queue"] .section-table-intent.bad,
+  body[data-inkdrop-view="wanted"] .section-table-intent.bad,
+  body[data-inkdrop-view="history"] .section-table-intent.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-intent.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-intent.bad,
+  body[data-inkdrop-view="queue"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="wanted"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="history"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="source_memory"] .section-table-status-badge.bad,
+  body[data-inkdrop-view="manual_review"] .section-table-status-badge.bad {
+    background: rgba(255, 125, 125, .16);
+    color: var(--bad);
+  }
+  /* Icon actions: round, compact, icon-only buttons instead of bordered
+     rectangles -- matches the mockups' trailing pause/folder/eye/more rail. */
+  body[data-inkdrop-view="queue"] .arr-table-icon-button,
+  body[data-inkdrop-view="wanted"] .arr-table-icon-button,
+  body[data-inkdrop-view="history"] .arr-table-icon-button,
+  body[data-inkdrop-view="source_memory"] .arr-table-icon-button,
+  body[data-inkdrop-view="manual_review"] .arr-table-icon-button {
+    min-width: 30px;
+    min-height: 30px;
+    border-radius: 999px;
+    border-color: transparent;
+    background: transparent;
+  }
+  body[data-inkdrop-view="queue"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="wanted"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="history"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="source_memory"] .arr-table-icon-button:hover,
+  body[data-inkdrop-view="manual_review"] .arr-table-icon-button:hover {
+    background: rgba(255, 255, 255, .06);
+    border-color: transparent;
+  }
+  /* Lane-header glyph + tinted label, matching the mockups' colored
+     "Downloading / Importing / Waiting" group headings. The glyph masks the
+     shared --arr-glyph-* artwork (15-redesign-shell.css) and rides
+     currentColor, so tinting the label tints the glyph with it. Keyed on the
+     lane keys renderInkdropTableLaneHeader() stamps into data-table-lane;
+     lanes without a mapping keep a plain dot so a new lane never renders an
+     unmasked square. */
+  body[data-inkdrop-view="queue"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="history"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header strong::before,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header strong::before {
+    content: "";
+    display: inline-block;
+    width: 13px;
+    height: 13px;
+    margin-right: 6px;
+    vertical-align: -2px;
+    background: currentColor;
+    -webkit-mask: var(--arr-lane-glyph, radial-gradient(circle at center, #000 0 34%, transparent 36%)) center / contain no-repeat;
+    mask: var(--arr-lane-glyph, radial-gradient(circle at center, #000 0 34%, transparent 36%)) center / contain no-repeat;
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="history"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header.good strong,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header.good strong {
+    color: var(--good);
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="history"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header.warn strong,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header.warn strong {
+    color: var(--warn);
+  }
+  body[data-inkdrop-view="queue"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="wanted"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="history"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="source_memory"] .section-table-lane-header.bad strong,
+  body[data-inkdrop-view="manual_review"] .section-table-lane-header.bad strong {
+    color: var(--bad);
+  }
+  .section-table-lane-header[data-table-lane="queue-work"],
+  .section-table-lane-header[data-table-lane="wanted-moving"] { --arr-lane-glyph: var(--arr-glyph-cloud-download); }
+  .section-table-lane-header[data-table-lane="queue-automatic"],
+  .section-table-lane-header[data-table-lane="queue-retry"],
+  .section-table-lane-header[data-table-lane="wanted-retry"] { --arr-lane-glyph: var(--arr-glyph-refresh); }
+  .section-table-lane-header[data-table-lane="queue-provider-wait"],
+  .section-table-lane-header[data-table-lane="wanted-provider-wait"],
+  .section-table-lane-header[data-table-lane="manual-parked"] { --arr-lane-glyph: var(--arr-glyph-clock); }
+  .section-table-lane-header[data-table-lane="queue-no-candidate"],
+  .section-table-lane-header[data-table-lane="wanted-no-candidate"],
+  .section-table-lane-header[data-table-lane="wanted-missing"],
+  .section-table-lane-header[data-table-lane="manual-source"] { --arr-lane-glyph: var(--arr-glyph-search); }
+  .section-table-lane-header[data-table-lane="queue-covered"],
+  .section-table-lane-header[data-table-lane="wanted-covered"] { --arr-lane-glyph: var(--arr-glyph-check); }
+  .section-table-lane-header[data-table-lane="queue-attention"],
+  .section-table-lane-header[data-table-lane="wanted-needs-user"],
+  .section-table-lane-header[data-table-lane="manual-decision"] { --arr-lane-glyph: var(--arr-glyph-alert); }
+  .section-table-lane-header[data-table-lane="manual-blocked"] { --arr-lane-glyph: var(--arr-glyph-x); }
+  .section-table-lane-header[data-table-lane="manual-ready-import"] { --arr-lane-glyph: var(--arr-glyph-upload); }
+}

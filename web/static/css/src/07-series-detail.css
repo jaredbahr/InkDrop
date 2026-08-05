@@ -1179,6 +1179,75 @@
     .manual-review-decision-body {
       gap: 14px;
     }
+    .manual-review-decision-heading {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+    .manual-review-evidence-columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+    }
+    .manual-review-evidence-column {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .manual-review-evidence-column h4 {
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+    @media (max-width: 640px) {
+      .manual-review-evidence-columns {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+    .manual-review-decision-advanced {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 2px 10px;
+    }
+    .manual-review-decision-advanced summary {
+      cursor: pointer;
+      padding: 6px 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+    }
+    .manual-review-decision-actions-secondary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 4px 0 10px;
+    }
+    .manual-review-decision-actions-secondary button {
+      display: grid;
+      gap: 2px;
+      align-content: center;
+      min-height: 38px;
+      padding: 6px 10px;
+      text-align: left;
+    }
+    .manual-review-decision-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 16px;
+      border-top: 1px solid var(--line);
+    }
+    .manual-review-decision-nav span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
     .manual-review-decision-grid {
       display: grid;
       grid-template-columns: minmax(140px, .32fr) minmax(0, 1fr);

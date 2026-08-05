@@ -262,6 +262,27 @@ def _task_raw_json(download_task):
     return raw if isinstance(raw, dict) else {}
 
 
+def _page_pack_task_seed(download_task):
+    """The nested download_task_seed capsule, as persisted by the recorder.
+
+    reader_page_pack_attempt_seed() puts the executable task seed (with the
+    page_pack_task/download_guard markers under its own raw_json, and its
+    own local_path/partial_path/provider/identity fields at this level)
+    under raw.download_task_seed, and download_task_from_attempt()
+    serializes that whole normalized attempt as the task's own raw_json --
+    so a persisted row's markers live here, not at the task raw's own root.
+    _candidate_from_task() already reads the candidate from this same
+    nested location; this mirrors it for the provenance markers and the
+    seed's own recorded path/identity fields, which prove the capsule
+    wasn't tampered with before a rebase trusts it.
+    """
+
+    raw = _task_raw_json(download_task)
+    nested_raw = raw.get("raw") if isinstance(raw.get("raw"), dict) else raw
+    seed = nested_raw.get("download_task_seed") if isinstance(nested_raw.get("download_task_seed"), dict) else {}
+    return seed
+
+
 def owned_page_pack_rebase_target(download_task, staging_root):
     """Rebuild only an exact InkDrop discovery-default page-pack target."""
     task = download_task if isinstance(download_task, dict) else {}
@@ -270,8 +291,12 @@ def owned_page_pack_rebase_target(download_task, staging_root):
     if not str(staging_root or "").strip():
         return None
     raw = _task_raw_json(task)
+    seed = _page_pack_task_seed(task)
+    seed_raw = seed.get("raw_json") if isinstance(seed.get("raw_json"), dict) else {}
     candidate = _candidate_from_task(task)
-    modern_provenance = raw.get("page_pack_task") is True and raw.get("download_guard") == "reader_page_pack_verdict"
+    root_modern_provenance = raw.get("page_pack_task") is True and raw.get("download_guard") == "reader_page_pack_verdict"
+    nested_modern_provenance = seed_raw.get("page_pack_task") is True and seed_raw.get("download_guard") == "reader_page_pack_verdict"
+    modern_provenance = root_modern_provenance or nested_modern_provenance
     legacy_provenance = bool(
         raw.get("artifact_safe") is True
         and str(raw.get("auto_grab_verdict") or "").strip().lower() == "auto_grab_safe"
@@ -310,17 +335,42 @@ def owned_page_pack_rebase_target(download_task, staging_root):
         if raw_identity != identity or any(value != provider_id for value in raw_provider_values):
             return None
 
-    legacy = providers.reader_page_pack_task_seed(candidate, None)
-    supplied_local = Path(str(task.get("local_path") or "")).expanduser().resolve()
-    legacy_local = Path(legacy["local_path"]).expanduser().resolve()
-    legacy_partial = Path(legacy["partial_path"]).expanduser().resolve()
-    if supplied_local != legacy_local:
-        return None
-    supplied_partial_text = str(task.get("partial_path") or "").strip()
-    if legacy_provenance and not supplied_partial_text:
-        return None
-    if supplied_partial_text and Path(supplied_partial_text).expanduser().resolve() != legacy_partial:
-        return None
+    nested_only_modern_provenance = nested_modern_provenance and not root_modern_provenance and not legacy_provenance
+    if nested_only_modern_provenance:
+        # The task raw's own root carries none of the trusted markers --
+        # they only exist because the recorder nested this exact seed
+        # capsule under raw.download_task_seed. Prove the capsule's own
+        # recorded identity/provider/paths are exactly what got persisted
+        # onto the task's real columns before trusting a rebase derived
+        # from it; a tampered or unrelated capsule fails here instead of
+        # silently reusing the task's own (unverified) columns.
+        seed_identity = str(seed.get("candidate_identity") or "").strip().lower()
+        seed_external_id = str(seed.get("external_id") or "").strip().lower()
+        seed_provider_id = inkdrop_sources.provider_key(seed.get("provider_id") or seed.get("provider"))
+        if seed_identity != identity or seed_external_id != identity or seed_provider_id != provider_id:
+            return None
+        supplied_local = Path(str(task.get("local_path") or "")).expanduser().resolve()
+        supplied_partial_text = str(task.get("partial_path") or "").strip()
+        seed_local_text = str(seed.get("local_path") or "").strip()
+        seed_partial_text = str(seed.get("partial_path") or "").strip()
+        if not seed_local_text or Path(seed_local_text).expanduser().resolve() != supplied_local:
+            return None
+        if seed_partial_text and supplied_partial_text and (
+            Path(seed_partial_text).expanduser().resolve() != Path(supplied_partial_text).expanduser().resolve()
+        ):
+            return None
+    else:
+        legacy = providers.reader_page_pack_task_seed(candidate, None)
+        supplied_local = Path(str(task.get("local_path") or "")).expanduser().resolve()
+        legacy_local = Path(legacy["local_path"]).expanduser().resolve()
+        legacy_partial = Path(legacy["partial_path"]).expanduser().resolve()
+        if supplied_local != legacy_local:
+            return None
+        supplied_partial_text = str(task.get("partial_path") or "").strip()
+        if legacy_provenance and not supplied_partial_text:
+            return None
+        if supplied_partial_text and Path(supplied_partial_text).expanduser().resolve() != legacy_partial:
+            return None
     if legacy_provenance:
         raw_root = Path(str(raw.get("staging_root") or "")).expanduser().resolve()
         raw_local = Path(str(raw.get("local_path") or "")).expanduser().resolve()

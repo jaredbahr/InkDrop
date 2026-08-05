@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import time
 from collections import namedtuple
@@ -36,7 +37,7 @@ logger = logging.getLogger("inkdrop.notifications")
 PROVIDER_CONFIG_ID = "notifications"
 REQUEST_TIMEOUT_SECONDS = 10
 
-SendResult = namedtuple("SendResult", "ok detail retryable")
+SendResult = namedtuple("SendResult", "ok detail retryable retry_after", defaults=[None])
 
 
 def _is_retryable_exception(exc):
@@ -85,6 +86,26 @@ def _response_status(response):
         return None
 
 
+def _retry_after_seconds(response):
+    """Return bounded provider retry guidance without logging response data."""
+    try:
+        raw = response.headers.get("Retry-After")
+        seconds = float(raw)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return max(30, min(3600, int(seconds)))
+
+
+def _pushover_quota_reset_seconds(response):
+    """Pushover's 429 guidance is an absolute monthly quota-reset epoch."""
+    try:
+        reset_at = float(response.headers.get("X-Limit-App-Reset"))
+        seconds = math.ceil(reset_at - time.time())
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return max(30, min(2678400, seconds))
+
+
 class NotificationProvider:
     """One outbound channel. Subclasses read their own settings keys."""
 
@@ -129,7 +150,12 @@ class DiscordWebhookProvider(NotificationProvider):
         if status_code >= 400:
             logger.warning("discord notify failed (HTTP %d)", status_code)
             retryable = status_code >= 500 or status_code == 429
-            return SendResult(False, f"send failed (HTTP {status_code})", retryable)
+            return SendResult(
+                False,
+                f"send failed (HTTP {status_code})",
+                retryable,
+                _retry_after_seconds(response) if status_code == 429 else None,
+            )
         return SendResult(True, "sent", False)
 
 
@@ -168,7 +194,18 @@ class PushoverProvider(NotificationProvider):
         if status_code >= 400:
             logger.warning("pushover notify failed (HTTP %d)", status_code)
             retryable = status_code >= 500 or status_code == 429
-            return SendResult(False, f"send failed (HTTP {status_code})", retryable)
+            return SendResult(
+                False,
+                f"send failed (HTTP {status_code})",
+                retryable,
+                _pushover_quota_reset_seconds(response) if status_code == 429 else None,
+            )
+        try:
+            accepted = int((response.json() or {}).get("status")) == 1
+        except (AttributeError, TypeError, ValueError):
+            accepted = False
+        if not accepted:
+            return SendResult(False, "send failed (provider rejected request)", False)
         return SendResult(True, "sent", False)
 
 
@@ -311,6 +348,14 @@ def _redact(value, limit=240):
     return inkdrop_manual_search.redacted_text(value, limit)
 
 
+def _quiet_hours_release_at(settings, now):
+    end_minutes = _parse_hhmm(settings.get("quiet_hours_end")) or 0
+    now_struct = time.localtime(now)
+    now_minutes = now_struct.tm_hour * 60 + now_struct.tm_min
+    delay_minutes = (end_minutes - now_minutes) % (24 * 60)
+    return float(now) + max(1, delay_minutes * 60)
+
+
 def _dispatch_to_channel(db_path, channel, settings, *, event_type, subject, message, series_id, issue_id, occurrence_key, urgent):
     """Apply filter -> dedup -> quiet-hours -> rate-limit -> send, recording
     exactly one delivery-history row describing what happened. Returns that
@@ -336,45 +381,56 @@ def _dispatch_to_channel(db_path, channel, settings, *, event_type, subject, mes
         )
 
     dedup_window = settings.get("dedup_window_seconds", store.DEFAULT_DEDUP_WINDOW_SECONDS)
-    if dedup_window and store.last_sent_at(db_path, occurrence_key, channel_id, within_seconds=dedup_window):
-        return store.record_delivery(
-            db_path, event_type=event_type, channel_id=channel_id, occurrence_key=occurrence_key,
-            series_id=series_id, issue_id=issue_id, subject=subject, message=message,
-            status="deduped", attempt=1, max_attempts=1,
-            error_detail="already notified for this occurrence within the dedup window",
-        )
-
     urgent_events = set(settings.get("quiet_hours_urgent_events") or store.DEFAULT_URGENT_EVENTS)
     bypasses_quiet_hours = urgent or event_type in urgent_events
+    defer_reason = None
+    next_attempt_at = None
     if not bypasses_quiet_hours and _in_quiet_hours(settings):
-        end_minutes = _parse_hhmm(settings.get("quiet_hours_end")) or 0
-        now_struct = time.localtime()
-        now_minutes = now_struct.tm_hour * 60 + now_struct.tm_min
-        delay_minutes = (end_minutes - now_minutes) % (24 * 60)
-        return store.record_delivery(
-            db_path, event_type=event_type, channel_id=channel_id, occurrence_key=occurrence_key,
-            series_id=series_id, issue_id=issue_id, subject=subject, message=message,
-            status="queued", queue_reason="quiet_hours", attempt=0, max_attempts=max_attempts,
-            next_attempt_at=time.time() + delay_minutes * 60,
-        )
+        defer_reason = "quiet_hours"
+        next_attempt_at = _quiet_hours_release_at(settings, time.time())
 
     max_per_hour = settings.get("rate_limit_max_per_hour", store.DEFAULT_RATE_LIMIT_PER_HOUR)
-    if max_per_hour and store.sent_count_since(db_path, channel_id, time.time() - 3600) >= max_per_hour:
-        return store.record_delivery(
-            db_path, event_type=event_type, channel_id=channel_id, occurrence_key=occurrence_key,
-            series_id=series_id, issue_id=issue_id, subject=subject, message=message,
-            status="queued", queue_reason="rate_limit", attempt=0, max_attempts=max_attempts,
-            next_attempt_at=time.time() + 600,
-        )
-
+    reservation = store.reserve_new_delivery(
+        db_path,
+        event_type=event_type,
+        channel_id=channel_id,
+        occurrence_key=occurrence_key,
+        series_id=series_id,
+        issue_id=issue_id,
+        subject=subject,
+        message=message,
+        max_attempts=max_attempts,
+        dedup_window_seconds=dedup_window,
+        max_per_hour=max_per_hour,
+        defer_reason=defer_reason,
+        next_attempt_at=next_attempt_at,
+        lease_seconds=REQUEST_TIMEOUT_SECONDS * 3 + 15,
+    )
+    if reservation["status"] != "sending":
+        return reservation
     return _attempt_send(
         db_path, channel, settings, event_type=event_type, subject=subject, message=message,
         series_id=series_id, issue_id=issue_id, occurrence_key=occurrence_key,
-        attempt=1,
+        attempt=1, existing_delivery_id=reservation["id"],
+        reservation_deadline=reservation["next_attempt_at"],
     )
 
 
-def _attempt_send(db_path, channel, settings, *, event_type, subject, message, series_id, issue_id, occurrence_key, attempt, existing_delivery_id=None):
+def _attempt_send(
+    db_path,
+    channel,
+    settings,
+    *,
+    event_type,
+    subject,
+    message,
+    series_id,
+    issue_id,
+    occurrence_key,
+    attempt,
+    existing_delivery_id=None,
+    reservation_deadline=None,
+):
     """Make one send attempt and record/update its outcome. When
     existing_delivery_id is set (a retry), the same history row is updated
     in place instead of spawning a new one, so one event -> one channel
@@ -388,6 +444,7 @@ def _attempt_send(db_path, channel, settings, *, event_type, subject, message, s
             return store.update_delivery(
                 db_path, existing_delivery_id, status=status, error_detail=error_detail,
                 next_attempt_at=next_attempt_at, attempt=attempt, queue_reason=queue_reason,
+                expected_lease_until=reservation_deadline,
             )
         return store.record_delivery(
             db_path, event_type=event_type, channel_id=channel_id, occurrence_key=occurrence_key,
@@ -406,7 +463,7 @@ def _attempt_send(db_path, channel, settings, *, event_type, subject, message, s
         return _finish("sent")
     if result.retryable and attempt < max(1, max_attempts):
         backoff = settings.get("retry_backoff_seconds", store.DEFAULT_RETRY_BACKOFF_SECONDS)
-        delay = min(3600, backoff * (2 ** (attempt - 1)))
+        delay = result.retry_after or min(3600, backoff * (2 ** (attempt - 1)))
         return _finish("queued", queue_reason="retry", error_detail=_redact(result.detail), next_attempt_at=time.time() + delay)
     return _finish("failed", error_detail=_redact(result.detail))
 
@@ -453,17 +510,38 @@ def notify(
 def process_due_retries(db_path, *, now=None, limit=100):
     """Re-attempt everything queued for quiet-hours release, rate-limit
     backoff, or transient-failure retry whose next_attempt_at has passed."""
-    now = time.time() if now is None else now
-    due = store.due_queued_deliveries(db_path, now=now, limit=limit)
-    if not due:
-        return {"attempted": 0}
+    fixed_now = float(now) if now is not None else None
     settings = store.get_settings(db_path)
     channels = {c["id"]: c for c in _load_channels(db_path)}
     attempted = 0
-    for delivery in due:
+    processed = 0
+    process_limit = max(1, int(limit or 100))
+    max_per_hour = settings.get("rate_limit_max_per_hour", store.DEFAULT_RATE_LIMIT_PER_HOUR)
+    while processed < process_limit:
+        claim_now = fixed_now if fixed_now is not None else time.time()
+        delivery = store.claim_next_due_delivery(
+            db_path,
+            now=claim_now,
+            max_per_hour=max_per_hour,
+            lease_seconds=REQUEST_TIMEOUT_SECONDS * 3 + 15,
+        )
+        if not delivery:
+            break
+        processed += 1
         channel = channels.get(delivery["channel_id"])
         if channel is None or not channel["enabled"] or delivery["event_type"] not in channel["events"]:
             store.update_delivery(db_path, delivery["id"], status="disabled", error_detail="channel disabled or event untoggled before retry")
+            continue
+        urgent_events = set(settings.get("quiet_hours_urgent_events") or store.DEFAULT_URGENT_EVENTS)
+        if delivery["queue_reason"] == "quiet_hours" and delivery["event_type"] not in urgent_events and _in_quiet_hours(settings, claim_now):
+            store.update_delivery(
+                db_path,
+                delivery["id"],
+                status="queued",
+                queue_reason="quiet_hours",
+                next_attempt_at=_quiet_hours_release_at(settings, claim_now),
+                attempt=delivery["attempt"],
+            )
             continue
         attempted += 1
         next_attempt = max(1, int(delivery["attempt"]) + 1) if delivery["queue_reason"] == "retry" else 1
@@ -472,6 +550,7 @@ def process_due_retries(db_path, *, now=None, limit=100):
             message=delivery["message"], series_id=delivery["series_id"], issue_id=delivery["issue_id"],
             occurrence_key=delivery["occurrence_key"], attempt=next_attempt,
             existing_delivery_id=delivery["id"],
+            reservation_deadline=delivery["next_attempt_at"],
         )
     return {"attempted": attempted}
 
@@ -575,13 +654,28 @@ def notify_grabbed(db_path, *, series, issue_label=None, series_id=None, issue_i
     )
 
 
-def notify_download_failed(db_path, *, series, issue_label=None, reason=None, series_id=None, issue_id=None, task_id=None):
+def notify_download_failed(
+    db_path, *, series, issue_label=None, reason=None, series_id=None, issue_id=None, task_id=None, terminal=True
+):
+    """One task reached a failed state. `terminal` must be set by the caller
+    from the canonical queue/Wanted unit, not from the task alone -- a task
+    can fail (including a post-download match/import rejection of a file
+    that actually finished transferring) while the queue itself still has an
+    active task, a scheduled retry, a remaining automatic source, or a
+    completed file/import that already owns it. Only when none of those
+    apply is the failure actually terminal at the item level; otherwise this
+    is scoped to the one attempt so it never claims InkDrop has given up on
+    a unit it is still working on."""
     headline = " ".join(part for part in (series, issue_label) if part) or "An item"
-    lines = [f"{headline} failed to download and will not be retried automatically."]
+    if terminal:
+        lines = [f"{headline} failed to download and will not be retried automatically."]
+    else:
+        lines = [f"This download attempt for {headline} did not complete. InkDrop will continue with the remaining automatic sources."]
     if reason:
         lines.append(_redact(reason, 200))
     return notify(
-        db_path, "download_failed", subject="InkDrop: Download failed", message="\n".join(lines),
+        db_path, "download_failed", subject="InkDrop: Download failed" if terminal else "InkDrop: Download attempt failed",
+        message="\n".join(lines),
         series_id=series_id, issue_id=issue_id,
         occurrence_key=_occurrence_key("download_failed", task_id or series_id or series, issue_id or issue_label),
     )

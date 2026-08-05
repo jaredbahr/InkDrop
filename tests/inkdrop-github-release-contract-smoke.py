@@ -79,6 +79,43 @@ def main():
     contract = release_tool.load_contract()
     require(contract["tag"] == f"v{contract['version']}", contract)
     require(contract["prerelease"] is True and len(contract["notes"]) >= 80, contract)
+    version_match = release_tool.INKDROP_VERSION_PATTERN.fullmatch(contract["version"])
+    require(version_match and not version_match.group("prerelease"), "current contract versions are bare numbers")
+    require(
+        contract["image_tags"]
+        == [
+            contract["version"],
+            f"{version_match.group('major')}.{version_match.group('minor')}",
+            version_match.group("major"),
+            "latest",
+        ],
+        contract["image_tags"],
+    )
+    require(
+        release_tool.release_image_tags("0.1.2", prerelease=False) == ["0.1.2", "0.1", "0", "latest"],
+        "stable image tags should include exact, minor, major, and latest tags",
+    )
+    require(
+        release_tool.release_image_tags("0.1.2", prerelease=True) == ["0.1.2", "0.1", "0", "latest"],
+        "a bare-version closed-alpha prerelease publishes the same public tag ladder",
+    )
+    require(
+        release_tool.release_image_tags("0.1.0-beta.4", prerelease=True)
+        == ["0.1.0-beta.4", "0.1-beta", "0-beta", "beta", "latest"],
+        "beta image tags should retain their prerelease channel",
+    )
+    require(
+        release_tool.release_image_tags("0.1.0-alpha.4", prerelease=True)
+        == ["0.1.0-alpha.4", "0.1-alpha", "0-alpha", "alpha"],
+        "alpha image tags must not move latest",
+    )
+    for version, prerelease in (("0.1", False), ("0.1", True), ("0.1.2-beta", False)):
+        try:
+            release_tool.release_image_tags(version, prerelease=prerelease)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid image tag release contract passed: {version!r}, {prerelease!r}")
 
     commit = "a" * 40
     api = FakeApi()
@@ -156,6 +193,10 @@ def main():
         release_tool.append_github_output(output, contract)
         rendered = output.read_text(encoding="utf-8")
         require(f"version={contract['version']}" in rendered and f"tag={contract['tag']}" in rendered, rendered)
+        require(
+            f"image_tags_json={json.dumps(contract['image_tags'], separators=(',', ':'))}" in rendered,
+            rendered,
+        )
 
         candidate_path = temp_root / "qa-candidate.json"
         validation_path = temp_root / "qa-image-validation.json"
@@ -189,6 +230,21 @@ def main():
             "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
             "previous_state_schema_version": contract["previous_state_schema_version"],
             "target_state_schema_version": candidate["state_schema_version"],
+            "release_image_tags": contract["image_tags"],
+            "platforms": ["linux/amd64", "linux/arm64"],
+            "platform_runtime": [
+                {"platform": "linux/amd64", "machine": "x86_64", "passed": True},
+                {"platform": "linux/arm64", "machine": "aarch64", "passed": True},
+            ],
+            "checks": [
+                "candidate_identity",
+                "image_platforms",
+                "platform_runtime",
+                "oci_labels",
+                "strict_preflight",
+                "container_health",
+                "public_http",
+            ],
         }
         validation_path.write_text(json.dumps(validation, sort_keys=True) + "\n", encoding="utf-8")
         evidence = release_tool.load_verified_evidence(
@@ -225,8 +281,30 @@ def main():
             else:
                 raise AssertionError(f"mismatched {field} evidence passed")
 
+        incomplete_runtime = dict(validation)
+        incomplete_runtime["platform_runtime"] = validation["platform_runtime"][:1]
+        validation_path.write_text(json.dumps(incomplete_runtime), encoding="utf-8")
+        try:
+            release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", commit, "177")
+        except RuntimeError as exc:
+            require("incomplete platform runtime" in str(exc), exc)
+        else:
+            raise AssertionError("incomplete platform runtime evidence passed")
+        validation_path.write_text(json.dumps(validation), encoding="utf-8")
+
     workflow = (ROOT / ".github/workflows/inkdrop-public-release.yml").read_text(encoding="utf-8")
     require("validate_qa_image:" in workflow, "immutable-image validation job is required")
+    require("docker/setup-qemu-action@v3" in workflow, "multi-platform builds require QEMU on the hosted runner")
+    require("platforms: linux/amd64,linux/arm64" in workflow, "QA images must publish amd64 and arm64 manifests")
+    require("docker buildx imagetools inspect" in workflow, "published platform manifests must be verified by digest")
+    require('["linux/amd64", "linux/arm64"]' in workflow, "platform validation must require exactly one descriptor for each supported architecture")
+    require("allowed_media_types" in workflow and "invalid platform manifest digest" in workflow, "platform descriptors must have valid child digests and image media types")
+    require("image_tags_json: ${{ steps.release.outputs.image_tags_json }}" in workflow, "release image tags must survive as a job output")
+    require("EXPECTED_IMAGE_TAGS_JSON: ${{ needs.qa_image.outputs.image_tags_json }}" in workflow, "validation evidence must retain release image tags")
+    require('for platform in linux/amd64 linux/arm64' in workflow, "both platform images must execute under validation")
+    require('docker run --rm --platform "$platform"' in workflow, "cross-platform runtime probes must select each platform explicitly")
+    require('"platforms": platforms' in workflow and '"platform_runtime": runtime_platforms' in workflow, "validation evidence must record platform and runtime results")
+    require("qa-image-index.json" in workflow and "qa-platform-runtime.jsonl" in workflow, "raw platform evidence must be uploaded")
     require("needs: [qa_image, validate_qa_image]" in workflow, "release job must retain build outputs and wait for immutable-image validation")
     require('image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa@${IMAGE_DIGEST}"' in workflow, "validation must pull the exact QA digest")
     require("QA candidate identity mismatch" in workflow and "QA image label mismatch" in workflow, "manifest and OCI identity checks are required")

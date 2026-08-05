@@ -27,6 +27,30 @@
     return String(payload?.detail || payload?.message || payload?.error_description || fallback || "Request failed.");
   }
 
+  function safeDownloadFilename(value) {
+    const leaf = String(value || "").split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    if (!leaf || leaf === "." || leaf === "..") return "";
+    return leaf.slice(0, 180);
+  }
+
+  function contentDispositionFilename(value) {
+    const header = String(value || "");
+    const extended = header.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    if (extended) {
+      const encoded = extended[1].trim().replace(/^"|"$/g, "");
+      try {
+        const decoded = safeDownloadFilename(decodeURIComponent(encoded));
+        if (decoded) return decoded;
+      } catch (_error) {
+        // Fall through to the ordinary filename parameter.
+      }
+    }
+    const quoted = header.match(/filename\s*=\s*"((?:\\.|[^"])*)"/i);
+    if (quoted) return safeDownloadFilename(quoted[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+    const plain = header.match(/filename\s*=\s*([^;]+)/i);
+    return safeDownloadFilename(plain ? plain[1].trim() : "");
+  }
+
   function defaultMutationContract() {
     return {
       csrfCookieName: DEFAULT_CSRF_COOKIE,
@@ -114,8 +138,10 @@
   async function request(path, options) {
     const input = Object.assign({}, options || {});
     const method = String(input.method || "GET").toUpperCase();
+    const responseType = input.responseType === "blob" ? "blob" : "json";
+    delete input.responseType;
     const headers = new Headers(input.headers || {});
-    headers.set("Accept", "application/json");
+    if (!headers.has("Accept")) headers.set("Accept", responseType === "blob" ? "application/octet-stream" : "application/json");
     let body = input.body;
     if (isPlainObject(body)) {
       headers.set("Content-Type", "application/json");
@@ -150,6 +176,16 @@
     }
     const requestId = response.headers.get("X-Request-ID") || response.headers.get("X-InkDrop-Request-ID") || "";
     const contentType = response.headers.get("Content-Type") || "";
+    if (response.ok && responseType === "blob") {
+      return {
+        ok: true,
+        blob: await response.blob(),
+        filename: contentDispositionFilename(response.headers.get("Content-Disposition")),
+        content_type: contentType,
+        request_id: requestId,
+        status: response.status,
+      };
+    }
     let payload = {};
     try {
       payload = contentType.includes("json") ? await response.json() : {detail: await response.text()};
@@ -174,5 +210,11 @@
     return payload;
   }
 
-  window.InkDropApi = {request, Error: InkDropApiError, friendlyMessage, refreshAuthContract: () => loadMutationContract(true)};
+  window.InkDropApi = {
+    request,
+    Error: InkDropApiError,
+    friendlyMessage,
+    contentDispositionFilename,
+    refreshAuthContract: () => loadMutationContract(true),
+  };
 })();

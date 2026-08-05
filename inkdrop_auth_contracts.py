@@ -66,6 +66,9 @@ _add("POST", {
     "/api/system/logs/download",
 }, "settings_backup", "admin", admin=True, high_impact=True)
 _add("POST", {
+    "/api/system/support-bundle/download",
+}, "support_bundle_export", "admin", admin=True, high_impact=True)
+_add("POST", {
     "/api/inkdrop-settings/backup/restore",
 }, "settings_restore", "admin", admin=True, destructive=True, high_impact=True)
 _add("POST", {
@@ -138,7 +141,7 @@ def _download_client_dynamic_policy(path, method):
 _add("POST", {
     "/api/comicvine/delete", "/api/watch/delete", "/api/inkdrop-state/series/remove",
     "/api/inkdrop-state/series/library/migrate",
-    "/api/manual-review/approve", "/api/manual-review/approve-pack", "/api/manual-review/resolve-noop",
+    "/api/manual-review/approve", "/api/manual-review/approve-local-file", "/api/manual-review/approve-pack", "/api/manual-review/resolve-noop",
     "/api/manual-review/ignore", "/api/manual-review/bad-match", "/api/manual-review/add-alias",
     "/api/unmatched-downloads/quarantine", "/api/pack-review/clear",
     "/api/inkdrop-diagnostics/managed-library-duplicates/quarantine",

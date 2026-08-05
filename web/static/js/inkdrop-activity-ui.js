@@ -8,7 +8,6 @@
     deferred: "/api/inkdrop-maintenance/deferred-queue-sync"
   };
   const mountedRoots = new WeakSet();
-  let remountTimer = null;
 
   function text(value) {
     return value == null ? "" : String(value);
@@ -425,41 +424,27 @@
     });
   }
 
-  function shouldAutoMount() {
-    const locationText = `${location.pathname} ${location.hash}`.toLowerCase();
-    if (locationText.includes("activity") || locationText.includes("queue")) return true;
-    const heading = document.querySelector("h1, h2, .page-title");
-    return heading && /^(activity|queue)\b/i.test(heading.textContent.trim());
-  }
-
-  function ensureAutoRoot() {
-    if (document.querySelector("[data-inkdrop-activity-dashboard]") || !shouldAutoMount()) return;
-    // These are ordered preferences, not a selector list. querySelector on a
-    // comma list returns whichever match comes first in the *document*, and
-    // body precedes main, so "main, #content, .content, body" always resolved
-    // to body -- the panel was prepended outside the app shell and rendered
-    // full document width across the sidebar.
-    const host = document.querySelector("main")
-      || document.querySelector("#content")
-      || document.querySelector(".content")
-      || document.body;
-    if (!host) return;
-    const root = document.createElement("section");
-    root.setAttribute("data-inkdrop-activity-dashboard", "auto");
-    root.className = "inkdrop-activity-auto-root";
-    host.prepend(root);
-  }
-
-  function scheduleMount() {
-    clearTimeout(remountTimer);
-    remountTimer = setTimeout(() => {
-      ensureAutoRoot();
-      mount(document);
-    }, 80);
-  }
-
+  // This widget used to self-inject a full duplicate dashboard (its own
+  // "Activity" heading, its own status summary, its own Series/Stage/Source/
+  // Next table) onto any page whose URL or heading matched /activity|queue/i
+  // -- a heuristic written before the current app had a real Queue page.
+  // It now matches the real app's routing too (the Queue page's hash and the
+  // "Activity" nav category both contain those words), so it silently
+  // prepended itself above the real, actively-maintained Queue table, and
+  // once mounted it was never unmounted on navigation -- a MutationObserver
+  // kept re-triggering `mount()` on every DOM change, but nothing ever
+  // called the inverse. Visiting Queue and then clicking to Wanted left this
+  // orphaned widget's stale content sitting at the top of Wanted's real,
+  // successfully-loaded data. Its own periodic reload (Promise.all across
+  // three endpoints) surfaces InkDropApi's generic "InkDrop is unavailable.
+  // Check the connection, then retry." on any transient network hiccup --
+  // exactly the kind of blip a phone browser hits -- rendering a banner that
+  // looks like it belongs to whatever real page it's currently squatting on,
+  // even though that page's own data loaded fine through a separate path.
+  // Nothing in the app calls InkDropActivityUi.mount() intentionally (grep
+  // confirms it: only this file's own auto-trigger ever called it), so the
+  // fix is to drop the auto-trigger, not find and gate every symptom it
+  // caused. mount()/renderFixture() stay exported for the fixture harness
+  // and any future deliberate caller.
   global.InkDropActivityUi = { mount, renderFixture: render, endpoints: ENDPOINTS };
-  document.addEventListener("DOMContentLoaded", scheduleMount);
-  if (document.readyState !== "loading") scheduleMount();
-  new MutationObserver(scheduleMount).observe(document.documentElement, { childList: true, subtree: true });
 })(window);

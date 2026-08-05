@@ -1,0 +1,25 @@
+/* Styling for React-mounted sections (web/frontend). Reuses arr-table and
+   the app's existing button styles for the parts that are structurally
+   identical to the vanilla-rendered tables; only the pieces every island
+   shares but the vanilla shell doesn't have a class for already (an inline
+   error banner, a pager) get shared rules here. */
+
+.inkdrop-react-error-banner {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid #a33;
+  background: rgba(170, 51, 51, 0.12);
+  color: inherit;
+}
+
+.inkdrop-react-pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.inkdrop-react-pager span {
+  opacity: 0.75;
+}

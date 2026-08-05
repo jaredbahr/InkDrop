@@ -18,6 +18,27 @@
 !/web/static/js/*.js
 # Browser regressions remain in Git/CI but are not production runtime inputs.
 /web/tests/
+# Frontend source only -- the frontend-builder Docker stage compiles this
+# into web/static/dist, which is never part of the build context itself
+# (it's produced inside the image, then copied stage-to-stage).
+!/web/frontend/
+!/web/frontend/package.json
+!/web/frontend/package-lock.json
+!/web/frontend/tsconfig.json
+!/web/frontend/vite.config.ts
+!/web/frontend/index.html
+!/web/frontend/src/
+!/web/frontend/src/*.tsx
+!/web/frontend/src/*.ts
+!/web/frontend/src/sections/
+!/web/frontend/src/sections/*.tsx
+!/web/frontend/src/sections/*.ts
+# A directory-level `!` above does not stop later patterns from re-excluding
+# what's inside it -- explicit belts-and-braces, since a locally-installed
+# node_modules/ here is 100+ MB and must never reach the build context (the
+# frontend-builder stage installs its own via `npm ci` from the lockfile).
+/web/frontend/node_modules/
+/web/frontend/dist/
 !/inkdrop-completion-identity-audit-diff-alert.sh
 !/inkdrop-completion-identity-audit-diff-check.sh
 !/inkdrop-import-ready-worker.sh
@@ -55,10 +76,12 @@
 !/inkdrop_download_client_routing.py
 !/inkdrop_secret_store.py
 !/inkdrop_deferred_sync.py
+!/inkdrop_credential_evidence_cleanup.py
 !/inkdrop_db.py
 !/inkdrop_client_status.py
 !/inkdrop_effective_config.py
 !/inkdrop_language.py
+!/inkdrop_log_retention.py
 !/inkdrop_library_adoption.py
 !/inkdrop_library_frontends.py
 !/inkdrop_library_identity.py
@@ -79,7 +102,9 @@
 !/inkdrop_pack_import.py
 !/inkdrop_page_pack_downloader.py
 !/inkdrop_operator_contracts.py
+!/inkdrop_opds.py
 !/inkdrop_log_export.py
+!/inkdrop_support_bundle.py
 !/inkdrop_portability_export.py
 !/inkdrop_process_lifecycle.py
 !/inkdrop_preflight.py
@@ -92,6 +117,7 @@
 !/inkdrop_series_autopilot.py
 !/inkdrop_service_inventory.py
 !/inkdrop_slskd_source_probe.py
+!/inkdrop_slskd_root_health.py
 !/inkdrop_slskd_staging_sweep.py
 !/inkdrop_source_catalog.py
 !/inkdrop_source_providers.py
@@ -114,6 +140,7 @@
 !/inkdrop_transfer.py
 !/inkdrop_suwayomi_managed_folder.py
 !/inkdrop_version.py
+!/inkdrop_web_config.py
 !/inkdrop_web_state_views.py
 !/inkdrop_web.py
 !/docs/
@@ -149,6 +176,7 @@ inkdrop_*_cleanup.py
 inkdrop_*_diagnostic.py
 
 # Runtime allowlist exceptions that would otherwise match cleanup/audit guards.
+!/inkdrop_credential_evidence_cleanup.py
 !/inkdrop_folder_cleanup.py
 !/inkdrop_sab_failed_cleanup.py
 !/inkdrop_slskd_search_cleanup.py

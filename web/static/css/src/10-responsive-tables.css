@@ -595,11 +595,29 @@
         padding: 2px 6px;
         font-size: 9px;
       }
+      /* Queue/Wanted's desktop min-width:1040px (04-tables-rows.css) is
+         declared on the same ".section-table-head, .section-table-row"
+         selector pair; this query only ever overrode .section-table-row's
+         grid-template-columns/areas, never its min-width and never touched
+         .section-table-head at all. The result on a real phone: the header
+         stayed pinned to the full 6-track desktop grid (forcing 1040px+
+         horizontal scroll) while rows tried to lay out as a 2-column card
+         inside a container still stretched to that same 1040px min-width --
+         so both the header labels and the row content ended up scrolled to
+         unrelated positions instead of the intended narrow single-column
+         card. Manual Review and Issues (11-responsive-layout.css) already
+         hide their head the same way this now does. */
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head {
+        display: none;
+      }
       body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
       body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
+        min-width: 0;
         grid-template-columns: minmax(0, 1fr) minmax(74px, auto);
         grid-template-areas:
           "item state"
+          "source source"
           "detail detail"
           "actions actions";
         gap: 5px 7px;
@@ -615,6 +633,10 @@
         grid-area: state;
         justify-self: end;
         max-width: 112px;
+      }
+      body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-source,
+      body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-source {
+        grid-area: source;
       }
       body[data-inkdrop-view="queue"] .section-table-queue .section-table-row > .section-table-detail,
       body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row > .section-table-detail {

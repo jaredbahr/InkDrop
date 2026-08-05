@@ -42,6 +42,11 @@ except Exception:
     inkdrop_source_worker_coordinator = None
 
 try:
+    import inkdrop_source_registry
+except Exception:
+    inkdrop_source_registry = None
+
+try:
     import inkdrop_source_worker_cli
 except Exception:
     inkdrop_source_worker_cli = None
@@ -83,6 +88,8 @@ SLSKD_SOURCE_PROBE_CACHE_FILE = STATE_DIR / "slskd-source-probe-cache.json"
 SLSKD_AUTO_GRAB_STATE_FILE = STATE_DIR / "slskd-auto-grab-state.json"
 MANUAL_SOURCE_AUTORESOLVE_STATUS_FILE = STATE_DIR / "manual-source-autoresolve-status.json"
 MANUAL_SOURCE_QUEUE_SYNC_FILE = STATE_DIR / "manual-source-queue-sync-pending.json"
+USER_SEARCH_PRIORITY_FILE = STATE_DIR / "user-search-priority.json"
+USER_SEARCH_PRIORITY_MAX_AGE_SECONDS = 10 * 60
 IMPORT_STATUS_FILE = STATE_DIR / "import-status.json"
 PACK_AUTO_IMPORT_STATUS_FILE = STATE_DIR / "pack-auto-import-status.json"
 PACK_REVIEW_STATE_FILE = STATE_DIR / "pack-review-state.json"
@@ -179,7 +186,6 @@ DEFAULT_PROWLARR_PROVIDER_FETCH_FAILURE_COOLDOWN_SECONDS = 1800
 DEFAULT_FAILED_RETRY_COMMAND_TIMEOUT_SECONDS = 60
 STALE_PROWLARR_SOURCE_MARKER_SECONDS = max(180, DEFAULT_PROWLARR_COMMAND_TIMEOUT_SECONDS + 60)
 DEFAULT_STARTUP_SYNC_TIMEOUT_SECONDS = 20
-DEFAULT_METADATA_ADAPTER_SYNC_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_RUN_SECONDS = 8 * 60
 DEFAULT_AUTOPILOT_IMPORT_BACKLOG_PRIORITY_MIN = 1
 DEFAULT_AUTOPILOT_IMPORT_BACKLOG_HARD_LIMIT = 24
@@ -2583,6 +2589,38 @@ def rss_source_worker_direct_allowed_hosts_from_settings(settings):
     return normalized_host_list(hosts)
 
 
+def source_worker_provider_pack_detail_allowed_hosts():
+    """Explicit provider-detail authorities (e.g. DOGnzb's own dognzb.cr) that
+    a Prowlarr child indexer is configured to fetch pack/NZB metadata from.
+
+    These are a different trusted role than the Prowlarr proxy itself: a
+    child's `downloadUrl` is usually proxied through Prowlarr, but its pack
+    detail/metadata fetch goes straight to the indexer's own host. The
+    worker's global host cap has to contain both roles, or every pack-detail
+    request the strict candidate gate depends on gets rejected before any
+    network call -- title-only evidence is then all that's left, and a safe
+    pack can never prove it contains the exact Wanted unit.
+    """
+
+    if inkdrop_state is None or inkdrop_source_registry is None:
+        return []
+    try:
+        snapshot = inkdrop_state.settings_snapshot(INKDROP_STATE_DB)
+        rows = inkdrop_source_registry.registry_from_settings_snapshot(snapshot, include_disabled=False)
+    except Exception as exc:
+        log("source_worker_provider_pack_detail_allowed_hosts_failed", error=f"{type(exc).__name__}: {exc}")
+        return []
+    hosts = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        for key in ("pack_detail_allowed_hosts", "allowed_pack_detail_hosts", "indexer_pack_detail_allowed_hosts"):
+            value = row.get(key)
+            if isinstance(value, (list, tuple)):
+                hosts.extend(value)
+    return normalized_host_list(hosts)
+
+
 def source_worker_prowlarr_allowed_hosts():
     hosts = []
     hosts.extend(SOURCE_WORKER_PROWLARR_ALLOWED_HOSTS)
@@ -2595,6 +2633,11 @@ def source_worker_prowlarr_allowed_hosts():
     persisted_host = configured_http_host(effective_persisted_url)
     if persisted_host:
         hosts.append(persisted_host)
+    # The global cap is the upper bound for both the Prowlarr proxy
+    # authority above and each enabled child provider's explicit
+    # pack-detail authority -- the per-request cap (built downstream from
+    # each request's own role) still narrows this down per URL.
+    hosts.extend(source_worker_provider_pack_detail_allowed_hosts())
     return normalized_host_list(hosts)
 
 
@@ -3579,16 +3622,40 @@ def source_already_reported_result_since(item, source, started_at):
     fact arrived and blanks current_source right as the item became
     actionable. Only the source's own check-in timestamp can tell the two
     cases apart, since wall-clock elapsed time alone can't.
+
+    SLSKD gets a dedicated fast path via last_slskd_at/last_slskd_status
+    because its probe reconciliation writes those fields directly. Every
+    source's real result -- SLSKD included -- also lands in item["attempts"]
+    (queue_item_recorded_source_result_attempt_count reads the same ledger),
+    so any source can hit the same "recorded after the stale check started"
+    race under load, not just SLSKD; the fallback below covers those too.
     """
-    if source != "slskd":
+    if source == "slskd":
+        try:
+            checked_at = float(item.get("last_slskd_at") or 0)
+        except (TypeError, ValueError):
+            checked_at = 0
+        if checked_at > 0 and checked_at >= started_at and item.get("last_slskd_status"):
+            return True
+    source_key = source_order_attempt_key(source)
+    if not source_key:
         return False
-    try:
-        checked_at = float(item.get("last_slskd_at") or 0)
-    except (TypeError, ValueError):
-        checked_at = 0
-    if checked_at <= 0 or checked_at < started_at:
-        return False
-    return bool(item.get("last_slskd_status"))
+    for attempt in item.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        if str(attempt.get("kind") or "").strip().lower() in NON_RESULT_SOURCE_ATTEMPT_KINDS:
+            continue
+        attempt_source = source_order_attempt_key(
+            attempt.get("source")
+            or attempt.get("provider_id")
+            or attempt.get("provider")
+            or attempt.get("download_client")
+        )
+        if attempt_source != source_key:
+            continue
+        if numeric_timestamp(attempt.get("ts") or attempt.get("started_at")) >= started_at:
+            return True
+    return False
 
 
 def normalize_stale_source_started_attempts(queue, now=None, stale_seconds=STALE_SEARCH_SOURCE_MARKER_SECONDS):
@@ -3801,9 +3868,7 @@ def persist_startup_queue_normalization(queue, *, stale_source_started_count=0):
 
 def sync_watched_state(
     sync=False,
-    sync_metadata_adapter=False,
     sync_timeout_seconds=DEFAULT_STARTUP_SYNC_TIMEOUT_SECONDS,
-    sync_metadata_adapter_timeout_seconds=DEFAULT_METADATA_ADAPTER_SYNC_TIMEOUT_SECONDS,
 ):
     sync_result = None
     if sync:
@@ -3833,22 +3898,16 @@ def sync_watched_state(
                 timeout_seconds=sync_timeout_seconds,
                 error=f"{type(exc).__name__}: {exc}",
             )
-    # sync_metadata_adapter is accepted but ignored -- Kapowarr is retired
-    # software with no live endpoint to sync against.
     return sync_result
 
 
 def load_watches(
     sync=False,
-    sync_metadata_adapter=False,
     sync_timeout_seconds=DEFAULT_STARTUP_SYNC_TIMEOUT_SECONDS,
-    sync_metadata_adapter_timeout_seconds=DEFAULT_METADATA_ADAPTER_SYNC_TIMEOUT_SECONDS,
 ):
     sync_result = sync_watched_state(
         sync=sync,
-        sync_metadata_adapter=sync_metadata_adapter,
         sync_timeout_seconds=sync_timeout_seconds,
-        sync_metadata_adapter_timeout_seconds=sync_metadata_adapter_timeout_seconds,
     )
     data = read_json(COMIC_SERIES_FILE, {"watches": []}) or {"watches": []}
     if not isinstance(data, dict):
@@ -9590,6 +9649,28 @@ def source_runtime_budget_child_provider_context(
     job_count = 0
     error_count = 0
     missing_queue_count = 0
+    # settings_snapshot/registry_rows are identical for every queue_id in
+    # this sample, so build them once instead of letting each of up to
+    # RUNTIME_BUDGET_CHILD_PROVIDER_SAMPLE_LIMIT rows rebuild them.
+    batch_snapshot = None
+    batch_registry_rows = None
+    batch_provider_health_map = None
+    if inkdrop_state is not None and inkdrop_source_registry is not None:
+        try:
+            batch_snapshot = inkdrop_state.settings_snapshot(INKDROP_STATE_DB)
+            batch_provider_health_map = {}
+            with inkdrop_state.connect_read(INKDROP_STATE_DB) as health_con:
+                if inkdrop_state.table_exists(health_con, "history_events"):
+                    batch_provider_health_map = inkdrop_state.latest_provider_health_map(health_con)
+            batch_registry_rows = inkdrop_source_registry.registry_from_settings_snapshot(
+                batch_snapshot,
+                include_disabled=True,
+                provider_health_map=batch_provider_health_map,
+            )
+        except Exception:
+            batch_snapshot = None
+            batch_registry_rows = None
+            batch_provider_health_map = None
     for queue_id in queue_ids:
         try:
             planned = inkdrop_source_worker_coordinator.source_jobs_for_queue(
@@ -9599,6 +9680,9 @@ def source_runtime_budget_child_provider_context(
                 include_blocked=False,
                 provider_ids=None,
                 job_limit=job_limit,
+                settings_snapshot=batch_snapshot,
+                registry_rows=batch_registry_rows,
+                provider_health_map=batch_provider_health_map,
             )
         except Exception:
             error_count += 1
@@ -9845,12 +9929,13 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
                 "lifecycle_phase": "searched_no_candidates",
                 "reason": "SLSKD pass did not return a concrete result for this row; automatic retry scheduled",
             }
-        if int(row_count or 0) > 0:
-            return {
-                "status": "searched_no_candidates",
-                "lifecycle_phase": "searched_no_candidates",
-                "reason": "SLSKD did not select this row in the bounded source pass; automatic retry scheduled",
-            }
+        # A row the bounded pass never selected has no provider evidence at
+        # all -- row_count alone (how many rows this cycle was scanning) used
+        # to be enough to fabricate a searched_no_candidates result here, even
+        # though the reason text ("did not select this row") admits the
+        # provider never ran. Returning None leaves the row untouched and
+        # eligible for a real pass instead of falsely closing the SLSKD
+        # source and starving the row of another attempt.
         return None
     if source == "mangadex":
         if not any(
@@ -9891,7 +9976,12 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
                 "lifecycle_phase": "retry_later",
                 "reason": payload.get("reason") or "MangaDex source errored before returning a row result",
             }
-        if int(payload.get("rows_considered") or 0) > 0 or int(row_count or 0) > 0:
+        # rows_considered is real evidence the MangaDex worker actually ran
+        # against this row; row_count alone (how many rows this cycle was
+        # scanning) is not -- that used to let a row admitted but never
+        # executed (e.g. its queue claim was already held by another worker)
+        # get recorded as a completed zero-result search.
+        if int(payload.get("rows_considered") or 0) > 0:
             return {
                 "status": "searched_no_candidates",
                 "lifecycle_phase": "searched_no_candidates",
@@ -9942,8 +10032,14 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
         missing = int(payload.get("missing_candidates") or 0)
         attempted = int(payload.get("attempted_total") or 0)
         blocked = int(payload.get("blocked_candidate_count") or 0)
-        plans = int(payload.get("source_worker_schedule_plan_count") or 0)
-        if missing > 0 or attempted > 0 or blocked > 0 or plans > 0 or int(row_count or 0) > 0:
+        # source_worker_schedule_plan_count and row_count both reflect
+        # scheduling/admission, not execution -- a plan being scheduled or a
+        # row being in this cycle's batch does not mean a provider request
+        # ever ran for it (the queue claim can be lost to another worker
+        # first). Only missing/attempted/blocked -- all derived from actual
+        # runs[] entries in source_worker_row_result_payload() -- count as
+        # real evidence a search happened.
+        if missing > 0 or attempted > 0 or blocked > 0:
             return {
                 "status": "searched_no_candidates",
                 "lifecycle_phase": "searched_no_candidates",
@@ -9978,12 +10074,13 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
             "lifecycle_phase": "retry_later",
             "reason": f"{public_source_name(source) or source} source errored before finding a candidate",
         }
+    # missing_targets must come from the payload itself -- the worker's own
+    # count of targets it checked and found nothing for. row_count (how many
+    # rows this cycle happened to be scanning) is scheduling metadata, not
+    # execution evidence, and synthesizing missing_targets from it let a row
+    # that was never actually run get recorded as a completed zero-result
+    # search purely because no actions/reviews existed yet.
     missing_targets = int(payload.get("missing_targets") or 0)
-    if missing_targets <= 0 and int(row_count or 0) > 0:
-        actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
-        reviews = result_review_rows(payload)
-        if not actions and not reviews:
-            missing_targets = int(row_count or 0)
     if missing_targets <= 0:
         return None
     return {
@@ -12938,19 +13035,17 @@ def due_group_sort_key(series, rows, series_activity=None):
     )
 
 
-def missing_provider_result_lane_source(item):
-    if not has_missing_required_source_result(item):
-        return ""
-    missing = missing_required_source_result_sources(item)
-    return str(missing[0] if missing else "").strip().lower()
-
-
 def due_group_key(item):
+    # Every other due-row category (retry_due, first_pass, stale_downloader,
+    # ...) folds a series' rows into one group here. Splitting out a
+    # "missing_provider:<source>" suffix just for the missing-provider-result
+    # case let one series occupy multiple max_series slots in the same pass
+    # whenever its due issues had different first-missing providers --
+    # process_series() already tries every eligible source across the whole
+    # rows list it's handed, so the split bought nothing but broke the
+    # per-series admission count it's used for below.
     series = item.get("series") or ""
     identity = series_summary_identity(item) or f"title:{normalize(series)}"
-    missing_source = missing_provider_result_lane_source(item)
-    if missing_source:
-        return (series, identity, f"missing_provider:{missing_source}")
     return (series, identity)
 
 
@@ -13095,6 +13190,33 @@ def missing_recovery_cohort_for_rows(rows, *, bucket=None, now=None):
     return "ordinary_new"
 
 
+def interleave_broad_before_recovery_groups(broad_groups, recovery_groups):
+    """Order selected groups so recovery work can't consume the deadline
+    before any broad group gets a provider call.
+
+    A count-bounded selection (e.g. 2 of 6 slots reserved for recovery)
+    guarantees a broad group is *chosen*, but the run loop executes the
+    returned list in order against one shared pass deadline -- if recovery
+    groups lead, they can exhaust the deadline before a broad group starts.
+    Interleaving broad-first (broad, recovery, broad, recovery, broad, broad
+    for 4 broad + 2 recovery) guarantees at least one broad group is handed
+    to the loop before any recovery group, without changing which groups
+    were selected or their relative order within their own kind.
+    """
+
+    broad_groups = list(broad_groups or [])
+    recovery_groups = list(recovery_groups or [])
+    if not recovery_groups or not broad_groups:
+        return broad_groups + recovery_groups
+    ordered = [broad_groups.pop(0)]
+    while recovery_groups or broad_groups:
+        if recovery_groups:
+            ordered.append(recovery_groups.pop(0))
+        if broad_groups:
+            ordered.append(broad_groups.pop(0))
+    return ordered
+
+
 def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=None):
     """Select a bounded mixed cohort without changing the enclosing pass cap."""
 
@@ -13140,6 +13262,15 @@ def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=N
     # Preserve the established shared SLSKD recovery fraction. Cached starts
     # and zero-result reprobes rotate through one bounded pool instead of being
     # counted as separate new cohorts and displacing broad acquisition work.
+    # Recovery groups are tracked separately from broad ones (instead of
+    # appended straight into `selected`) so the run loop can't burn the whole
+    # pass deadline on recovery before a single broad group starts -- they're
+    # interleaved back in below, broad-first, after both lists are built.
+    recovery_selected = []
+
+    def total_selected():
+        return len(selected) + len(recovery_selected)
+
     if broad_exists:
         recovery_capacity = max(1, max_groups // 3)
         recovery_lanes = {
@@ -13170,7 +13301,7 @@ def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=N
                     break
                 _fairness, bucket = min(candidates, key=lambda row: row[0])
             cohort, group = recovery_lanes[bucket].pop(0)
-            selected.append(group)
+            recovery_selected.append(group)
             counts[cohort] += 1
         for cohort, rows in list(cohort_rows.items()):
             cohort_rows[cohort] = [
@@ -13181,7 +13312,7 @@ def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=N
 
     # One opportunity per available cohort first. This is the starvation guard.
     for cohort in MISSING_RECOVERY_COHORTS:
-        if len(selected) >= max_groups:
+        if total_selected() >= max_groups:
             break
         if cohort_rows.get(cohort):
             bucket, group = cohort_rows[cohort].pop(0)
@@ -13190,7 +13321,7 @@ def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=N
 
     # Then round-robin. Prefer the configured ceiling first; once every waiting
     # cohort reaches it, refill evenly so bounded pass capacity is not idled.
-    while len(selected) < max_groups:
+    while total_selected() < max_groups:
         available = [cohort for cohort in MISSING_RECOVERY_COHORTS if cohort_rows.get(cohort)]
         if not available:
             break
@@ -13200,7 +13331,7 @@ def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=N
             break
         moved = False
         for cohort in choices:
-            if len(selected) >= max_groups:
+            if total_selected() >= max_groups:
                 break
             _bucket, group = cohort_rows[cohort].pop(0)
             selected.append(group)
@@ -13208,7 +13339,7 @@ def select_missing_recovery_groups(buckets, *, max_groups, max_per_cohort, now=N
             moved = True
         if not moved:
             break
-    return selected
+    return interleave_broad_before_recovery_groups(selected, recovery_selected)
 
 
 def scheduler_bucket_for_rows(rows, now=None):
@@ -13246,6 +13377,53 @@ def scheduler_bucket_rank(bucket):
         "queued": 7,
     }
     return ranks.get(str(bucket or ""), 99)
+
+
+def user_search_priority_index():
+    """Rows explicitly bumped by a user clicking Search/Manual Search on a Wanted
+    row (see inkdrop_web.record_user_search_priority). Keyed by queue item "key",
+    value is the request timestamp; entries older than USER_SEARCH_PRIORITY_MAX_AGE_SECONDS
+    are treated as expired so a stale, never-picked-up request doesn't linger forever.
+    """
+    data = read_json(USER_SEARCH_PRIORITY_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    cutoff = time.time() - USER_SEARCH_PRIORITY_MAX_AGE_SECONDS
+    index = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            requested_at = float(value.get("requested_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if requested_at > cutoff:
+            index[str(key)] = requested_at
+    return index
+
+
+def consume_user_search_priority(rows):
+    """Clear the priority request(s) for a group once it has actually been handed
+    to process_series() -- the explicit ask was "get the next pass", not "keep
+    jumping the line forever". Safe to call even if nothing was pending.
+    """
+    keys = {
+        str(item.get("key") or "").strip()
+        for item in rows or []
+        if isinstance(item, dict) and str(item.get("key") or "").strip()
+    }
+    if not keys:
+        return
+    data = read_json(USER_SEARCH_PRIORITY_FILE, {})
+    if not isinstance(data, dict) or not data:
+        return
+    changed = False
+    for key in keys:
+        if key in data:
+            del data[key]
+            changed = True
+    if changed:
+        write_json(USER_SEARCH_PRIORITY_FILE, data)
 
 
 def due_series(queue, args):
@@ -13289,6 +13467,31 @@ def due_series(queue, args):
     for rows in groups.values():
         rows.sort(key=due_row_sort_key)
     max_groups = max(1, int(args.max_series or 1))
+
+    # A user clicking Search/Manual Search on a Wanted row wants the next pass,
+    # not its normal turn in the fairness/starvation rotation below. Carve any
+    # such groups out first and hand them the front of the result, capped at
+    # this pass's own max_groups so a burst of clicks can't crowd out everything
+    # else -- the rest still goes through the unmodified bucket/lane logic on
+    # whatever capacity remains.
+    priority_groups = []
+    priority_index = user_search_priority_index()
+    if priority_index:
+        for group_key in list(groups.keys()):
+            rows = groups[group_key]
+            requested_ats = [
+                priority_index[str(item.get("key") or "")]
+                for item in rows
+                if str(item.get("key") or "") in priority_index
+            ]
+            if requested_ats:
+                priority_groups.append((group_key, rows, min(requested_ats)))
+                del groups[group_key]
+        if priority_groups:
+            priority_groups.sort(key=lambda entry: entry[2])
+            priority_groups = priority_groups[:max_groups]
+    max_groups = max(1, max_groups - len(priority_groups))
+
     buckets = collections.defaultdict(list)
     for group_key, rows in groups.items():
         bucket = scheduler_bucket_for_rows(rows, now=now)
@@ -13326,6 +13529,8 @@ def due_series(queue, args):
         else:
             bucket_rows.sort(key=lambda row: (broad_group_service_key(row[1]), row[2]))
 
+    priority_result = [(group_key[0], rows) for group_key, rows, _requested_at in priority_groups if group_key[0]]
+
     if missing_recovery_enabled(args):
         selected = select_missing_recovery_groups(
             buckets,
@@ -13333,7 +13538,7 @@ def due_series(queue, args):
             max_per_cohort=missing_recovery_max_per_cohort(args, max_groups),
             now=now,
         )
-        return [(group_key[0], rows) for group_key, rows, _sort_key in selected if group_key[0]]
+        return priority_result + [(group_key[0], rows) for group_key, rows, _sort_key in selected if group_key[0]]
 
     selected = []
 
@@ -13404,7 +13609,7 @@ def due_series(queue, args):
         leftovers.sort(key=lambda row: (row[0], row[3]))
         selected.extend((group_key, rows, sort_key) for _rank, group_key, rows, sort_key in leftovers[: max_groups - len(selected)])
 
-    return [(group_key[0], rows) for group_key, rows, _sort_key in selected if group_key[0]]
+    return priority_result + [(group_key[0], rows) for group_key, rows, _sort_key in selected if group_key[0]]
 
 
 def mark_series_searching(rows, source):
@@ -14832,6 +15037,25 @@ def source_probe_in_progress():
     return process_running_for_script(SLSKD_SOURCE_PROBE_SCRIPT)
 
 
+def group_result_provider_invoked(result):
+    """True if process_series() actually called a real provider for this
+    group, as opposed to every source ending in a skip (budget, health gate,
+    targeted-evidence block, ...). "local" is bookkeeping (managed-folder/
+    library truth), never a search, and always present -- it must not count.
+    A budget-exhausted group with every source skipped is exactly the
+    all-skip case processed_count used to hide."""
+
+    if not isinstance(result, dict):
+        return False
+    sources = result.get("sources")
+    if not isinstance(sources, dict):
+        return False
+    return any(
+        name != "local" and isinstance(entry, dict) and not entry.get("skipped")
+        for name, entry in sources.items()
+    )
+
+
 def status_payload(args, sync_result, reconcile, processed, fatal_error=None, **progress):
     raw_source = progress.get("current_source")
     if "progress_note" in progress:
@@ -14862,6 +15086,15 @@ def status_payload(args, sync_result, reconcile, processed, fatal_error=None, **
         "reconcile": reconcile,
         "processed": processed,
         "processed_count": len(processed),
+        # processed_count includes groups where every source was skipped
+        # (budget exhaustion, health gates, targeted-evidence blocks) --
+        # this is the count of groups that actually reached a provider.
+        "provider_invoked_group_count": sum(
+            1 for result in processed if group_result_provider_invoked(result)
+        ),
+        "budget_skipped_group_count": sum(
+            1 for result in processed if isinstance(result, dict) and result.get("budget_exhausted")
+        ),
         "fatal_error": fatal_error,
         "policy": AUTOPILOT_POLICY,
         "source_order": list(getattr(args, "source_order", SOURCE_ORDER)),
@@ -15212,7 +15445,6 @@ def run(args):
             lambda: write_startup_progress(queue, args, "syncing InkDrop queue state", source="sync"),
         )
     sync_requested = bool(args.sync)
-    metadata_sync_requested = bool(getattr(args, "sync_metadata_adapter", False))
     sync_result = {}
     if sync_requested:
         startup_sync_timeout = startup_maintenance_timeout(
@@ -15230,25 +15462,6 @@ def run(args):
                 sync_result.update(stage_result)
         else:
             sync_result["startup_sync_deferred"] = "provider_budget_boundary_reached"
-    if metadata_sync_requested:
-        metadata_sync_timeout = startup_maintenance_timeout(
-            args,
-            getattr(args, "sync_metadata_adapter_timeout_seconds", None) or DEFAULT_METADATA_ADAPTER_SYNC_TIMEOUT_SECONDS,
-            setup_started_monotonic,
-            share=0.3,
-        )
-        if metadata_sync_timeout > 0:
-            stage_result = startup_phase(
-                "metadata_adapter_sync",
-                lambda: sync_watched_state(
-                    sync_metadata_adapter=True,
-                    sync_metadata_adapter_timeout_seconds=metadata_sync_timeout,
-                ),
-            )
-            if isinstance(stage_result, dict):
-                sync_result.update(stage_result)
-        else:
-            sync_result["metadata_sync_deferred"] = "provider_budget_boundary_reached"
     watches, _ = startup_phase("load_watches", lambda: load_watches(sync=False))
     if not getattr(args, "dry_run", False) and not getattr(args, "status_only", False):
         startup_phase(
@@ -15404,6 +15617,7 @@ def run(args):
                                 publish_progress(note="cached SLSKD retries finished after broad queue")
                         break
                     series, rows, group_key = next_group
+                    consume_user_search_priority(rows)
                     publish_progress(series=series, source="queue", note=f"starting {series}")
                     processed.append(
                         process_series(
@@ -15574,9 +15788,7 @@ def main():
     parser = argparse.ArgumentParser(description="InkDrop watched-series autopilot queue")
     parser.add_argument("--series", action="append", default=[], help="limit run to exact series title")
     parser.add_argument("--sync", action="store_true", help="sync InkDrop Core state before reading the watched-series queue")
-    parser.add_argument("--sync-metadata-adapter", action="store_true", help="also sync the temporary Kapowarr metadata adapter")
     parser.add_argument("--sync-timeout-seconds", type=int, default=None, help="bounded startup InkDrop Core sync timeout")
-    parser.add_argument("--sync-metadata-adapter-timeout-seconds", type=int, default=None, help="bounded startup metadata-adapter sync timeout")
     parser.add_argument("--annotate-timeout-seconds", type=int, default=None, help="bounded queue annotation budget before source processing")
     parser.add_argument("--max-run-seconds", type=int, default=0, help="stop starting new source work after this many seconds and finish the pass cleanly")
     parser.add_argument("--dry-run", action="store_true")
@@ -15758,13 +15970,6 @@ def main():
         min(int(args.sync_timeout_seconds or DEFAULT_STARTUP_SYNC_TIMEOUT_SECONDS), 240),
     )
     args.max_run_seconds = max(0, min(int(args.max_run_seconds or 0), 60 * 60))
-    args.sync_metadata_adapter_timeout_seconds = max(
-        5,
-        min(
-            int(args.sync_metadata_adapter_timeout_seconds or DEFAULT_METADATA_ADAPTER_SYNC_TIMEOUT_SECONDS),
-            240,
-        ),
-    )
     args.annotate_timeout_seconds = max(
         10,
         min(int(args.annotate_timeout_seconds or DEFAULT_ANNOTATE_TIMEOUT_SECONDS), 300),

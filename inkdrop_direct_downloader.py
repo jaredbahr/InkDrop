@@ -7,6 +7,7 @@ explicit staging path. It does not talk to the database or import into Kavita.
 from __future__ import annotations
 
 import json
+import errno
 import hashlib
 import os
 import time
@@ -293,39 +294,54 @@ def _iter_chunks(body, chunk_size=DEFAULT_CHUNK_SIZE):
                 yield bytes(chunk)
 
 
-def _confined_paths(staging_root, *, final_filename=None, local_path=None, partial_path=None):
-    root = Path(staging_root or "").expanduser().resolve()
-    if not str(staging_root or "").strip():
-        return None, None, None, "missing_staging_root"
+def _confined_paths(download_root, incomplete_root=None, *, final_filename=None, local_path=None, partial_path=None):
+    """Resolve the final and partial paths, each confined to its own trusted root.
+
+    ``download_root`` confines the final file; ``incomplete_root`` confines the
+    in-progress ``.part`` file. They are validated independently -- a caller
+    with a separately configured scratch volume for ``incomplete_root`` must
+    not be forced to share ``download_root``'s confinement boundary. When
+    ``incomplete_root`` is omitted it defaults to ``download_root``, which
+    reproduces the original single-root behavior for callers that only know
+    about one staging root.
+    """
+    if not str(download_root or "").strip():
+        return None, None, None, None, "missing_staging_root"
+    root = Path(download_root).expanduser().resolve()
+    incomplete = (
+        Path(incomplete_root).expanduser().resolve()
+        if str(incomplete_root or "").strip()
+        else root
+    )
     if local_path:
         target = Path(str(local_path)).expanduser()
         if not target.is_absolute():
             target = root / target
     else:
         if not str(final_filename or "").strip():
-            return None, None, None, "missing_final_filename"
+            return root, None, incomplete, None, "missing_final_filename"
         target = root / str(final_filename)
     target = target.resolve()
     try:
         target.relative_to(root)
     except ValueError:
-        return root, target, None, "target_outside_staging_root"
+        return root, target, incomplete, None, "target_outside_staging_root"
     if target == root:
-        return root, target, None, "target_is_staging_root"
+        return root, target, incomplete, None, "target_is_staging_root"
     if partial_path:
         partial = Path(str(partial_path)).expanduser()
         if not partial.is_absolute():
-            partial = root / partial
+            partial = incomplete / partial
     else:
-        partial = Path(str(target) + ".part")
+        partial = incomplete / (target.name + ".part")
     partial = partial.resolve()
     try:
-        partial.relative_to(root)
+        partial.relative_to(incomplete)
     except ValueError:
-        return root, target, partial, "partial_outside_staging_root"
+        return root, target, incomplete, partial, "partial_outside_staging_root"
     if partial == target:
-        return root, target, partial, "partial_matches_final_path"
-    return root, target, partial, ""
+        return root, target, incomplete, partial, "partial_matches_final_path"
+    return root, target, incomplete, partial, ""
 
 
 def _close_body(body):
@@ -351,6 +367,54 @@ def _cleanup_partial(partial_path, root):
         pass
 
 
+def _publish_staged_file(partial, target, download_root, content_hash_hex):
+    """Atomically publish a validated ``.part`` file to its final name.
+
+    ``incomplete_root`` and ``download_root`` can be configured on separate
+    filesystems (that is the whole point of independently configuring them),
+    so the fast-path ``replace()`` can raise ``EXDEV`` -- there is no atomic
+    rename across devices in POSIX. Fall back to copying the already-validated
+    bytes into a same-filesystem temp file next to the final name, verifying
+    the copy against the hash computed while streaming the download, then
+    atomically replacing the final name from that local temp file. The source
+    partial is removed only after the copy is verified and published, so a
+    crash mid-copy leaves the original partial recoverable instead of
+    silently losing a validated download.
+    """
+    try:
+        partial.replace(target)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    tmp_target = target.with_name(f"{target.name}.publish-{os.getpid()}-{int(time.monotonic() * 1000)}.tmp")
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        with partial.open("rb") as src, tmp_target.open("wb") as dst:
+            while True:
+                chunk = src.read(DEFAULT_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        if digest.hexdigest() != content_hash_hex:
+            raise ValueError("cross_device_copy_hash_mismatch")
+        if size != partial.stat().st_size:
+            raise ValueError("cross_device_copy_size_mismatch")
+        tmp_target.replace(target)
+    except Exception:
+        _cleanup_partial(tmp_target, download_root)
+        raise
+    try:
+        partial.unlink()
+    except Exception:
+        pass
+
+
 def _metadata_path(final_path):
     final_path = Path(final_path)
     return final_path.with_name(final_path.name + ".source.json")
@@ -367,7 +431,9 @@ def download_direct_file(
     url,
     provider_id,
     download_task_id,
-    staging_root,
+    staging_root=None,
+    download_root=None,
+    incomplete_root=None,
     final_filename=None,
     local_path=None,
     partial_path=None,
@@ -397,8 +463,14 @@ def download_direct_file(
         return _policy_blocked("download_host_not_allowed", provider_id=provider_id, download_task_id=download_task_id)
     if not http_get:
         return _blocked("http_client_required", provider_id=provider_id, download_task_id=download_task_id)
-    root, target, partial, path_reason = _confined_paths(
-        staging_root,
+    # download_root/incomplete_root are the trusted confinement boundaries; a
+    # caller that only knows about one shared root (the pre-#281 contract)
+    # still works because both fall back to staging_root.
+    resolved_download_root = download_root or staging_root
+    resolved_incomplete_root = incomplete_root or resolved_download_root
+    root, target, incomplete_root_path, partial, path_reason = _confined_paths(
+        resolved_download_root,
+        resolved_incomplete_root,
         final_filename=final_filename,
         local_path=local_path,
         partial_path=partial_path,
@@ -409,6 +481,7 @@ def download_direct_file(
             provider_id=provider_id,
             download_task_id=download_task_id,
             staging_root=str(root) if root else "",
+            incomplete_root=str(incomplete_root_path) if incomplete_root_path else "",
             path=str(target) if target else "",
         )
 
@@ -562,10 +635,10 @@ def download_direct_file(
             handle.flush()
             os.fsync(handle.fileno())
     except ValueError as exc:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _reject(_policy_blocked(str(exc), provider_id=provider_id, download_task_id=download_task_id, max_bytes=byte_limit))
     except Exception as exc:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         if _is_response_too_large(exc):
             # The transport's own limit tripped mid-stream; classify it like
             # the local size check so it lands as policy, not infrastructure.
@@ -578,10 +651,10 @@ def download_direct_file(
         ))
 
     if size <= 0:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _source_content_blocked("zero_size", provider_id=provider_id, download_task_id=download_task_id)
     if declared_size is not None and size != declared_size:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _source_content_blocked(
             "content_length_mismatch",
             provider_id=provider_id,
@@ -591,7 +664,7 @@ def download_direct_file(
         )
     expected_size = _intish(expected_size_bytes)
     if expected_size is not None and expected_size > 0 and size != expected_size:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _source_content_blocked(
             "probe_size_mismatch",
             provider_id=provider_id,
@@ -603,10 +676,10 @@ def download_direct_file(
     try:
         archive_reason = _archive_validation_reason(partial, extension)
     except Exception as exc:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _blocked("archive_validation_failed", provider_id=provider_id, download_task_id=download_task_id, error=f"{type(exc).__name__}: {exc}")
     if archive_reason:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _source_content_blocked(
             archive_reason,
             provider_id=provider_id,
@@ -616,9 +689,9 @@ def download_direct_file(
         )
 
     try:
-        partial.replace(target)
+        _publish_staged_file(partial, target, root, digest.hexdigest())
     except Exception as exc:
-        _cleanup_partial(partial, root)
+        _cleanup_partial(partial, incomplete_root_path)
         return _blocked("staged_file_replace_failed", provider_id=provider_id, download_task_id=download_task_id, error=f"{type(exc).__name__}: {exc}")
     elapsed = time.monotonic() - started
     final_url = response.get("final_url") or url
@@ -681,6 +754,8 @@ def download_direct_task(
     allowed_hosts=None,
     max_bytes=None,
     staging_root=None,
+    download_root=None,
+    incomplete_root=None,
     headers=None,
     max_redirects=DEFAULT_MAX_REDIRECTS,
     **kwargs,
@@ -711,7 +786,17 @@ def download_direct_task(
         or task.get("download_url")
     )
     local_path = task.get("local_path") or task.get("download_path")
+    partial_path = task.get("partial_path") or raw.get("partial_path") or nested_raw.get("partial_path") or seed.get("partial_path")
     root = staging_root or task.get("save_path") or (Path(str(local_path)).parent if local_path else "")
+    resolved_download_root = download_root or root
+    # incomplete_root is a trusted confinement boundary, so it must come from
+    # an explicit caller (the coordinator resolves it from the provider
+    # registry row -- see inkdrop_source_providers.direct_download_incomplete_
+    # root) or fall back to sharing download_root, same as the pre-#281
+    # single-root contract. Deriving it from the task's own stored
+    # partial_path would make the confinement check meaningless: a path is
+    # always "inside" its own parent, so any stored path would trivially pass.
+    resolved_incomplete_root = incomplete_root or resolved_download_root
     ext = providers.normalize_extension(local_path or candidate.get("extension") or download_url)
     derived_extensions = allowed_extensions or candidate.get("allowed_extensions") or ([ext] if ext else [])
     derived_content_types = allowed_content_types or [candidate.get("content_type") or providers.content_type_for_extension(ext)]
@@ -732,8 +817,10 @@ def download_direct_task(
         provider_id=task.get("provider_id") or task.get("provider") or task.get("source"),
         download_task_id=task.get("id") or task.get("external_id") or candidate.get("candidate_identity"),
         staging_root=root,
+        download_root=resolved_download_root,
+        incomplete_root=resolved_incomplete_root,
         local_path=local_path,
-        partial_path=task.get("partial_path") or raw.get("partial_path") or nested_raw.get("partial_path") or seed.get("partial_path"),
+        partial_path=partial_path,
         allowed_extensions=derived_extensions,
         allowed_content_types=derived_content_types,
         max_bytes=max_bytes,

@@ -38,6 +38,7 @@ def main() -> int:
     system_area_body = function_body(text, "openSystemArea")
     system_body = function_body(text, "loadInkdropSystemPage")
     suwayomi_settings_body = function_body(text, "hydrateSuwayomiSettingsTruth")
+    duplicate_workload_body = function_body(text, "getDuplicateSeriesWorkloadMap")
 
     require("const INKDROP_SECTION_LOAD_MORE_MAX = 240;" in text, "load-more cap should stay bounded")
     require('["queue", "wanted", "manual_review"].includes(view) && !hasFocusLinks' in first_paint_body, "Operational broad first paint should honor the selected page size")
@@ -106,7 +107,10 @@ def main() -> int:
     require(system_body.count('activeArea === "advanced"') >= 5, "each expensive diagnostic should be independently gated")
 
     require('const WORKER_ACTIVITY_ENDPOINT = "/api/inkdrop-state/workers?limit=12&summary=compact";' in text, "worker activity endpoint should be compact and bounded")
-    require('fetch("/api/inkdrop-state/series?series_filter=duplicate_titles&limit=200&summary=compact&rows=compact")' in text, "duplicate-title workload fetch should stay compact and bounded")
+    duplicate_workload_endpoint = '"/api/inkdrop-state/series?series_filter=duplicate_titles&limit=200&summary=compact&rows=compact"'
+    require(duplicate_workload_endpoint in duplicate_workload_body, "duplicate-title workload request should stay compact and bounded")
+    require("getJsonWithTimeout(" in duplicate_workload_body and '"Duplicate series review"' in duplicate_workload_body, "duplicate-title workload request should have a labeled timeout")
+    require("duplicateSeriesWorkloadFetchInFlight" in duplicate_workload_body, "duplicate-title workload requests should share one in-flight query")
     require('series_filter=duplicate_titles&limit=5000' not in text, "duplicate-title workload fetch must not use an unbounded heavy limit")
     require('parsed.searchParams.delete("rows")' not in text, "fallback logic must not remove compact row mode")
     require('state_view_performance' in text, "state-view payloads should include route/timing diagnostics")

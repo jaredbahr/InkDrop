@@ -512,6 +512,10 @@ def create_backup_archive(
             tmp_root = Path(tmp)
             temp_db = tmp_root / STATE_DB_ARCHIVE_NAME
             db_backup = backup_sqlite_db(state_db_path, temp_db)
+            if not db_backup.get("ok"):
+                raise ValueError(
+                    f"state database backup failed: {db_backup.get('reason') or 'unknown_error'}"
+                )
             # Logins, sessions, and API keys live in their own database next
             # to the state file; a backup that skipped it would restore a
             # library with last year's credentials.
@@ -596,6 +600,46 @@ def _safe_zip_members(zf):
     return members
 
 
+def _validate_sqlite_database(database_path, *, label):
+    """Reject non-databases and internally inconsistent SQLite snapshots."""
+    try:
+        with contextlib.closing(
+            sqlite3.connect(f"file:{Path(database_path)}?mode=ro", uri=True)
+        ) as con:
+            quick_check = [row[0] for row in con.execute("pragma quick_check").fetchall()]
+            foreign_key_violations = con.execute("pragma foreign_key_check").fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"{label} is not a valid SQLite database: {exc}") from exc
+    if quick_check != ["ok"]:
+        raise ValueError(f"{label} failed SQLite quick_check: {quick_check!r}")
+    if foreign_key_violations:
+        raise ValueError(
+            f"{label} has {len(foreign_key_violations)} foreign-key violation(s)"
+        )
+    return {"quick_check": "ok", "foreign_key_violations": 0}
+
+
+def _stage_archive_member(zf, archive_name, target_dir):
+    """Copy a member to a durable sibling temp file for atomic replacement."""
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    fd, staged_name = tempfile.mkstemp(prefix=".inkdrop-restore-", dir=target_dir)
+    staged_path = Path(staged_name)
+    try:
+        with os.fdopen(fd, "wb") as dst, zf.open(archive_name) as src:
+            fd = -1
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        return staged_path
+    except Exception:
+        staged_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _clear_state_auth_generation(state_db_path):
     """Drop a restored state database's claim about which auth store it owns."""
     state_db_path = Path(state_db_path)
@@ -626,6 +670,12 @@ def restore_backup_archive(
     path_remaps = dict(path_remaps or {})
     with zipfile.ZipFile(archive_path, "r") as zf:
         _safe_zip_members(zf)
+        archive_names = set(zf.namelist())
+        if STATE_DB_ARCHIVE_NAME not in archive_names:
+            raise ValueError("backup archive does not contain the required state database")
+        for required_name in (MANIFEST_ARCHIVE_NAME, CONFIG_EXPORT_ARCHIVE_NAME, SECRET_REFS_ARCHIVE_NAME):
+            if required_name not in archive_names:
+                raise ValueError(f"backup archive is missing required member: {required_name}")
         manifest = json.loads(zf.read(MANIFEST_ARCHIVE_NAME).decode("utf-8"))
         config_export = json.loads(zf.read(CONFIG_EXPORT_ARCHIVE_NAME).decode("utf-8"))
         source_values = config_export.get("values") if isinstance(config_export.get("values"), dict) else {}
@@ -645,6 +695,19 @@ def restore_backup_archive(
                         "next_action": "Provide a path remap or update this setting after restore.",
                     }
                 )
+        # A dry run must prove the databases are usable, not merely that the
+        # ZIP member names exist.  Extraction is isolated from restore targets.
+        with tempfile.TemporaryDirectory(prefix="inkdrop-restore-preview-") as preview_dir:
+            preview_root = Path(preview_dir)
+            preview_state = _stage_archive_member(zf, STATE_DB_ARCHIVE_NAME, preview_root)
+            database_validation = {
+                "state_db": _validate_sqlite_database(preview_state, label="backup state database")
+            }
+            if AUTH_DB_ARCHIVE_NAME in archive_names:
+                preview_auth = _stage_archive_member(zf, AUTH_DB_ARCHIVE_NAME, preview_root)
+                database_validation["auth_db"] = _validate_sqlite_database(
+                    preview_auth, label="backup auth database"
+                )
         result = {
             "ok": True,
             "dry_run": not bool(apply),
@@ -652,75 +715,97 @@ def restore_backup_archive(
             "target_config_dir": path_text(target_config_dir),
             "target_state_dir": path_text(target_state_dir),
             "manifest": manifest,
+            "database_validation": database_validation,
             "path_warnings": path_warnings,
             "would_restore": {
-                "state_db": STATE_DB_ARCHIVE_NAME in zf.namelist(),
-                "auth_db": AUTH_DB_ARCHIVE_NAME in zf.namelist(),
-                "config_export": CONFIG_EXPORT_ARCHIVE_NAME in zf.namelist(),
-                "secret_refs": SECRET_REFS_ARCHIVE_NAME in zf.namelist(),
+                "state_db": STATE_DB_ARCHIVE_NAME in archive_names,
+                "auth_db": AUTH_DB_ARCHIVE_NAME in archive_names,
+                "config_export": CONFIG_EXPORT_ARCHIVE_NAME in archive_names,
+                "secret_refs": SECRET_REFS_ARCHIVE_NAME in archive_names,
             },
         }
         if not apply:
             return result
         target_config_dir.mkdir(parents=True, exist_ok=True)
         target_state_dir.mkdir(parents=True, exist_ok=True)
+        staged_files = {}
+        try:
+            staged_files[STATE_DB_ARCHIVE_NAME] = _stage_archive_member(
+                zf, STATE_DB_ARCHIVE_NAME, target_state_dir
+            )
+            _validate_sqlite_database(
+                staged_files[STATE_DB_ARCHIVE_NAME], label="backup state database"
+            )
+            if AUTH_DB_ARCHIVE_NAME in archive_names:
+                staged_files[AUTH_DB_ARCHIVE_NAME] = _stage_archive_member(
+                    zf, AUTH_DB_ARCHIVE_NAME, target_state_dir
+                )
+                _validate_sqlite_database(
+                    staged_files[AUTH_DB_ARCHIVE_NAME], label="backup auth database"
+                )
+            for archive_name in (CONFIG_EXPORT_ARCHIVE_NAME, SECRET_REFS_ARCHIVE_NAME):
+                staged_files[archive_name] = _stage_archive_member(
+                    zf, archive_name, target_config_dir
+                )
+        except Exception:
+            for staged_path in staged_files.values():
+                staged_path.unlink(missing_ok=True)
+            raise
         # Snapshot whatever's already on disk before any restore write
         # overwrites it -- restore_portable_settings has always done this for
         # its own narrower scope (_write_settings_snapshot); this path never
         # did, so an operator restoring the wrong archive (or restoring twice)
         # had no automatic way back to what was there a moment before.
         pre_restore_snapshots = []
-        if STATE_DB_ARCHIVE_NAME in zf.namelist():
+        try:
             state_target = target_state_dir / inkdrop_runtime_config.STATE_DB_NAME
             snapshot = _snapshot_existing_file(state_target, backup_dir)
             if snapshot:
                 pre_restore_snapshots.append(path_text(snapshot))
-            with zf.open(STATE_DB_ARCHIVE_NAME) as src, state_target.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+            os.replace(staged_files.pop(STATE_DB_ARCHIVE_NAME), state_target)
             result["restored_state_db"] = path_text(state_target)
-        auth_target = target_state_dir / inkdrop_auth.AUTH_STORE_DB_NAME
-        if preserve_current_auth:
-            # Explicitly requested: keep whatever credentials exist right now
-            # and let the next open adopt them. The restored state database
-            # must not carry a generation claim about a store it never met.
-            _clear_state_auth_generation(target_state_dir / inkdrop_runtime_config.STATE_DB_NAME)
-            result["auth_store"] = "preserved_current_auth"
-        elif AUTH_DB_ARCHIVE_NAME in zf.namelist():
-            snapshot = _snapshot_existing_file(auth_target, backup_dir)
-            if snapshot:
-                pre_restore_snapshots.append(path_text(snapshot))
-            with zf.open(AUTH_DB_ARCHIVE_NAME) as src, auth_target.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
-            for suffix in ("-wal", "-shm"):
-                Path(str(auth_target) + suffix).unlink(missing_ok=True)
-            result["restored_auth_db"] = path_text(auth_target)
-            result["auth_store"] = "restored_from_archive"
-        elif auth_target.exists():
-            # The archive predates the auth split: its credentials live in the
-            # state database it carries. Leaving today's store in place would
-            # mix that old application state with current logins -- not a
-            # point-in-time restore. Snapshot and remove the store so the
-            # first open rebuilds it from the restored state database.
-            snapshot = _snapshot_existing_file(auth_target, backup_dir)
-            if snapshot:
-                pre_restore_snapshots.append(path_text(snapshot))
-            auth_target.unlink()
-            for suffix in ("-wal", "-shm"):
-                Path(str(auth_target) + suffix).unlink(missing_ok=True)
-            result["auth_store"] = "removed_for_archive_epoch"
-        else:
-            result["auth_store"] = "absent"
-        inkdrop_auth.reset_auth_store_cache()
-        for archive_name, target_name in (
-            (CONFIG_EXPORT_ARCHIVE_NAME, "inkdrop-config-export.json"),
-            (SECRET_REFS_ARCHIVE_NAME, "inkdrop-secret-refs.json"),
-        ):
-            existing_target = target_config_dir / target_name
-            snapshot = _snapshot_existing_file(existing_target, backup_dir)
-            if snapshot:
-                pre_restore_snapshots.append(path_text(snapshot))
-            with zf.open(archive_name) as src, existing_target.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+            auth_target = target_state_dir / inkdrop_auth.AUTH_STORE_DB_NAME
+            if preserve_current_auth:
+                # Explicitly requested: keep whatever credentials exist right
+                # now and let the next open adopt them. The restored state
+                # database must not claim a store generation it never met.
+                _clear_state_auth_generation(target_state_dir / inkdrop_runtime_config.STATE_DB_NAME)
+                result["auth_store"] = "preserved_current_auth"
+            elif AUTH_DB_ARCHIVE_NAME in archive_names:
+                snapshot = _snapshot_existing_file(auth_target, backup_dir)
+                if snapshot:
+                    pre_restore_snapshots.append(path_text(snapshot))
+                os.replace(staged_files.pop(AUTH_DB_ARCHIVE_NAME), auth_target)
+                for suffix in ("-wal", "-shm"):
+                    Path(str(auth_target) + suffix).unlink(missing_ok=True)
+                result["restored_auth_db"] = path_text(auth_target)
+                result["auth_store"] = "restored_from_archive"
+            elif auth_target.exists():
+                # The archive predates the auth split. Leaving today's store
+                # would mix old application state with current logins, so the
+                # first open must rebuild it from the restored state database.
+                snapshot = _snapshot_existing_file(auth_target, backup_dir)
+                if snapshot:
+                    pre_restore_snapshots.append(path_text(snapshot))
+                auth_target.unlink()
+                for suffix in ("-wal", "-shm"):
+                    Path(str(auth_target) + suffix).unlink(missing_ok=True)
+                result["auth_store"] = "removed_for_archive_epoch"
+            else:
+                result["auth_store"] = "absent"
+            inkdrop_auth.reset_auth_store_cache()
+            for archive_name, target_name in (
+                (CONFIG_EXPORT_ARCHIVE_NAME, "inkdrop-config-export.json"),
+                (SECRET_REFS_ARCHIVE_NAME, "inkdrop-secret-refs.json"),
+            ):
+                existing_target = target_config_dir / target_name
+                snapshot = _snapshot_existing_file(existing_target, backup_dir)
+                if snapshot:
+                    pre_restore_snapshots.append(path_text(snapshot))
+                os.replace(staged_files.pop(archive_name), existing_target)
+        finally:
+            for staged_path in staged_files.values():
+                staged_path.unlink(missing_ok=True)
         result["restored_config_files"] = [
             path_text(target_config_dir / "inkdrop-config-export.json"),
             path_text(target_config_dir / "inkdrop-secret-refs.json"),

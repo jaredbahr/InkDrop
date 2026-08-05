@@ -177,6 +177,15 @@ def authenticate(
     user = str(username or "").strip()
     secret = str(password or "")
 
+    # Set once, on the session itself, before either auth branch: the API-key
+    # branch makes no login call to attach a per-request override to, and every
+    # later request on this session (list, add, torrents/info, ...) reuses
+    # whatever session.verify was left at. Leaving it at the requests default
+    # of True silently ignores a user's verify_tls=false against a self-signed
+    # qBittorrent -- real traffic then fails TLS verification even though the
+    # separate one-off "Test" call (which passes verify= inline) succeeds.
+    session.verify = bool(verify)
+
     if key:
         # Deliberately no login call: an API key is rejected by the auth
         # endpoints, and an API-key-only user has no password to log in with.

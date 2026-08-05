@@ -389,35 +389,63 @@
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
     min-width: 1000px;
-    grid-template-columns: minmax(330px, 1.45fr) minmax(120px, .34fr) minmax(300px, .9fr) minmax(132px, .34fr);
+    grid-template-columns: minmax(280px, 1.15fr) minmax(108px, .3fr) minmax(130px, .4fr) minmax(260px, .85fr) minmax(132px, .34fr);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-row {
-    grid-template-columns: minmax(330px, 1.35fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
+    grid-template-columns: minmax(330px, 1.35fr) minmax(140px, .5fr) minmax(300px, 1.65fr) minmax(168px, .7fr);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-detail:not(.arr-table-hide-state) .section-table-row {
-    grid-template-columns: minmax(350px, 1.65fr) minmax(126px, .55fr) minmax(168px, .7fr);
+    grid-template-columns: minmax(350px, 1.65fr) minmax(126px, .55fr) minmax(140px, .5fr) minmax(168px, .7fr);
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-head,
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state.arr-table-hide-detail .section-table-row {
-    grid-template-columns: minmax(360px, 1fr) minmax(168px, .35fr);
+    grid-template-columns: minmax(360px, 1fr) minmax(140px, .5fr) minmax(168px, .35fr);
   }
 }
 
 @media (min-width: 621px) and (max-width: 1099px) {
-  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head {
-    grid-template-columns: minmax(220px, 1.1fr) minmax(120px, .58fr) minmax(190px, .9fr) minmax(64px, auto);
+  /* This tablet/phone-landscape breakpoint predates Queue/Wanted's Source
+     column split (inkdrop_web.py's SPLIT_SOURCE_COLUMN_VIEWS). The ROW's
+     layout at this breakpoint is owned by 12-manual-search-and-auth.css
+     (its own @media (min-width: 621px) and (max-width: 1099px) block) --
+     that rule now carries "source", see the comment there. But neither that
+     rule nor any other ever touched the HEAD row at this breakpoint, so it
+     kept using the base 6-track desktop grid-template-columns meant for a
+     1040px-wide table squeezed into ~900px, with no matching per-cell
+     grid-area assignment -- cells landed in overlapping/implicit tracks and
+     "Series / Issue" collapsed to ~30px, reading as "Ser..." on a real phone
+     in landscape (the width this breakpoint actually covers). Give the head
+     the same 4-area layout the row uses, source included. */
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head {
+    grid-template-columns: minmax(170px, 1fr) minmax(90px, .5fr) minmax(90px, .5fr) minmax(64px, auto);
+    grid-template-areas: "item state source actions";
   }
-
-  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
-    grid-template-columns: minmax(220px, 1.1fr) minmax(190px, .9fr) minmax(64px, auto);
-    grid-template-areas:
-      "item state actions"
-      "detail detail actions";
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-item,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-item { grid-area: item; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-state,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-state { grid-area: state; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-source,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-source { grid-area: source; }
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-actions,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-actions { grid-area: actions; }
+  /* Queue has no select column at this breakpoint (never has, at any
+     width); Wanted's select column here is its own "select" grid-area in
+     12-manual-search-and-auth.css's row layout, which the head has no
+     matching line for. Both hide from the head. The row's "detail" cell
+     spans a second line under item/state/source; the head has no second
+     line to put a matching label on, and an unassigned grid item falls
+     back into the already-occupied "item" area and overlaps its label. */
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-select,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-select,
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-head > .section-table-col-detail,
+  body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-head > .section-table-col-detail {
+    display: none;
   }
 
   body[data-inkdrop-view="queue"] .section-table-queue.arr-table-hide-state:not(.arr-table-hide-detail) .section-table-head {
@@ -1197,9 +1225,75 @@
   gap: 16px;
 }
 
+.missing-recovery-heading-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* Same tinted-circle-plus-mask-icon language as the page-masthead stat cards
+   (.arr-page-stat-icon in 15-redesign-shell.css) so this banner reads as
+   part of the same visual system instead of a bespoke card. */
+.missing-recovery-icon {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: rgba(114, 210, 255, .16);
+}
+.missing-recovery-icon::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  background: var(--accent);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4,12a8,8 0,1,1 2.3,5.6M4,12v5h5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4,12a8,8 0,1,1 2.3,5.6M4,12v5h5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
 .missing-recovery-copy h3,
 .missing-recovery-copy p {
   margin: 2px 0 0;
+}
+.missing-recovery-copy h3 {
+  font-size: var(--font-md, 14px);
+}
+
+/* Collapsed by default -- the always-visible surface is just the heading,
+   any notice, and the footer (result + Start/Pause). The nine-tile progress
+   grid and the advanced admission-limit metrics are real operator detail,
+   not clutter, but they don't need to be on screen before anyone asks. */
+.missing-recovery-details {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 12px 12px;
+  background: var(--panel-2);
+}
+.missing-recovery-details > summary {
+  cursor: pointer;
+  padding: 8px 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: var(--weight-medium, 600);
+  user-select: none;
+}
+.missing-recovery-details[open] > summary { color: var(--text); }
+.missing-recovery-details > p.mini {
+  margin: 0 0 12px;
+}
+/* .missing-recovery-progress/.missing-recovery-metrics/.missing-recovery-categories
+   all set their own `display: grid` below. An author `display` declaration
+   beats the browser's built-in `details:not([open]) > *:not(summary) {
+   display: none }` rule regardless of selector order (author origin always
+   wins over the user-agent sheet) -- so without this, closed <details>
+   content with its own `display` rule renders anyway. Same trap as
+   `[hidden]` (see 04-tables-rows.css), just triggered by <details> instead.
+   Applies to the pre-existing .missing-recovery-advanced nesting too. */
+.missing-recovery-details:not([open]) > *:not(summary),
+.missing-recovery-advanced:not([open]) > *:not(summary) {
+  display: none;
 }
 
 .missing-recovery-state,
@@ -1290,6 +1384,9 @@ button.missing-recovery-metric:focus-visible {
 .missing-recovery-result {
   display: grid;
   gap: 8px;
+}
+.missing-recovery-progress {
+  margin: 0 0 14px;
 }
 
 .missing-recovery-advanced {
