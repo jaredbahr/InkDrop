@@ -139,7 +139,7 @@ def compose_text():
       - ./library/comics:/library/comics
       - ./library/manga:/library/manga
     healthcheck:
-      test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"]
+      test: ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--timeout", "5"]
       interval: 10s
       timeout: 10s
       retries: 6
@@ -155,9 +155,9 @@ def compose_text():
       <<: *inkdrop_environment
       INKDROP_CONTAINER_SCHEDULER_ENABLED: "1"
     volumes: *inkdrop_volumes
-    command: ["python", "-B", "inkdrop_container_scheduler.py"]
+    command: ["python", "-B", "core/inkdrop_container_scheduler.py"]
     healthcheck:
-      test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--worker"]
+      test: ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--worker"]
       interval: 10s
       timeout: 10s
       retries: 9
@@ -323,7 +323,7 @@ test "$(docker inspect "$(docker compose ps -q inkdrop-worker)" --format '{{{{.I
 PUBLISHED_ADDRESS="$(docker compose port inkdrop 8796 | head -n 1)"
 curl -fsS "http://$PUBLISHED_ADDRESS/api/system/version" | python -c 'import json,sys; p=json.load(sys.stdin); c=json.load(open("state/release/qa-candidate.json", encoding="utf-8")); assert p["candidate_manifest_status"] == "matched", p; assert p["image_digest"] == c["image_digest"], p; assert p["commit_sha"] == c["full_commit_sha"], p; assert p["version"] == c["version"], p; assert p["release_channel"] == c["release_channel"], p; assert int(p["qa_build_number"]) == int(c["qa_build_number"]), p; assert int(p["state_schema_version"]) == int(c["state_schema_version"]), p; print(p["version"], p["commit_sha"])'
 docker compose exec -T inkdrop python -B -c 'import sqlite3,inkdrop_runtime_config,inkdrop_state; c=sqlite3.connect(inkdrop_runtime_config.state_db_path()); actual=int(c.execute("select value from schema_meta where key=?", ("schema_version",)).fetchone()[0]); assert c.execute("pragma quick_check").fetchone()[0] == "ok"; assert not c.execute("pragma foreign_key_check").fetchall(); assert actual == inkdrop_state.SCHEMA_VERSION, (actual, inkdrop_state.SCHEMA_VERSION); print(actual)'
-docker compose exec -T inkdrop-worker python -B inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
+docker compose exec -T inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
 ```
 
 For rollback without a database restore, first confirm the prior image supports

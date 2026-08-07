@@ -22,40 +22,40 @@ PUBLIC_FILES = (
     ".gitignore",
     "requirements.txt",
     "inkdrop-logo-mark.png",
-    "inkdrop_container_healthcheck.py",
-    "inkdrop_container_start.py",
-    "inkdrop_runtime_config.py",
-    "inkdrop_preflight.py",
-    "inkdrop-public-docker-runtime-smoke.py",
-    "inkdrop-public-repo-export-smoke.py",
+    "core/inkdrop_container_healthcheck.py",
+    "core/inkdrop_container_start.py",
+    "core/inkdrop_runtime_config.py",
+    "core/inkdrop_preflight.py",
+    "tests/inkdrop-public-docker-runtime-smoke.py",
+    "tests/inkdrop-public-repo-export-smoke.py",
     "tools/inkdrop_public_release_check.py",
     "tools/inkdrop_public_repo_export.py",
     "docs/inkdrop/docker-first-install.md",
     "docs/inkdrop-source-candidate-catalog-20260702.json",
 )
 
-STARTUP_FILE = "inkdrop_web.py"
+STARTUP_FILE = "core/inkdrop_web.py"
 STARTUP_SCAN_LINES = 450
 BACKEND_STARTUP_SCANS = {
-    "inkdrop_state.py": 130,
-    "inkdrop_source_worker_cli.py": 80,
-    "inkdrop_completed_import.py": 110,
-    "inkdrop_missing_acquire.py": 130,
-    "inkdrop_series_autopilot.py": 120,
-    "inkdrop_acquire.py": 70,
-    "inkdrop_reconcile_imports.py": 90,
-    "inkdrop_slskd_source_probe.py": 80,
-    "inkdrop_sab_failed_cleanup.py": 80,
-    "inkdrop_pack_import.py": 80,
-    "inkdrop_manual_source_autoresolve.py": 90,
-    "inkdrop_rss_discovery.py": 80,
-    "inkdrop_comicscodes_discovery.py": 75,
-    "inkdrop_mangadex_direct.py": 70,
+    "core/inkdrop_state.py": 130,
+    "core/inkdrop_source_worker_cli.py": 80,
+    "core/inkdrop_completed_import.py": 110,
+    "core/inkdrop_missing_acquire.py": 130,
+    "core/inkdrop_series_autopilot.py": 120,
+    "core/inkdrop_acquire.py": 70,
+    "core/inkdrop_reconcile_imports.py": 90,
+    "core/inkdrop_slskd_source_probe.py": 80,
+    "core/inkdrop_sab_failed_cleanup.py": 80,
+    "core/inkdrop_pack_import.py": 80,
+    "core/inkdrop_manual_source_autoresolve.py": 90,
+    "core/inkdrop_rss_discovery.py": 80,
+    "core/inkdrop_comicscodes_discovery.py": 75,
+    "core/inkdrop_mangadex_direct.py": 70,
 }
 FULL_FILE_SCANS = (
-    "inkdrop_acquire.py",
-    "inkdrop_reconcile_imports.py",
-    "inkdrop_sab_failed_cleanup.py",
+    "core/inkdrop_acquire.py",
+    "core/inkdrop_reconcile_imports.py",
+    "core/inkdrop_sab_failed_cleanup.py",
 )
 
 REQUIRED_DOCKERIGNORE_PATTERNS = (
@@ -63,11 +63,11 @@ REQUIRED_DOCKERIGNORE_PATTERNS = (
     "!/Dockerfile",
     "!/requirements.txt",
     "!/inkdrop-logo-mark.png",
-    "!/inkdrop_web.py",
-    "!/inkdrop_state.py",
-    "!/inkdrop_runtime_config.py",
-    "!/inkdrop_container_healthcheck.py",
-    "!/inkdrop_container_start.py",
+    "!/core/inkdrop_web.py",
+    "!/core/inkdrop_state.py",
+    "!/core/inkdrop_runtime_config.py",
+    "!/core/inkdrop_container_healthcheck.py",
+    "!/core/inkdrop_container_start.py",
     "!/docs/",
     "/docs/**",
     "!/docs/inkdrop-source-candidate-catalog-20260702.json",
@@ -256,6 +256,8 @@ def scan_public_image_context_private_text_files():
     ]
     candidates.extend(sorted(ROOT.glob("inkdrop*.py")))
     candidates.extend(sorted(ROOT.glob("kavita*.py")))
+    candidates.extend(sorted((ROOT / "core").glob("inkdrop*.py")))
+    candidates.extend(sorted((ROOT / "core").glob("kavita*.py")))
     for path in candidates:
         if not path.is_file():
             continue

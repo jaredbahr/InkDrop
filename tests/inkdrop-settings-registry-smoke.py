@@ -3,8 +3,8 @@ import json
 import tempfile
 from pathlib import Path
 
-import inkdrop_settings_registry as registry
-import inkdrop_state
+from core import inkdrop_settings_registry as registry
+from core import inkdrop_state
 
 
 def require(value, message):

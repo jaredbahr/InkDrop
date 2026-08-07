@@ -4,7 +4,7 @@
 import json
 from unittest import mock
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 MIB = 1024 * 1024

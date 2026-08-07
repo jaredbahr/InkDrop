@@ -9,12 +9,12 @@ import time
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_auth_contracts
-import inkdrop_manual_search
-import inkdrop_manual_search_core as core
-import inkdrop_manual_search_executor as executor
-import inkdrop_slskd_source_probe as slskd
-import inkdrop_state
+from core import inkdrop_auth_contracts
+from core import inkdrop_manual_search
+from core import inkdrop_manual_search_core as core
+from core import inkdrop_manual_search_executor as executor
+from core import inkdrop_slskd_source_probe as slskd
+from core import inkdrop_state
 
 
 def require(value, message):

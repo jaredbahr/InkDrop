@@ -71,107 +71,7 @@ COPY web/static/css/inkdrop.css ./web/static/css/inkdrop.css
 COPY web/static/img/inkdrop-auth-backdrop.webp ./web/static/img/inkdrop-auth-backdrop.webp
 COPY web/static/js/ ./web/static/js/
 COPY --from=frontend-builder /app/web/static/dist ./web/static/dist
-COPY \
-    inkdrop_acquire_adapter.py \
-    inkdrop_archive_conversion.py \
-    inkdrop_acquire.py \
-    inkdrop_acquisition_funnel.py \
-    inkdrop_backup_restore.py \
-    inkdrop_auth.py \
-    inkdrop_auth_contracts.py \
-    inkdrop_auth_cli.py \
-    inkdrop_artifact_acceptance.py \
-    inkdrop_comicscodes_discovery.py \
-    inkdrop_completed_import.py \
-    inkdrop_incident_recovery.py \
-    inkdrop_container_healthcheck.py \
-    inkdrop_internal_jobs.py \
-    inkdrop_container_scheduler.py \
-    inkdrop_container_start.py \
-    inkdrop_direct_downloader.py \
-    inkdrop_download_clients.py \
-    inkdrop_download_client_config.py \
-    inkdrop_download_client_api.py \
-    inkdrop_download_client_routing.py \
-    inkdrop_qbittorrent_auth.py \
-    inkdrop_secret_store.py \
-    inkdrop_db.py \
-    inkdrop_client_status.py \
-    inkdrop_effective_config.py \
-    inkdrop_language.py \
-    inkdrop_log_retention.py \
-    inkdrop_library_adoption.py \
-    inkdrop_library_frontends.py \
-    inkdrop_library_identity.py \
-    inkdrop_manga_companion.py \
-    inkdrop_manga_metadata_guard.py \
-    inkdrop_manual_source_autoresolve.py \
-    inkdrop_mangadex_direct.py \
-    inkdrop_manual_search.py \
-    inkdrop_manual_search_core.py \
-    inkdrop_manual_search_executor.py \
-    inkdrop_manual_search_worker.py \
-    inkdrop_missing_acquire.py \
-    inkdrop_missing_recovery_policy.py \
-    inkdrop_notifications.py \
-    inkdrop_notification_events.py \
-    inkdrop_notification_store.py \
-    inkdrop_nfo_parser.py \
-    inkdrop_pack_import.py \
-    inkdrop_page_pack_downloader.py \
-    inkdrop_operator_contracts.py \
-    inkdrop_opds.py \
-    inkdrop_folder_cleanup.py \
-    inkdrop_log_export.py \
-    inkdrop_support_bundle.py \
-    inkdrop_portability_export.py \
-    inkdrop_process_lifecycle.py \
-    inkdrop_preflight.py \
-    inkdrop_public_contracts.py \
-    inkdrop_reconcile_imports.py \
-    inkdrop_release_calendar.py \
-    inkdrop_runtime_config.py \
-    inkdrop_settings_registry.py \
-    inkdrop_rss_discovery.py \
-    inkdrop_sab_failed_cleanup.py \
-    inkdrop_slskd_search_cleanup.py \
-    sab_rescue_server.py \
-    inkdrop_series_autopilot.py \
-    inkdrop_service_inventory.py \
-    inkdrop_slskd_source_probe.py \
-    inkdrop_slskd_root_health.py \
-    inkdrop_slskd_staging_sweep.py \
-    inkdrop_candidate_matching.py \
-    inkdrop_source_catalog.py \
-    inkdrop_source_providers.py \
-    inkdrop_source_registry.py \
-    inkdrop_source_suppression.py \
-    inkdrop_source_worker_adapters.py \
-    inkdrop_source_worker_batch.py \
-    inkdrop_source_worker_cli.py \
-    inkdrop_source_worker_coordinator.py \
-    inkdrop_source_worker_http.py \
-    inkdrop_source_worker_jobs.py \
-    inkdrop_source_worker_plan.py \
-    inkdrop_source_worker_recorder.py \
-    inkdrop_source_worker_runtime.py \
-    inkdrop_source_worker_scheduler.py \
-    inkdrop_source_worker_service.py \
-    inkdrop_sources.py \
-    inkdrop_activity.py \
-    inkdrop_staged_projection.py \
-    inkdrop_deferred_sync.py \
-    inkdrop_credential_evidence_cleanup.py \
-    inkdrop_issue_identity.py \
-    inkdrop_state.py \
-    inkdrop_state_maintenance.py \
-    inkdrop_transfer.py \
-    inkdrop_suwayomi_managed_folder.py \
-    inkdrop_version.py \
-    inkdrop_web_config.py \
-    inkdrop_web_state_views.py \
-    inkdrop_web.py \
-    ./
+COPY core/ ./core/
 COPY docs/inkdrop-source-candidate-catalog-20260702.json ./docs/inkdrop-source-candidate-catalog-20260702.json
 COPY tools/inkdrop_install_support_summary.py ./tools/inkdrop_install_support_summary.py
 COPY \
@@ -191,6 +91,6 @@ RUN chmod +x /app/inkdrop-*.sh
 EXPOSE 8796
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -B inkdrop_container_healthcheck.py --timeout 5
+    CMD python -B core/inkdrop_container_healthcheck.py --timeout 5
 
-CMD ["python", "-B", "inkdrop_container_start.py"]
+CMD ["python", "-B", "core/inkdrop_container_start.py"]

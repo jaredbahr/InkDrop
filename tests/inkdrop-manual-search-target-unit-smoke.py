@@ -5,10 +5,10 @@ import json
 import tempfile
 from pathlib import Path
 
-import inkdrop_candidate_matching as matching
-import inkdrop_manual_search as manual
-import inkdrop_manual_search_core as core
-import inkdrop_state
+from core import inkdrop_candidate_matching as matching
+from core import inkdrop_manual_search as manual
+from core import inkdrop_manual_search_core as core
+from core import inkdrop_state
 
 
 def require(value, message):

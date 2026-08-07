@@ -5,11 +5,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "inkdrop_web.py"
-STATE = ROOT / "inkdrop_state.py"
-IMPORTER = ROOT / "inkdrop_completed_import.py"
-PACK_IMPORT = ROOT / "inkdrop_pack_import.py"
-FRONTENDS = ROOT / "inkdrop_library_frontends.py"
+WEB = ROOT / "core" / "inkdrop_web.py"
+STATE = ROOT / "core" / "inkdrop_state.py"
+IMPORTER = ROOT / "core" / "inkdrop_completed_import.py"
+PACK_IMPORT = ROOT / "core" / "inkdrop_pack_import.py"
+FRONTENDS = ROOT / "core" / "inkdrop_library_frontends.py"
 PLAN = ROOT / "docs" / "inkdrop" / "folder-based-completion-plan.md"
 
 
@@ -40,9 +40,11 @@ def main():
     require(web, "def komga_api_health", "Komga provider test health check")
     require(web, 'komga: ["libraries", "Connect"', "Komga Settings display group")
     require(web, "Library frontend adapters, sync visibility hooks, and outbound notifications", "Connect adapter safety copy")
-    require(web, "function appendLibraryAdaptersLens", "Library Adapters settings lens")
-    require(web, "Folder completion is primary", "Library Adapters folder-first title")
-    require(web, "Komga and Kavita are optional", "Library Adapters optional frontend copy")
+    require(
+        web,
+        "Leave this off to let InkDrop work on its own. Turn it on only if an issue should stay unfinished until Kavita or Komga can actually see the file.",
+        "folder-completion-is-primary/optional-frontend contract (Media Management field help)",
+    )
     require(web, "frontend_adapter", "optional frontend provider ownership")
     require(web, "library_adapters: \"libraries\"", "Library Adapters route alias")
     require(web, '"komga": lambda: komga_api_health', "Komga Test Provider mapping")

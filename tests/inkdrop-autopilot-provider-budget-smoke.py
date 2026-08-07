@@ -9,8 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
-import inkdrop_series_autopilot as autopilot
-import inkdrop_source_worker_cli as source_worker_cli
+from core import inkdrop_series_autopilot as autopilot
+from core import inkdrop_source_worker_cli as source_worker_cli
 
 
 def require(condition, message):

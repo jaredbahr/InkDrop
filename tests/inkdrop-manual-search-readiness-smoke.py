@@ -6,9 +6,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import inkdrop_manual_search as manual
-import inkdrop_source_providers as providers
-import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_manual_search as manual
+from core import inkdrop_source_providers as providers
+from core import inkdrop_source_worker_adapters as adapters
 
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -4,8 +4,32 @@
 // this view's first paint). Every field is optional --
 // compact_state_view_rows() omits any key whose value is falsy/empty rather
 // than sending null.
+// normalize_transfer_status()'s stable telemetry contract
+// (core/inkdrop_transfer.py) as exposed on thin queue rows. progress_kind
+// "determinate" is the ONLY licence to draw a bar -- everything else is a
+// stage with no meaningful percentage.
+export type QueueTransfer = {
+  client?: string;
+  transfer_state?: string;
+  progress_kind?: "determinate" | "indeterminate";
+  percent_complete?: number | null;
+  bytes_completed?: number | null;
+  bytes_total?: number | null;
+  download_rate_bytes_per_second?: number | null;
+  eta_seconds?: number | null;
+  elapsed_seconds?: number | null;
+  stalled?: boolean;
+  client_error?: string | null;
+  import_stage?: string | null;
+  next_step?: string;
+  rate?: number | null;
+  eta?: number | null;
+  elapsed?: number | null;
+};
+
 export type QueueRow = {
   id: string;
+  revision?: number;
   series?: string;
   issue_number?: string;
   state?: string;
@@ -21,6 +45,35 @@ export type QueueRow = {
   display_source?: string;
   current_source?: string;
   source_key?: string;
+  media_type?: string;
+  image?: string;
+  transfer?: QueueTransfer;
+};
+
+// The focused full-row shape (queue_row_from_record without table
+// compaction): only the pieces the Details panel reads are typed; every
+// field is optional because each is genuinely nullable in the store.
+export type QueueRowDetail = QueueRow & {
+  query?: string;
+  last_event?: string;
+  attempt_count?: number;
+  created_at?: number;
+  updated_at?: number;
+  download_task?: {
+    title?: string;
+    local_path?: string;
+    save_path?: string;
+    size_bytes?: number;
+    download_client?: string;
+    external_id?: string;
+    provider?: string;
+    peer?: string;
+    failure_reason?: string;
+    started_at?: number;
+    completed_at?: number;
+  };
+  last_attempt?: { title?: string; provider?: string; failure_reason?: string };
+  latest_import?: { dest_path?: string };
 };
 
 export type StateViewFilter = {

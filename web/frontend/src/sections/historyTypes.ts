@@ -11,12 +11,19 @@ export type HistoryRow = {
   history_kind?: string;
   status?: string;
   outcome?: string;
+  display_phase?: string;
+  display_phase_label?: string;
+  failure_reason?: string;
+  retry_eligible?: boolean;
   next_action?: string;
   activity_summary?: string;
   message?: string;
   display_source?: string;
   provider_id?: string;
   provider_key?: string;
+  created_at?: number;
+  created_at_iso?: string;
+  activity_at?: number;
 };
 
 export type StateViewFilter = {

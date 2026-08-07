@@ -8,8 +8,8 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_state
-import inkdrop_web_state_views
+from core import inkdrop_state
+from core import inkdrop_web_state_views
 
 
 def insert_fixture(db_path: Path, count: int = 140) -> None:
@@ -132,9 +132,9 @@ def main() -> int:
         assert row.get("title"), row
         assert row.get("image"), row
         assert row.get("metadata_provider") == "comicvine", row
-    web_source = Path("inkdrop_web.py").read_text(encoding="utf-8")
-    view_source = Path("inkdrop_web_state_views.py").read_text(encoding="utf-8")
-    state_source = Path("inkdrop_state.py").read_text(encoding="utf-8")
+    web_source = Path("core/inkdrop_web.py").read_text(encoding="utf-8")
+    view_source = Path("core/inkdrop_web_state_views.py").read_text(encoding="utf-8")
+    state_source = Path("core/inkdrop_state.py").read_text(encoding="utf-8")
     assert "import inkdrop_web_state_views" in web_source, "web compact Series path should delegate payload shaping to inkdrop_web_state_views"
     assert "inkdrop_web_state_views.series_compact_view(" in web_source, "web compact Series endpoint is not wired to the extracted helper"
     assert "def series_compact_view(" in view_source, "extracted compact Series helper is missing"

@@ -6,8 +6,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-import inkdrop_acquisition_funnel as funnel
-import inkdrop_state
+from core import inkdrop_acquisition_funnel as funnel
+from core import inkdrop_state
 
 
 def require(condition, message):

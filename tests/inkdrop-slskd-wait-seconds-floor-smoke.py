@@ -20,7 +20,7 @@ polling once results stop growing, independent of how high the ceiling is.
 
 from unittest import mock
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

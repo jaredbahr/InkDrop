@@ -6,6 +6,7 @@ import { Wanted } from "./sections/Wanted";
 import { Queue } from "./sections/Queue";
 import { History } from "./sections/History";
 import { ManualReview } from "./sections/ManualReview";
+import { Series } from "./sections/Series";
 
 // Bridge between the existing vanilla-JS shell (inkdrop_web.py's inline
 // renderInkdropSection) and React. The shell owns navigation, the section
@@ -33,6 +34,7 @@ const SECTION_COMPONENTS: Record<string, SectionComponent> = {
   queue: Queue as unknown as SectionComponent,
   history: History as unknown as SectionComponent,
   manual_review: ManualReview as unknown as SectionComponent,
+  series: Series as unknown as SectionComponent,
 };
 
 const roots = new WeakMap<Element, Root>();

@@ -313,7 +313,10 @@ def main():
     require("qa-image-validation.json" in workflow and "candidate_sha256" in workflow, "permanent validation evidence is required")
     require(workflow.index("Create verified QA image summary") > workflow.index("Prove container health and public HTTP"), "validation summary must be created only after exact-image checks")
     require("--candidate release-evidence/candidate/qa-candidate.json" in workflow, "release must reverify downloaded candidate evidence")
-    require("concurrency:" in workflow and "cancel-in-progress: false" in workflow, "QA publication runs must be serialized")
+    require(
+        "concurrency:" in workflow and "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow,
+        "QA publication (push) runs must never be auto-cancelled; only pull_request runs, which never reach the publish jobs, may be",
+    )
     require("github.ref == 'refs/heads/qa'" in workflow, "release publication must be QA-only")
     require("github.event_name != 'pull_request'" in workflow, "release publication must reject PRs")
     require("contents: write" in workflow, "release job needs scoped contents permission")

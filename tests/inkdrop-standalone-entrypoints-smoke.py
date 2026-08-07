@@ -17,33 +17,33 @@ from __future__ import annotations
 import py_compile
 from pathlib import Path
 
-import inkdrop_service_inventory as inventory
+from core import inkdrop_service_inventory as inventory
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "inkdrop" / "service-inventory.md"
 SMOKES_DOC = ROOT / "docs" / "inkdrop" / "smokes.md"
-IMPORT_READY_WORKER = ROOT / "scripts/inkdrop-import-ready-worker.sh"
-WEB_IMPL = ROOT / "inkdrop_web.py"
-RECONCILE_IMPL = ROOT / "inkdrop_reconcile_imports.py"
-PACK_IMPORT_IMPL = ROOT / "inkdrop_pack_import.py"
-SAB_CLEANUP = ROOT / "inkdrop_sab_failed_cleanup.py"
-AUTOPILOT_IMPL = ROOT / "inkdrop_series_autopilot.py"
+IMPORT_READY_WORKER = ROOT / "inkdrop-import-ready-worker.sh"
+WEB_IMPL = ROOT / "core" / "inkdrop_web.py"
+RECONCILE_IMPL = ROOT / "core" / "inkdrop_reconcile_imports.py"
+PACK_IMPORT_IMPL = ROOT / "core" / "inkdrop_pack_import.py"
+SAB_CLEANUP = ROOT / "core" / "inkdrop_sab_failed_cleanup.py"
+AUTOPILOT_IMPL = ROOT / "core" / "inkdrop_series_autopilot.py"
 
 
 IMPLEMENTATIONS = {
-    "inkdrop_acquire.py": "inkdrop_library_adapters",
-    "inkdrop_web.py": "inkdrop_web",
-    "inkdrop_completed_import.py": "inkdrop_importer",
-    "inkdrop_reconcile_imports.py": "inkdrop_download_clients",
-    "inkdrop_series_autopilot.py": "inkdrop_worker",
-    "inkdrop_missing_acquire.py": "inkdrop_sources",
-    "inkdrop_slskd_source_probe.py": "inkdrop_sources",
-    "inkdrop_rss_discovery.py": "inkdrop_sources",
-    "inkdrop_comicscodes_discovery.py": "inkdrop_sources",
-    "inkdrop_mangadex_direct.py": "inkdrop_sources",
-    "inkdrop_manual_source_autoresolve.py": "inkdrop_sources",
-    "inkdrop_pack_import.py": "inkdrop_importer",
+    "core/inkdrop_acquire.py": "inkdrop_library_adapters",
+    "core/inkdrop_web.py": "inkdrop_web",
+    "core/inkdrop_completed_import.py": "inkdrop_importer",
+    "core/inkdrop_reconcile_imports.py": "inkdrop_download_clients",
+    "core/inkdrop_series_autopilot.py": "inkdrop_worker",
+    "core/inkdrop_missing_acquire.py": "inkdrop_sources",
+    "core/inkdrop_slskd_source_probe.py": "inkdrop_sources",
+    "core/inkdrop_rss_discovery.py": "inkdrop_sources",
+    "core/inkdrop_comicscodes_discovery.py": "inkdrop_sources",
+    "core/inkdrop_mangadex_direct.py": "inkdrop_sources",
+    "core/inkdrop_manual_source_autoresolve.py": "inkdrop_sources",
+    "core/inkdrop_pack_import.py": "inkdrop_importer",
 }
 
 REMOVED_LEGACY_MODULES = (
@@ -61,11 +61,11 @@ REMOVED_LEGACY_MODULES = (
     "kavita_pack_import",
 )
 SUPPORTING_RUNTIME_FILES = (
-    "inkdrop_acquire_adapter.py",
-    "inkdrop_container_scheduler.py",
-    "inkdrop_source_worker_coordinator.py",
-    "inkdrop_state.py",
-    "inkdrop_manga_metadata_guard.py",
+    "core/inkdrop_acquire_adapter.py",
+    "core/inkdrop_container_scheduler.py",
+    "core/inkdrop_source_worker_coordinator.py",
+    "core/inkdrop_state.py",
+    "core/inkdrop_manga_metadata_guard.py",
 )
 
 
@@ -122,8 +122,8 @@ def main() -> int:
 
     worker_text = IMPORT_READY_WORKER.read_text(encoding="utf-8")
     require(worker_text, 'SCRIPT_DIR="${INKDROP_BIN_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"', "import-ready worker script-relative bin dir")
-    require(worker_text, 'RECONCILE_SCRIPT="${INKDROP_RECONCILE_IMPORTS_SCRIPT:-$SCRIPT_DIR/inkdrop_reconcile_imports.py}"', "import-ready worker neutral reconcile command")
-    require(worker_text, 'SAB_CLEANUP_SCRIPT="${INKDROP_SAB_FAILED_CLEANUP_SCRIPT:-$SCRIPT_DIR/inkdrop_sab_failed_cleanup.py}"', "import-ready worker neutral SAB cleanup command")
+    require(worker_text, 'RECONCILE_SCRIPT="${INKDROP_RECONCILE_IMPORTS_SCRIPT:-$SCRIPT_DIR/core/inkdrop_reconcile_imports.py}"', "import-ready worker neutral reconcile command")
+    require(worker_text, 'SAB_CLEANUP_SCRIPT="${INKDROP_SAB_FAILED_CLEANUP_SCRIPT:-$SCRIPT_DIR/core/inkdrop_sab_failed_cleanup.py}"', "import-ready worker neutral SAB cleanup command")
     require(worker_text, 'LOG="${INKDROP_IMPORT_READY_LOG:-$LOG_DIR/inkdrop-import-ready-worker.log}"', "import-ready worker configurable log path")
     private_home = "/home/" + "curlz620"
     if f"{private_home}/bin/" in worker_text or f"{private_home}/arr-docker/" in worker_text:
@@ -133,7 +133,7 @@ def main() -> int:
     # that used to live directly in inkdrop_web.py (see
     # inkdrop_web_config.py's own docstring); the neutral-path checks below
     # apply to that combined surface, not to inkdrop_web.py alone.
-    web_text = WEB_IMPL.read_text(encoding="utf-8") + (ROOT / "inkdrop_web_config.py").read_text(encoding="utf-8")
+    web_text = WEB_IMPL.read_text(encoding="utf-8") + (ROOT / "core" / "inkdrop_web_config.py").read_text(encoding="utf-8")
     require(web_text, 'script_path("inkdrop_completed_import.py"', "web neutral import command")
     require(web_text, 'script_path("inkdrop_reconcile_imports.py"', "web neutral reconcile command")
     require(web_text, 'script_path("inkdrop_pack_import.py"', "web neutral pack import command")

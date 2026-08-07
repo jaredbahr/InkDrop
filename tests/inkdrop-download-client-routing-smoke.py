@@ -2,11 +2,11 @@
 import contextlib, json, os, sqlite3, tempfile
 from pathlib import Path
 
-import inkdrop_download_client_config as config
-import inkdrop_download_client_routing as routing
-import inkdrop_secret_store
-import inkdrop_source_worker_coordinator as coordinator
-import inkdrop_state
+from core import inkdrop_download_client_config as config
+from core import inkdrop_download_client_routing as routing
+from core import inkdrop_secret_store
+from core import inkdrop_source_worker_coordinator as coordinator
+from core import inkdrop_state
 
 
 def require(value, message):
@@ -76,7 +76,7 @@ def main():
             "hostile generic SLSKD dispatch was not safely fenced")
         require(db.read_bytes() == before, "blocked generic SLSKD dispatch mutated state")
 
-        import inkdrop_slskd_source_probe as slskd_probe
+        from core import inkdrop_slskd_source_probe as slskd_probe
         slskd_probe.INKDROP_STATE_DB = db
         selected_settings = slskd_probe.apply_slskd_provider_settings()
         require(selected_settings["download_client_instance_id"] == "slskd-primary" and
@@ -133,7 +133,7 @@ def main():
         empty = root / "empty.db"
         with inkdrop_state.connect(empty) as con: inkdrop_state.init_schema(con)
         require(routing.select_instances(empty, {"protocol": "torrent"}) == [], "empty store changed behavior")
-        import inkdrop_acquire
+        from core import inkdrop_acquire
         called = []; old_qbit = inkdrop_acquire.qbit_add
         inkdrop_acquire.qbit_add = lambda *_a, **_k: called.append(True) or {"ok": True, "added": True, "client_external_id": "legacy"}
         try: coordinator._default_download_client_adder({**task, "_runtime_db_path": str(empty)})

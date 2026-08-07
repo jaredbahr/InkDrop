@@ -5,7 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_deferred_sync
+from core import inkdrop_deferred_sync
 
 
 def main():

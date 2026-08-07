@@ -13,7 +13,7 @@ this test pins the actual root removal -- the "kapowarr:N" identity concept
 no longer exists anywhere in the identity/dedup pipeline.
 """
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

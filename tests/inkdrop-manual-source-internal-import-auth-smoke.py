@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_manual_source_autoresolve as resolver
+from core import inkdrop_manual_source_autoresolve as resolver
 
 
 def require(condition, message):
@@ -26,7 +26,7 @@ def require(condition, message):
 
 
 def smoke_live_manual_import_defers_broad_sync():
-    import inkdrop_web
+    from core import inkdrop_web
 
     source_path = Path("/staging/slskd/pending.cbz")
     item = {"review_id": "review:pending", "series": "Pending Series", "issue": "1"}
@@ -137,7 +137,7 @@ def smoke_live_manual_import_defers_broad_sync():
 
 
 def smoke_live_manual_import_requires_durable_completion_proof():
-    import inkdrop_web
+    from core import inkdrop_web
 
     source_path = Path("/staging/slskd/verified.cbz")
     item = {
@@ -233,7 +233,7 @@ def smoke_live_manual_import_requires_durable_completion_proof():
 
 
 def smoke_live_manual_import_requires_exact_artifact_inspection():
-    import inkdrop_web
+    from core import inkdrop_web
 
     source_path = Path("/staging/slskd/uninspected.cbz")
     item = {
@@ -292,8 +292,8 @@ def smoke_live_manual_import_requires_exact_artifact_inspection():
 
 
 def smoke_manual_source_proof_settles_queue_and_wanted():
-    import inkdrop_state
-    import inkdrop_web
+    from core import inkdrop_state
+    from core import inkdrop_web
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-manual-proof-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -411,7 +411,7 @@ def smoke_manual_source_proof_settles_queue_and_wanted():
 
 
 def smoke_manual_source_threads_exact_issue_identity():
-    import inkdrop_web
+    from core import inkdrop_web
 
     source_path = Path("/staging/slskd/Fullmetal Alchemist #007 - After The Rain.cbz")
     item = {
@@ -467,7 +467,7 @@ def smoke_manual_source_threads_exact_issue_identity():
 
 
 def smoke_deferred_status_allows_concurrent_queue_writer():
-    import inkdrop_completed_import as completed_import
+    from core import inkdrop_completed_import as completed_import
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-manual-import-defer-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -537,8 +537,8 @@ def main():
             },
         }
     )
-    original_web = sys.modules.get("inkdrop_web")
-    sys.modules["inkdrop_web"] = fake_web
+    original_web = sys.modules.get("core.inkdrop_web")
+    sys.modules["core.inkdrop_web"] = fake_web
     try:
         with mock.patch.dict(
             os.environ,
@@ -647,9 +647,9 @@ def main():
         )
     finally:
         if original_web is None:
-            sys.modules.pop("inkdrop_web", None)
+            sys.modules.pop("core.inkdrop_web", None)
         else:
-            sys.modules["inkdrop_web"] = original_web
+            sys.modules["core.inkdrop_web"] = original_web
 
     smoke_live_manual_import_defers_broad_sync()
     smoke_live_manual_import_requires_durable_completion_proof()

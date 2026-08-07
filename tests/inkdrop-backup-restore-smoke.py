@@ -11,7 +11,7 @@ import contextlib
 import zipfile
 from pathlib import Path
 
-import inkdrop_backup_restore
+from core import inkdrop_backup_restore
 
 
 def require(condition, message):
@@ -29,9 +29,55 @@ def main():
         for path in (config, state, backups, library):
             path.mkdir(parents=True, exist_ok=True)
         db_path = state / "inkdrop-state.sqlite3"
+        provider_secret = "komga-canary-password-DEADBEEF12345678"
         with contextlib.closing(sqlite3.connect(db_path)) as con:
             con.execute("create table app_settings(key text primary key, value_json text)")
             con.execute("insert into app_settings(key, value_json) values (?, ?)", ("path.comic_root", json.dumps(str(library))))
+            # provider_configs has no vault indirection like
+            # download_client_instances does -- credentials entered through
+            # Settings for a provider like Komga land directly in
+            # settings_json. This row reproduces AUDIT-BACKUP-P1-01's live
+            # production shape: a plaintext password sitting in the raw
+            # column the full backup archive embeds a byte-for-byte copy of.
+            con.execute(
+                "create table provider_configs(id text primary key, provider_type text, "
+                "display_name text, enabled integer, base_url text, secret_ref text, "
+                "settings_json text, source text, created_at real, updated_at real)"
+            )
+            con.execute(
+                "insert into provider_configs(id, provider_type, display_name, enabled, "
+                "base_url, secret_ref, settings_json, source, created_at, updated_at) "
+                "values (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "komga",
+                    "reader",
+                    "Komga",
+                    1,
+                    "https://komga.example.invalid",
+                    None,
+                    json.dumps({"username": "acquire-bot", "password": provider_secret}),
+                    "user",
+                    0.0,
+                    0.0,
+                ),
+            )
+            # Phase 1 notification connectors: the exact same raw-credential
+            # shape as the komga row above (webhook_url has no vault
+            # indirection either), but in a table redact_provider_secrets
+            # didn't know to scan until AUDIT-BACKUP-P1-02 -- confirm it's
+            # covered now, not just provider_configs.
+            connector_secret = "https://discord.com/api/webhooks/1/canary-webhook-DEADBEEF"
+            con.execute(
+                "create table notification_connectors(id text primary key, type text, "
+                "name text, enabled integer, settings_json text, events_json text, "
+                "series_filter_json text, created_at real, updated_at real)"
+            )
+            con.execute(
+                "insert into notification_connectors(id, type, name, enabled, "
+                "settings_json, events_json, series_filter_json, created_at, updated_at) "
+                "values (?,?,?,?,?,?,?,?,?)",
+                ("discord", "discord", "Discord", 1, json.dumps({"webhook_url": connector_secret}), "[]", "[]", 0.0, 0.0),
+            )
             con.commit()
         env = {
             "INKDROP_CONFIG_DIR": str(config),
@@ -60,10 +106,43 @@ def main():
         require(result["manifest"]["contains"]["media_files"] is False, "backup must not contain media files")
         require(result["config_export"]["secret_ref_count"] == 2, "secret refs should be recorded without values")
 
+        # AUDIT-BACKUP-P1-01: the embedded state-DB copy must not carry
+        # provider_configs.settings_json credentials in plaintext. Checking
+        # only the raw zip bytes (below) is not enough on its own -- the
+        # member is DEFLATE-compressed, so a plaintext secret wouldn't show
+        # up in raw bytes even if the redaction never ran. The decisive
+        # check is the *decompressed* state DB member, read the same way
+        # restore_backup_archive() itself reads it.
+        provider_redaction = result["manifest"]["state_db_backup"].get("provider_secret_redaction")
+        require(provider_redaction and provider_redaction.get("rows_redacted") == 2, f"provider secret redaction should report 2 redacted rows (komga + discord connector): {provider_redaction}")
+        require(provider_redaction.get("fields_redacted") == 4, f"komga (username+password) and discord connector (webhook_url+declared secret_fields marker) should redact 4 fields total: {provider_redaction}")
+        with zipfile.ZipFile(archive) as zf:
+            decompressed_state_db = zf.read(inkdrop_backup_restore.STATE_DB_ARCHIVE_NAME)
+        require(provider_secret.encode() not in decompressed_state_db, "provider credential leaked into decompressed embedded state DB")
+        require(connector_secret.encode() not in decompressed_state_db, "notification connector credential leaked into decompressed embedded state DB")
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as handle:
+            handle.write(decompressed_state_db)
+            extracted_state_db = Path(handle.name)
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{extracted_state_db}?mode=ro", uri=True)) as con:
+                provider_row = con.execute("select settings_json from provider_configs where id='komga'").fetchone()
+                connector_row = con.execute("select settings_json from notification_connectors where id='discord'").fetchone()
+            require(provider_row is not None, "redaction must not delete the provider row, only its secret fields")
+            provider_settings = json.loads(provider_row[0])
+            require("password" not in provider_settings, f"password field should be redacted from embedded provider settings: {provider_settings}")
+            require("username" not in provider_settings, f"username field should be redacted from embedded provider settings: {provider_settings}")
+            require(connector_row is not None, "redaction must not delete the notification connector row, only its secret fields")
+            connector_settings = json.loads(connector_row[0])
+            require("webhook_url" not in connector_settings, f"webhook_url should be redacted from embedded connector settings: {connector_settings}")
+        finally:
+            extracted_state_db.unlink(missing_ok=True)
+
         with archive.open("rb") as handle:
             blob = handle.read()
         require(b"super-secret-comicvine-key" not in blob, "raw ComicVine secret leaked into backup")
         require(b"super-secret-qbit-password" not in blob, "raw qBit secret leaked into backup")
+        require(provider_secret.encode() not in blob, "raw provider credential leaked into backup archive bytes")
+        require(connector_secret.encode() not in blob, "raw notification connector credential leaked into backup archive bytes")
 
         restore_config = root / "restore-config"
         restore_state = root / "restore-state"
@@ -77,15 +156,31 @@ def main():
         require(preview["dry_run"] is True, "preview should be dry-run")
         require(preview["would_restore"]["state_db"] is True, "preview should include state DB")
         require(preview["database_validation"]["state_db"]["quick_check"] == "ok", "preview must validate state DB integrity")
-        require(preview["path_warnings"], "preview should warn when source paths are not remapped")
+        require(preview["path_warnings"], "preview should warn about source paths missing on this host")
         require(not restore_config.exists(), "dry-run restore must not create config dir")
         require(not restore_state.exists(), "dry-run restore must not create state dir")
+
+        # AUDIT-BACKUP-P2-01: path_remaps/--path-remap was wired but never
+        # actually remapped anything -- it only suppressed the warning above.
+        # Rather than ship a flag that quietly does nothing, it was removed;
+        # confirm it stays removed instead of quietly reappearing.
+        try:
+            inkdrop_backup_restore.restore_backup_archive(
+                archive,
+                target_config_dir=restore_config,
+                target_state_dir=restore_state,
+                apply=False,
+                path_remaps={"INKDROP_COMIC_ROOT": "/wherever"},
+            )
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("path_remaps should no longer be an accepted parameter")
 
         applied = inkdrop_backup_restore.restore_backup_archive(
             archive,
             target_config_dir=restore_config,
             target_state_dir=restore_state,
-            path_remaps={"INKDROP_COMIC_ROOT": str(root / "new-library" / "comics")},
             apply=True,
         )
         require(applied["ok"], f"restore apply should succeed: {applied}")
@@ -109,7 +204,6 @@ def main():
             archive,
             target_config_dir=restore_config,
             target_state_dir=restore_state,
-            path_remaps={"INKDROP_COMIC_ROOT": str(root / "new-library" / "comics")},
             apply=True,
             backup_dir=restore_backups,
         )

@@ -12,11 +12,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-import inkdrop_auth
-import inkdrop_manual_search
-import inkdrop_manual_search_core as core
-import inkdrop_state
-import inkdrop_web
+from core import inkdrop_auth
+from core import inkdrop_manual_search
+from core import inkdrop_manual_search_core as core
+from core import inkdrop_state
+from core import inkdrop_web
 
 
 SECRET = "manual-search-secret-sentinel"

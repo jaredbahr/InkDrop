@@ -15,7 +15,7 @@ progress through the rest of the query list.
 
 import time
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

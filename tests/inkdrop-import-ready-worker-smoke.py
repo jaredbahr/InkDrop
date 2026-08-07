@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 from PIL import Image
 
-import inkdrop_state
+from core import inkdrop_state
 
 
 def valid_large_png():
@@ -27,10 +27,10 @@ def valid_large_png():
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "scripts/inkdrop-import-ready-worker.sh"
-RECONCILE = ROOT / "inkdrop_reconcile_imports.py"
-COMPLETED_IMPORT = ROOT / "inkdrop_completed_import.py"
-STATE = ROOT / "inkdrop_state.py"
+WORKER = ROOT / "inkdrop-import-ready-worker.sh"
+RECONCILE = ROOT / "core" / "inkdrop_reconcile_imports.py"
+COMPLETED_IMPORT = ROOT / "core" / "inkdrop_completed_import.py"
+STATE = ROOT / "core" / "inkdrop_state.py"
 
 
 def fail(message):
@@ -41,7 +41,7 @@ def smoke_import_result_state_uses_library_neutral_statuses():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -499,7 +499,7 @@ def smoke_reconcile_lock_waits_then_reports_busy():
     except ModuleNotFoundError:
         return
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -535,7 +535,7 @@ def smoke_reconciliation_replay_to_inkdrop():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -664,7 +664,7 @@ def smoke_reconciliation_replay_skips_missing_import_destination():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -776,7 +776,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1096,7 +1096,7 @@ def smoke_import_ready_sync_preserves_suppressed_existing_path():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1272,7 +1272,7 @@ def smoke_hash_suppression_preserves_managed_destination():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1326,7 +1326,7 @@ def smoke_replay_identity_accepts_explicit_manga_volume_file():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1366,7 +1366,7 @@ def smoke_reconciliation_replay_uses_queue_identity_for_imported_file_proof():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1489,7 +1489,7 @@ def smoke_verified_manga_import_results_backfill_completion_tables():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1659,7 +1659,7 @@ def smoke_verified_manga_import_results_backfill_completion_tables():
 
 def smoke_stale_completion_retraction_records_history():
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1753,7 +1753,7 @@ def smoke_import_ready_rejection_requeues():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -1900,7 +1900,7 @@ def smoke_wrong_series_or_subseries_rejection_is_terminal():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2063,7 +2063,7 @@ def smoke_failed_import_attempt_requeues_import_ready_download():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2258,7 +2258,7 @@ def smoke_import_ready_records_existing_planned_destination():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2470,7 +2470,7 @@ def smoke_import_ready_timeout_recovers_imported_file():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2717,7 +2717,7 @@ def smoke_queue_backed_ready_import_skips_duplicate_prevalidation():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2801,7 +2801,7 @@ def smoke_failed_filename_guard_recovery_is_queue_authoritative():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2903,7 +2903,7 @@ def smoke_import_ready_runs_state_sync_before_record_selection():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -2944,7 +2944,7 @@ def smoke_ready_import_defers_qbit_incomplete_source_files():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3038,7 +3038,7 @@ def smoke_ready_import_accepts_valid_child_from_incomplete_pack():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3135,7 +3135,7 @@ def smoke_import_ready_deferral_updates_inkdrop_task_state():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3236,7 +3236,7 @@ def smoke_import_ready_promotion_restores_completed_qbit_source_files():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3386,7 +3386,7 @@ def smoke_retryable_failed_staged_source_recovery_promotes_only_importable_files
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3553,7 +3553,7 @@ def smoke_queue_only_ready_import_skips_unowned_rows():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3663,7 +3663,7 @@ def smoke_completed_pack_download_client_rows_are_import_ready():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3765,7 +3765,7 @@ def smoke_completed_slskd_staged_source_rows_are_import_ready():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -3925,7 +3925,7 @@ def smoke_local_completed_pack_replay_creates_import_ready_row():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4064,7 +4064,7 @@ def smoke_local_completed_pack_replay_defers_qbit_incomplete_archive():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4187,7 +4187,7 @@ def smoke_import_ready_classifier_accepts_cached_string_paths():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4223,7 +4223,7 @@ def smoke_import_ready_timeout_continues():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4308,7 +4308,7 @@ def smoke_import_ready_uses_planned_path_by_default_with_opt_out():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4381,8 +4381,8 @@ def smoke_import_ready_child_defers_broad_import_status_sync():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
-        import inkdrop_completed_import
+        from core import inkdrop_reconcile_imports
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4498,7 +4498,7 @@ def smoke_import_ready_child_defers_broad_import_status_sync():
 def smoke_deferred_import_statuses_are_lossless():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
-    import inkdrop_completed_import
+    from core import inkdrop_completed_import
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-lossless-import-status-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -4654,7 +4654,7 @@ def smoke_active_import_ready_recovers_from_imported_file_proof():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4843,7 +4843,7 @@ def smoke_active_import_ready_rejects_mismatched_imported_file_proof():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -4972,7 +4972,7 @@ def smoke_imported_path_must_match_trusted_target():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -5030,7 +5030,7 @@ def smoke_queue_owned_target_classifies_without_adapter_target():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -5075,8 +5075,8 @@ def smoke_queue_owned_one_word_manga_chapter_classifies_exact_unit():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
-        import inkdrop_completed_import
+        from core import inkdrop_reconcile_imports
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -5169,7 +5169,7 @@ def smoke_import_target_accepts_safe_leading_article_alias():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -5246,7 +5246,7 @@ def smoke_import_ready_pack_priority_helpers():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -5276,7 +5276,7 @@ def smoke_import_ready_skip_result_classification():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -5352,7 +5352,7 @@ def smoke_completed_import_reports_incomplete_qbit_source_file():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError:
         return
     with tempfile.TemporaryDirectory(prefix="inkdrop-completed-incomplete-", ignore_cleanup_errors=True) as tmp:
@@ -5427,7 +5427,7 @@ def smoke_completed_import_reports_media_management_preview():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError:
         return
     with tempfile.TemporaryDirectory(prefix="inkdrop-completed-media-preview-", ignore_cleanup_errors=True) as tmp:
@@ -5575,7 +5575,7 @@ def smoke_completed_import_applies_media_management_path_when_enabled():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError:
         return
     with tempfile.TemporaryDirectory(prefix="inkdrop-completed-media-apply-", ignore_cleanup_errors=True) as tmp:
@@ -5746,7 +5746,7 @@ def smoke_completed_import_applies_media_management_path_when_enabled():
 def smoke_exact_manga_volume_plans_and_imports_volume_only_destination():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
-    import inkdrop_completed_import
+    from core import inkdrop_completed_import
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-manga-volume-canonical-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -6058,7 +6058,7 @@ def smoke_completed_import_trusted_issue_lifts_filename_guard():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -6089,7 +6089,7 @@ def smoke_completed_import_trusted_tpb_lifts_missing_number_guard():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -6139,7 +6139,7 @@ def smoke_completed_import_trusted_issue_title_state_lookup():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -6315,7 +6315,7 @@ def smoke_completed_import_trusted_tpb_lookup_survives_same_target_match():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -6452,7 +6452,7 @@ def smoke_direct_import_unit_gate_uses_trusted_tpb_source_evidence():
 
 def smoke_ready_import_records_threads_issue_title():
     try:
-        import inkdrop_reconcile_imports
+        from core import inkdrop_reconcile_imports
     except FileNotFoundError as exc:
         if "inkdrop_reconcile_imports.py" in str(exc):
             return
@@ -6608,7 +6608,7 @@ def smoke_completed_import_allows_duplicate_chapter_token_filename():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
     try:
-        import inkdrop_completed_import
+        from core import inkdrop_completed_import
     except FileNotFoundError as exc:
         if "inkdrop_completed_import.py" in str(exc):
             return
@@ -6679,7 +6679,7 @@ def smoke_completed_import_allows_duplicate_chapter_token_filename():
 def smoke_exact_volume_import_does_not_use_ambiguous_existing_file_as_duplicate():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
-    import inkdrop_completed_import
+    from core import inkdrop_completed_import
 
     old_values = {
         "STATE_DIR": inkdrop_completed_import.STATE_DIR,
@@ -6834,7 +6834,7 @@ def smoke_exact_volume_import_does_not_use_ambiguous_existing_file_as_duplicate(
 def smoke_slskd_manga_completion_requires_durable_exact_path_and_settles_wanted():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
-    import inkdrop_completed_import
+    from core import inkdrop_completed_import
 
     old_db_path = inkdrop_completed_import.DB_PATH
     old_state_dir = inkdrop_completed_import.STATE_DIR
@@ -7032,7 +7032,7 @@ def smoke_slskd_manga_completion_requires_durable_exact_path_and_settles_wanted(
 def smoke_import_authority_fences_callbacks_and_releases_exact_task():
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace()
-    import inkdrop_reconcile_imports
+    from core import inkdrop_reconcile_imports
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-import-authority-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -7461,7 +7461,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
 
 
 def smoke_completed_client_import_gets_turn_after_manual_source_cycle():
-    import inkdrop_completed_import
+    from core import inkdrop_completed_import
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-import-fairness-") as tmp:
         root = Path(tmp)

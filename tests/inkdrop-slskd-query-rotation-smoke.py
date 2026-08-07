@@ -4,8 +4,8 @@
 import math
 from unittest import mock
 
-import inkdrop_candidate_matching as matching
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_candidate_matching as matching
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

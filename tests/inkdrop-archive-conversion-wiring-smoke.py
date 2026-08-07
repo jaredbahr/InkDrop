@@ -16,7 +16,7 @@ import time
 import zipfile
 from pathlib import Path
 
-import inkdrop_web
+from core import inkdrop_web
 
 
 def require(condition, message):

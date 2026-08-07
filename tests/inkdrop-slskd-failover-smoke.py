@@ -17,11 +17,11 @@ from types import SimpleNamespace
 from unittest import mock
 from PIL import Image
 
-import inkdrop_manual_source_autoresolve as resolver
-import inkdrop_completed_import as completed_import
-import inkdrop_series_autopilot as autopilot
-import inkdrop_slskd_source_probe as probe
-import inkdrop_state
+from core import inkdrop_manual_source_autoresolve as resolver
+from core import inkdrop_completed_import as completed_import
+from core import inkdrop_series_autopilot as autopilot
+from core import inkdrop_slskd_source_probe as probe
+from core import inkdrop_state
 
 
 def require(condition, message):
@@ -63,8 +63,8 @@ def threshold_smoke():
         resolver.now = lambda: start
         remote["same_candidate_active_transfer_count"] = 1
         require(
-            resolver.queued_transfer_stale_seconds(remote) == resolver.SLSKD_WAITING_REMOTE_QUEUE_ACTIVE_USER_STALE_SECONDS,
-            "only same-candidate progress may shorten the delay",
+            resolver.queued_transfer_stale_seconds(remote) == resolver.SLSKD_WAITING_QUEUED_STALE_SECONDS,
+            "same-candidate progress elsewhere must not shorten the queued-wait delay below the 48h default",
         )
 
         active = {
@@ -357,7 +357,7 @@ def configured_completed_transfer_root_smoke():
                 }
             )
             configured_probe, settings = resolver.load_configured_probe_module(
-                (Path(__file__).resolve().parents[1] / "inkdrop_slskd_source_probe.py")
+                Path(__file__).resolve().parents[1] / "core" / "inkdrop_slskd_source_probe.py"
             )
         finally:
             for name, value in original_env.items():
@@ -2667,7 +2667,7 @@ def replay_smoke():
         env.update({"INKDROP_STATE_DIR": str(state_dir), "INKDROP_CONFIG_DIR": str(config_dir), "INKDROP_LOG_DIR": str(log_dir)})
         writer = r'''
 import json
-import inkdrop_manual_source_autoresolve as resolver
+from core import inkdrop_manual_source_autoresolve as resolver
 payload = {
   "state": "deferred",
   "processed": [{"autopilot_queue": True, "autopilot_queue_key": "queue:1", "status": "transfer_failed"}],
@@ -2684,7 +2684,7 @@ print(json.dumps(resolver.persist_deferred_autopilot_queue_sync(payload, "restar
         require(json.loads(persisted.stdout)["status"] == "stored", "deferred serializer did not store restart fixture")
         reader = r'''
 import json
-import inkdrop_series_autopilot as autopilot
+from core import inkdrop_series_autopilot as autopilot
 snapshots = autopilot.manual_source_autoresolve_snapshots({})
 assert len(snapshots) == 1, snapshots
 snapshot = snapshots[0]
@@ -2699,7 +2699,7 @@ print(json.dumps(result))
         require(json.loads(replayed.stdout)["recorded"] == 1, "fresh-process replay failed")
         verifier = r'''
 import json
-import inkdrop_series_autopilot as autopilot
+from core import inkdrop_series_autopilot as autopilot
 print(json.dumps({"remaining": len(autopilot.deferred_manual_source_queue_sync_entries())}))
 '''
         verified = subprocess.run([sys.executable, "-c", verifier], cwd=Path(__file__).resolve().parents[1], env=env, text=True, capture_output=True, check=True)

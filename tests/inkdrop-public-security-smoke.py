@@ -12,8 +12,8 @@ import json
 import tempfile
 from pathlib import Path
 
-import inkdrop_preflight
-import inkdrop_runtime_config
+from core import inkdrop_preflight
+from core import inkdrop_runtime_config
 from tools import inkdrop_install_support_summary
 
 
@@ -41,7 +41,7 @@ def assert_static_security_contracts():
         ("secret references", "path allowlists", "archive traversal checks", "SSRF guardrails"),
     )
     require_tokens(
-        "inkdrop-source-worker-http-smoke.py",
+        "tests/inkdrop-source-worker-http-smoke.py",
         (
             "redacted request contains no raw secret",
             "Torznab redacted request contains no raw secret",
@@ -56,7 +56,7 @@ def assert_static_security_contracts():
         ),
     )
     require_tokens(
-        "inkdrop-direct-source-certification-smoke.py",
+        "tests/inkdrop-direct-source-certification-smoke.py",
         (
             "sidecar drops cookie headers",
             "redirect host escape is blocked",
@@ -68,23 +68,23 @@ def assert_static_security_contracts():
         ),
     )
     require_tokens(
-        "inkdrop_state.py",
+        "core/inkdrop_state.py",
         ("privacy_safe_evidence_payload", "SENSITIVE_EVIDENCE_HEADER_KEYS"),
     )
     require_tokens(
-        "inkdrop-series-remove-files-smoke.py",
+        "tests/inkdrop-series-remove-files-smoke.py",
         ("outside configured comic/manga roots", '"deleteFiles": True', "default remove should not delete files"),
     )
     require_tokens(
-        "inkdrop-import-ready-worker-smoke.py",
+        "tests/inkdrop-import-ready-worker-smoke.py",
         ("validate_comic_archive", "zip_file_invalid", "load_bad_archive_validation_memory"),
     )
     require_tokens(
-        "inkdrop-public-release-safety-audit.py",
+        "tests/inkdrop-public-release-safety-audit.py",
         ("scan_env_example_secret_defaults", "scan_public_image_context_private_text_files", "scan_public_image_root_private_files"),
     )
     require_tokens(
-        "inkdrop_web.py",
+        "core/inkdrop_web.py",
         (
             "DEBUG_ACTIVE_REQUESTS_ENABLED",
             "INKDROP_DEBUG_ACTIVE_REQUESTS",

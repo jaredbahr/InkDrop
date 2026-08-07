@@ -6,9 +6,9 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_backup_restore
-import inkdrop_portability_export
-import inkdrop_state
+from core import inkdrop_backup_restore
+from core import inkdrop_portability_export
+from core import inkdrop_state
 
 
 SECRET_VALUE = "prowlarr-key-1f2e3d4c5b6a"

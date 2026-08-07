@@ -8,12 +8,12 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_candidate_matching as matching
-import inkdrop_source_providers as providers
-import inkdrop_source_worker_adapters as adapters
-import inkdrop_source_worker_coordinator as coordinator
-import inkdrop_state
-import inkdrop_slskd_source_probe as slskd
+from core import inkdrop_candidate_matching as matching
+from core import inkdrop_source_providers as providers
+from core import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_source_worker_coordinator as coordinator
+from core import inkdrop_state
+from core import inkdrop_slskd_source_probe as slskd
 
 
 def require(condition, message):

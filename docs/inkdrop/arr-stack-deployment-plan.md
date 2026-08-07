@@ -20,7 +20,7 @@ cd inkdrop
 git clone https://github.com/jaredbahr/InkDrop .
 cp .env.example .env
 docker compose up -d --build
-docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
 ```
 
 That trial keeps rollback simple:
@@ -68,8 +68,8 @@ file:
 ```bash
 python -B tools/inkdrop_compose_deployment_plan.py /path/to/compose.yaml --output inkdrop.override.yaml
 docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml config
-docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
-docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only
+docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only
 ```
 
 The `--output` mode refuses to overwrite an existing overlay unless you pass
@@ -121,7 +121,7 @@ services:
       - ./inkdrop/manual-inbox:/manual-inbox
       - ./inkdrop/library:/library
     healthcheck:
-      test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"]
+      test: ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--timeout", "5"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -140,8 +140,8 @@ After adding the service, run:
 
 ```bash
 docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml config
-docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
-docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only
+docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only
 ```
 
 Expected clean-install warnings include unconfigured optional adapters. They

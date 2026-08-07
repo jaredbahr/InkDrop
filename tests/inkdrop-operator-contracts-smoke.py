@@ -6,8 +6,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import inkdrop_operator_contracts as contracts
-import inkdrop_version
+from core import inkdrop_operator_contracts as contracts
+from core import inkdrop_version
 
 
 def assert_true(value, message):

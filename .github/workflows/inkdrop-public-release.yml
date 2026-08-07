@@ -22,6 +22,7 @@ on:
       - "docs/inkdrop-source-candidate-catalog-20260702.json"
       - "docs/inkdrop/docker-first-install.md"
       - "docs/inkdrop/QA_RELEASE_PROCESS.md"
+      - "docs/inkdrop/public-release-process.md"
       - "docs/inkdrop/releases/**"
       - "tools/inkdrop_docker_context_manifest.py"
       - "tools/inkdrop_install_support_summary.py"
@@ -33,11 +34,13 @@ on:
       - "tools/inkdrop_settings_sync_smoke.py"
       - "tools/inkdrop_state_schema_audit.py"
       - "tools/inkdrop_web_surface_audit.py"
-      - "inkdrop-autopilot-provider-budget-smoke.py"
+      - "tests/inkdrop-autopilot-provider-budget-smoke.py"
       - "inkdrop*.py"
       - "inkdrop_*.py"
       - "kavita*.py"
       - "kavita_*.py"
+      - "tests/**"
+      - "core/**"
   pull_request:
     paths:
       - ".github/workflows/inkdrop-public-release.yml"
@@ -56,6 +59,7 @@ on:
       - "docs/inkdrop-source-candidate-catalog-20260702.json"
       - "docs/inkdrop/docker-first-install.md"
       - "docs/inkdrop/QA_RELEASE_PROCESS.md"
+      - "docs/inkdrop/public-release-process.md"
       - "docs/inkdrop/releases/**"
       - "tools/inkdrop_docker_context_manifest.py"
       - "tools/inkdrop_install_support_summary.py"
@@ -71,6 +75,8 @@ on:
       - "inkdrop_*.py"
       - "kavita*.py"
       - "kavita_*.py"
+      - "tests/**"
+      - "core/**"
   workflow_dispatch:
 
 permissions:
@@ -78,7 +84,12 @@ permissions:
 
 concurrency:
   group: inkdrop-public-release-${{ github.ref }}
-  cancel-in-progress: false
+  # Safe to cancel a superseded pull_request run: qa_image/validate_qa_image/
+  # github_release below are all gated on `github.event_name != 'pull_request'`,
+  # so a PR-triggered run only ever contains the two test jobs (public_release,
+  # full_smoke_suite) -- never a publish/deploy step. A push run (to qa/main),
+  # which *can* reach those publish jobs, still never auto-cancels.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   public_release:
@@ -132,11 +143,14 @@ jobs:
 
       - name: Verify the staged public export actually runs
         timeout-minutes: 10
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: python -B tests/inkdrop-public-export-runnable-smoke.py
 
       - name: Run Automatic Search provider-budget smoke
         timeout-minutes: 2
         env:
+          PYTHONPATH: ${{ github.workspace }}
           INKDROP_CONFIG_DIR: ${{ runner.temp }}/inkdrop/config
           INKDROP_STATE_DIR: ${{ runner.temp }}/inkdrop/state
           INKDROP_LOCK_DIR: ${{ runner.temp }}/inkdrop/state/locks
@@ -178,8 +192,8 @@ jobs:
       - name: Run strict container preflight
         timeout-minutes: 5
         run: |
-          docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
-          docker compose run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only
+          docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+          docker compose run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only
 
       - name: Verify container install support summary
         timeout-minutes: 5
@@ -368,7 +382,7 @@ jobs:
           import ast
           from pathlib import Path
 
-          tree = ast.parse(Path("inkdrop_state.py").read_text(encoding="utf-8"))
+          tree = ast.parse(Path("core/inkdrop_state.py").read_text(encoding="utf-8"))
           for node in tree.body:
               if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION" for target in node.targets):
                   print(ast.literal_eval(node.value))
@@ -593,7 +607,7 @@ jobs:
             -e INKDROP_STAGING_DIR=/tmp/inkdrop/staging \
             -e INKDROP_MANUAL_INBOX_DIR=/tmp/inkdrop/manual-inbox \
             -e INKDROP_QUARANTINE_DIR=/tmp/inkdrop/state/quarantine \
-            "$image" -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+            "$image" -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
           docker run --rm --entrypoint python \
             -e INKDROP_CONFIG_DIR=/tmp/inkdrop/config \
             -e INKDROP_STATE_DIR=/tmp/inkdrop/state \
@@ -604,7 +618,7 @@ jobs:
             -e INKDROP_STAGING_DIR=/tmp/inkdrop/staging \
             -e INKDROP_MANUAL_INBOX_DIR=/tmp/inkdrop/manual-inbox \
             -e INKDROP_QUARANTINE_DIR=/tmp/inkdrop/state/quarantine \
-            "$image" -B inkdrop_container_healthcheck.py --preflight-only --json
+            "$image" -B core/inkdrop_container_healthcheck.py --preflight-only --json
 
       - name: Prove container health and public HTTP
         env:

@@ -2,15 +2,21 @@
 """Regression coverage for authoritative download-client ownership reconciliation."""
 
 from __future__ import annotations
+import sys as _sys
+from pathlib import Path as _Path
+_ROOT = _Path(__file__).resolve().parents[1]
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+
 
 import json
 import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_reconcile_imports
-import inkdrop_source_worker_scheduler
-import inkdrop_state
+from core import inkdrop_reconcile_imports
+from core import inkdrop_source_worker_scheduler
+from core import inkdrop_state
 
 
 NOW = 1_800_000_000.0

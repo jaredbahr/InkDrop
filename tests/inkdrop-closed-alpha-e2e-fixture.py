@@ -15,11 +15,11 @@ from pathlib import Path
 
 from PIL import Image
 
-import inkdrop_library_frontends
-import inkdrop_source_catalog as catalog
-import inkdrop_source_worker_scheduler as scheduler
-import inkdrop_source_worker_service as service
-import inkdrop_state
+from core import inkdrop_library_frontends
+from core import inkdrop_source_catalog as catalog
+from core import inkdrop_source_worker_scheduler as scheduler
+from core import inkdrop_source_worker_service as service
+from core import inkdrop_state
 
 
 NOW = 1_234_567.0
@@ -232,7 +232,7 @@ def run_import(db_path, source_path, root):
     ):
         path.mkdir(parents=True, exist_ok=True)
     command = [
-        sys.executable, "-B", "inkdrop_completed_import.py", "--kind", "comics",
+        sys.executable, "-B", "core/inkdrop_completed_import.py", "--kind", "comics",
         "--source-file", str(source_path), "--trusted-series-id", SERIES_ID,
         "--trusted-issue", "1", "--trusted-issue-id", ISSUE_ID,
         "--all-series", "--apply-planned-path",

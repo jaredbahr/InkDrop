@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_web as web
+from core import inkdrop_web as web
 
 
 def require(condition, message):

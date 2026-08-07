@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import inkdrop_state
+from core import inkdrop_state
 
 
 def load_json(value, fallback):
@@ -62,6 +62,26 @@ def main() -> int:
                         "editable_fields": ["language", "pack_mode"],
                     },
                     "source": "user",
+                },
+                now,
+            )
+            # A provider row that has never been touched by an operator --
+            # source stays "runtime" from its original seed, same as
+            # comicscodes/rss on a real install. This is the shape that used
+            # to get permanently frozen: preserve_stored compared the
+            # incoming payload's source (always "runtime") instead of this
+            # row's own stored source, so it was treated as "already
+            # user-owned" forever and a later default flip never reached it.
+            inkdrop_state.upsert_provider_config(
+                con,
+                {
+                    "id": "comicscodes",
+                    "provider_type": "direct_download",
+                    "display_name": "ComicsCodes",
+                    "enabled": True,
+                    "base_url": "https://comics.codes/",
+                    "settings": {},
+                    "source": "runtime",
                 },
                 now,
             )
@@ -119,6 +139,15 @@ def main() -> int:
                     "settings": {"download_root_env": "INKDROP_SLSKD_DOWNLOAD_ROOT"},
                     "source": "runtime",
                 },
+                {
+                    "id": "comicscodes",
+                    "provider_type": "direct_download",
+                    "display_name": "ComicsCodes",
+                    "enabled": False,
+                    "base_url": "https://comics.codes/",
+                    "settings": {},
+                    "source": "runtime",
+                },
             ],
             settings=[
                 {
@@ -146,12 +175,14 @@ def main() -> int:
         try:
             comicvine = row_dict(con.execute("select * from provider_configs where id='comicvine'").fetchone())
             slskd = row_dict(con.execute("select * from provider_configs where id='slskd'").fetchone())
+            comicscodes = row_dict(con.execute("select * from provider_configs where id='comicscodes'").fetchone())
             rename = row_dict(con.execute("select * from app_settings where key='media_management.rename_imported_files'").fetchone())
             protocol_order = row_dict(con.execute("select * from app_settings where key='sources.protocol_order'").fetchone())
         finally:
             con.close()
 
     require(comicvine.get("display_name") == "ComicVine Runtime", "runtime metadata should refresh display name")
+    require(comicvine.get("enabled") == 1, "user-owned provider enabled should be preserved even when the runtime default disagrees")
     require(comicvine.get("base_url") == "https://user.example.invalid/comicvine", "user-owned provider base_url should be preserved")
     require(comicvine.get("secret_ref") == "user:comicvine-token", "user-owned provider secret_ref should be preserved")
     require(comicvine.get("source") == "user", "user-owned provider source should be preserved")
@@ -168,6 +199,9 @@ def main() -> int:
     require(slskd.get("base_url") in ("", None), "new runtime provider should keep blank endpoint default")
     require(slskd.get("ownership") == "native", "new runtime provider should record native ownership")
     require("staged_import" in load_json(slskd.get("capabilities_json"), []), "new runtime provider should store capabilities")
+
+    require(comicscodes.get("enabled") == 0, "a never-user-touched runtime row must pick up a later code-level default change")
+    require(comicscodes.get("source") == "runtime", "an un-edited row's source should stay runtime, not silently become user")
 
     require(rename.get("source") == "user", "user app setting source should be preserved")
     require(load_json(rename.get("value_json"), None) is False, "user app setting value should not be overwritten by runtime default")

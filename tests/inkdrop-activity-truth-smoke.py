@@ -5,7 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_activity
+from core import inkdrop_activity
 
 
 def schema(con):

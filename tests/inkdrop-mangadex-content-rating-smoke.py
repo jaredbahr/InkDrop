@@ -14,9 +14,9 @@ Offline on purpose: these are the two policy decisions, not MangaDex's data.
 import json
 import sqlite3
 
-import inkdrop_state as state
-import inkdrop_web as web
-import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_state as state
+from core import inkdrop_web as web
+from core import inkdrop_source_worker_adapters as adapters
 
 
 def require(condition, message):

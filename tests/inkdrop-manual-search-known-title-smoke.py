@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import json
 
-import inkdrop_auth_contracts
-import inkdrop_manual_search as manual
+from core import inkdrop_auth_contracts
+from core import inkdrop_manual_search as manual
 
 
 CASES = (

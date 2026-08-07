@@ -24,8 +24,8 @@ Wild Strawberry companion pair (manga_companion_links, status='linked').
 import tempfile
 from pathlib import Path
 
-import inkdrop_slskd_source_probe as probe
-import inkdrop_state
+from core import inkdrop_slskd_source_probe as probe
+from core import inkdrop_state
 
 
 def require(condition, message):

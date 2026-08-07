@@ -4,9 +4,9 @@ import time
 import tempfile
 from pathlib import Path
 
-import inkdrop_source_catalog as catalog
-import inkdrop_source_worker_jobs as jobs
-import inkdrop_state
+from core import inkdrop_source_catalog as catalog
+from core import inkdrop_source_worker_jobs as jobs
+from core import inkdrop_state
 
 
 def fail(message):

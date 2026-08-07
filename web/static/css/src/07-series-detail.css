@@ -1129,6 +1129,10 @@
       padding: 14px 16px;
       border-bottom: 1px solid rgba(255, 255, 255, .14);
     }
+    .series-remove-foot:empty,
+    .series-remove-foot[hidden] {
+      display: none;
+    }
     .series-remove-foot {
       justify-content: flex-end;
       border-top: 1px solid rgba(255, 255, 255, .14);

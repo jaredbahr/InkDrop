@@ -2,6 +2,11 @@
   "use strict";
 
   const API = "/api/missing-recovery";
+  // This status call aggregates the whole monitored missing backlog and can
+  // legitimately take a long time on a large state database -- without a
+  // bound here, a slow/cold read left the panel stuck on "Loading recovery
+  // selection and progress..." forever with no feedback and no way to retry.
+  const LOAD_TIMEOUT_MS = 20000;
   const state = {
     payload: null,
     loading: null,
@@ -70,9 +75,17 @@
     nav.openStage(stageKey, label);
   }
 
-  function renderMessage(host, message, tone="") {
+  function renderMessage(host, message, tone="", onRetry=null) {
     if (!state.wantedActive) return;
-    host.replaceChildren(element("div", `missing-recovery-message ${tone}`.trim(), message));
+    const wrap = element("div", `missing-recovery-message ${tone}`.trim(), message);
+    if (onRetry) {
+      const retry = element("button", "missing-recovery-retry", "Retry");
+      retry.type = "button";
+      retry.addEventListener("click", onRetry);
+      wrap.appendChild(document.createTextNode(" "));
+      wrap.appendChild(retry);
+    }
+    host.replaceChildren(wrap);
     host.hidden = false;
   }
 
@@ -86,13 +99,28 @@
     if (payload.control?.valid === false) return {label: "Control needs attention", tone: "warn"};
     if (payload.control?.paused) return {label: "Paused", tone: "warn"};
     if (payload.control?.one_shot_requested) return {label: "Pass requested", tone: "active"};
+    // A one-shot request that never got a turn (the ordinary Autopilot lock
+    // stayed busy the whole retry window, or the pass itself errored) used
+    // to clear back to this exact same "Ready to run a pass" state with no
+    // visible difference from a pass that actually completed. Surface it.
+    if (payload.control?.last_outcome === "busy_exhausted") return {label: "Pass didn't run — Autopilot stayed busy", tone: "bad"};
+    if (payload.control?.last_outcome === "failed") return {label: "Pass failed to start", tone: "bad"};
     return {label: "Ready to run a pass", tone: "good"};
   }
 
   function scheduleRefresh(payload) {
     window.clearTimeout(state.refreshTimer);
-    if (!payload?.control?.one_shot_requested) return;
-    state.refreshTimer = window.setTimeout(() => load(true), 5000);
+    if (payload?.control?.one_shot_requested) {
+      state.refreshTimer = window.setTimeout(() => load(true), 5000);
+      return;
+    }
+    // The status endpoint never blocks on its expensive aggregate anymore:
+    // it hands back "computing" (nothing cached) or a stale snapshot while a
+    // background recompute runs. Repoll until a fresh snapshot lands, so the
+    // panel converges on real counts without the user touching anything.
+    if (payload?.computing || payload?.stale) {
+      state.refreshTimer = window.setTimeout(() => load(true), 6000);
+    }
   }
 
   function renderPayload(payload) {
@@ -115,6 +143,25 @@
     const mode = stateLabel(payload);
     heading.append(headingMain, element("span", `missing-recovery-state ${mode.tone}`.trim(), mode.label));
     host.append(heading);
+
+    // A snapshot served from cache while a slow recompute is still in
+    // flight (missing_recovery_dashboard_status()'s bounded-lock fallback)
+    // used to render identically to a fresh one -- same numbers, same
+    // tone, no way to tell the counts might be seconds to minutes old.
+    if (payload.stale) {
+      const staleNotice = element("div", "missing-recovery-notice warn");
+      staleNotice.append(element("strong", "", "Showing cached data."));
+      staleNotice.append(element("span", "", "A refresh is already in progress; these counts may be a little behind and update on their own in a few seconds."));
+      host.append(staleNotice);
+    }
+
+    if (!state.actionError && !payload.control?.one_shot_requested && payload.control?.last_outcome
+        && (payload.control.last_outcome === "busy_exhausted" || payload.control.last_outcome === "failed")) {
+      const outcomeNotice = element("div", "missing-recovery-notice bad");
+      outcomeNotice.append(element("strong", "", mode.label));
+      outcomeNotice.append(element("span", "", payload.control.last_outcome_note || "The requested pass did not run. Try again."));
+      host.append(outcomeNotice);
+    }
 
     if (!payload.enabled) {
       const notice = element("div", "missing-recovery-notice warn");
@@ -269,7 +316,9 @@
     const activationGeneration = state.activationGeneration;
     if (!force && state.loading?.activationGeneration === activationGeneration) return state.loading.promise;
     const requestGeneration = ++state.requestGeneration;
-    const promise = window.InkDropApi.request(API)
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timeoutId = controller ? window.setTimeout(() => controller.abort(), LOAD_TIMEOUT_MS) : 0;
+    const promise = window.InkDropApi.request(API, controller ? {signal: controller.signal} : {})
       .then(payload => {
         if (!activationIsCurrent(activationGeneration) || requestGeneration !== state.requestGeneration) return payload;
         state.payload = payload;
@@ -279,9 +328,14 @@
       })
       .catch(error => {
         if (!activationIsCurrent(activationGeneration) || requestGeneration !== state.requestGeneration) return;
-        renderMessage(host, error?.message || "Recovery status is unavailable.", "bad");
+        const timedOut = error?.name === "AbortError";
+        const message = timedOut
+          ? "Recovery status is taking longer than expected."
+          : (error?.message || "Recovery status is unavailable.");
+        renderMessage(host, message, "bad", () => load(true));
       })
       .finally(() => {
+        window.clearTimeout(timeoutId);
         if (state.loading?.requestGeneration === requestGeneration) state.loading = null;
       });
     state.loading = {activationGeneration, requestGeneration, promise};

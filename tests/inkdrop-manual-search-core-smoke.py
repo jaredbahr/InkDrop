@@ -9,9 +9,9 @@ import threading
 import time
 from pathlib import Path
 
-import inkdrop_auth_contracts
-import inkdrop_manual_search_core as core
-import inkdrop_state
+from core import inkdrop_auth_contracts
+from core import inkdrop_manual_search_core as core
+from core import inkdrop_state
 
 
 def check(condition, message):
@@ -83,7 +83,7 @@ def run():
         with inkdrop_state.connect_read(db_path) as con:
             version = con.execute("select value from schema_meta where key='schema_version'").fetchone()["value"]
             original_series = con.execute("select count(*) count from series").fetchone()["count"]
-        check(version == "18", "additive schema must report version 18")
+        check(version == str(inkdrop_state.SCHEMA_VERSION), f"additive schema must report version {inkdrop_state.SCHEMA_VERSION}")
         check(original_series == 1, "schema upgrade must preserve legacy Series")
 
         projection = core.project_series(db_path, "series-fma", now=1_700_000_001)

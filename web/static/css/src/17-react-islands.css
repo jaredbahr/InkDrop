@@ -23,3 +23,1133 @@
 .inkdrop-react-pager span {
   opacity: 0.75;
 }
+
+/* Blocklist island (web/frontend/src/sections/Blocklist.tsx): filter
+   controls row, info banner, thumbnail/badge/format-tag cells, kebab menu,
+   and the numbered pager. */
+
+.blocklist-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+.blocklist-controls .blocklist-search {
+  flex: 1 1 240px;
+  min-width: 180px;
+  min-height: 36px;
+}
+.blocklist-filter-select {
+  display: grid;
+  gap: 2px;
+  min-width: 130px;
+}
+.blocklist-filter-select > span {
+  color: var(--muted);
+  font-size: var(--font-xs, 11px);
+  font-weight: var(--weight-medium, 600);
+}
+.blocklist-filter-select select {
+  min-height: 36px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 12px);
+}
+
+.blocklist-info-banner {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--accent) 8%);
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+}
+
+.blocklist-row {
+  cursor: pointer;
+}
+.blocklist-series-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.blocklist-cover {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 5px;
+  border: 1px solid var(--line-soft);
+  background: var(--panel-2);
+}
+.blocklist-cover-empty {
+  display: inline-grid;
+  place-items: center;
+  color: var(--muted);
+  font-weight: var(--weight-bold, 800);
+  font-size: var(--font-md, 14px);
+}
+.blocklist-series-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.blocklist-series-text strong {
+  /* No nowrap here: inside an auto-layout table a nowrap title sets the
+     column's min-content width, and long release names pushed the whole
+     6-column table 100px+ past its container even at desktop width. Titles
+     wrap at word boundaries instead. */
+  overflow-wrap: break-word;
+}
+
+.blocklist-candidate-cell {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.blocklist-candidate-title {
+  overflow-wrap: anywhere;
+}
+.blocklist-format-tag {
+  flex: 0 0 auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: var(--weight-semibold, 700);
+  letter-spacing: .04em;
+}
+
+.blocklist-reason-cell {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.blocklist-reason-badge {
+  justify-self: start;
+}
+
+.blocklist-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.blocklist-allow-btn {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #0b1720;
+  font-weight: var(--weight-semibold, 700);
+}
+.blocklist-kebab {
+  position: relative;
+}
+.blocklist-kebab > summary {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.blocklist-kebab > summary::-webkit-details-marker {
+  display: none;
+}
+.blocklist-kebab-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 10;
+  min-width: 190px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px;
+  background: var(--panel);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .4);
+}
+.blocklist-kebab-menu button {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  padding: 6px 10px;
+}
+.blocklist-kebab-menu button:hover {
+  background: var(--panel-2);
+}
+.blocklist-kebab-menu .blocklist-kebab-remove {
+  color: var(--bad);
+}
+
+.blocklist-pager {
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.blocklist-pager-pages {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.blocklist-pager-pages button {
+  min-width: 32px;
+  min-height: 32px;
+  height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 12px);
+}
+.blocklist-pager-pages button.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #0b1720;
+  font-weight: var(--weight-semibold, 700);
+}
+.blocklist-pager-gap {
+  padding: 0 4px;
+  color: var(--muted);
+}
+
+/* Series island (web/frontend/src/sections/Series.tsx). The poster grid, the
+   publisher ribbon, the single status pill, and the alphabet rail that stays
+   exposed down the right-hand side of the grid.
+
+   Colour comes from the existing --good/--warn/--bad tokens so the pill reads
+   the same as every other status surface in the app; nothing here introduces a
+   new palette. */
+
+.inkdrop-series-poster-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
+/* Virtuoso scroller: own real height (useWindowScroll collapses to ~1 row
+   in this app's auto-height layout). !important beats its inline style. */
+.inkdrop-series-grid-scroller,
+.inkdrop-series-virtual-scroller {
+  min-width: 0;
+  height: calc(100vh - 220px) !important;
+  min-height: 320px;
+  overflow-y: auto;
+}
+
+.inkdrop-series-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 14px;
+  min-width: 0;
+}
+
+.inkdrop-series-empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 18px 4px;
+  color: var(--muted);
+}
+
+.inkdrop-series-card {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.inkdrop-series-cover {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  background: var(--panel-2);
+}
+
+.inkdrop-series-cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.inkdrop-series-cover-fallback {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: var(--muted);
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+/* The ENTIRE card -- cover, title, meta, pill -- is one hit target for
+   opening the series (a cover-only target left the text half of the card
+   dead on phones). The overlay button is the article's last child so it
+   paints above everything and stays a single accessible control. */
+.inkdrop-series-card-open {
+  position: absolute;
+  inset: 0;
+  /* The sitewide button { height: 38px } rule beats the inset-derived
+     height, silently shrinking this overlay to a 38px strip at the top of
+     the card (measured). Explicit 100% restores full coverage. */
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.inkdrop-series-card-open:hover,
+.inkdrop-series-card-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.inkdrop-series-card-body {
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px 11px;
+  min-width: 0;
+}
+
+/* Every card in a grid row renders the same height regardless of content:
+   the cover is a fixed 2/3 aspect box, the title always occupies exactly
+   two lines (clamped with an ellipsis; the full title stays in the hover
+   title attribute), and the meta line always occupies exactly one (it
+   renders even when empty). Without this, a long wrapping title pushed
+   its whole card taller than its row neighbours. */
+.inkdrop-series-card-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: calc(2 * 1.3em);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.inkdrop-series-card-meta {
+  min-height: 1.35em;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The one status rendering per card. */
+.inkdrop-series-pill {
+  justify-self: start;
+  min-height: 20px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.inkdrop-series-pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
+.inkdrop-series-pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.inkdrop-series-pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
+
+/* Kept exposed down the right-hand edge of the grid rather than tucked into a
+   menu: 378 series with no fast jump is a long scroll. */
+.inkdrop-series-alpha-rail {
+  position: sticky;
+  top: 8px;
+  display: grid;
+  gap: 1px;
+  justify-items: center;
+}
+
+.inkdrop-series-alpha-rail button {
+  min-width: 20px;
+  min-height: 17px;
+  padding: 0 3px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.inkdrop-series-alpha-rail button:hover,
+.inkdrop-series-alpha-rail button:focus-visible {
+  background: var(--panel-2);
+  color: var(--accent);
+}
+
+.inkdrop-series-table td[data-label="Publisher"] {
+  color: var(--muted);
+}
+
+/* Sticky header needs an opaque background or scrolled rows show through
+   it (on th, not thead: doesn't paint under position:sticky otherwise). */
+.inkdrop-series-table thead th {
+  background: var(--bg);
+}
+
+/* Five columns do not fit a phone: measured 446px of table in a 414px
+   viewport, which pushed the whole page 40px wide with no way to scroll to the
+   Actions cell. Stack each row into a card and promote data-label to the field
+   name, the same pattern #seriesSearchSection already uses at this width. */
+@media (max-width: 760px) {
+  .inkdrop-series-table,
+  .inkdrop-series-table tbody,
+  .inkdrop-series-table tr,
+  .inkdrop-series-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .inkdrop-series-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .inkdrop-series-table tr {
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+  }
+
+  .inkdrop-series-table td {
+    padding: 4px 0;
+    border: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .inkdrop-series-table td:not([data-label="Series"])::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .inkdrop-series-table td[data-label="Series"] {
+    color: var(--text);
+    font-weight: 700;
+  }
+
+  /* An empty cell would otherwise draw its label with nothing under it. */
+  .inkdrop-series-table td:empty {
+    display: none;
+  }
+}
+
+/* Narrow viewports: the rail would eat too much of a phone's width beside a
+   two-column grid, so it drops under the grid as a horizontal strip rather
+   than disappearing -- the jump is the point of it. */
+@media (max-width: 760px) {
+  .inkdrop-series-poster-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .inkdrop-series-grid {
+    grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+    gap: 10px;
+  }
+
+  .inkdrop-series-alpha-rail {
+    position: static;
+    grid-auto-flow: column;
+    justify-content: start;
+    gap: 2px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .inkdrop-series-alpha-rail button {
+    min-width: 26px;
+    min-height: 26px;
+  }
+}
+
+/* History island (web/frontend/src/sections/History.tsx): day-group section
+   rows, colored result pills, per-row chevron expansion, numbered pager with
+   a rows-per-page selector. */
+
+.history-day-row td {
+  padding: 10px 12px 6px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: var(--font-xs, 11px);
+  font-weight: var(--weight-semibold, 700);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  background: var(--panel-2);
+}
+.history-row {
+  cursor: pointer;
+}
+.history-col-time {
+  white-space: nowrap;
+  color: var(--muted);
+  width: 84px;
+}
+.history-result-pill {
+  white-space: nowrap;
+}
+.history-col-details {
+  color: var(--muted);
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-col-chevron {
+  width: 28px;
+  text-align: right;
+}
+.history-chevron {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 16px;
+  transition: transform .12s ease;
+}
+.history-chevron.open {
+  transform: rotate(90deg);
+}
+.history-detail-row td {
+  padding: 10px 14px 14px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line-soft);
+}
+.history-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.history-detail-grid > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.history-detail-grid span {
+  color: var(--muted);
+  font-size: var(--font-xs, 11px);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.history-detail-grid strong {
+  font-weight: var(--weight-medium, 600);
+  overflow-wrap: anywhere;
+}
+
+.history-pager {
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.history-pager-pages {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.history-pager-pages button {
+  min-width: 32px;
+  min-height: 32px;
+  height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 12px);
+}
+.history-pager-pages button.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #0b1720;
+  font-weight: var(--weight-semibold, 700);
+}
+.history-pager-gap {
+  padding: 0 4px;
+  color: var(--muted);
+}
+.history-page-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+}
+.history-page-size select {
+  min-height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+/* Manual Review island: sort control + humanized reason badges. */
+.mr-sort-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+}
+.mr-sort-select select {
+  min-height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+.mr-reason-cell {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.mr-reason-badge {
+  justify-self: start;
+  white-space: nowrap;
+}
+.mr-reason-cell .mini {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* ---- Island tables: shared width base + mobile card transform ----
+   The Blocklist/History/Manual Review/Wanted islands render bare .arr-table
+   markup, which has NO responsive treatment of its own -- at phone widths
+   a 5-7 column table crams into ~375px and every cell's content wraps
+   into overlapping-looking stacks (real-device report, 2026-08-06). This
+   is the same fix the Series island already shipped for the identical
+   problem (.inkdrop-series-table's card transform above): stack each row
+   into a card and promote data-label to the field name. */
+.blocklist-table,
+.history-table,
+.mr-table,
+.wanted-table {
+  width: 100%;
+}
+
+@media (max-width: 760px) {
+  .blocklist-table, .blocklist-table tbody, .blocklist-table tr, .blocklist-table td,
+  .history-table, .history-table tbody, .history-table tr, .history-table td,
+  .mr-table, .mr-table tbody, .mr-table tr, .mr-table td,
+  .wanted-table, .wanted-table tbody, .wanted-table tr, .wanted-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+  .blocklist-table thead,
+  .history-table thead,
+  .mr-table thead,
+  .wanted-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .blocklist-table tr,
+  .history-table tr,
+  .mr-table tr,
+  .wanted-table tr {
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+  }
+  .blocklist-table td,
+  .history-table td,
+  .mr-table td,
+  .wanted-table td {
+    padding: 4px 0;
+    border: 0;
+    overflow-wrap: anywhere;
+  }
+  .blocklist-table td:empty,
+  .history-table td:empty,
+  .mr-table td:empty,
+  .wanted-table td:empty {
+    display: none;
+  }
+  /* Field-name labels above each value, except the cells that are
+     self-describing (the title cell leads the card; result/reason badges
+     name themselves). */
+  .blocklist-table td[data-label]:not([data-label="Series / Issue"])::before,
+  .history-table td[data-label]:not([data-label="Event"])::before,
+  .mr-table td[data-label]:not([data-label="Series / Issue"]):not([data-label="Select"])::before,
+  .wanted-table td[data-label]:not([data-label="Series / Issue"])::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+  /* History card specifics: the day header row is a section divider, not a
+     card; the chevron column is pointless when the whole card is tappable;
+     the expanded detail row reads as part of its parent card. */
+  .history-day-row {
+    margin: 0 0 8px;
+    padding: 0 2px 4px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+  .history-day-row td::before {
+    content: none;
+  }
+  .history-col-chevron {
+    display: none !important;
+  }
+  .history-col-details {
+    max-width: none;
+    white-space: normal;
+  }
+  .history-detail-row {
+    margin-top: -10px;
+    border-top: 0;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
+  .history-detail-row td {
+    background: transparent;
+    border-bottom: 0;
+  }
+  /* Blocklist card specifics: the action row lays out horizontally inside
+     the card, and the kebab's dropdown anchors to the card rather than
+     hanging off-screen. */
+  .blocklist-row-actions {
+    flex-wrap: wrap;
+  }
+  /* Manual Review: the checkbox floats beside the title instead of being a
+     labeled block field of its own. */
+  .mr-table td[data-label="Select"] {
+    float: right;
+    width: auto;
+    padding: 0 0 0 10px;
+  }
+}
+
+/* Above the card breakpoint the Blocklist table must never outgrow its
+   container: with auto table layout the summed min-content widths of six
+   columns (nowrap badges, the ~210px action rail) pushed the whole island
+   ~110px past the content shell even at 1400px, hiding the Actions column
+   behind a horizontal scroll nobody notices. Fixed layout + explicit
+   column widths makes 100% a hard ceiling; cell content wraps or
+   ellipsizes inside its column instead of widening the table. */
+@media (min-width: 761px) {
+  .blocklist-table {
+    table-layout: fixed;
+  }
+  .blocklist-table th:nth-child(1) { width: 18%; }
+  .blocklist-table th:nth-child(2) { width: 18%; }
+  .blocklist-table th:nth-child(3) { width: 21%; }
+  .blocklist-table th:nth-child(4) { width: 9%; }
+  .blocklist-table th:nth-child(5) { width: 72px; }
+  /* Wide enough for "Allow & retry" + "Inspect" + "Remove" on one nowrap
+     line -- an undersized fixed column doesn't shrink its content, it just
+     lets the buttons paint past the table edge (measured 293px at default
+     font metrics; 240px pushed Remove ~50px over the border). */
+  .blocklist-table th:nth-child(6) { width: 300px; }
+  .blocklist-reason-badge {
+    white-space: normal;
+  }
+}
+
+/* The island rows reuse the vanilla .section-table-row class purely as the
+   selected-detail-row highlight hook -- but that class also carries the
+   vanilla operational-table's `display: grid` row layout, which turns real
+   <tr> elements into grids and paints their cells on top of each other
+   (caught by desktop screenshots, 2026-08-06; the mobile card transform
+   masked it below 760px). Real tables stay tables. */
+@media (min-width: 761px) {
+  .blocklist-table tr,
+  .history-table tr,
+  .mr-table tr,
+  .wanted-table tr {
+    display: table-row;
+  }
+  .blocklist-table td,
+  .history-table td,
+  .mr-table td,
+  .wanted-table td {
+    display: table-cell;
+  }
+  .blocklist-row-actions button,
+  .blocklist-row-actions summary {
+    white-space: nowrap;
+  }
+}
+
+/* Selected-row highlight for the island rows, matching the treatment
+   15-redesign-shell.css gives the vanilla .section-table-row (the island
+   rows deliberately no longer carry that class -- its ::before accent
+   element becomes an anonymous first table-cell inside a real <tr>,
+   shifting every column one slot right). */
+.blocklist-row.selected-detail-row,
+.mr-row.selected-detail-row {
+  background: rgba(114, 210, 255, .07);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* Slimmed download-client-manager empty state: one muted line where a
+   bordered explainer box used to be. */
+.download-client-empty-line {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+}
+
+/* Event-column glyphs: masks from the shell's :root --arr-glyph registry,
+   sized for a table row rather than a masthead card. */
+.history-event {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.history-event-icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  background: var(--muted);
+  -webkit-mask: var(--arr-stat-icon-mask, none) center / contain no-repeat;
+  mask: var(--arr-stat-icon-mask, none) center / contain no-repeat;
+}
+
+.history-event-icon[data-icon="check"] { --arr-stat-icon-mask: var(--arr-glyph-check); background: var(--ok, #6fd087); }
+.history-event-icon[data-icon="x"] { --arr-stat-icon-mask: var(--arr-glyph-x); background: var(--bad, #e26464); }
+.history-event-icon[data-icon="refresh"] { --arr-stat-icon-mask: var(--arr-glyph-refresh); background: var(--warn, #e8c268); }
+.history-event-icon[data-icon="eye"] { --arr-stat-icon-mask: var(--arr-glyph-eye); }
+.history-event-icon[data-icon="search"] { --arr-stat-icon-mask: var(--arr-glyph-search); }
+.history-event-icon[data-icon="download"] { --arr-stat-icon-mask: var(--arr-glyph-download); }
+.history-event-icon[data-icon="cloud-download"] { --arr-stat-icon-mask: var(--arr-glyph-cloud-download); }
+.history-event-icon[data-icon="shield"] { --arr-stat-icon-mask: var(--arr-glyph-shield); }
+.history-event-icon[data-icon="radar"] { --arr-stat-icon-mask: var(--arr-glyph-radar); }
+.history-event-icon[data-icon="calendar"] { --arr-stat-icon-mask: var(--arr-glyph-calendar); }
+.history-event-icon[data-icon="clock"] { --arr-stat-icon-mask: var(--arr-glyph-clock); }
+
+/* ---- Queue island: grouped rows with real transfer progress ----
+   The Queue view left its table behind: rows are cards inside collapsible
+   status groups, with a progress bar only for transfers whose downloader
+   reported a real percentage (progress_kind "determinate" -- see
+   core/inkdrop_transfer.py). Waiting rows show their next-action text and
+   no bar on purpose. */
+.queue-attention-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border: 1px solid rgba(226, 100, 100, .45);
+  border-radius: 8px;
+  background: rgba(226, 100, 100, .12);
+}
+
+.queue-attention-banner button {
+  white-space: nowrap;
+}
+
+.queue-filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.queue-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 12px);
+  cursor: pointer;
+}
+
+.queue-filter-chip.selected {
+  border-color: var(--accent);
+  background: rgba(114, 210, 255, .12);
+}
+
+.queue-filter-chip-count {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.queue-group {
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.queue-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 0;
+  background: var(--panel-2);
+  color: var(--text);
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.queue-group-caret {
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--muted);
+}
+
+.queue-group-caret.closed {
+  transform: rotate(-90deg);
+}
+
+.queue-row-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.queue-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.queue-row > .queue-row-main {
+  min-width: 240px;
+}
+
+.queue-row-cover {
+  width: 34px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+  background: var(--panel-2);
+}
+
+.queue-row-cover-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.queue-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.queue-row-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.queue-row-title-line strong {
+  overflow-wrap: anywhere;
+}
+
+.queue-row-format {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.queue-row-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--font-sm, 12px);
+}
+
+.queue-row-status {
+  font-weight: 700;
+}
+
+.queue-row-status.info { color: var(--info, #72d2ff); }
+.queue-row-status.good { color: var(--ok, #6fd087); }
+.queue-row-status.warn { color: var(--warn, #e8c268); }
+.queue-row-status.bad { color: var(--bad, #e26464); }
+.queue-row-status.accent { color: var(--accent); }
+
+.queue-row-source,
+.queue-row-elapsed {
+  color: var(--muted);
+}
+
+.queue-row-next {
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+  overflow-wrap: anywhere;
+}
+
+.queue-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 460px;
+}
+
+.queue-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.queue-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--info, #72d2ff);
+  transition: width .6s ease;
+}
+
+.queue-progress.done .queue-progress-fill {
+  background: var(--ok, #6fd087);
+}
+
+.queue-progress.stalled .queue-progress-fill {
+  background: var(--warn, #e8c268);
+}
+
+.queue-progress-meta {
+  color: var(--muted);
+  font-size: var(--font-sm, 12px);
+}
+
+.queue-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.queue-row-remove {
+  color: var(--bad, #e26464);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.queue-row-detail {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.queue-row-detail dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 6px 18px;
+  margin: 0;
+}
+
+.queue-row-detail-field dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.queue-row-detail-field dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.queue-row-detail-error {
+  margin: 0;
+  color: var(--bad, #e26464);
+}
+
+.queue-row-detail-loading {
+  margin: 0;
+  color: var(--muted);
+}
+
+.queue-empty-line {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+
+/* Phone widths: the action button drops under the text instead of
+   squeezing the title column. */
+@media (max-width: 620px) {
+  .queue-row {
+    flex-wrap: wrap;
+  }
+
+  .queue-row-actions {
+    width: 100%;
+    display: flex;
+    justify-content: flex-end;
+  }
+}
+

@@ -73,6 +73,107 @@
   background: var(--panel-2);
 }
 
+/* One card per channel -- same grid/card language as
+   .download-client-instance-grid/-card above, so this reads as the same kind
+   of "list of configured things" rather than a bespoke layout. */
+.notifications-channel-grid {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.notifications-channel-card {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.notifications-channel-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.notifications-channel-card-head h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Same pill language as .missing-recovery-state/-category (pill badges
+   elsewhere in Settings/Series), so "active trigger" reads as the same kind
+   of small status chip everywhere it shows up, not a one-off shape. */
+.notifications-trigger-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.notifications-trigger-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--good) 45%, var(--border));
+  border-radius: 999px;
+  color: var(--good);
+  background: color-mix(in srgb, var(--good) 10%, var(--panel-2));
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.notifications-trigger-pill.muted {
+  border-color: var(--border);
+  color: var(--muted);
+  background: var(--panel-2);
+  font-weight: 500;
+}
+
+.notifications-channel-scope {
+  margin: 0;
+}
+
+.notifications-channel-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.notifications-channel-card-actions button {
+  flex: 1 1 auto;
+}
+
+/* The Add Connection tile is the same card shape as every other connection
+   card (same grid, same width) but dashed instead of solid-bordered and
+   centered, so it reads as "the empty slot" rather than a fifth configured
+   connector -- the same visual language Sonarr's own "+" card uses. */
+.notifications-add-card {
+  align-items: center;
+  justify-items: center;
+  text-align: center;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: transparent;
+}
+
+.notifications-add-card select,
+.notifications-add-card input,
+.notifications-add-card button {
+  width: 100%;
+}
+
+@media (max-width: 760px) {
+  .notifications-channel-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .inkdrop-one-time-key output {
   display: block;
   border: 1px solid rgba(247, 201, 111, .45);
@@ -1330,6 +1431,8 @@
 .missing-recovery-notice.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); color: var(--bad); }
 .missing-recovery-notice.bad .mini { color: color-mix(in srgb, var(--bad) 70%, var(--muted)); }
 .missing-recovery-message.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); color: var(--bad); }
+
+.missing-recovery-retry { justify-self: start; margin-top: 2px; }
 
 .missing-recovery-metrics,
 .missing-recovery-progress-grid {

@@ -3,7 +3,7 @@
 import json
 import os
 
-import inkdrop_container_scheduler as scheduler
+from core import inkdrop_container_scheduler as scheduler
 
 
 job = scheduler.ScheduledJob("comicvine-scan", 21600, url="http://inkdrop:8796/api/comicvine/scan", critical=False)
@@ -52,10 +52,10 @@ assert scheduled["verified-import-projection"].command[-1] == "5"
 assert scheduled["verified-import-projection"].critical is False
 assert scheduled["queue-maintenance"].critical is True
 assert scheduled["comicvine-scan"].url == ""
-assert scheduled["comicvine-scan"].command[-2:] == ("inkdrop_internal_jobs.py", "comicvine-scan")
+assert scheduled["comicvine-scan"].command[-2:] == (scheduler._script("inkdrop_internal_jobs.py"), "comicvine-scan")
 assert scheduled["manual-review-noop-resolve"].url == ""
 assert scheduled["manual-review-noop-resolve"].command[-2:] == (
-    "inkdrop_internal_jobs.py",
+    scheduler._script("inkdrop_internal_jobs.py"),
     "manual-review-noop-resolve",
 )
 manual_source_command = scheduled["manual-source-autoresolve"].command
@@ -101,7 +101,7 @@ finally:
     else:
         os.environ[projection_limit_name] = original_projection_limit
 
-web = open("inkdrop_web.py", encoding="utf-8").read()
+web = open("core/inkdrop_web.py", encoding="utf-8").read()
 assert '"status": provider_status' in web
 assert '"reason": "comicvine_provider_disabled"' in web
 assert 'watch_log("comic_series_scan_skipped", summary)' in web

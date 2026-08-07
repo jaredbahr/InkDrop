@@ -8,8 +8,8 @@ import tempfile
 import threading
 from pathlib import Path
 
-import inkdrop_reconcile_imports as reconcile
-import inkdrop_state
+from core import inkdrop_reconcile_imports as reconcile
+from core import inkdrop_state
 
 
 def require(condition, message):

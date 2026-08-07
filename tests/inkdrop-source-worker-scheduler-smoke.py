@@ -3,9 +3,9 @@ import json
 import tempfile
 from pathlib import Path
 
-import inkdrop_source_catalog as catalog
-import inkdrop_source_worker_scheduler as scheduler
-import inkdrop_state
+from core import inkdrop_source_catalog as catalog
+from core import inkdrop_source_worker_scheduler as scheduler
+from core import inkdrop_state
 
 
 NOW = 123456.0

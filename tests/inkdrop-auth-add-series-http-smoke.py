@@ -16,8 +16,8 @@ import urllib.request
 from http.cookiejar import CookieJar
 from pathlib import Path
 
-import inkdrop_auth
-import inkdrop_state
+from core import inkdrop_auth
+from core import inkdrop_state
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
@@ -26,7 +26,7 @@ if "requests" not in sys.modules:
     requests_stub.exceptions = types.SimpleNamespace(RequestException=_RequestsException, Timeout=_RequestsException, ConnectionError=_RequestsException, HTTPError=_RequestsException)
     sys.modules["requests"] = requests_stub
 
-import inkdrop_web
+from core import inkdrop_web
 
 
 def require(condition, message):

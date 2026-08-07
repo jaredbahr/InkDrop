@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.modules.setdefault("requests", types.ModuleType("requests"))
 
-import inkdrop_state
-import inkdrop_web as web
+from core import inkdrop_state
+from core import inkdrop_web as web
 
 
 def require(condition, message):

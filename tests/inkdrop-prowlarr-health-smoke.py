@@ -7,8 +7,8 @@ try:
 except Exception:
     sys.modules["requests"] = types.SimpleNamespace()
 
-import inkdrop_web as web
-import inkdrop_acquire_adapter
+from core import inkdrop_web as web
+from core import inkdrop_acquire_adapter
 
 
 def fail(message):

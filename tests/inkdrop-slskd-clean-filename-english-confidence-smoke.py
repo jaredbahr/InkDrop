@@ -17,7 +17,7 @@ while "Chew 012 (2010).cbr" from the same user only passed because of the
 unrelated learned-history fallback.
 """
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

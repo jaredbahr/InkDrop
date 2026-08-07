@@ -21,7 +21,7 @@ def catalog_matches_release_contract():
     return f'version: "{tag}"' in catalog and f'slug: "{expected_slug}"' in catalog
 # inkdrop_web_config.py holds the static-asset registration constants that
 # used to live directly in inkdrop_web.py.
-web = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8") + (ROOT / "inkdrop_web_config.py").read_text(encoding="utf-8")
+web = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8") + (ROOT / "core" / "inkdrop_web_config.py").read_text(encoding="utf-8")
 css = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")
 dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 gaps = (ROOT / "docs/inkdrop/UI_BACKEND_GAPS.md").read_text(encoding="utf-8")
@@ -117,8 +117,11 @@ checks = {
     "server-side operational sort": 'params.set("sort", sort.key)' in web
     and 'params.set("direction", sort.dir)' in web
     and 'loadInkdropSection(key, focus' in web,
+    # The tilde alone marks a facet count approximate ("~1.2K"); the word
+    # "sampled" moved out of the button text (it read as jargon in the tab
+    # strip -- flagged in review) and survives in the hover title.
     "sampled facets are visibly labeled": "function facetCountText" in web
-    and '`~${count} sampled`' in web
+    and '`~${count}`' in web
     and "count.textContent = item.countText || compactNumber" in web
     and 'btn.textContent = `${filterLabel} ${facetCountText(item)}`' in web
     and 'appendSectionSummaryChip(box, "sources", facetCountText(sectionFilterRow(viewPayload, "sources")))' in web

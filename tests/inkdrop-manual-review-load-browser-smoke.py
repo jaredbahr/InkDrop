@@ -11,8 +11,8 @@ import threading
 import time
 from pathlib import Path
 
-import inkdrop_auth
-import inkdrop_state
+from core import inkdrop_auth
+from core import inkdrop_state
 
 
 def main():
@@ -47,7 +47,7 @@ def main():
             json.dumps({"ok": True, "state": "healthy", "failure_count": 0, "heartbeat_at": time.time()}),
             encoding="utf-8",
         )
-        import inkdrop_web
+        from core import inkdrop_web
 
         db = state / inkdrop_state.STATE_DB_NAME
         inkdrop_state.sync_settings(db, providers=[])

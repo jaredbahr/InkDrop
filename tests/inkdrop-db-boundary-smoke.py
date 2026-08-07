@@ -9,8 +9,8 @@ import threading
 import time
 from pathlib import Path
 
-import inkdrop_db
-import inkdrop_state
+from core import inkdrop_db
+from core import inkdrop_state
 
 
 def check(condition, message):

@@ -43,7 +43,7 @@ from unittest import mock
 if "requests" not in sys.modules:
     sys.modules["requests"] = types.SimpleNamespace()
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

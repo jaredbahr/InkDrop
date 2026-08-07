@@ -6,7 +6,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8")
+WEB = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
 AUTH = (ROOT / "web/static/js/inkdrop-auth-ui.js").read_text(encoding="utf-8")
 API = (ROOT / "web/static/js/inkdrop-api.js").read_text(encoding="utf-8")
 DOWNLOAD_CLIENTS = (ROOT / "web/static/js/inkdrop-download-clients-ui.js").read_text(encoding="utf-8")

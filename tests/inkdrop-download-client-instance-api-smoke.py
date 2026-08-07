@@ -14,11 +14,11 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_auth
-import inkdrop_auth_contracts
-import inkdrop_download_client_api
-import inkdrop_state
-import inkdrop_web
+from core import inkdrop_auth
+from core import inkdrop_auth_contracts
+from core import inkdrop_download_client_api
+from core import inkdrop_state
+from core import inkdrop_web
 
 
 def require(condition, message):

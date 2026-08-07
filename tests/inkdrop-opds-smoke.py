@@ -12,10 +12,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-import inkdrop_auth
-import inkdrop_opds
-import inkdrop_state
-import inkdrop_web
+from core import inkdrop_auth
+from core import inkdrop_opds
+from core import inkdrop_state
+from core import inkdrop_web
 
 
 def require(value, message):

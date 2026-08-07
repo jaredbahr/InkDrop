@@ -18,14 +18,16 @@
    ledger committed, leaving a false "bad candidate" for 17 minutes.
 """
 
+import atexit
 import json
+import shutil
 import sqlite3
 import tempfile
 import zipfile
 from pathlib import Path
 
-import inkdrop_completed_import as completed_import
-import inkdrop_state as state
+from core import inkdrop_completed_import as completed_import
+from core import inkdrop_state as state
 
 
 def require(condition, message):
@@ -35,6 +37,7 @@ def require(condition, message):
 
 def archive_with_comicinfo(number="7"):
     root = Path(tempfile.mkdtemp())
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
     path = root / f"issue{number}.cbz"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(
@@ -80,7 +83,9 @@ require(
 )
 
 # An archive that genuinely has no ComicInfo is a fact, and is worth caching.
-plain = Path(tempfile.mkdtemp()) / "plain.cbz"
+plain_root = Path(tempfile.mkdtemp())
+atexit.register(shutil.rmtree, plain_root, ignore_errors=True)
+plain = plain_root / "plain.cbz"
 with zipfile.ZipFile(plain, "w") as archive:
     archive.writestr("001.jpg", "x" * 16)
 con2 = fresh_db()

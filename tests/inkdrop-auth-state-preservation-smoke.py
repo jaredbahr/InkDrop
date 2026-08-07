@@ -10,9 +10,9 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_auth
-import inkdrop_settings_registry
-import inkdrop_state
+from core import inkdrop_auth
+from core import inkdrop_settings_registry
+from core import inkdrop_state
 
 
 def logical_digest(db):

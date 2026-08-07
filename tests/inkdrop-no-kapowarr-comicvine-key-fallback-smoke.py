@@ -12,8 +12,8 @@ setting and the fallback code removed, so InkDrop resolves its ComicVine
 key from its own settings only.
 """
 
-import inkdrop_slskd_source_probe as probe
-import inkdrop_web
+from core import inkdrop_slskd_source_probe as probe
+from core import inkdrop_web
 
 
 def require(condition, message):

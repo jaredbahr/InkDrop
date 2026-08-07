@@ -10,10 +10,10 @@ import time
 import zipfile
 from pathlib import Path
 
-import inkdrop_folder_cleanup
-import inkdrop_log_export
-import inkdrop_settings_registry as registry
-import inkdrop_state
+from core import inkdrop_folder_cleanup
+from core import inkdrop_log_export
+from core import inkdrop_settings_registry as registry
+from core import inkdrop_state
 
 
 def require(value, message):
@@ -71,7 +71,7 @@ def check_folder_cleanup(tmp):
 
 
 def check_quarantine_wiring(tmp):
-    import inkdrop_completed_import as importer
+    from core import inkdrop_completed_import as importer
 
     library = Path(tmp) / "comics"
     series_dir = library / "Duped Series (2021)"

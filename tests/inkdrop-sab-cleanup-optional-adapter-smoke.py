@@ -34,7 +34,7 @@ def main() -> None:
             }
         )
         proc = subprocess.run(
-            [sys.executable, "-B", str(ROOT / "inkdrop_sab_failed_cleanup.py"), "--json"],
+            [sys.executable, "-B", str(ROOT / "core" / "inkdrop_sab_failed_cleanup.py"), "--json"],
             cwd=ROOT,
             env=env,
             text=True,

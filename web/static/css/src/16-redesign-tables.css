@@ -250,3 +250,61 @@
   .section-table-lane-header[data-table-lane="manual-blocked"] { --arr-lane-glyph: var(--arr-glyph-x); }
   .section-table-lane-header[data-table-lane="manual-ready-import"] { --arr-lane-glyph: var(--arr-glyph-upload); }
 }
+
+/* Blocklist stat cards: one consistent icon treatment -- a solid filled
+   colored circle with a white glyph -- instead of the mixed tinted-outline
+   looks each tone class produced. Colors follow the reference: red for
+   Blocked, blue for Recent and SLSKD, purple for Prowlarr; Direct downloads
+   keeps its card (real data) and joins the same style in slate. */
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon {
+  border-radius: 50%;
+}
+
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon::before {
+  background: #fff;
+}
+
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon[data-icon="x-plain"] { background: #d75757; }
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon[data-icon="calendar"] { background: #3f7fd4; }
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon[data-icon="peers"] { background: #3f7fd4; }
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon[data-icon="search"] { background: #7d63c9; }
+body[data-inkdrop-view="source_memory"] #inkdropSectionWorkbench .section-workbench-card-icon[data-icon="download"] { background: #6a7687; }
+
+/* With the Inspect panel docked, the table column keeps roughly half its
+   width, and the fixed-layout column plan (sized for the full-width table)
+   compresses below its content minimums -- squeezed cells PAINT OVER their
+   neighbours instead of shrinking (headers merged, series text bleeding
+   into the release column; caught on screenshots with the panel open).
+   In the docked state the table sizes to content and scrolls inside its
+   own container instead. */
+body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-detail-panel[hidden])) .inkdrop-react-blocklist {
+  overflow-x: auto;
+}
+
+body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-detail-panel[hidden])) .blocklist-table {
+  table-layout: auto;
+}
+
+/* The docked table used to keep all six columns and scroll horizontally --
+   which hid the action buttons behind a scroll nobody notices (the exact
+   failure the fixed-layout comment above warns about; caught again on
+   screenshots: Inspect half-cut, Remove past the edge). Source and Added
+   are already shown in the open panel, so drop those columns while it is
+   docked and let the remaining four fit without any hidden scroll. */
+body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-detail-panel[hidden])) .blocklist-table th:nth-child(4),
+body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-detail-panel[hidden])) .blocklist-table td[data-label="Source"],
+body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-detail-panel[hidden])) .blocklist-table th:nth-child(5),
+body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-detail-panel[hidden])) .blocklist-table td[data-label="Added"] {
+  display: none;
+}
+
+/* Direct row Remove (replaces the single-item kebab menu). */
+.blocklist-remove-btn {
+  color: var(--bad, #e26464);
+}
+
+.source-memory-detail-action.busy {
+  opacity: .65;
+  cursor: progress;
+}
+

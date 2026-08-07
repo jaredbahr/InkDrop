@@ -22,11 +22,11 @@ def main():
         "existing-stack docs should validate the combined base+overlay compose config",
     )
     require(
-        "docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools" in install_doc,
+        "docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools" in install_doc,
         "existing-stack docs should run strict preflight through the combined compose stack",
     )
     require(
-        "docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only" in install_doc,
+        "docker compose -f /path/to/compose.yaml -f inkdrop.override.yaml run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only" in install_doc,
         "existing-stack docs should run healthcheck preflight through the combined compose stack",
     )
 

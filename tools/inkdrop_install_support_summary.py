@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import inkdrop_preflight
-import inkdrop_public_contracts
-import inkdrop_runtime_config
-import inkdrop_state
+from core import inkdrop_preflight
+from core import inkdrop_public_contracts
+from core import inkdrop_runtime_config
+from core import inkdrop_state
 
 
 ADAPTER_GUIDANCE = {

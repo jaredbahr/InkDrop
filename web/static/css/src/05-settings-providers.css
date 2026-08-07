@@ -601,14 +601,33 @@ body[data-inkdrop-view="manual_review"] .manual-review-inline-decision {
       gap: 10px;
       padding: 12px 14px 14px;
     }
+    /* Sonarr-style toolbar row: the icon+label action buttons sit in one
+       bordered cluster (.settings-toolbar-cluster, markup in
+       inkdrop_web.py's settings shell) and the search input sits apart on
+       the right -- it used to be mixed into the middle of the action row.
+       This file owns all toolbar styling; 15-redesign-shell.css must not
+       restyle these selectors (inkdrop-css-selector-conflict-smoke.py
+       enforces it). */
     .settings-actions {
       flex-wrap: wrap;
-      justify-content: flex-start;
-      align-items: stretch;
-      gap: 0;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
       min-height: 52px;
       border-bottom: 1px solid rgba(255, 255, 255, .10);
       padding: 0 0 9px;
+    }
+    .settings-toolbar-cluster {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      border: 1px solid rgba(255, 255, 255, .12);
+      border-radius: 10px;
+      padding: 3px;
+      background: rgba(255, 255, 255, .03);
+    }
+    .settings-toolbar-cluster button:last-child {
+      border-right: 0;
     }
     .settings-search {
       display: flex;
@@ -680,6 +699,16 @@ body[data-inkdrop-view="manual_review"] .manual-review-inline-decision {
       opacity: .62;
       cursor: default;
     }
+    /* 02-series-library.css's shortcut-chrome scrub kills ::before content
+       on ANY [data-arr-control-label] button with !important -- it exists to
+       strip auto-generated kbd glyphs, but it has also been silently killing
+       these deliberate toolbar icons since they were written (the toolbar
+       always rendered as plain text links). Scoped exception at higher
+       specificity, later in the bundle, so the icons actually draw. */
+    .settings-actions .settings-toolbar-cluster button::before {
+      content: "" !important;
+      display: block !important;
+    }
     .settings-actions button::before {
       content: "";
       width: 20px;
@@ -706,6 +735,26 @@ body[data-inkdrop-view="manual_review"] .manual-review-inline-decision {
     }
     .settings-actions button[hidden] {
       display: none !important;
+    }
+
+    /* Below ~800px the cluster and search stop fitting on one line and
+       wrap. .settings-actions (this file) sets space-between; the shared
+       .workflow-actions class this element also carries (06-settings-forms.css,
+       later in the bundle, same specificity) sets flex-end -- either way,
+       once wrapped, each item is alone on its own line with nothing to
+       justify against, so it just hugs one edge with the whole rest of the
+       line empty. Reads as two disconnected floating chips rather than a
+       toolbar. Give each wrapped item the full row instead of fighting the
+       justify-content cascade: with both at 100% width there's no leftover
+       space on the line for either alignment value to place them into. */
+    @media (max-width: 819px) {
+      .settings-actions .settings-toolbar-cluster,
+      .settings-actions .settings-search {
+        flex: 1 1 100%;
+      }
+      .settings-toolbar-cluster {
+        justify-content: center;
+      }
     }
     body[data-inkdrop-view="settings"]:not(.settings-advanced-visible) .settings-overview {
       display: none;

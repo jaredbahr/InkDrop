@@ -31,11 +31,23 @@
   --arr-glyph-clock: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M12,7v5l3.5,2' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --arr-glyph-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M8.5,12.3l2.4,2.4l4.6,-5.4' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --arr-glyph-x: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M9,9l6,6M15,9l-6,6' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
-  --arr-glyph-refresh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4,12a8,8 0,1,1 2.3,5.6M4,12v5h5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-refresh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M19.5,12a7.5,7.5 0 1 1 -2.2,-5.3' fill='none' stroke='black' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M17.8,2.6l0.3,4.6l-4.6,-0.3z' fill='black'/%3E%3C/svg%3E");
   --arr-glyph-eye: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M2,12s3.5,-6.5 10,-6.5s10,6.5 10,6.5s-3.5,6.5 -10,6.5s-10,-6.5 -10,-6.5z' fill='none' stroke='black' stroke-width='2' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='12' r='2.6' fill='none' stroke='black' stroke-width='2'/%3E%3C/svg%3E");
   --arr-glyph-alert: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M12,7.5v6M12,16.5h.01' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
   --arr-glyph-shield: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12,3.5l7,3v5c0,5 -3,8 -7,9c-4,-1 -7,-4 -7,-9v-5z' fill='none' stroke='black' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E");
   --arr-glyph-calendar: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='4' y='5' width='16' height='15' rx='1.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M4,10h16M8,3v4M16,3v4' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  /* "Searching" used --arr-glyph-refresh (a reload/loading spinner shape),
+     which reads as "in progress" rather than "actively looking" -- a radar
+     sweep (ring + sweep line + center ping) is unambiguous and distinct from
+     both refresh and the plain search magnifying glass. */
+  --arr-glyph-radar: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='8.5' fill='none' stroke='black' stroke-width='2'/%3E%3Cpath d='M12,12L12,4.5M12,12L17,16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='12' cy='12' r='1.4' fill='black'/%3E%3C/svg%3E");
+  /* "Downloading" used --arr-glyph-cloud-download, which reads as cloud
+     storage/sync rather than an active transfer -- a plain arrow-into-tray
+     (the mirror of --arr-glyph-upload) is unambiguous at a glance. */
+  --arr-glyph-bolt: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13.2,2.5L5.8,13.4h4.6L9.2,21.5l7.6,-11.3h-4.7z' fill='black' stroke='black' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --arr-glyph-x-plain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6.5,6.5L17.5,17.5M17.5,6.5L6.5,17.5' fill='none' stroke='black' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E");
+  --arr-glyph-peers: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8,12L16.2,6.4M8,12l8.2,5.6' fill='none' stroke='black' stroke-width='2'/%3E%3Ccircle cx='6.4' cy='12' r='2.8' fill='black'/%3E%3Ccircle cx='17.6' cy='5.6' r='2.8' fill='black'/%3E%3Ccircle cx='17.6' cy='18.4' r='2.8' fill='black'/%3E%3C/svg%3E");
+  --arr-glyph-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12,4v11M8,11l4,4l4,-4M5,20h14' fill='none' stroke='black' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 @media (min-width: 1100px) {
   body {
@@ -286,6 +298,12 @@
   .arr-page-stat.bad .arr-page-stat-icon::before { background: var(--bad); }
   .arr-page-stat-icon[data-icon="search"],
   .section-workbench-card-icon[data-icon="search"] { --arr-stat-icon-mask: var(--arr-glyph-search); }
+  .arr-page-stat-icon[data-icon="bolt"],
+  .section-workbench-card-icon[data-icon="bolt"] { --arr-stat-icon-mask: var(--arr-glyph-bolt); }
+  .arr-page-stat-icon[data-icon="x-plain"],
+  .section-workbench-card-icon[data-icon="x-plain"] { --arr-stat-icon-mask: var(--arr-glyph-x-plain); }
+  .arr-page-stat-icon[data-icon="peers"],
+  .section-workbench-card-icon[data-icon="peers"] { --arr-stat-icon-mask: var(--arr-glyph-peers); }
   .arr-page-stat-icon[data-icon="cloud-download"],
   .section-workbench-card-icon[data-icon="cloud-download"] { --arr-stat-icon-mask: var(--arr-glyph-cloud-download); }
   .arr-page-stat-icon[data-icon="upload"],
@@ -306,6 +324,10 @@
   .section-workbench-card-icon[data-icon="shield"] { --arr-stat-icon-mask: var(--arr-glyph-shield); }
   .arr-page-stat-icon[data-icon="calendar"],
   .section-workbench-card-icon[data-icon="calendar"] { --arr-stat-icon-mask: var(--arr-glyph-calendar); }
+  .arr-page-stat-icon[data-icon="radar"],
+  .section-workbench-card-icon[data-icon="radar"] { --arr-stat-icon-mask: var(--arr-glyph-radar); }
+  .arr-page-stat-icon[data-icon="download"],
+  .section-workbench-card-icon[data-icon="download"] { --arr-stat-icon-mask: var(--arr-glyph-download); }
 
   /* Workbench summary cards with an icon (today: the Blocklist counts).
      The card is a single-column grid of title/count/detail spans; when
@@ -415,16 +437,18 @@
   }
 }
 
-/* Blocklist's 4 real filter cards (Blocked/Recent/SLSKD/Prowlarr) already
-   sit exactly where the mockup wants a stat-card row -- right below the
-   masthead, always visible, correct counts (source_memory's masthead
-   deliberately carries no stats of its own; see the model comment in
-   inkdropPageMastheadModel). This gives them the same icon-badge tinted-
-   circle treatment as .arr-page-stat, and widens the row to 4 columns so
-   they sit on one line instead of wrapping 3+1. */
+/* Blocklist's 5 real filter cards (Blocked/Recent/SLSKD/Prowlarr/Direct
+   downloads) already sit exactly where the mockup wants a stat-card row --
+   right below the masthead, always visible, correct counts (source_memory's
+   masthead deliberately carries no stats of its own; see the model comment
+   in inkdropPageMastheadModel). This gives them the same icon-badge tinted-
+   circle treatment as .arr-page-stat, and widens the row to 5 columns so
+   they sit on one line. Each card gets a distinct icon color below so the
+   row reads as five different sources at a glance rather than one repeated
+   blue circle. */
 @media (min-width: 1100px) {
   body[data-inkdrop-view="source_memory"] .section-workbench {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
   body[data-inkdrop-view="source_memory"] .section-workbench-card {
     grid-template-columns: 34px 1fr;
@@ -457,6 +481,17 @@
   body[data-inkdrop-view="source_memory"] .section-workbench-card.warn .section-workbench-card-icon::before { background: var(--warn); }
   body[data-inkdrop-view="source_memory"] .section-workbench-card.bad .section-workbench-card-icon { background: rgba(255, 125, 125, .18); }
   body[data-inkdrop-view="source_memory"] .section-workbench-card.bad .section-workbench-card-icon::before { background: var(--bad); }
+  /* Distinct per-source icon hues (mockup gives every stat card its own
+     color). Tone classes above still win for Blocked (red); these cover the
+     tone-less cards: calendar=blue (accent default), shield=teal,
+     refresh=purple, cloud-download=amber. Keyed by data-icon rather than a
+     new tone system since each icon appears exactly once on this page. */
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon[data-icon="shield"] { background: rgba(94, 214, 198, .16); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon[data-icon="shield"]::before { background: #5ed6c6; }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon[data-icon="refresh"] { background: rgba(178, 140, 255, .18); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon[data-icon="refresh"]::before { background: #b28cff; }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon[data-icon="cloud-download"] { background: rgba(247, 201, 111, .18); }
+  body[data-inkdrop-view="source_memory"] .section-workbench-card-icon[data-icon="cloud-download"]::before { background: var(--warn); }
 }
 
 .arr-table-text-filter {
@@ -488,7 +523,10 @@
   body[data-inkdrop-view="manual_review"] #opDetailDock,
   body[data-inkdrop-view="source_memory"] #opDetailDock {
     display: grid;
-    grid-template-columns: minmax(300px, 1fr) minmax(320px, .78fr);
+    /* The right (decision/detail) column is FIXED-width: with a fractional
+       track, every wrap or reflow in the table column re-balanced the grid
+       and the docked panel visibly changed size as rows rendered. */
+    grid-template-columns: minmax(0, 1fr) 400px;
     gap: 20px;
     align-items: start;
   }
@@ -514,9 +552,47 @@
     border-color: var(--line);
     border-radius: 10px;
     background: var(--panel);
+    /* Content taller than max-height used to spill past the rounded border
+       (overflow was visible), which is how the old footer buttons ended up
+       floating over the table. The dialog is a column; the body scrolls. */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
-  body[data-inkdrop-view="manual_review"] .manual-review-decision-modal .series-remove-close,
-  body[data-inkdrop-view="source_memory"] .source-memory-detail-panel .series-remove-close {
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-dialog .series-remove-body,
+  body[data-inkdrop-view="source_memory"] .source-memory-detail-dialog .series-remove-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  /* The body is a grid elsewhere, but under the docked dialog's viewport
+     height cap the grid sized the facts table's row BELOW its content
+     (overflow:hidden zeroes a grid item's automatic minimum), so the grown
+     facts painted straight through the Actions cards -- the "text
+     overwriting" seen live. These panels are a plain vertical stack;
+     block flow cannot overlap and overflow goes to the body scrollbar. */
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-dialog .series-remove-body,
+  body[data-inkdrop-view="source_memory"] .source-memory-detail-dialog .series-remove-body {
+    display: block;
+  }
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-dialog .series-remove-body > * + *,
+  body[data-inkdrop-view="source_memory"] .source-memory-detail-dialog .series-remove-body > * + * {
+    margin-top: 12px;
+  }
+  /* At the docked panel's fixed 400px, the side-by-side Expected/Candidate
+     columns leave each fact value ~40px -- long filenames and paths broke
+     into one-character-per-line stacks (overflow-wrap: anywhere doing
+     exactly what it says in a column with no room). Stack the two evidence
+     sections vertically inside the docked panel instead. */
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-modal .manual-review-evidence-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Manual Review's docked panel keeps its footer controls, so its X stays
+     hidden. The Blocklist panel now closes ONLY via this X -- its footer
+     strip is gone (it painted past the dialog's max-height boundary and
+     floated over the table below). */
+  body[data-inkdrop-view="manual_review"] .manual-review-decision-modal .series-remove-close {
     display: none;
   }
   /* Both pages start with no row selected -- showing a placeholder card here
@@ -544,6 +620,101 @@
     color: #0b1720;
     font-weight: var(--weight-semibold, 700);
   }
+}
+
+/* Blocklist detail panel internals: cover header, DETAILS/ACTIONS/MORE
+   section labels, the stacked decision buttons, and the destructive
+   remove row. Unscoped (not desktop-only) -- on narrow viewports the panel
+   falls back to the centered series-remove-modal overlay and these rules
+   still apply inside it. */
+.source-memory-detail-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.source-memory-detail-cover {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 62px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line-soft);
+  background: var(--panel-2);
+}
+.source-memory-detail-section-label {
+  margin: 14px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: var(--font-xs, 11px);
+  font-weight: var(--weight-semibold, 700);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.source-memory-detail-section-label:first-child {
+  margin-top: 0;
+}
+.source-memory-detail-action-stack {
+  display: grid;
+  gap: 8px;
+}
+.source-memory-detail-action {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+}
+.source-memory-detail-action strong {
+  font-size: var(--font-sm, 12px);
+}
+.source-memory-detail-action span {
+  color: var(--muted);
+  font-size: var(--font-xs, 11px);
+  line-height: 1.35;
+}
+.source-memory-detail-action.primary {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--panel-2) 78%, var(--accent) 22%);
+}
+.source-memory-detail-action:hover {
+  border-color: var(--accent);
+}
+.source-memory-detail-more {
+  display: grid;
+}
+.source-memory-detail-remove {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 10px 14px;
+  background: transparent;
+  color: var(--bad);
+  text-align: left;
+  font: inherit;
+}
+.source-memory-detail-remove strong {
+  font-size: var(--font-sm, 12px);
+}
+.source-memory-detail-remove span {
+  color: var(--muted);
+  font-size: var(--font-xs, 11px);
+}
+.source-memory-detail-remove:hover {
+  border-color: rgba(255, 125, 125, .45);
+  background: rgba(255, 125, 125, .08);
 }
 
 /* Page-level alert banner (currently used by Queue's "N downloads need

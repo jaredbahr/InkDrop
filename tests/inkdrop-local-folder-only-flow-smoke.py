@@ -12,8 +12,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import inkdrop_preflight
-import inkdrop_runtime_config
+from core import inkdrop_preflight
+from core import inkdrop_runtime_config
 from tools import inkdrop_install_support_summary
 
 

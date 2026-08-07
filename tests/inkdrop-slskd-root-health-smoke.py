@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_slskd_root_health as root_health
+from core import inkdrop_slskd_root_health as root_health
 
 
 def main():
@@ -125,7 +125,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_slskd_root_health as root_health
+from core import inkdrop_slskd_root_health as root_health
 
 root = Path(sys.argv[1])
 rendezvous = Path(sys.argv[2])
@@ -164,7 +164,7 @@ print(json.dumps(result))
         assert all(item["state"] == "healthy" for item in decoded_results), decoded_results
         assert not list(download.glob(".inkdrop-write-probe*")), "multiprocess probes left residue"
 
-    web_source = (Path(__file__).resolve().parents[1] / "inkdrop_web.py").read_text(encoding="utf-8")
+    web_source = (Path(__file__).resolve().parents[1] / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
     for contract in (
         '"path_checks": path_checks',
         '"slskd_root_checks": slskd_health.get("root_checks")',
@@ -174,7 +174,7 @@ print(json.dumps(result))
     ):
         assert contract in web_source, f"missing web health contract: {contract}"
 
-    import inkdrop_web
+    from core import inkdrop_web
     with tempfile.TemporaryDirectory() as temp_dir:
         base = Path(temp_dir)
         download = base / "complete"

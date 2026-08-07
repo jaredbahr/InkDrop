@@ -9,7 +9,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import inkdrop_state
+from core import inkdrop_state
 
 
 ADDITIVE_TABLES = (
@@ -106,8 +106,8 @@ def run():
             session = con.execute("select user_id,token_hash,csrf_hash from auth_sessions where id='session-fixture'").fetchone()
             api_key = con.execute("select scopes_json,enabled from api_keys where id='key-fixture'").fetchone()
             setting = con.execute("select value_json,source from app_settings where key='download_clients.qbittorrent.url'").fetchone()
-        require(version == "18", "schema version must advance to 18")
-        require(before == after, f"schema 18 changed Build 61 state: {before} != {after}")
+        require(version == str(inkdrop_state.SCHEMA_VERSION), f"schema version must advance to {inkdrop_state.SCHEMA_VERSION}")
+        require(before == after, f"schema {inkdrop_state.SCHEMA_VERSION} changed Build 61 state: {before} != {after}")
         require(additive == set(ADDITIVE_TABLES), "all additive identity/search tables must exist")
         require(integrity == "ok" and not foreign_keys, "upgrade must retain SQLite integrity")
         require(ledger and ledger["name"] == "manual_search_identity_and_private_handoff", "schema 14 migration ledger entry must identify Manual Search")

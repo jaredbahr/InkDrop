@@ -4,11 +4,11 @@
 import json
 import xmlrpc.client
 
-import inkdrop_acquire
-import inkdrop_client_status
-import inkdrop_download_clients as clients
-import inkdrop_source_worker_coordinator as coordinator
-import inkdrop_transfer
+from core import inkdrop_acquire
+from core import inkdrop_client_status
+from core import inkdrop_download_clients as clients
+from core import inkdrop_source_worker_coordinator as coordinator
+from core import inkdrop_transfer
 
 
 TORRENT = b"d4:infod4:name7:Fixture12:piece lengthi16384e6:lengthi12345eee"

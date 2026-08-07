@@ -29,7 +29,7 @@ services:
       - /path/to/your/Manga:/data/manga
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"]
+      test: ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--timeout", "5"]
       interval: 60s
       timeout: 10s
       retries: 3

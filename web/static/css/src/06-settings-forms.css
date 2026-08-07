@@ -722,6 +722,13 @@
       color: var(--settings-arr-text);
       font-weight: 700;
     }
+    /* The blanket color above outranked 05's equal-specificity amber for the
+       dirty save-state indicator, so "Unsaved Changes" rendered in the same
+       grey as every idle button -- restated here at higher specificity since
+       this file owns settings-view button colors. */
+    body[data-inkdrop-view="settings"] .settings-actions button[data-settings-action="dirty"] {
+      color: var(--warn);
+    }
     body[data-inkdrop-view="settings"] .settings-actions button::before {
       width: 18px;
       height: 18px;

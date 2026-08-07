@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { request, InkDropApiError } from "../api";
+import { useRowActions } from "../rowActions";
 import type { WantedRow, WantedViewPayload, WantedRunResult } from "./wantedTypes";
 
 const PAGE_SIZE = 80;
@@ -48,7 +49,7 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
   const [wantedFilter, setWantedFilter] = useState(payload.wanted_filter || "active");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pendingId, setPendingId] = useState<string | null>(null);
+  const { pendingIds, doneIds, actionError, clearActionError, runRowAction } = useRowActions(() => loadPage(offset));
 
   // A fresh `payload` reference only arrives when the surrounding shell
   // re-fetched page one on our behalf (filter change, section re-entry) --
@@ -60,6 +61,7 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
     setHasMore(Boolean(payload.has_more));
     setWantedFilter(payload.wanted_filter || "active");
     setError(null);
+    clearActionError();
   }, [payload]);
 
   async function loadPage(nextOffset: number) {
@@ -79,25 +81,17 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
     }
   }
 
-  async function runSearch(row: WantedRow) {
-    setPendingId(row.id);
-    setError(null);
-    try {
+  // A queued search can move its row to a different status bucket, which can
+  // drop it out of the current filter/page -- the shared hook reloads once
+  // per click-burst after the last in-flight search settles.
+  function runSearch(row: WantedRow) {
+    void runRowAction(row.id, rowTitle(row), "Queued", async () => {
       const data = await request<WantedRunResult>("/api/inkdrop-state/wanted/run", {
         method: "POST",
-        body: { id: row.id },
+        body: { id: row.id, revision: row.revision },
       });
       if (!data.ok) throw new InkDropApiError("Could not queue this search.", { status: 200, code: "wanted_run_failed" });
-      // A queued search can move the row to a different status bucket
-      // (wanted -> in_progress), which can drop it out of the current
-      // filter/page entirely -- reload the current page rather than assume
-      // the row is still here, same reasoning as Blocklist's Allow & Retry.
-      await loadPage(offset);
-    } catch (cause) {
-      setError(cause instanceof InkDropApiError ? cause.message : "Could not queue this search.");
-    } finally {
-      setPendingId(null);
-    }
+    });
   }
 
   const pageStart = totalCount === 0 ? 0 : offset + 1;
@@ -105,12 +99,12 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
 
   return (
     <div className="inkdrop-react-wanted">
-      {error && (
+      {(error || actionError) && (
         <div className="inkdrop-react-error-banner" role="alert">
-          {error}
+          {error || actionError}
         </div>
       )}
-      <table className="arr-table">
+      <table className="arr-table wanted-table">
         <thead>
           <tr>
             <th>Series / Issue</th>
@@ -134,11 +128,11 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
                   {canAct && (
                     <button
                       type="button"
-                      disabled={pendingId === row.id}
+                      disabled={pendingIds.has(row.id) || doneIds.has(row.id)}
                       onClick={() => runSearch(row)}
                       title="Queue and search this wanted item"
                     >
-                      {pendingId === row.id ? "Queuing…" : label}
+                      {pendingIds.has(row.id) ? "Queuing…" : doneIds.get(row.id) || label}
                     </button>
                   )}
                 </td>

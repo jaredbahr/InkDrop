@@ -11,12 +11,12 @@ import zipfile
 import zlib
 from pathlib import Path
 
-import inkdrop_artifact_acceptance as acceptance
-import inkdrop_candidate_matching as matching
-import inkdrop_completed_import as importer
-import inkdrop_incident_recovery as recovery
-import inkdrop_pack_import as pack_import
-import inkdrop_state
+from core import inkdrop_artifact_acceptance as acceptance
+from core import inkdrop_candidate_matching as matching
+from core import inkdrop_completed_import as importer
+from core import inkdrop_incident_recovery as recovery
+from core import inkdrop_pack_import as pack_import
+from core import inkdrop_state
 
 INCIDENT_SHA = "ce15d2dabbeb3e6e3a1f95a400eec17c84b654d56d22c9df5247eb6f4fd85c34"
 

@@ -6,7 +6,7 @@ from unittest import mock
 import copy
 import time
 
-import inkdrop_series_autopilot as autopilot
+from core import inkdrop_series_autopilot as autopilot
 
 
 def require(condition, message):

@@ -27,7 +27,7 @@ import urllib.parse
 
 import requests
 
-import inkdrop_qbittorrent_auth as qauth
+from core import inkdrop_qbittorrent_auth as qauth
 
 
 GOOD_USER = "jibz"
@@ -234,8 +234,8 @@ def run_checks(base):
 
 def end_to_end_checks(base):
     """The reported bug, driven through the real service layer over real HTTP."""
-    import inkdrop_download_client_api as api
-    import inkdrop_download_client_config as store
+    from core import inkdrop_download_client_api as api
+    from core import inkdrop_download_client_config as store
 
     QbitFixture.mode = "normal"
 

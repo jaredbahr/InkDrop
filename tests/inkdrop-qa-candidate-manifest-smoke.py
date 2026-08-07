@@ -5,7 +5,7 @@ import tempfile
 from argparse import Namespace
 from pathlib import Path
 
-import inkdrop_version
+from core import inkdrop_version
 from tools import inkdrop_qa_candidate_manifest as manifest_tool
 
 

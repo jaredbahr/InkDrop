@@ -166,7 +166,7 @@ Before starting the web UI, you can verify runtime folders and optional adapter
 configuration:
 
 ```bash
-docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --json
+docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --json
 ```
 
 The preflight creates/checks the configured runtime folders, verifies they are
@@ -194,7 +194,7 @@ before enabling automatic imports.
 
 The container startup command runs preflight with `--create`,
 `--strict-dependencies`, and `--strict-runtime-tools` before launching the web
-UI. Docker healthchecks run `inkdrop_container_healthcheck.py` after startup;
+UI. Docker healthchecks run `core/inkdrop_container_healthcheck.py` after startup;
 that repeats the same strict preflight and probes `/status.json` on the
 configured `INKDROP_PORT`. That makes missing Python runtime packages, missing
 archive tools, unwritable required folders, invalid bind settings, and a
@@ -262,9 +262,9 @@ After startup, check Docker health with:
 docker compose ps
 docker inspect "$(docker compose ps -q inkdrop)" --format '{{json .State.Health}}'
 docker compose logs inkdrop
-docker compose exec inkdrop python -B inkdrop_container_healthcheck.py --json
-docker compose exec inkdrop python -B inkdrop_container_healthcheck.py --json --wait-seconds 60
-docker compose exec inkdrop-worker python -B inkdrop_container_healthcheck.py --worker --json
+docker compose exec inkdrop python -B core/inkdrop_container_healthcheck.py --json
+docker compose exec inkdrop python -B core/inkdrop_container_healthcheck.py --json --wait-seconds 60
+docker compose exec inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json
 ```
 
 The healthcheck prints JSON. A failure with `phase=preflight` means
@@ -288,7 +288,7 @@ job, or a hung critical job makes the worker unhealthy.
 InkDrop includes a small config/state backup helper for public installs:
 
 ```bash
-docker compose exec inkdrop python -B inkdrop_backup_restore.py backup
+docker compose exec inkdrop python -B core/inkdrop_backup_restore.py backup
 ```
 
 The archive includes a SQLite state backup, a redacted config/settings export,
@@ -299,7 +299,7 @@ service state.
 Preview a restore into new roots before writing files:
 
 ```bash
-docker compose exec inkdrop python -B inkdrop_backup_restore.py restore /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-manual.zip --target-config-dir /config-restore --target-state-dir /state-restore
+docker compose exec inkdrop python -B core/inkdrop_backup_restore.py restore /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-manual.zip --target-config-dir /config-restore --target-state-dir /state-restore
 ```
 
 Add `--apply` only after reviewing path warnings. Restored path values that do
@@ -412,7 +412,7 @@ export INKDROP_EXPECTED_COMMIT="$(docker image inspect "$INKDROP_IMAGE" --format
 export INKDROP_EXPECTED_BUILD_DATE="$(docker image inspect "$INKDROP_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.created"}}')"
 export INKDROP_EXPECTED_CHANNEL="$(docker image inspect "$INKDROP_IMAGE" --format '{{index .Config.Labels "io.inkdrop.release.channel"}}')"
 export INKDROP_EXPECTED_BUILD="$(docker image inspect "$INKDROP_IMAGE" --format '{{index .Config.Labels "io.inkdrop.qa.build-number"}}')"
-docker compose exec inkdrop python -B inkdrop_backup_restore.py backup --label pre-upgrade
+docker compose exec inkdrop python -B core/inkdrop_backup_restore.py backup --label pre-upgrade
 ```
 
 2. Set the new immutable image plus its expected public identity, pull it, and
@@ -459,11 +459,11 @@ test "$INKDROP_READY" = 1
 VERSION_JSON="$(cat "$VERSION_FILE")"
 rm -f "$VERSION_FILE"
 printf '%s\n' "$VERSION_JSON" | python -c 'import json,sys; p=json.load(sys.stdin); assert p["version"] == sys.argv[1], p; assert p["commit_sha"] == sys.argv[2], p; assert str(p["qa_build_number"]) == sys.argv[3], p; print(json.dumps({"commit_sha": p["commit_sha"], "qa_build_number": p["qa_build_number"], "version": p["version"]}, sort_keys=True))' "$INKDROP_EXPECTED_VERSION" "$INKDROP_EXPECTED_COMMIT" "$INKDROP_EXPECTED_BUILD"
-docker compose exec inkdrop python -B inkdrop_container_healthcheck.py --json --wait-seconds 60
+docker compose exec inkdrop python -B core/inkdrop_container_healthcheck.py --json --wait-seconds 60
 docker compose exec inkdrop python -B -c 'import json,sqlite3,inkdrop_runtime_config,inkdrop_state; c=sqlite3.connect(inkdrop_runtime_config.state_db_path()); actual=int(c.execute("select value from schema_meta where key=\"schema_version\"").fetchone()[0]); assert c.execute("pragma quick_check").fetchone()[0] == "ok"; assert not c.execute("pragma foreign_key_check").fetchall(); assert actual == inkdrop_state.SCHEMA_VERSION, (actual, inkdrop_state.SCHEMA_VERSION); print(json.dumps({"schema_version": actual, "quick_check": "ok", "foreign_key_violations": 0}))'
 docker compose up -d --no-deps --force-recreate inkdrop-worker
 test "$(docker inspect "$(docker compose ps -q inkdrop-worker)" --format '{{.Config.Image}}')" = "$INKDROP_IMAGE"
-docker compose exec inkdrop-worker python -B inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
+docker compose exec inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
 docker compose ps
 ```
 
@@ -497,11 +497,11 @@ for attempt in $(seq 1 60); do curl -fsS "http://127.0.0.1:${INKDROP_EFFECTIVE_P
 test -s /tmp/inkdrop-version.json
 python -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["version"] == sys.argv[2], p; assert p["commit_sha"] == sys.argv[3], p; assert str(p["qa_build_number"]) == sys.argv[4], p' /tmp/inkdrop-version.json "$INKDROP_EXPECTED_VERSION" "$INKDROP_EXPECTED_COMMIT" "$INKDROP_EXPECTED_BUILD"
 rm -f /tmp/inkdrop-version.json
-docker compose exec inkdrop python -B inkdrop_container_healthcheck.py --json --wait-seconds 60
+docker compose exec inkdrop python -B core/inkdrop_container_healthcheck.py --json --wait-seconds 60
 docker compose exec inkdrop python -B -c 'import json,sqlite3,inkdrop_runtime_config,inkdrop_state; c=sqlite3.connect(inkdrop_runtime_config.state_db_path()); actual=int(c.execute("select value from schema_meta where key=\"schema_version\"").fetchone()[0]); assert c.execute("pragma quick_check").fetchone()[0] == "ok"; assert not c.execute("pragma foreign_key_check").fetchall(); assert actual == inkdrop_state.SCHEMA_VERSION, (actual, inkdrop_state.SCHEMA_VERSION); print(json.dumps({"schema_version": actual, "quick_check": "ok", "foreign_key_violations": 0}))'
 docker compose up -d --no-deps --force-recreate inkdrop-worker
 test "$(docker inspect "$(docker compose ps -q inkdrop-worker)" --format '{{.Config.Image}}')" = "$INKDROP_IMAGE"
-docker compose exec inkdrop-worker python -B inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
+docker compose exec inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
 docker compose ps
 ```
 
@@ -521,8 +521,8 @@ only full-tree safety net -- keep doing it:
 ```bash
 docker compose stop inkdrop-worker inkdrop
 cp -a ./state "./state.before-restore-$(date +%Y%m%d-%H%M%S)"
-docker compose run --rm --no-deps inkdrop python -B inkdrop_backup_restore.py restore /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-pre-upgrade.zip --target-config-dir /state/restore-preview-config --target-state-dir /state/restore-preview-state
-docker compose run --rm --no-deps inkdrop python -B inkdrop_backup_restore.py restore /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-pre-upgrade.zip --target-config-dir /config --target-state-dir /state --apply
+docker compose run --rm --no-deps inkdrop python -B core/inkdrop_backup_restore.py restore /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-pre-upgrade.zip --target-config-dir /state/restore-preview-config --target-state-dir /state/restore-preview-state
+docker compose run --rm --no-deps inkdrop python -B core/inkdrop_backup_restore.py restore /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-pre-upgrade.zip --target-config-dir /config --target-state-dir /state --apply
 docker compose up -d --no-deps --force-recreate inkdrop
 INKDROP_CONTAINER_PORT="$(docker inspect "$(docker compose ps -q inkdrop)" --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^INKDROP_PORT=//p')"
 INKDROP_PUBLISHED_ADDRESS="$(docker compose port inkdrop "$INKDROP_CONTAINER_PORT" | head -n 1)"
@@ -533,11 +533,11 @@ test -s /tmp/inkdrop-version.json
 python -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["version"] == sys.argv[2], p; assert p["commit_sha"] == sys.argv[3], p; assert str(p["qa_build_number"]) == sys.argv[4], p' /tmp/inkdrop-version.json "$INKDROP_EXPECTED_VERSION" "$INKDROP_EXPECTED_COMMIT" "$INKDROP_EXPECTED_BUILD"
 rm -f /tmp/inkdrop-version.json
 test "$(docker inspect "$(docker compose ps -q inkdrop)" --format '{{.Config.Image}}')" = "$INKDROP_IMAGE"
-docker compose exec inkdrop python -B inkdrop_container_healthcheck.py --json --wait-seconds 60
+docker compose exec inkdrop python -B core/inkdrop_container_healthcheck.py --json --wait-seconds 60
 docker compose exec inkdrop python -B -c 'import json,sqlite3,inkdrop_runtime_config,inkdrop_state; c=sqlite3.connect(inkdrop_runtime_config.state_db_path()); actual=int(c.execute("select value from schema_meta where key=\"schema_version\"").fetchone()[0]); assert c.execute("pragma quick_check").fetchone()[0] == "ok"; assert not c.execute("pragma foreign_key_check").fetchall(); assert actual == inkdrop_state.SCHEMA_VERSION, (actual, inkdrop_state.SCHEMA_VERSION); print(json.dumps({"schema_version": actual, "quick_check": "ok", "foreign_key_violations": 0}))'
 docker compose up -d --no-deps --force-recreate inkdrop-worker
 test "$(docker inspect "$(docker compose ps -q inkdrop-worker)" --format '{{.Config.Image}}')" = "$INKDROP_IMAGE"
-docker compose exec inkdrop-worker python -B inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
+docker compose exec inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
 docker compose ps
 ```
 
@@ -745,7 +745,7 @@ If adding InkDrop directly to an existing Arr Compose file, do it deliberately:
 - run strict preflight before enabling automation:
 
 ```bash
-docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
 ```
 
 Do not mount another application's SQLite database or config folder just
@@ -764,7 +764,7 @@ one of those installs into Compose, capture the current process model:
 - the web PID and command line
 - crontab entries that call `inkdrop_*` or legacy `kavita_*` scripts
 - current `INKDROP_CONFIG_DIR`, `INKDROP_STATE_DIR`, and mounted media roots
-- state/config backup path from `inkdrop_backup_restore.py`
+- state/config backup path from `core/inkdrop_backup_restore.py`
 - current compact endpoint timing for Queue, Wanted, and Series
 
 The safe migration pattern is parallel validation first, not an in-place cutover:
@@ -965,8 +965,8 @@ python -B tools/inkdrop_public_release_check.py --docker --require-docker --skip
 python -B tools/inkdrop_public_release_check.py --docker-only --skip-docker-build
 docker compose config --quiet
 docker compose build inkdrop
-docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
-docker compose run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only
+docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
+docker compose run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only
 ```
 
 Local development environments without Docker can still run the first command;
@@ -1092,9 +1092,9 @@ Do not publish beyond the closed-alpha channel until all release blockers are cl
 - The release JSON reports `release_blockers.ready=true`; any failed
   `release_blockers.items[]` entry is treated as a broader-release blocker.
 - `docker compose build inkdrop` completes on a Docker-capable host.
-- `docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools`
+- `docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools`
   passes inside the built image.
-- `docker compose run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only`
+- `docker compose run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only`
   passes inside the built image.
 - `python -B tests/inkdrop-public-release-safety-audit.py` reports
   `finding_count=0`.

@@ -7,7 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-import inkdrop_state
+from core import inkdrop_state
 
 
 def main() -> int:

@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB_FILE = ROOT / "inkdrop_web.py"
-STATE_FILE = ROOT / "inkdrop_state.py"
+WEB_FILE = ROOT / "core" / "inkdrop_web.py"
+STATE_FILE = ROOT / "core" / "inkdrop_state.py"
 
 REQUIRED_GET_ROUTES = {
     "/api/inkdrop-settings": "inkdrop_settings_public(sync=False",

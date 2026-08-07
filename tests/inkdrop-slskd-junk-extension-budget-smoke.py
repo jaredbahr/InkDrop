@@ -15,7 +15,7 @@ Confirmed live: rejected_file_count landed exactly on the 2000-file cap in
 executed searches (10%).
 """
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):

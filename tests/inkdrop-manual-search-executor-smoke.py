@@ -7,10 +7,10 @@ import json
 import time
 from unittest import mock
 
-import inkdrop_manual_search_executor as executor
-import inkdrop_source_worker_adapters as adapters
-import inkdrop_source_worker_jobs as jobs
-import inkdrop_source_worker_runtime as runtime
+from core import inkdrop_manual_search_executor as executor
+from core import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_source_worker_jobs as jobs
+from core import inkdrop_source_worker_runtime as runtime
 
 
 PLAN = {

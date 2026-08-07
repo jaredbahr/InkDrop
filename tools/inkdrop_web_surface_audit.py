@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB_FILE = ROOT / "inkdrop_web.py"
-WEB_CONFIG_FILE = ROOT / "inkdrop_web_config.py"
+WEB_FILE = ROOT / "core" / "inkdrop_web.py"
+WEB_CONFIG_FILE = ROOT / "core" / "inkdrop_web_config.py"
 
 REQUIRED_GET_PATHS = {
     "/",

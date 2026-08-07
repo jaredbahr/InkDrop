@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from urllib.parse import quote, quote_plus
 
-import inkdrop_diagnostic_artifacts as artifacts
+from core import inkdrop_diagnostic_artifacts as artifacts
 
 
 def require(value, message):

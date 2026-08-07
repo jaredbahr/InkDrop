@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import json
 
-import inkdrop_download_clients as clients
-import inkdrop_source_worker_coordinator as coordinator
-import inkdrop_transfer
+from core import inkdrop_download_clients as clients
+from core import inkdrop_source_worker_coordinator as coordinator
+from core import inkdrop_transfer
 
 
 def require(condition, message):
@@ -584,7 +584,7 @@ def smoke_worker_restart_identity_propagation():
         }
 
     old = coordinator.inkdrop_acquire.transmission_add if hasattr(coordinator, "inkdrop_acquire") else None
-    import inkdrop_acquire
+    from core import inkdrop_acquire
 
     old = inkdrop_acquire.transmission_add
     try:
@@ -624,7 +624,7 @@ def smoke_worker_restart_identity_propagation_deluge():
             "handoff_tag": unique_tag,
         }
 
-    import inkdrop_acquire
+    from core import inkdrop_acquire
 
     old = inkdrop_acquire.deluge_add
     try:
@@ -664,7 +664,7 @@ def smoke_worker_restart_identity_propagation_nzbget():
             "handoff_key": unique_tag,
         }
 
-    import inkdrop_acquire
+    from core import inkdrop_acquire
 
     old = inkdrop_acquire.nzbget_add
     try:

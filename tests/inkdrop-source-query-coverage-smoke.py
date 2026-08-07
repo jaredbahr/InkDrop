@@ -7,8 +7,8 @@ import tempfile
 from contextlib import closing
 from pathlib import Path
 
-import inkdrop_source_worker_adapters as adapters
-import inkdrop_source_worker_jobs as jobs
+from core import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_source_worker_jobs as jobs
 
 
 def require(condition, detail):

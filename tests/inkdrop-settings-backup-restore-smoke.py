@@ -9,8 +9,8 @@ import time
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_backup_restore as backup
-import inkdrop_state
+from core import inkdrop_backup_restore as backup
+from core import inkdrop_state
 
 
 def require(value, message):
@@ -36,6 +36,12 @@ def main():
             {"key": "legacy.removed", "scope": "general", "label": "Legacy", "value": "stale", "description": "test"},
             {"key": "auth.allowed_origins", "scope": "auth", "label": "Origins", "value": ["https://private.example"], "description": "private"},
             {"key": "path.comic_root", "scope": "paths", "label": "Root", "value": "/private/comics", "description": "private"},
+            {"key": "media_management.apply_planned_path", "scope": "media_management", "label": "Planned path", "value": True, "description": "policy"},
+            {"key": "media_management.root_folder_strategy", "scope": "media_management", "label": "Root strategy", "value": "media_type", "description": "policy"},
+            {"key": "media_management.series_folder_format", "scope": "media_management", "label": "Folder format", "value": "{Series Title} ({Year})", "description": "policy"},
+            {"key": "media_management.manga_companion_folder_convergence", "scope": "media_management", "label": "Companion convergence", "value": True, "description": "policy"},
+            {"key": "quality.allow_raw_image_page_folders", "scope": "quality", "label": "Raw pages", "value": False, "description": "policy"},
+            {"key": "setup.local_folder_only_mode", "scope": "setup", "label": "Local only", "value": False, "description": "policy"},
         ])
         first = backup.export_portable_settings(db, now=1_700_000_000, version="0.1.0-alpha.7")
         second = backup.export_portable_settings(db, now=1_700_000_000, version="0.1.0-alpha.7")
@@ -47,6 +53,17 @@ def main():
         require(not backup.inkdrop_settings_registry.is_defined_public_setting("legacy.removed"), "deprecated fixture unexpectedly remains in the public registry")
         require("legacy.removed" not in first["settings"], "stale DB setting was exported")
         require(any(row["key"] == "legacy.removed" and row["reason"] == "unknown_or_deprecated" for row in first["excluded"]), "stale export exclusion missing")
+        for policy_key, policy_value in (
+            ("media_management.apply_planned_path", True),
+            ("media_management.root_folder_strategy", "media_type"),
+            ("media_management.series_folder_format", "{Series Title} ({Year})"),
+            ("media_management.manga_companion_folder_convergence", True),
+            ("quality.allow_raw_image_page_folders", False),
+            ("setup.local_folder_only_mode", False),
+        ):
+            require(first["settings"].get(policy_key) == policy_value, f"portable policy dropped from export: {policy_key}")
+        require("path.comic_root" not in first["settings"] and any(row["key"] == "path.comic_root" for row in first["excluded"]), "real path settings must stay excluded")
+        require("auth.allowed_origins" not in first["settings"], "auth settings must stay excluded")
         for legacy_token in ("NaN", "Infinity", "-Infinity", "1e9999"):
             with sqlite3.connect(db) as con:
                 con.execute("update app_settings set value_json=? where key='legacy.removed'", (legacy_token,))
@@ -58,14 +75,16 @@ def main():
         restored = json.loads(json.dumps(first))
         restored["settings"]["automation.queue_watchdog_enabled"] = False
         restored["settings"]["automation.queue_watchdog_slskd_stale_minutes"] = 60
+        restored["settings"]["media_management.apply_planned_path"] = False
         restored["checksum"] = backup._settings_checksum(restored)
         raw = json.dumps(restored)
         preview = backup.restore_portable_settings(db, raw, apply=False)
-        require(preview["ok"] and preview["dry_run"] and len(preview["plan"]["changes"]) == 2, preview)
+        require(preview["ok"] and preview["dry_run"] and len(preview["plan"]["changes"]) == 3, preview)
         require(value(db, "automation.queue_watchdog_enabled") is True, "preview mutated settings")
         applied = backup.restore_portable_settings(db, raw, apply=True, backup_dir=snapshots, now=1_700_000_001)
-        require(applied["ok"] and applied["applied"] and applied["changed_count"] == 2, applied)
+        require(applied["ok"] and applied["applied"] and applied["changed_count"] == 3, applied)
         require(value(db, "automation.queue_watchdog_enabled") is False and value(db, "automation.queue_watchdog_slskd_stale_minutes") == 60, "roundtrip failed")
+        require(value(db, "media_management.apply_planned_path") is False, "formerly-dropped policy key did not restore")
         require(Path(applied["snapshot"]).exists(), "pre-restore snapshot missing")
 
         unknown = json.loads(raw)

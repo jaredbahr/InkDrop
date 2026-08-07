@@ -15,8 +15,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-import inkdrop_runtime_config
-import inkdrop_preflight
+from core import inkdrop_runtime_config
+from core import inkdrop_preflight
 import importlib.util
 import re
 import yaml
@@ -128,19 +128,19 @@ def assert_runtime_state_only_uses_state_as_config():
 
 def assert_packaging_files():
     root = Path(__file__).resolve().parents[1]
-    for name in ("README.md", "Dockerfile", "docker-compose.yml", ".env.example", ".dockerignore", ".gitignore", "requirements.txt", "inkdrop-logo-mark.png", "inkdrop_container_healthcheck.py", "inkdrop_container_start.py", "inkdrop_preflight.py", "inkdrop-public-release-safety-audit.py"):
+    for name in ("README.md", "Dockerfile", "docker-compose.yml", ".env.example", ".dockerignore", ".gitignore", "requirements.txt", "inkdrop-logo-mark.png", "core/inkdrop_container_healthcheck.py", "core/inkdrop_container_start.py", "core/inkdrop_preflight.py", "tests/inkdrop-public-release-safety-audit.py"):
         path = root / name
         require(path.exists(), f"missing {name}")
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if name not in {"inkdrop-logo-mark.png", "inkdrop-public-docker-runtime-smoke.py", "inkdrop-public-release-safety-audit.py"}:
+        if name not in {"inkdrop-logo-mark.png", "tests/inkdrop-public-docker-runtime-smoke.py", "tests/inkdrop-public-release-safety-audit.py"}:
             for token in PRIVATE_TOKENS:
                 require(token not in text, f"{name} contains private token {token}")
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
     dockerignore = (root / ".dockerignore").read_text(encoding="utf-8")
     gitignore = (root / ".gitignore").read_text(encoding="utf-8")
-    container_start = (root / "inkdrop_container_start.py").read_text(encoding="utf-8")
-    container_healthcheck = (root / "inkdrop_container_healthcheck.py").read_text(encoding="utf-8")
+    container_start = (root / "core" / "inkdrop_container_start.py").read_text(encoding="utf-8")
+    container_healthcheck = (root / "core" / "inkdrop_container_healthcheck.py").read_text(encoding="utf-8")
     readme = (root / "README.md").read_text(encoding="utf-8")
     env_example = (root / ".env.example").read_text(encoding="utf-8")
     install_doc = (root / "docs" / "inkdrop" / "docker-first-install.md").read_text(encoding="utf-8")
@@ -191,29 +191,26 @@ def assert_packaging_files():
     require("COPY inkdrop-logo-mark.png ./" in dockerfile, "Dockerfile should copy the InkDrop logo asset explicitly")
     require("COPY web/static/img/inkdrop-auth-backdrop.webp ./web/static/img/inkdrop-auth-backdrop.webp" in dockerfile, "Dockerfile should copy the project-owned auth backdrop explicitly")
     require("COPY inkdrop*.py" not in dockerfile and "kavita*.py" not in dockerfile, "Dockerfile should not use broad runtime Python COPY globs")
-    docker_context_root_py = [
+    docker_context_core_py = [
         line[2:]
         for line in dockerignore.splitlines()
-        if line.startswith("!/")
+        if line.startswith("!/core/")
         and line.endswith(".py")
-        and "/" not in line[2:]
     ]
-    require(docker_context_root_py, ".dockerignore should allowlist runtime Python modules by exact filename")
-    for module_name in docker_context_root_py:
-        require(module_name in dockerfile, f"Dockerfile should explicitly copy {module_name}")
+    require(docker_context_core_py, ".dockerignore should allowlist runtime Python modules under core/")
+    require("!/core/" in dockerignore, ".dockerignore should allow descending into core/")
+    require("COPY core/ ./core/" in dockerfile, "Dockerfile should copy the whole core/ package directory")
     require(
-        "!/inkdrop_process_lifecycle.py" in dockerignore
-        and "inkdrop_process_lifecycle.py" in dockerfile,
+        "!/core/inkdrop_process_lifecycle.py" in dockerignore,
         "web/worker image context should include the shared child lifecycle module",
     )
     require(
-        "!/inkdrop_library_identity.py" in dockerignore
-        and "inkdrop_library_identity.py" in dockerfile,
+        "!/core/inkdrop_library_identity.py" in dockerignore,
         "runtime image should package the canonical library identity module",
     )
     require(
-        "import inkdrop_process_lifecycle" in (root / "inkdrop_web.py").read_text(encoding="utf-8")
-        and "import inkdrop_process_lifecycle" in (root / "inkdrop_container_scheduler.py").read_text(encoding="utf-8"),
+        "import inkdrop_process_lifecycle" in (root / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
+        and "import inkdrop_process_lifecycle" in (root / "core" / "inkdrop_container_scheduler.py").read_text(encoding="utf-8"),
         "both web and worker entrypoints should import the packaged child lifecycle module",
     )
     require("COPY docs/inkdrop-source-candidate-catalog-20260702.json ./docs/inkdrop-source-candidate-catalog-20260702.json" in dockerfile, "Dockerfile should copy the runtime source catalog explicitly")
@@ -225,7 +222,7 @@ def assert_packaging_files():
     )
     require("p7zip-full" in dockerfile, "Dockerfile should install 7z archive tooling")
     require("unrar-free" in dockerfile, "Dockerfile should install unrar fallback tooling")
-    require('CMD ["python", "-B", "inkdrop_container_start.py"]' in dockerfile, "Dockerfile should start through the public InkDrop container shim")
+    require('CMD ["python", "-B", "core/inkdrop_container_start.py"]' in dockerfile, "Dockerfile should start through the public InkDrop container shim")
     require("inkdrop_preflight.run_preflight(create=True, strict_dependencies=True, strict_runtime_tools=True)" in container_start, "container start shim should run strict preflight first")
     require("inkdrop_preflight.run_preflight(create=True, strict_dependencies=True, strict_runtime_tools=True)" in container_healthcheck, "container healthcheck should run strict preflight")
     require('conn.request("GET", "/status.json"' in container_healthcheck, "container healthcheck should probe /status.json")
@@ -269,12 +266,12 @@ def assert_packaging_files():
         "!/Dockerfile",
         "!/requirements.txt",
         "!/inkdrop-logo-mark.png",
-        "!/inkdrop_acquire.py",
-        "!/inkdrop_public_contracts.py",
-        "!/inkdrop_web.py",
-        "!/inkdrop_state.py",
-        "!/inkdrop_runtime_config.py",
-        "!/inkdrop_container_start.py",
+        "!/core/inkdrop_acquire.py",
+        "!/core/inkdrop_public_contracts.py",
+        "!/core/inkdrop_web.py",
+        "!/core/inkdrop_state.py",
+        "!/core/inkdrop_runtime_config.py",
+        "!/core/inkdrop_container_start.py",
         "!/docs/",
         "/docs/**",
         "!/docs/inkdrop-source-candidate-catalog-20260702.json",
@@ -354,7 +351,7 @@ def assert_compose_yaml_contract():
     for key in ("INKDROP_CONFIG_DIR", "INKDROP_STATE_DIR", "INKDROP_STAGING_DIR", "INKDROP_MANUAL_INBOX_DIR", "INKDROP_COMIC_ROOT", "INKDROP_MANGA_ROOT"):
         require(key in environment, f"compose should pass {key}")
     healthcheck = inkdrop.get("healthcheck") or {}
-    require(healthcheck.get("test") == ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"], "compose healthcheck should probe strict preflight and /status.json")
+    require(healthcheck.get("test") == ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--timeout", "5"], "compose healthcheck should probe strict preflight and /status.json")
     worker = services.get("inkdrop-worker") or {}
     worker_build = worker.get("build") if isinstance(worker.get("build"), dict) else {}
     require(worker_build.get("context") == ".", "worker should build from repository root")
@@ -488,8 +485,8 @@ def assert_public_release_workflow_contract():
         "GITHUB_STEP_SUMMARY",
         "docker compose config --quiet",
         "docker compose build inkdrop",
-        "docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools",
-        "docker compose run --rm inkdrop python -B inkdrop_container_healthcheck.py --preflight-only",
+        "docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools",
+        "docker compose run --rm inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only",
         "docker compose run --rm inkdrop python -B tools/inkdrop_install_support_summary.py --create --json",
         "inkdrop-install-support-summary.json",
         "inkdrop-public-http-smoke.json",
@@ -831,7 +828,7 @@ def assert_public_release_docs_contract():
     require("INKDROP_SLSKD_API_BASE_URL: ${INKDROP_SLSKD_API_BASE_URL:-}" in arr_stack_doc, "Arr stack plan should leave SLSKD URL blank by default")
     require("INKDROP_KAVITA_URL: ${INKDROP_KAVITA_URL:-}" in arr_stack_doc, "Arr stack plan should leave Kavita URL blank by default")
     require("INKDROP_KOMGA_URL: ${INKDROP_KOMGA_URL:-}" in arr_stack_doc, "Arr stack plan should leave Komga URL blank by default")
-    require("docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools" in arr_stack_doc, "Arr stack plan should require strict preflight")
+    require("docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools" in arr_stack_doc, "Arr stack plan should require strict preflight")
     require("Rollback" in arr_stack_doc and "compose.yaml.bak" in arr_stack_doc, "Arr stack plan should include rollback guidance")
     upgrade_needles = (
         "## Upgrade And Image-Version Rollback",
@@ -945,7 +942,7 @@ def assert_public_release_docs_contract():
         "python -B tools/inkdrop_public_release_check.py --docker-only --skip-docker-build",
         "python -B tools/inkdrop_public_release_check.py --strict-host-dependencies",
         "docker compose build inkdrop",
-        "docker compose run --rm inkdrop python -B inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools",
+        "docker compose run --rm inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools",
         "Docker-capable host",
     )
     for label, text in doc_pairs:
@@ -962,7 +959,7 @@ def assert_public_release_docs_contract():
         require("docker compose ps" in text, f"{label} should document Docker health inspection")
         require('docker inspect "$(docker compose ps -q inkdrop)" --format' in text, f"{label} should document Compose-scoped Docker health details")
         require("docker compose logs inkdrop" in text, f"{label} should document Docker log inspection")
-        require("docker compose exec inkdrop python -B inkdrop_container_healthcheck.py --json" in text, f"{label} should document manual healthcheck execution")
+        require("docker compose exec inkdrop python -B core/inkdrop_container_healthcheck.py --json" in text, f"{label} should document manual healthcheck execution")
         require("phase=preflight" in text and "phase=http" in text, f"{label} should explain healthcheck phases")
         require("First-Run Checklist" in text, f"{label} should include a first-run checklist")
         require("Required for a clean Docker start" in text, f"{label} should separate required first-run steps")
@@ -1177,7 +1174,7 @@ def assert_state_schema_audit_contract():
         "REQUIRED_STATE_SUMMARY_FIELDS",
         "REQUIRED_STATE_SECTIONS_FIELDS",
         "STATE_DB_NAME = \"inkdrop-state.sqlite3\"",
-        "SCHEMA_VERSION = 18",
+        "SCHEMA_VERSION = 19",
         "runtime_schema_version",
         "runtime_integrity",
         "runtime_foreign_key_violations",
@@ -1306,7 +1303,7 @@ def assert_public_operator_knobs_are_visible():
 
 def assert_manual_source_callback_derivation_contract():
     root = Path(__file__).resolve().parents[1]
-    text = (root / "inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8")
+    text = (root / "core" / "inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8")
     require("def _inkdrop_web_endpoint" in text, "manual-source worker should derive callback endpoints from a shared helper")
     require("inkdrop_runtime_config.worker_web_base_url()" in text, "manual-source callback fallback should use the shared container-aware resolver")
     require('API_URL = _inkdrop_web_endpoint("INKDROP_MANUAL_SOURCE_IMPORT_API_URL", "/api/manual-source/import-detected")' in text, "manual-source import callback should derive from the worker callback base when unset")
@@ -1317,10 +1314,10 @@ def assert_manual_source_callback_derivation_contract():
 
 def assert_worker_callback_runtime_contract():
     import importlib
-    import inkdrop_manual_source_autoresolve
-    import inkdrop_missing_acquire
-    import inkdrop_series_autopilot
-    import inkdrop_slskd_source_probe
+    from core import inkdrop_manual_source_autoresolve
+    from core import inkdrop_missing_acquire
+    from core import inkdrop_series_autopilot
+    from core import inkdrop_slskd_source_probe
 
     env_keys = (
         "INKDROP_PORT",
@@ -1383,10 +1380,10 @@ def assert_worker_callback_runtime_contract():
         importlib.reload(inkdrop_missing_acquire)
 
     source_contracts = {
-        "autopilot": Path("inkdrop_series_autopilot.py").read_text(encoding="utf-8"),
-        "slskd": Path("inkdrop_slskd_source_probe.py").read_text(encoding="utf-8"),
-        "manual": Path("inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8"),
-        "missing": Path("inkdrop_missing_acquire.py").read_text(encoding="utf-8"),
+        "autopilot": Path("core/inkdrop_series_autopilot.py").read_text(encoding="utf-8"),
+        "slskd": Path("core/inkdrop_slskd_source_probe.py").read_text(encoding="utf-8"),
+        "manual": Path("core/inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8"),
+        "missing": Path("core/inkdrop_missing_acquire.py").read_text(encoding="utf-8"),
     }
     for label, source in source_contracts.items():
         require("worker_auth_headers(required=True)" in source, f"{label} HTTP callback must attach the supported worker API-key header")
@@ -1462,10 +1459,11 @@ def assert_image_defaults_live_under_documented_mounts():
 
 def assert_docker_python_allowlist_import_closure():
     root = Path(__file__).resolve().parents[1]
+    core_dir = root / "core"
     patterns = _dockerignore_patterns(root)
     included_paths = [
         path
-        for path in sorted(list(root.glob("inkdrop*.py")) + list(root.glob("kavita*.py")))
+        for path in sorted(list(core_dir.glob("inkdrop*.py")) + list(core_dir.glob("kavita*.py")))
         if not _dockerignore_matches(path.relative_to(root), patterns)
     ]
     included_modules = {path.stem for path in included_paths}
@@ -1473,7 +1471,7 @@ def assert_docker_python_allowlist_import_closure():
     require(not non_importable_names, "Docker runtime Python allowlist should not include non-importable hyphenated scripts: " + ", ".join(non_importable_names))
     local_modules = {
         path.stem: path
-        for path in root.glob("*.py")
+        for path in core_dir.glob("*.py")
         if path.stem.startswith(("inkdrop", "kavita"))
     }
     missing = []
@@ -1481,10 +1479,10 @@ def assert_docker_python_allowlist_import_closure():
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
         for node in ast.walk(tree):
             modules = []
-            if isinstance(node, ast.Import):
-                modules = [alias.name.split(".")[0] for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                modules = [node.module.split(".")[0]]
+            if isinstance(node, ast.ImportFrom) and node.module == "core":
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("core."):
+                modules = [node.module.split(".")[1]]
             for module in modules:
                 if module.startswith(("inkdrop", "kavita")) and module in local_modules and module not in included_modules:
                     missing.append(f"{path.name} imports excluded local module {module} ({local_modules[module].name})")
@@ -1511,13 +1509,13 @@ def assert_docker_context_manifest_contract():
     require(manifest.get("schema") == "inkdrop.docker_context_manifest.v1", "Docker context manifest should expose a stable schema")
     require(manifest.get("file_count") == len(paths), "Docker context manifest file_count should match files")
     require(isinstance(warnings, list), "Docker context manifest should expose non-blocking size warnings")
-    require(any(item.get("kind") == "large_context_file" and item.get("path") == "inkdrop_web.py" for item in warnings), "Docker context size warnings should identify the oversized web implementation")
+    require(any(item.get("kind") == "large_context_file" and item.get("path") == "core/inkdrop_web.py" for item in warnings), "Docker context size warnings should identify the oversized web implementation")
     accepted_large = {
         item.get("path")
         for item in warnings
         if item.get("kind") == "large_context_file" and item.get("accepted") is True
     }
-    require({"inkdrop_state.py", "inkdrop_web.py"}.issubset(accepted_large), "known oversized implementation modules should be explicitly accepted packaging debt")
+    require({"core/inkdrop_state.py", "core/inkdrop_web.py"}.issubset(accepted_large), "known oversized implementation modules should be explicitly accepted packaging debt")
     total_context = next((item for item in warnings if item.get("kind") == "total_context_size"), None)
     if total_context is not None:
         require(total_context.get("accepted") is True, "bounded closed-alpha runtime context growth should be explicitly accepted")
@@ -1546,12 +1544,12 @@ def assert_docker_context_manifest_contract():
     for required in (
         "Dockerfile",
         "requirements.txt",
-        "inkdrop_public_contracts.py",
-        "inkdrop_acquire_adapter.py",
-        "inkdrop_acquire.py",
-        "inkdrop_container_start.py",
-        "inkdrop_web.py",
-        "inkdrop_acquire_adapter.py",
+        "core/inkdrop_public_contracts.py",
+        "core/inkdrop_acquire_adapter.py",
+        "core/inkdrop_acquire.py",
+        "core/inkdrop_container_start.py",
+        "core/inkdrop_web.py",
+        "core/inkdrop_acquire_adapter.py",
         "docs/inkdrop-source-candidate-catalog-20260702.json",
         "tools/inkdrop_install_support_summary.py",
     ):
@@ -1578,17 +1576,17 @@ def assert_docker_core_worker_scripts_included():
     root = Path(__file__).resolve().parents[1]
     patterns = _dockerignore_patterns(root)
     required_scripts = (
-        "inkdrop_acquire.py",
-        "inkdrop_web.py",
-        "inkdrop_missing_acquire.py",
-        "inkdrop_completed_import.py",
-        "inkdrop_reconcile_imports.py",
-        "inkdrop_pack_import.py",
-        "inkdrop_series_autopilot.py",
-        "inkdrop_slskd_source_probe.py",
-        "inkdrop_manual_source_autoresolve.py",
-        "inkdrop_source_worker_service.py",
-        "inkdrop_source_worker_cli.py",
+        "core/inkdrop_acquire.py",
+        "core/inkdrop_web.py",
+        "core/inkdrop_missing_acquire.py",
+        "core/inkdrop_completed_import.py",
+        "core/inkdrop_reconcile_imports.py",
+        "core/inkdrop_pack_import.py",
+        "core/inkdrop_series_autopilot.py",
+        "core/inkdrop_slskd_source_probe.py",
+        "core/inkdrop_manual_source_autoresolve.py",
+        "core/inkdrop_source_worker_service.py",
+        "core/inkdrop_source_worker_cli.py",
     )
     missing = []
     excluded = []
@@ -1647,10 +1645,11 @@ def assert_runtime_source_catalog_contract():
 
 def assert_docker_runtime_python_files_compile():
     root = Path(__file__).resolve().parents[1]
+    core_dir = root / "core"
     patterns = _dockerignore_patterns(root)
     runtime_files = [
         path
-        for path in sorted(list(root.glob("inkdrop*.py")) + list(root.glob("kavita*.py")))
+        for path in sorted(list(core_dir.glob("inkdrop*.py")) + list(core_dir.glob("kavita*.py")))
         if not _dockerignore_matches(path.relative_to(root), patterns)
     ]
     require(runtime_files, "Docker runtime Python allowlist should include app modules")
@@ -1667,15 +1666,16 @@ def assert_docker_runtime_python_files_compile():
 
 def assert_runtime_third_party_imports_are_declared():
     root = Path(__file__).resolve().parents[1]
+    core_dir = root / "core"
     patterns = _dockerignore_patterns(root)
     runtime_files = [
         path
-        for path in sorted(list(root.glob("inkdrop*.py")) + list(root.glob("kavita*.py")))
+        for path in sorted(list(core_dir.glob("inkdrop*.py")) + list(core_dir.glob("kavita*.py")))
         if not _dockerignore_matches(path.relative_to(root), patterns)
     ]
     local_modules = {
         path.stem
-        for path in root.glob("*.py")
+        for path in core_dir.glob("*.py")
         if path.stem.startswith(("inkdrop", "kavita"))
     }
     try:
@@ -1689,6 +1689,10 @@ def assert_runtime_third_party_imports_are_declared():
             modules = []
             if isinstance(node, ast.Import):
                 modules = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module == "core":
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("core."):
+                modules = [node.module.split(".")[1]]
             elif isinstance(node, ast.ImportFrom) and node.module:
                 modules = [node.module.split(".")[0]]
             for module in modules:
@@ -1724,10 +1728,10 @@ def assert_dockerignore_allowlist_shape():
         Path("requirements.txt"),
         Path("inkdrop-logo-mark.png"),
         Path("web/static/img/inkdrop-auth-backdrop.webp"),
-        Path("inkdrop_public_contracts.py"),
-        Path("inkdrop_sab_failed_cleanup.py"),
-        Path("inkdrop_acquire.py"),
-        Path("inkdrop_web.py"),
+        Path("core/inkdrop_public_contracts.py"),
+        Path("core/inkdrop_sab_failed_cleanup.py"),
+        Path("core/inkdrop_acquire.py"),
+        Path("core/inkdrop_web.py"),
         Path("docs/inkdrop-source-candidate-catalog-20260702.json"),
         Path("tools/inkdrop_install_support_summary.py"),
     ):
@@ -2037,7 +2041,7 @@ def assert_preflight_cli_json_contract():
     with tempfile.TemporaryDirectory(prefix="inkdrop-preflight-cli-smoke-") as tmp:
         tmp_root = Path(tmp)
         clean = subprocess.run(
-            [sys.executable, "-B", "inkdrop_preflight.py", "--create", "--json"],
+            [sys.executable, "-B", "core/inkdrop_preflight.py", "--create", "--json"],
             cwd=root,
             env=base_env(tmp_root),
             text=True,
@@ -2063,7 +2067,7 @@ def assert_preflight_cli_json_contract():
             }
         )
         bad = subprocess.run(
-            [sys.executable, "-B", "inkdrop_preflight.py", "--create", "--json"],
+            [sys.executable, "-B", "core/inkdrop_preflight.py", "--create", "--json"],
             cwd=root,
             env=bad_env,
             text=True,
@@ -2091,7 +2095,7 @@ def assert_preflight_cli_json_contract():
 
 
 def assert_container_start_failure_diagnostics():
-    import inkdrop_container_start
+    from core import inkdrop_container_start
 
     def run_startup(env_updates):
         old_env = dict(os.environ)
@@ -2208,7 +2212,7 @@ def assert_container_start_failure_diagnostics():
 
 
 def assert_container_healthcheck_diagnostics():
-    import inkdrop_container_healthcheck
+    from core import inkdrop_container_healthcheck
 
     original_run_preflight = inkdrop_container_healthcheck.inkdrop_preflight.run_preflight
     original_probe_status = inkdrop_container_healthcheck._probe_status
@@ -2320,8 +2324,8 @@ def assert_web_uses_runtime_config():
     # inkdrop_web_config.py holds the module-level runtime-config-backed
     # constants (HOST/PORT/STATE_DIR/etc.) that used to live directly in
     # inkdrop_web.py; every check below spans both files.
-    web_text = (Path(__file__).resolve().parents[1] / "inkdrop_web.py").read_text(encoding="utf-8")
-    config_text = (Path(__file__).resolve().parents[1] / "inkdrop_web_config.py").read_text(encoding="utf-8")
+    web_text = (Path(__file__).resolve().parents[1] / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
+    config_text = (Path(__file__).resolve().parents[1] / "core" / "inkdrop_web_config.py").read_text(encoding="utf-8")
     text = web_text + config_text
     require("import inkdrop_runtime_config" in text, "web runtime imports inkdrop_runtime_config")
     require("HOST = inkdrop_runtime_config.web_host()" in text, "web host is runtime-config-backed")
@@ -2349,13 +2353,13 @@ def assert_web_uses_runtime_config():
 
 def assert_optional_adapter_defaults_are_explicit():
     root = Path(__file__).resolve().parents[1]
-    completed_import = (root / "inkdrop_completed_import.py").read_text(encoding="utf-8")
-    slskd_probe = (root / "inkdrop_slskd_source_probe.py").read_text(encoding="utf-8")
-    manual_autoresolve = (root / "inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8")
-    series_autopilot = (root / "inkdrop_series_autopilot.py").read_text(encoding="utf-8")
-    acquire = (root / "inkdrop_acquire.py").read_text(encoding="utf-8")
-    missing_acquire = (root / "inkdrop_missing_acquire.py").read_text(encoding="utf-8")
-    reconcile = (root / "inkdrop_reconcile_imports.py").read_text(encoding="utf-8")
+    completed_import = (root / "core" / "inkdrop_completed_import.py").read_text(encoding="utf-8")
+    slskd_probe = (root / "core" / "inkdrop_slskd_source_probe.py").read_text(encoding="utf-8")
+    manual_autoresolve = (root / "core" / "inkdrop_manual_source_autoresolve.py").read_text(encoding="utf-8")
+    series_autopilot = (root / "core" / "inkdrop_series_autopilot.py").read_text(encoding="utf-8")
+    acquire = (root / "core" / "inkdrop_acquire.py").read_text(encoding="utf-8")
+    missing_acquire = (root / "core" / "inkdrop_missing_acquire.py").read_text(encoding="utf-8")
+    reconcile = (root / "core" / "inkdrop_reconcile_imports.py").read_text(encoding="utf-8")
     require('KAVITA_API = os.environ.get("INKDROP_KAVITA_URL") or ""' in completed_import, "Kavita importer URL should be blank unless configured")
     require('KOMGA_API = os.environ.get("INKDROP_KOMGA_URL") or ""' in completed_import, "Komga importer URL should be blank unless configured")
     require('inkdrop_acquire.load_qbit_settings()' in completed_import, "completed import should delegate to the shared qBittorrent settings loader instead of duplicating it")
@@ -2387,8 +2391,8 @@ def assert_optional_adapter_defaults_are_explicit():
 
 def assert_protocol_order_contract():
     root = Path(__file__).resolve().parents[1]
-    acquire = (root / "inkdrop_acquire.py").read_text(encoding="utf-8")
-    missing_acquire = (root / "inkdrop_missing_acquire.py").read_text(encoding="utf-8")
+    acquire = (root / "core" / "inkdrop_acquire.py").read_text(encoding="utf-8")
+    missing_acquire = (root / "core" / "inkdrop_missing_acquire.py").read_text(encoding="utf-8")
     for label, text in (
         ("inkdrop_acquire.py", acquire),
         ("inkdrop_missing_acquire.py", missing_acquire),
@@ -2399,14 +2403,14 @@ def assert_protocol_order_contract():
 
 
 def assert_release_safety_audit():
-    path = Path(__file__).resolve().parents[1] / "inkdrop-public-release-safety-audit.py"
+    path = Path(__file__).resolve().parents[1] / "tests" / "inkdrop-public-release-safety-audit.py"
     text = path.read_text(encoding="utf-8")
     require("scan_github_workflows" in text, "release safety audit scans GitHub workflow files")
     require("scan_public_image_context_private_text_files" in text, "release safety audit scans text files included in Docker context")
     require("scan_env_example_secret_defaults" in text, "release safety audit checks .env.example secret defaults")
     require("env_example_secret_default" in text, "release safety audit reports nonblank .env.example secrets")
     require("docs/inkdrop-source-candidate-catalog-20260702.json" in text, "release safety audit treats source catalog as public artifact")
-    require('"inkdrop_container_healthcheck.py"' in text, "release safety audit treats container healthcheck as a public runtime artifact")
+    require('"core/inkdrop_container_healthcheck.py"' in text, "release safety audit treats container healthcheck as a public runtime artifact")
     spec = importlib.util.spec_from_file_location("inkdrop_public_release_safety_audit", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

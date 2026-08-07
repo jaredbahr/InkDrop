@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import inkdrop_public_contracts
+from core import inkdrop_public_contracts
 
 RELEASE_BLOCKER_SCHEMA_VERSION = 1
 
@@ -73,7 +74,7 @@ LOCAL_CHECKS = (
             "-B",
             "-m",
             "py_compile",
-            "inkdrop_backup_restore.py",
+            "core/inkdrop_backup_restore.py",
             "inkdrop-backup-restore-smoke.py",
             "inkdrop-settings-backup-restore-smoke.py",
             "inkdrop-settings-backup-browser-smoke.py",
@@ -84,12 +85,12 @@ LOCAL_CHECKS = (
             "tools/inkdrop_github_release.py",
             "inkdrop-github-release-contract-smoke.py",
             "inkdrop-standalone-entrypoints-smoke.py",
-            "inkdrop_comicscodes_discovery.py",
-            "inkdrop_preflight.py",
-            "inkdrop_public_contracts.py",
-            "inkdrop_runtime_config.py",
-            "inkdrop_container_healthcheck.py",
-            "inkdrop_sab_failed_cleanup.py",
+            "core/inkdrop_comicscodes_discovery.py",
+            "core/inkdrop_preflight.py",
+            "core/inkdrop_public_contracts.py",
+            "core/inkdrop_runtime_config.py",
+            "core/inkdrop_container_healthcheck.py",
+            "core/inkdrop_sab_failed_cleanup.py",
             "inkdrop-sab-cleanup-optional-adapter-smoke.py",
             "inkdrop-auth-api-key-smoke.py",
             "inkdrop-auth-enforcement-smoke.py",
@@ -108,14 +109,14 @@ LOCAL_CHECKS = (
             "inkdrop-issue-identity-smoke.py",
             "inkdrop-deferred-sync-smoke.py",
             "inkdrop-diagnostic-artifacts-smoke.py",
-            "inkdrop_diagnostic_artifacts.py",
+            "core/inkdrop_diagnostic_artifacts.py",
             "inkdrop-slskd-failover-smoke.py",
             "inkdrop-slskd-coverage-selection-smoke.py",
             "inkdrop-slskd-root-health-smoke.py",
-            "inkdrop_slskd_root_health.py",
+            "core/inkdrop_slskd_root_health.py",
             "inkdrop-series-detail-performance-smoke.py",
-            "inkdrop_auth_contracts.py",
-            "inkdrop_opds.py",
+            "core/inkdrop_auth_contracts.py",
+            "core/inkdrop_opds.py",
             "inkdrop-opds-smoke.py",
             "inkdrop-series-activity-ui-smoke.py",
             "inkdrop-first-run-setup-status-smoke.py",
@@ -124,7 +125,7 @@ LOCAL_CHECKS = (
             "inkdrop-settings-section-contract-smoke.py",
             "inkdrop-operator-contracts-smoke.py",
             "inkdrop-import-ready-worker-smoke.py",
-            "inkdrop_incident_recovery.py",
+            "core/inkdrop_incident_recovery.py",
             "inkdrop-dispatch-recovery-closure-smoke.py",
             "inkdrop-library-import-plan-smoke.py",
             "inkdrop-local-folder-only-flow-smoke.py",
@@ -138,10 +139,10 @@ LOCAL_CHECKS = (
             "inkdrop-manual-search-known-title-smoke.py",
             "inkdrop-manual-search-security-smoke.py",
             "inkdrop-manual-search-ui-smoke.py",
-            "inkdrop_manual_search.py",
-            "inkdrop_manual_search_core.py",
-            "inkdrop_manual_search_executor.py",
-            "inkdrop_manual_search_worker.py",
+            "core/inkdrop_manual_search.py",
+            "core/inkdrop_manual_search_core.py",
+            "core/inkdrop_manual_search_executor.py",
+            "core/inkdrop_manual_search_worker.py",
             "inkdrop-library-frontends-smoke.py",
             "inkdrop-komga-settings-smoke.py",
             "inkdrop-planned-path-live-inspection.py",
@@ -160,9 +161,9 @@ LOCAL_CHECKS = (
             "inkdrop-direct-source-certification-smoke.py",
             "inkdrop-download-clients-round2-smoke.py",
             "inkdrop-utorrent-rtorrent-smoke.py",
-            "inkdrop_download_client_config.py",
-            "inkdrop_download_client_api.py",
-            "inkdrop_secret_store.py",
+            "core/inkdrop_download_client_config.py",
+            "core/inkdrop_download_client_api.py",
+            "core/inkdrop_secret_store.py",
             "inkdrop-download-client-instance-store-smoke.py",
             "inkdrop-download-client-instance-api-smoke.py",
             "inkdrop-download-client-routing-smoke.py",
@@ -178,12 +179,12 @@ LOCAL_CHECKS = (
             "inkdrop-github-release-contract-smoke.py",
             "inkdrop-runtime-source-settings-smoke.py",
             "inkdrop-source-settings-contract-smoke.py",
-            "inkdrop_manual_source_autoresolve.py",
-            "inkdrop_internal_jobs.py",
+            "core/inkdrop_manual_source_autoresolve.py",
+            "core/inkdrop_internal_jobs.py",
             "inkdrop-manual-source-internal-import-auth-smoke.py",
-            "inkdrop_mangadex_direct.py",
-            "inkdrop_rss_discovery.py",
-            "inkdrop_service_inventory.py",
+            "core/inkdrop_mangadex_direct.py",
+            "core/inkdrop_rss_discovery.py",
+            "core/inkdrop_service_inventory.py",
             "tools/inkdrop_docker_context_manifest.py",
             "tools/inkdrop_install_support_summary.py",
             "tools/inkdrop_compose_deployment_plan.py",
@@ -345,7 +346,7 @@ DOCKER_CHECKS = (
             "inkdrop",
             "python",
             "-B",
-            "inkdrop_preflight.py",
+            "core/inkdrop_preflight.py",
             "--create",
             "--quiet",
             "--strict-dependencies",
@@ -368,7 +369,7 @@ DOCKER_CHECKS = (
             "inkdrop",
             "python",
             "-B",
-            "inkdrop_container_healthcheck.py",
+            "core/inkdrop_container_healthcheck.py",
             "--preflight-only",
         ],
     ),
@@ -519,6 +520,7 @@ def isolated_state_env_defaults():
     global _ISOLATED_STATE_ENV
     if _ISOLATED_STATE_ENV is None:
         root = tempfile.mkdtemp(prefix="inkdrop-release-check-")
+        atexit.register(shutil.rmtree, root, ignore_errors=True)
         layout = {
             "INKDROP_CONFIG_DIR": "config",
             "INKDROP_STATE_DIR": "state",
@@ -632,7 +634,7 @@ def host_preflight_env(root):
 def run_host_preflight(*, strict_dependencies=False):
     with tempfile.TemporaryDirectory(prefix="inkdrop-public-release-preflight-") as tmp:
         env = host_preflight_env(Path(tmp))
-        command = [sys.executable, "-B", "inkdrop_preflight.py", "--create", "--quiet"]
+        command = [sys.executable, "-B", "core/inkdrop_preflight.py", "--create", "--quiet"]
         if strict_dependencies:
             command.append("--strict-dependencies")
         return run_command(

@@ -9,11 +9,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import inkdrop_container_scheduler as scheduler
+from core import inkdrop_container_scheduler as scheduler
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "scripts/inkdrop-series-autopilot-cron.sh"
+WRAPPER = ROOT / "inkdrop-series-autopilot-cron.sh"
 
 
 def require(condition, message):

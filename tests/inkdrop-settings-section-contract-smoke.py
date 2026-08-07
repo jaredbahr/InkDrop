@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import types
@@ -11,8 +12,8 @@ from pathlib import Path
 
 sys.modules.setdefault("requests", types.ModuleType("requests"))
 
-import inkdrop_state
-import inkdrop_web as web
+from core import inkdrop_state
+from core import inkdrop_web as web
 
 
 SETTINGS_SECTIONS = {
@@ -20,7 +21,7 @@ SETTINGS_SECTIONS = {
     "media_management": {"min_items": 1, "provider_ids": {"media_management"}},
     "language": {"min_items": 1, "provider_ids": {"quality_language_rules"}},
     "indexers": {"min_items": 1, "provider_ids": {"prowlarr"}},
-    "download_clients": {"min_items": 1, "provider_ids": {"sabnzbd", "qbittorrent", "slskd"}},
+    "download_clients": {"min_items": 1, "provider_ids": {"sabnzbd", "qbittorrent", "slskd", "comicscodes"}},
     "import_lists": {"min_items": 1, "setting_prefixes": ("import_lists.",)},
     "connect": {"min_items": 1, "provider_ids": {"kavita", "komga"}},
     "metadata_files": {"min_items": 1, "setting_prefixes": ("metadata_files.",)},
@@ -98,6 +99,50 @@ def main():
             require(
                 updated_rows["automation.queue_watchdog_slskd_stale_minutes"]["value"] == 60,
                 "saving a runtime-only app setting should claim and persist it",
+            )
+
+            # RSS and ComicsCodes are download sources, reachable by normal
+            # click-through under Download Clients now -- not stuck behind
+            # the "automation" nav entry, which stays hidden.
+            dc_payload = web.inkdrop_settings_public(sync=False, area="download_clients")
+            dc_providers, _ = payload_items(dc_payload)
+            dc_ids = {str(row.get("id") or "").strip().lower() for row in dc_providers}
+            require(
+                "comicscodes" in dc_ids and ("rss" in dc_ids or "rss_direct" in dc_ids),
+                f"RSS and ComicsCodes should be reachable from Download Clients, got {sorted(dc_ids)}",
+            )
+
+            # The Settings-UI toggle sends whatever id the payload showed it
+            # (canonicalize_settings_providers() may have rewritten "rss" to
+            # "rss_direct" for the cross-provider status rollup) -- saving
+            # must resolve back to the row actually stored in provider_configs
+            # rather than failing "provider config not found" or silently
+            # creating an orphaned duplicate row under the display id.
+            save_result = web.update_inkdrop_provider_settings({"id": "rss_direct", "enabled": False})
+            require(save_result.get("ok") is not False, f"saving RSS via its canonicalized id should succeed: {save_result}")
+            with sqlite3.connect(db_path) as con:
+                con.row_factory = sqlite3.Row
+                rss_rows = con.execute("select id, enabled, source from provider_configs where id like '%rss%'").fetchall()
+            require(len(rss_rows) == 1, f"saving RSS via its canonicalized id must update the one real row, not create a duplicate: {[dict(r) for r in rss_rows]}")
+            require(rss_rows[0]["id"] == "rss", f"the real stored row must stay keyed by its native id, got {rss_rows[0]['id']!r}")
+            require(rss_rows[0]["enabled"] == 0, "the save must actually persist the new enabled value")
+
+            # Regression: saving ANY one native provider used to silently
+            # drop every OTHER not-yet-individually-saved native provider
+            # from every subsequent settings response (merge_runtime_settings_
+            # snapshot only restored missing source_catalog templates, not
+            # missing native "runtime" providers) -- reproduced live: saving
+            # qBittorrent alone made SLSKD/SABnzbd disappear, even after a
+            # full page reload. Confirm they all still show up after two
+            # separate saves in this same area.
+            qbit_save = web.update_inkdrop_provider_settings({"id": "qbittorrent", "enabled": True})
+            require(qbit_save.get("ok") is not False, f"saving qBittorrent should succeed: {qbit_save}")
+            dc_payload_after = web.inkdrop_settings_public(sync=False, area="download_clients")
+            dc_ids_after = {str(row.get("id") or "").strip().lower() for row in payload_items(dc_payload_after)[0]}
+            require(
+                {"comicscodes", "slskd", "sabnzbd", "qbittorrent"}.issubset(dc_ids_after)
+                and ("rss" in dc_ids_after or "rss_direct" in dc_ids_after),
+                f"saving one provider must not hide its untouched siblings, got {sorted(dc_ids_after)}",
             )
         finally:
             web.INKDROP_STATE_DB = old_db

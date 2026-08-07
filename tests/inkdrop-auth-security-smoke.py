@@ -13,9 +13,9 @@ import types
 import zipfile
 from pathlib import Path
 
-import inkdrop_auth
-import inkdrop_backup_restore
-import inkdrop_state
+from core import inkdrop_auth
+from core import inkdrop_backup_restore
+from core import inkdrop_state
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
@@ -29,7 +29,7 @@ if "requests" not in sys.modules:
     )
     sys.modules["requests"] = requests_stub
 
-import inkdrop_web
+from core import inkdrop_web
 
 
 def require(condition, message):

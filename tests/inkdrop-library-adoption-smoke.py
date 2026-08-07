@@ -15,9 +15,9 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_library_adoption
-import inkdrop_state
-import inkdrop_web
+from core import inkdrop_library_adoption
+from core import inkdrop_state
+from core import inkdrop_web
 
 
 def require(condition, message):

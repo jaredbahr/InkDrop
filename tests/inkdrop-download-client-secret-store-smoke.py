@@ -10,10 +10,10 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_backup_restore
-import inkdrop_download_client_config as config
-import inkdrop_secret_store
-import inkdrop_state
+from core import inkdrop_backup_restore
+from core import inkdrop_download_client_config as config
+from core import inkdrop_secret_store
+from core import inkdrop_state
 
 
 def require(condition, message):

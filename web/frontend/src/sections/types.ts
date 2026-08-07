@@ -5,17 +5,31 @@
 // recorded failures simply omits "failure_count".
 export type BlocklistRow = {
   id: string;
+  revision?: number;
   title?: string;
   series?: string;
+  source?: string;
+  provider?: string;
   source_label?: string;
+  source_path?: string;
+  normalized_title?: string;
   reason?: string;
   reason_label?: string;
   failure_count?: number;
+  first_seen_at?: number;
+  last_seen_at?: number;
   last_seen_at_iso?: string;
+  activity_at?: number;
+  detail?: string;
   activity_summary?: string;
+  source_attempt_filter?: string;
   linked_entities?: {
     display_title?: string;
     series?: string;
+    series_id?: string;
+    issue_number?: string;
+    issue_title?: string;
+    image?: string;
   };
 };
 
@@ -23,6 +37,14 @@ export type StateViewFilter = {
   value: string;
   label: string;
   count: number;
+};
+
+export type BlocklistSummary = {
+  bad_source_candidates?: number;
+  bad_source_candidates_recent?: number;
+  bad_source_candidates_by_reason?: Record<string, number>;
+  bad_source_candidates_by_source?: Record<string, number>;
+  bad_source_candidates_by_provider?: Record<string, number>;
 };
 
 export type BlocklistViewPayload = {
@@ -37,6 +59,7 @@ export type BlocklistViewPayload = {
   offset: number;
   source_filter: string;
   filters: StateViewFilter[];
+  summary?: BlocklistSummary;
 };
 
 export type AllowCandidateResult = {
@@ -47,3 +70,21 @@ export type AllowCandidateResult = {
     [key: string]: unknown;
   };
 };
+
+export type BlocklistReasonMeta = {
+  label: string;
+  tone: string;
+  detail: string;
+};
+
+declare global {
+  interface Window {
+    InkDropSourceMemory?: {
+      openDetailPanel: (row: BlocklistRow) => void;
+      closeDetailPanel: () => void;
+      reasonMeta: (reason?: string, reasonLabel?: string) => BlocklistReasonMeta;
+      mutate: (row: BlocklistRow, decision: string, options?: Record<string, unknown>) => Promise<boolean>;
+      coverProxyUrl?: (value?: string) => string;
+    };
+  }
+}

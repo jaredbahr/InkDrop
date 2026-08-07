@@ -4,10 +4,10 @@ import tempfile
 import threading
 from pathlib import Path
 
-import inkdrop_library_frontends as frontends
-import inkdrop_library_identity as identity
-import inkdrop_state
-import inkdrop_completed_import as completed_import
+from core import inkdrop_library_frontends as frontends
+from core import inkdrop_library_identity as identity
+from core import inkdrop_state
+from core import inkdrop_completed_import as completed_import
 
 
 def require(value, message):

@@ -3,16 +3,16 @@
 
 from unittest import mock
 
-import inkdrop_slskd_source_probe as slskd
-import inkdrop_candidate_matching as matching
-import inkdrop_manual_search as manual_search
-import inkdrop_manual_search_executor as manual_search_executor
-import inkdrop_series_autopilot as autopilot
-import inkdrop_source_providers as providers
-import inkdrop_source_worker_adapters as adapters
-import inkdrop_source_worker_http as source_http
-import inkdrop_source_worker_jobs as jobs
-import inkdrop_sources
+from core import inkdrop_slskd_source_probe as slskd
+from core import inkdrop_candidate_matching as matching
+from core import inkdrop_manual_search as manual_search
+from core import inkdrop_manual_search_executor as manual_search_executor
+from core import inkdrop_series_autopilot as autopilot
+from core import inkdrop_source_providers as providers
+from core import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_source_worker_http as source_http
+from core import inkdrop_source_worker_jobs as jobs
+from core import inkdrop_sources
 
 
 def require(value, message):

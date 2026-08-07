@@ -3,8 +3,8 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import inkdrop_source_worker_adapters as adapters
-import inkdrop_source_worker_http as source_http
+from core import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_source_worker_http as source_http
 
 
 def fail(message):

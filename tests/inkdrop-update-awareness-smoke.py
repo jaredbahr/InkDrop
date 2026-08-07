@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-import inkdrop_version as updates
+from core import inkdrop_version as updates
 from tools import inkdrop_github_release as release_tool
 
 
@@ -344,7 +344,7 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     else:
         raise AssertionError("tampered update manifest was attached")
 
-web = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8")
+web = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
 workflow = (ROOT / ".github/workflows/inkdrop-public-release.yml").read_text(encoding="utf-8")
 require('const updatePromise = Promise.resolve({});' in web, "normal System pages should not request update status")
 require('fetchJson("/api/system/update-status?refresh=0")' not in web, "removed Updates surface must not fetch local update status")

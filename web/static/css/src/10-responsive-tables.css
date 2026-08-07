@@ -26,6 +26,30 @@
         align-items: center;
         gap: 8px;
       }
+      /* Flex children default to min-width:auto, so during a cold load the
+         status row's long detail text plus the nowrap action button forced
+         the page ~116px past a phone viewport until the status payload
+         settled (caught by real-device screenshots, 2026-08-06). Not
+         prefixed with a container: at this width the status pill renders in
+         the nav shell's activity region, not main > header. */
+      .status-pill .status-row {
+        /* The row is a grid item inside .status-pill; grid items also
+           default to min-width:auto, so the row itself was the element
+           painting 39px past the pill. Let it compress, and let the action
+           button drop to its own line when the title needs the width. */
+        min-width: 0;
+        flex-wrap: wrap;
+      }
+      .status-pill .status-row > * {
+        min-width: 0;
+      }
+      .status-pill .status-action {
+        white-space: normal;
+      }
+      .status-pill .status-metric {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
       main > header .status-title {
         font-size: 12px;
       }

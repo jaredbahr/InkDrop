@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-import inkdrop_issue_identity
+from core import inkdrop_issue_identity
 
 
 def setup(db):

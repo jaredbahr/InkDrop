@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "inkdrop_web.py").read_text(encoding="utf-8")
+WEB = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
 JS = (ROOT / "web/static/js/inkdrop-auth-ui.js").read_text(encoding="utf-8")
 CSS = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")
 FIXTURE = (ROOT / "web/tests/fixtures/auth-first-run.html").read_text(encoding="utf-8")

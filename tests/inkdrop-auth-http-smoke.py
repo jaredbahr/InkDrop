@@ -15,8 +15,8 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_auth
-import inkdrop_state
+from core import inkdrop_auth
+from core import inkdrop_state
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
@@ -30,7 +30,7 @@ if "requests" not in sys.modules:
     )
     sys.modules["requests"] = requests_stub
 
-import inkdrop_web
+from core import inkdrop_web
 
 
 def require(condition, message):
@@ -218,7 +218,7 @@ def main():
                 )
                 require(valid_worker_code == 200 and (valid_worker_payload.get("result") or {}).get("accepted") is True, "read+acquisition worker API key must authorize the protected callback")
 
-                import inkdrop_manual_source_autoresolve as worker_resolver
+                from core import inkdrop_manual_source_autoresolve as worker_resolver
                 with mock.patch.dict(
                     os.environ,
                     {

@@ -56,6 +56,10 @@ declare global {
   interface Window {
     InkDropManualReview?: {
       openDecisionModal: (row: ManualReviewRow) => void;
+      // Same reasoning as openDecisionModal: the confirm dialog and the
+      // sequential ignore calls stay in the vanilla shell's
+      // runBulkManualReviewIgnore(), reused via bridge rather than ported.
+      bulkIgnore: (rows: ManualReviewRow[]) => Promise<void>;
     };
   }
 }

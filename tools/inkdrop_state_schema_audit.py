@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-STATE_FILE = ROOT / "inkdrop_state.py"
+STATE_FILE = ROOT / "core" / "inkdrop_state.py"
 
 REQUIRED_TABLE_COLUMNS = {
     "series": {"id", "title", "media_type", "metadata_provider", "metadata_id", "library_path", "monitored", "monitor_new", "auto_grab", "raw_json"},
@@ -203,7 +203,7 @@ def _public_state_contract_findings(source: str):
 def _runtime_schema():
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    import inkdrop_state
+    from core import inkdrop_state
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-state-schema-audit-") as tmp:
         db_path = Path(tmp) / inkdrop_state.STATE_DB_NAME
@@ -426,7 +426,7 @@ def _query_plan_uses_index(con: sqlite3.Connection, sql: str, index_name: str, p
 def _migration_fixture():
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    import inkdrop_state
+    from core import inkdrop_state
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-state-migration-audit-") as tmp:
         db_path = Path(tmp) / inkdrop_state.STATE_DB_NAME
@@ -648,7 +648,7 @@ def _migration_fixture():
 def _schema_17_upgrade_fixture():
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    import inkdrop_state
+    from core import inkdrop_state
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-state-schema-17-upgrade-") as tmp:
         db_path = Path(tmp) / inkdrop_state.STATE_DB_NAME
@@ -740,8 +740,8 @@ def audit():
 
     if 'STATE_DB_NAME = "inkdrop-state.sqlite3"' not in source:
         findings.append({"kind": "missing_state_db_name", "message": "STATE_DB_NAME should remain inkdrop-state.sqlite3"})
-    if "SCHEMA_VERSION = 18" not in source:
-        findings.append({"kind": "schema_version_changed", "message": "schema audit expected SCHEMA_VERSION = 18; update audit deliberately if schema changes"})
+    if "SCHEMA_VERSION = 19" not in source:
+        findings.append({"kind": "schema_version_changed", "message": "schema audit expected SCHEMA_VERSION = 19; update audit deliberately if schema changes"})
     if "ensure_columns(" not in source:
         findings.append({"kind": "missing_migration_helper", "message": "state schema should keep ensure_columns migration helper"})
     findings.extend(_public_state_contract_findings(source))
@@ -776,15 +776,15 @@ def audit():
         migration_missing_indexes = sorted(REQUIRED_INDEX_NAMES - migration_indexes)
         for index_name in migration_missing_indexes:
             findings.append({"kind": "migration_missing_index", "index": index_name, "message": f"required index {index_name} was not created during legacy fixture migration"})
-    if runtime_schema_version is not None and str(runtime_schema_version) != "18":
-        findings.append({"kind": "runtime_schema_version_mismatch", "message": f"temp DB schema_version is {runtime_schema_version!r}, expected '18'"})
+    if runtime_schema_version is not None and str(runtime_schema_version) != "19":
+        findings.append({"kind": "runtime_schema_version_mismatch", "message": f"temp DB schema_version is {runtime_schema_version!r}, expected '19'"})
     if runtime_integrity is not None and runtime_integrity != "ok":
         findings.append({"kind": "runtime_integrity_failed", "message": f"temp DB integrity_check returned {runtime_integrity!r}"})
     if runtime_foreign_key_violations:
         findings.append({"kind": "runtime_foreign_key_violation", "rows": runtime_foreign_key_violations, "message": "temp DB has foreign-key violations"})
     if schema_17_upgrade:
-        if str(schema_17_upgrade.get("schema_version")) != "18":
-            findings.append({"kind": "schema_17_upgrade_version_mismatch", "message": f"schema-17 fixture upgraded to {schema_17_upgrade.get('schema_version')!r}, expected '18'"})
+        if str(schema_17_upgrade.get("schema_version")) != "19":
+            findings.append({"kind": "schema_17_upgrade_version_mismatch", "message": f"schema-17 fixture upgraded to {schema_17_upgrade.get('schema_version')!r}, expected '19'"})
         if tuple(schema_17_upgrade.get("preserved", {}).get("series") or ()) != ("Schema 17 Manga", '{"preserve":true}'):
             findings.append({"kind": "schema_17_upgrade_data_loss", "key": "series", "message": "schema-17 series row was not preserved"})
         if tuple(schema_17_upgrade.get("preserved", {}).get("issue") or ()) != ("comicvine:schema17", "1", '{"preserve":true}'):
@@ -860,7 +860,7 @@ def audit():
 
     return {
         "ok": not findings,
-        "schema_version": 18 if "SCHEMA_VERSION = 18" in source else None,
+        "schema_version": 19 if "SCHEMA_VERSION = 19" in source else None,
         "runtime_schema_version": runtime_schema_version,
         "runtime_integrity": runtime_integrity,
         "runtime_foreign_key_violations": runtime_foreign_key_violations,

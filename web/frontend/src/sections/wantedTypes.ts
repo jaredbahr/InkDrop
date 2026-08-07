@@ -6,6 +6,7 @@
 // than sending null.
 export type WantedRow = {
   id: string;
+  revision?: number;
   series?: string;
   issue_number?: string;
   status?: string;

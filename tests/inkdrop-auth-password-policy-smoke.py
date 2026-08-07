@@ -9,8 +9,8 @@ import tempfile
 import time
 from pathlib import Path
 
-import inkdrop_auth
-import inkdrop_state
+from core import inkdrop_auth
+from core import inkdrop_state
 
 
 def require(condition, message):

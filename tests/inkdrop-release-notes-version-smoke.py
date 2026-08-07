@@ -3,7 +3,7 @@ import json
 import re
 from pathlib import Path
 
-import inkdrop_version
+from core import inkdrop_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,21 +32,36 @@ metadata = inkdrop_version.build_metadata({
 assert metadata["version"] == injected_version, metadata
 assert metadata["display_version"] == injected_version, metadata
 
-# The in-app About catalog carries one entry: the current release. Full
-# history lives in docs/inkdrop/releases/ and on GitHub.
+# The in-app About catalog accumulates a rolling history, newest release
+# first, capped at DETAILED_RELEASE_LIMIT (10) -- GitHub is the record for
+# anything older than that. It must gain an entry each release, not replace
+# its one entry: that replace-only shape shipped every release from 0.1.02
+# through 0.1.07 (root-caused and fixed 2026-08-05, see
+# docs/inkdrop/public-release-process.md Step 1.4), because an earlier
+# version of this exact assertion pinned "exactly one entry" as if it were
+# permanent, when it was only ever meant to lock in a one-time purge of
+# alpha-era entries carrying private/closed-alpha language (2026-07-31,
+# db197018).
 detailed_releases_match = re.search(r"var DETAILED_RELEASES = Object\.freeze\(\[(.*?)\]\);", catalog, re.DOTALL)
 assert detailed_releases_match, "DETAILED_RELEASES array was not found"
 detailed_releases_body = detailed_releases_match.group(1)
-assert detailed_releases_body.count('publicRelease({') == 1, (
-    "DETAILED_RELEASES should carry exactly one entry post-clear; "
-    f"found {detailed_releases_body.count('publicRelease({')}"
+detailed_release_limit_match = re.search(r"var DETAILED_RELEASE_LIMIT = (\d+);", catalog)
+assert detailed_release_limit_match, "DETAILED_RELEASE_LIMIT was not found"
+detailed_release_limit = int(detailed_release_limit_match.group(1))
+entry_versions = re.findall(r'publicRelease\(\{\s*version:\s*"(v[^"]+)"', detailed_releases_body)
+assert entry_versions, "DETAILED_RELEASES has no entries"
+assert len(entry_versions) <= detailed_release_limit, (
+    f"DETAILED_RELEASES has {len(entry_versions)} entries, over its own DETAILED_RELEASE_LIMIT ({detailed_release_limit})"
 )
-assert f'version: "{catalog_version}"' in detailed_releases_body, "the single entry must be the current version"
+assert len(entry_versions) == len(set(entry_versions)), f"DETAILED_RELEASES has duplicate versions: {entry_versions}"
+assert entry_versions[0] == catalog_version, (
+    f"the first (newest) DETAILED_RELEASES entry must be the current release; found {entry_versions[0]!r}, expected {catalog_version!r}"
+)
 
 assert "var RELEASE_ROLLUPS" not in catalog, "RELEASE_ROLLUPS was dead code (never referenced) and should be removed, not left empty"
 assert "Older release notes remain available on GitHub" in catalog
 
-for forbidden in (
+forbidden_terms = (
     "private alpha",
     "private-alpha",
     "private qa",
@@ -54,7 +69,16 @@ for forbidden in (
     "owner",
     "coordinator",
     "not publicly launched",
-):
+)
+for forbidden in forbidden_terms:
     assert forbidden not in current_notes.lower(), f"current release notes contain launch-status language: {forbidden}"
+# The About catalog now carries every entry that gets shipped, not just the
+# current one -- so the release entries need the same launch-status-language
+# guard the current release's own notes file gets. Scoped to
+# detailed_releases_body specifically, not the whole file: PRERELEASE_STAGES
+# legitimately contains "not publicly launched" as the Channel-row label for
+# genuinely alpha-tagged builds, which is product copy, not a release note.
+for forbidden in forbidden_terms:
+    assert forbidden not in detailed_releases_body.lower(), f"a DETAILED_RELEASES entry contains launch-status language: {forbidden}"
 
 print("release notes/version alignment smoke passed")

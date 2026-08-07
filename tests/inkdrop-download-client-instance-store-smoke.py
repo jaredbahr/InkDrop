@@ -9,8 +9,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-import inkdrop_download_client_config as config
-import inkdrop_state
+from core import inkdrop_download_client_config as config
+from core import inkdrop_state
 
 
 def require(condition, message):
@@ -41,7 +41,7 @@ def main():
             require("download_client_instance_migrations" in tables, "migration scaffold exists")
             columns = {row[1] for row in con.execute("pragma table_info(download_tasks)")}
             require("download_client_instance_id" in columns, "download tasks gain an additive instance reference")
-            require(con.execute("select value from schema_meta where key='schema_version'").fetchone()[0] == "18", "schema 18 is recorded")
+            require(con.execute("select value from schema_meta where key='schema_version'").fetchone()[0] == str(inkdrop_state.SCHEMA_VERSION), "current schema version is recorded")
 
         first = inkdrop_state.create_download_client_instance(
             db,

@@ -295,6 +295,10 @@
         if (value !== null && String(value).trim() !== "") payload.settings[key] = Number(value);
         else delete payload.settings[key];
       }
+      for (const key of ["download_root", "incomplete_root"]) {
+        const value = String(data.get(`setting:${key}`) || "").trim();
+        if (value) payload.settings[key] = value; else delete payload.settings[key];
+      }
     }
     const secrets = {}, clear = [];
     form.querySelectorAll("[data-secret-name]").forEach(input => {
@@ -349,6 +353,10 @@
     if (Object.prototype.hasOwnProperty.call(fields, "category") || ["qbittorrent", "sabnzbd", "transmission", "deluge", "nzbget", "utorrent", "rtorrent"].includes(type)) field(form, "Default category", "category", {value: instance.category || "", help: "Category applied when a provider does not specify a media-specific category."});
     if (Object.prototype.hasOwnProperty.call(fields, "label")) field(form, "Label", "label", {value: instance.settings?.label || "", help: "Client label used to identify InkDrop-owned work."});
     if (Object.prototype.hasOwnProperty.call(fields, "download_path") || type !== "sabnzbd") field(form, "Default download path", "download_path", {value: instance.download_path || "", placeholder: "/downloads/comics"});
+    if (type === "slskd") {
+      field(form, "SLSKD Download Root", "setting:download_root", {value: instance.settings?.download_root || "", placeholder: "/downloads/slskd", help: "The completed-transfers folder as InkDrop sees it inside its own container, not the default download path above (that tells SLSKD where to save; this tells InkDrop where to look). Testing this instance checks the folder is actually mounted and readable."});
+      field(form, "SLSKD Incomplete Root", "setting:incomplete_root", {value: instance.settings?.incomplete_root || "", placeholder: "/downloads/slskd/incomplete", help: "SLSKD's in-progress-transfers folder, as InkDrop sees it. Leave both this and Download Root blank to skip the folder-visibility check."});
+    }
     if (Object.prototype.hasOwnProperty.call(fields, "verify_tls")) checkbox(form, "Verify TLS certificates", "verify_tls", instance.settings?.verify_tls !== false, "Keep enabled for HTTPS clients unless you intentionally use a trusted private certificate setup.");
     const routing = el("fieldset", "download-client-routing wide");
     routing.append(el("legend", "", "Media Routing"), el("p", "download-client-field-help", "Optional category and download-path overrides for comics, manga, and ebooks."));
@@ -374,8 +382,8 @@
       try {
         const result = await api("/api/download-clients/test", {method: "POST", body: editorPayload(form, instance, type)});
         const tested = result.result || {};
-        error.hidden = false; error.dataset.tone = tested.ok ? "good" : "bad";
-        error.textContent = tested.ok ? "Draft connection succeeded." : `Draft test failed: ${tested.reason || tested.error_type || "connection unavailable"}.`;
+        error.hidden = false; error.dataset.tone = tested.ok ? (tested.warning ? "warn" : "good") : "bad";
+        error.textContent = tested.ok ? (tested.warning ? `Draft connection succeeded, but ${tested.warning}` : "Draft connection succeeded.") : `Draft test failed: ${tested.reason || tested.error_type || "connection unavailable"}.`;
       } catch (err) {
         error.hidden = false; error.dataset.tone = "bad"; error.textContent = errorText(err, "Draft test failed.");
       } finally { draftTest.disabled = false; }
@@ -388,8 +396,8 @@
         try {
           const result = await api(`/api/download-clients/${encodeURIComponent(instance.id)}/test`, {method: "POST", body: {}});
           const tested = result.status?.result || {};
-          error.hidden = false; error.dataset.tone = tested.ok ? "good" : (tested.skipped ? "warn" : "bad");
-          error.textContent = tested.skipped ? "Saved test skipped because this instance is disabled." : (tested.ok ? "Saved connection succeeded." : `Saved test failed: ${tested.reason || tested.error_type || "connection unavailable"}.`);
+          error.hidden = false; error.dataset.tone = tested.ok ? (tested.warning ? "warn" : "good") : (tested.skipped ? "warn" : "bad");
+          error.textContent = tested.skipped ? "Saved test skipped because this instance is disabled." : (tested.ok ? (tested.warning ? `Saved connection succeeded, but ${tested.warning}` : "Saved connection succeeded.") : `Saved test failed: ${tested.reason || tested.error_type || "connection unavailable"}.`);
         } catch (err) { error.hidden = false; error.dataset.tone = "bad"; error.textContent = errorText(err, "Saved test failed."); }
         finally { savedTest.disabled = false; }
       });
@@ -421,6 +429,7 @@
   function statusText(status) {
     const result = status?.result || {};
     if (status?.skipped || result.skipped) return {text: `Skipped · ${status?.reason || result.reason || "not ready"}`, tone: "warn"};
+    if (result.ok && result.warning) return {text: `Connected · ${result.warning}`, tone: "warn"};
     if (result.ok) return {text: "Connected", tone: "good"};
     if (status) return {text: result.reason || result.error_type || "Connection failed", tone: "bad"};
     return {text: "Not tested", tone: ""};
@@ -433,7 +442,7 @@
       const payload = await api(`/api/download-clients/${encodeURIComponent(instance.id)}/test`, {method: "POST", body: {}});
       state.statuses.set(instance.id, payload.status || {}); renderCards(state);
       const result = payload.status?.result || {};
-      setLive(state, result.skipped ? `${instance.name} skipped: ${result.reason || "not ready"}.` : (result.ok ? `${instance.name} connected.` : `${instance.name} failed: ${result.reason || result.error_type || "connection unavailable"}.`), result.ok ? "good" : (result.skipped ? "warn" : "bad"));
+      setLive(state, result.skipped ? `${instance.name} skipped: ${result.reason || "not ready"}.` : (result.ok ? (result.warning ? `${instance.name} connected, but ${result.warning}` : `${instance.name} connected.`) : `${instance.name} failed: ${result.reason || result.error_type || "connection unavailable"}.`), result.ok ? (result.warning ? "warn" : "good") : (result.skipped ? "warn" : "bad"));
     } catch (err) { setLive(state, errorText(err, `Could not test ${instance.name}.`), "bad"); }
     finally { state.testing.delete(instance.id); }
   }
@@ -476,9 +485,9 @@
   function renderCards(state) {
     state.cards.replaceChildren();
     if (!state.instances.length) {
-      const empty = el("div", "download-client-empty");
-      empty.append(el("strong", "", "No additional download client instances"), el("p", "", "Your qBittorrent, SABnzbd, and SLSKD cards below already handle one instance of each. Add one here only if you need a second instance of the same client."));
-      state.cards.append(empty);
+      // One quiet line. The old bordered box restated the section heading
+      // plus a paragraph the manager's own Add button already implies.
+      state.cards.append(el("p", "download-client-empty-line", "None configured."));
     }
     for (const instance of state.instances) {
       const card = el("article", "download-client-instance-card"); card.dataset.downloadClientInstance = instance.id; card.dataset.clientType = instance.client_type;
@@ -526,7 +535,7 @@
 
   async function runTestAll(state) {
     if (state.testAllRunning) return;
-    state.testAllRunning = true; state.testAll.disabled = true; state.testAll.textContent = "Starting tests…";
+    state.testAllRunning = true; if (state.testAll) { state.testAll.disabled = true; state.testAll.textContent = "Starting tests…"; }
     setLive(state, "Starting download-client tests. Disabled clients will be skipped.", "");
     try {
       const accepted = await api("/api/download-clients/test-all", {method: "POST", body: {}});
@@ -552,7 +561,7 @@
       }
       renderCards(state); setLive(state, `Test All complete: ${passed} connected, ${failed} failed, ${skipped} skipped.`, failed ? "bad" : "good");
     } catch (err) { setLive(state, errorText(err, "Test All failed."), "bad"); }
-    finally { state.testAllRunning = false; state.testAll.disabled = false; state.testAll.textContent = "Test All Clients"; }
+    finally { state.testAllRunning = false; if (state.testAll) { state.testAll.disabled = false; state.testAll.textContent = "Test All Instances"; } }
   }
 
   async function load(state) {
@@ -561,8 +570,8 @@
     state.loading = api("/api/download-clients", {method: "GET", cache: "no-store"})
       .then(payload => {
         state.payload = payload || {}; state.registry = payload.registry?.clients || []; state.instances = payload.instances || [];
-        state.add.disabled = !selectableRegistry(state).length; state.testAll.disabled = !state.instances.length;
-        renderCards(state); setLive(state, `${state.instances.length} additional download client instance${state.instances.length === 1 ? "" : "s"}.`, "");
+        state.add.disabled = !selectableRegistry(state).length; if (state.testAll) state.testAll.disabled = !state.instances.length;
+        renderCards(state); setLive(state, "", "");
       })
       .catch(err => {
         state.cards.replaceChildren(el("div", "download-client-inline-error", errorText(err, "Could not load download clients.")));
@@ -572,27 +581,47 @@
     return state.loading;
   }
 
+  // Masthead-toolbar hook: Test All Clients (settings toolbar) covers these
+  // additional instances too, so the manager needs no test button of its own.
+  function mountedState() {
+    const root = document.querySelector("[data-download-client-manager]");
+    return root ? stateByRoot.get(root) || null : null;
+  }
+  window.InkDropDownloadClientManager = Object.freeze({
+    hasInstances() {
+      const state = mountedState();
+      return !!(state && state.instances.length);
+    },
+    testAll() {
+      const state = mountedState();
+      if (!state || !state.instances.length) return Promise.resolve(false);
+      return runTestAll(state).then(() => true);
+    },
+  });
+
   function mount(parent) {
     if (!parent) return null;
     const previous = parent.querySelector(":scope > [data-download-client-manager]");
     if (previous) return previous;
     const root = el("section", "download-client-manager"); root.dataset.downloadClientManager = "1";
     const head = el("div", "download-client-manager-head");
-    const copy = el("div", ""); copy.append(el("h3", "", "Additional Download Client Instances"), el("p", "", "For running more than one instance of the same client (e.g. two qBittorrent hosts). The single qBittorrent/SABnzbd/SLSKD cards below cover the common one-instance-each case."));
+    // Heading + Add only, Sonarr-density: the explainer paragraph restated
+    // what the section name says, and Test/Refresh duplicated the masthead
+    // toolbar (Test All Clients now covers these instances too, via the
+    // InkDropDownloadClientManager hook below; the area reload re-runs
+    // load(), so a separate Refresh button was the masthead's twin).
+    const copy = el("div", ""); copy.append(el("h3", "", "Additional Download Client Instances"));
     const actions = el("div", "download-client-manager-actions");
     const add = el("button", "primary", "Add Download Client"); add.type = "button";
-    const testAll = el("button", "", "Test All Clients"); testAll.type = "button"; testAll.disabled = true;
-    const refresh = el("button", "", "Refresh Clients"); refresh.type = "button";
-    actions.append(add, testAll, refresh); head.append(copy, actions);
+    const testAll = null;
+    actions.append(add); head.append(copy, actions);
     const live = el("div", "download-client-manager-live"); live.setAttribute("role", "status"); live.setAttribute("aria-live", "polite");
     const cards = el("div", "download-client-instance-grid");
     const dialog = document.createElement("dialog"); dialog.className = "download-client-dialog"; dialog.setAttribute("aria-modal", "true");
     root.append(head, live, cards, dialog); parent.prepend(root);
-    const state = {root, add, testAll, refresh, live, cards, dialog, payload: {}, registry: [], instances: [], statuses: new Map(), testing: new Set(), testAllRunning: false, loading: null, returnFocus: null};
+    const state = {root, add, testAll: null, live, cards, dialog, payload: {}, registry: [], instances: [], statuses: new Map(), testing: new Set(), testAllRunning: false, loading: null, returnFocus: null};
     stateByRoot.set(root, state);
     add.addEventListener("click", () => showChooser(state, add));
-    testAll.addEventListener("click", () => runTestAll(state));
-    refresh.addEventListener("click", () => load(state));
     dialog.addEventListener("keydown", event => dialogKeydown(state, event));
     dialog.addEventListener("cancel", event => { event.preventDefault(); closeDialog(state); });
     dialog.addEventListener("click", event => { if (event.target === dialog) closeDialog(state); });

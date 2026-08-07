@@ -8,11 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import inkdrop_completed_import as completed
-import inkdrop_missing_acquire as acquire
-import inkdrop_manual_source_autoresolve as autoresolve
-import inkdrop_slskd_source_probe as probe
-import inkdrop_state
+from core import inkdrop_completed_import as completed
+from core import inkdrop_missing_acquire as acquire
+from core import inkdrop_manual_source_autoresolve as autoresolve
+from core import inkdrop_slskd_source_probe as probe
+from core import inkdrop_state
 
 
 def require(condition, message):

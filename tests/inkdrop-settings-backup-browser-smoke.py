@@ -9,14 +9,14 @@ import threading
 import types
 from pathlib import Path
 
-import inkdrop_state
+from core import inkdrop_state
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
     requests_stub.exceptions = types.SimpleNamespace(RequestException=Exception, Timeout=Exception, ConnectionError=Exception, HTTPError=Exception)
     sys.modules["requests"] = requests_stub
 
-import inkdrop_web
+from core import inkdrop_web
 
 
 def main():

@@ -19,7 +19,7 @@ from a filename guess, and stays blocked whenever that metadata is absent
 regresses).
 """
 
-import inkdrop_candidate_matching as matching
+from core import inkdrop_candidate_matching as matching
 
 
 def require(condition, message):

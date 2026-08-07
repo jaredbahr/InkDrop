@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "inkdrop_web.py"
+WEB = ROOT / "core" / "inkdrop_web.py"
 
 
 def fail(message: str) -> None:

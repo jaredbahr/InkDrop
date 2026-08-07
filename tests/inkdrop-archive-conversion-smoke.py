@@ -20,7 +20,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-import inkdrop_archive_conversion as conversion
+from core import inkdrop_archive_conversion as conversion
 
 
 COMICINFO = (

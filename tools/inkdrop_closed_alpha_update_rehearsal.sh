@@ -67,7 +67,7 @@ services:
       - ./library/manga:/library/manga
       - ./rehearsal-backup:/rehearsal-backup:ro
     healthcheck:
-      test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--timeout", "5"]
+      test: ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--timeout", "5"]
       interval: 5s
       timeout: 10s
       retries: 18
@@ -81,9 +81,9 @@ services:
       <<: *env
       INKDROP_CONTAINER_SCHEDULER_ENABLED: "1"
     volumes: *volumes
-    command: ["python", "-B", "inkdrop_container_scheduler.py"]
+    command: ["python", "-B", "core/inkdrop_container_scheduler.py"]
     healthcheck:
-      test: ["CMD", "python", "-B", "inkdrop_container_healthcheck.py", "--worker"]
+      test: ["CMD", "python", "-B", "core/inkdrop_container_healthcheck.py", "--worker"]
       interval: 5s
       timeout: 10s
       retries: 18
@@ -145,7 +145,7 @@ auth = json.load(urllib.request.urlopen("http://127.0.0.1:8796/api/auth/status",
 assert ((auth.get("auth") or {}).get("built_in_auth") or {}).get("bootstrap_required") is False, auth
 print(json.dumps({"version": p["version"], "commit": p["commit_sha"], "digest": p["image_digest"], "schema": 17, "state": "preserved"}, sort_keys=True))
 PY
-  docker compose exec -T inkdrop-worker python -B inkdrop_container_healthcheck.py --worker --json --wait-seconds 90 </dev/null >/dev/null
+  docker compose exec -T inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90 </dev/null >/dev/null
   expected="$(docker image inspect "$(docker compose config --images | sort -u)" --format '{{.Id}}')"
   test "$(docker inspect "$(docker compose ps -q inkdrop)" --format '{{.Image}}')" = "$expected"
   test "$(docker inspect "$(docker compose ps -q inkdrop-worker)" --format '{{.Image}}')" = "$expected"

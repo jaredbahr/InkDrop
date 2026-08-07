@@ -49,6 +49,23 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.08",
+      slug: "v0-1-08",
+      released_at: "2026-08-07",
+      title: "Undo a wrong match, fix manga units per series, and steadier imports",
+      summary: "Mostly focused on search/import reliability, better troubleshooting when something goes wrong, and UI cleanup, including a way to correct a wrong match after import and fix a series' manga unit type individually.",
+      highlights: [
+        "Manga series that release as individual issues are no longer searched and imported as volumes -- InkDrop now checks the series itself instead of assuming based on the provider.",
+        "Added a way to correct a wrong match after import: retract it, quarantine the file, and start a new search for the right one.",
+        "Allow-and-retry on Blocklist no longer hangs waiting on an external API; blocked items now show the source filename, wanted issue, and rejection reason.",
+        "Manual Review now shows the actual SLSKD filename, wanted issue, and rejection reason, with working approve/retry/delete and pagination for larger queues.",
+        "The Test button for additional SLSKD instances now performs a real connection check instead of doing nothing.",
+        "ComicInfo.xml now includes publisher information from ComicVine, backfilled across 2,417 existing archives.",
+        "Suwayomi and MangaDex downloads are now correctly attributed in History instead of losing their source.",
+        "Fixed a long-running import verification bug that could leave successfully imported files stuck for weeks."
+      ]
+    }),
+    publicRelease({
       version: "v0.1.07",
       slug: "v0-1-07",
       released_at: "2026-08-05",
@@ -63,6 +80,83 @@
         "Search matching is more accurate, and several import problems (ordering, stuck-in-queue, duplicate imports, multi-series packs) are fixed.",
         "Security improvements: provider credentials are no longer written to persistent storage, and a script-injection issue in search-result data has been fixed.",
         "Wanted, Queue, History, Blocklist, and Manual Review now use a new page-rendering system — pagination is noticeably faster on larger libraries."
+      ]
+    }),
+    publicRelease({
+      version: "v0.1.06",
+      slug: "v0-1-06",
+      released_at: "2026-08-02",
+      title: "Notifications become a real system, and SLSKD gets smarter searches",
+      summary: "Notifications now support per-channel event triggers, series scoping, quiet hours, and delivery history. SLSKD searches use better terms and more patience, several stuck-download patterns are fixed, and provider secrets no longer leak into diagnostics.",
+      highlights: [
+        "Notifications are a real system now: per-channel event triggers, series scoping, quiet hours, delivery history, and test buttons for Discord and Pushover.",
+        "SLSKD searches no longer waste queries on literal \"cbz\"/\"cbr\" keywords or miss singular/plural title variants, and get more time before assuming a timeout.",
+        "Fixed several stuck-download patterns: repeat-reject loops, permanent single-timeout blocks, and dead-end searches that only turn up already-rejected results.",
+        "Fixed downloads that were grabbed but never finished landing in your library.",
+        "Rate-limited or temporarily unavailable sources no longer get mislabeled as failed transfers.",
+        "The \"item imported\" notification no longer repeats for the same file on every re-check.",
+        "Provider API keys and webhook tokens no longer show up in error messages or diagnostic output.",
+        "Recover Missing's tiles no longer overlap, Search All's scope is clearer, and SLSKD's default per-user transfer cap was raised."
+      ]
+    }),
+    publicRelease({
+      version: "v0.1.05",
+      slug: "v0-1-05",
+      released_at: "2026-08-02",
+      title: "Comic one-shots stop getting rejected, and series can move library folders",
+      summary: "A large batch of acquisition and UI fixes. Comic one-shots and graphic novels no longer get rejected at import, oversized packs go to Manual Review instead of auto-grabbing, and a series content type and library folder can now be changed after creation.",
+      highlights: [
+        "Packs over a configurable size limit now go to Manual Review instead of being auto-grabbed.",
+        "Fixed comic one-shots and graphic novels getting permanently rejected at import.",
+        "Fixed a ComicsCodes health-check bug that could get the source stuck instead of simply marking it unhealthy.",
+        "You can now change a series' content type and library root folder after it's created.",
+        "SLSKD searches no longer waste early attempts on a redundant qualifier, and no longer leak filename text into queries through series aliases.",
+        "SLSKD can now recognize and convert raw page-image folders into a CBZ during import.",
+        "The History page supports searching by series title and no longer repeats duplicate entries.",
+        "Recover Missing, Attempts, and the SLSKD/download-client Settings cards all got clarity and usability fixes this build."
+      ]
+    }),
+    publicRelease({
+      version: "v0.1.04",
+      slug: "v0-1-04",
+      released_at: "2026-08-02",
+      title: "SLSKD stops crying wolf, and a wrong print-run stops auto-grabbing",
+      summary: "Fixed a bug where finished SLSKD searches could be wrongly logged and retried as timed out, likely the cause of \"SLSKD isn't working\" reports. Also fixes a wrong-volume auto-grab bug and a queue bug that excluded some series from search.",
+      highlights: [
+        "Fixed finished SLSKD searches sometimes being wrongly logged and retried as timed out.",
+        "Fixed candidates with the wrong volume or print run getting auto-grabbed as a safe match; unclear cases now go to Manual Review.",
+        "Fixed a queue bug that could permanently exclude some series from SLSKD search, and a stalled RSS discovery check.",
+        "Fixed a wrong-series match retrying endlessly instead of stopping after the first rejection.",
+        "SLSKD, Prowlarr, Torznab, and Newznab now try more results on a genuine zero-result search instead of waiting for the next pass.",
+        "Manual Review no longer hides legacy decisions, and supports bulk-ignore.",
+        "Fixed several qBittorrent and download-client bugs, including one that could wrongly blacklist a release.",
+        "Smaller fixes: faster status indicator, a clearer Queue wait panel, and automatic search on by default for new installs."
+      ]
+    }),
+    publicRelease({
+      version: "v0.1.03",
+      slug: "v0-1-03",
+      released_at: "2026-08-02",
+      title: "Search tries the right title, and the System page stops hanging",
+      summary: "Search now tries the title people actually share files under instead of burning its budget on one nobody uses, and a real print-run marker on the exact issue you wanted no longer gets rejected. The System page also stops hanging if a request stalls.",
+      highlights: [
+        "Searches for licensed creator-credit titles (like \"Naoki Urasawa's Monster\") now try the title people actually share files under, instead of spending the whole budget on one nobody uses.",
+        "A volume/print-run marker like \"v1 #19\" no longer gets treated as a mismatch when it's exactly the issue you wanted — that was silently blocking real grabs.",
+        "The System page no longer hangs on a silent \"Loading...\" if a request stalls; you'll see what failed instead."
+      ]
+    }),
+    publicRelease({
+      version: "v0.1.02",
+      slug: "v0-1-02",
+      released_at: "2026-08-01",
+      title: "Searches that found nothing now work",
+      summary: "Several separate faults could each stop a series from ever getting a search result. If something has sat in Wanted with no explanation, this build is worth trying.",
+      highlights: [
+        "Searches run properly again, and reuse a recent result instead of asking twice for the same thing.",
+        "Volumes and chapters match correctly, and ordinary comic filenames are no longer rejected.",
+        "A failed archive read could be remembered as having no metadata for two weeks, and the wrong issue imported afterwards.",
+        "A CBR import could crash after copying the file and mark a good file as bad.",
+        "qBittorrent supports API keys. MangaDex mature content is ranked, not hidden."
       ]
     })
   ]);

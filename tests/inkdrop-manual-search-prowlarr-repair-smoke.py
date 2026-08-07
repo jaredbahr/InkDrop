@@ -12,11 +12,11 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-import inkdrop_manual_search as manual
-import inkdrop_manual_search_executor as executor
-import inkdrop_source_worker_adapters as adapters
-import inkdrop_source_worker_cli as cli
-import inkdrop_source_worker_http as source_http
+from core import inkdrop_manual_search as manual
+from core import inkdrop_manual_search_executor as executor
+from core import inkdrop_source_worker_adapters as adapters
+from core import inkdrop_source_worker_cli as cli
+from core import inkdrop_source_worker_http as source_http
 
 
 def require(value, message):

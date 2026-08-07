@@ -26,9 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import inkdrop_preflight
-import inkdrop_runtime_config
-import inkdrop_state
+from core import inkdrop_preflight
+from core import inkdrop_runtime_config
+from core import inkdrop_state
 
 
 REQUIRED_STATUS_FIELDS = {
@@ -224,7 +224,7 @@ def run_smoke(*, startup_timeout=45, skip_if_missing_dependencies=False):
         inkdrop_state.ensure_schema(inkdrop_runtime_config.state_db_path(env))
 
         proc = subprocess.Popen(
-            [sys.executable, "-B", "inkdrop_web.py"],
+            [sys.executable, "-B", "core/inkdrop_web.py"],
             cwd=ROOT,
             env=env,
             text=True,

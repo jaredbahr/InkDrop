@@ -3,7 +3,7 @@
 import sys
 import types
 
-import inkdrop_internal_jobs
+from core import inkdrop_internal_jobs
 
 
 calls = []
@@ -11,8 +11,8 @@ fake_web = types.SimpleNamespace(
     scan_comic_series=lambda payload: calls.append(("comicvine", payload)) or {"status": "configuration_needed"},
     resolve_noop_manual_reviews=lambda: calls.append(("review", None)) or {"status": "ok", "resolved": 2},
 )
-original = sys.modules.get("inkdrop_web")
-sys.modules["inkdrop_web"] = fake_web
+original = sys.modules.get("core.inkdrop_web")
+sys.modules["core.inkdrop_web"] = fake_web
 try:
     assert inkdrop_internal_jobs.run_job("comicvine-scan") == (78, {"status": "configuration_needed"})
     assert inkdrop_internal_jobs.run_job("manual-review-noop-resolve") == (
@@ -21,9 +21,9 @@ try:
     )
 finally:
     if original is None:
-        sys.modules.pop("inkdrop_web", None)
+        sys.modules.pop("core.inkdrop_web", None)
     else:
-        sys.modules["inkdrop_web"] = original
+        sys.modules["core.inkdrop_web"] = original
 
 assert calls == [("comicvine", {}), ("review", None)]
 print("INKDROP_INTERNAL_JOBS_AUTH_OK")

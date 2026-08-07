@@ -9,11 +9,11 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import inkdrop_direct_downloader as downloader
-import inkdrop_source_catalog as catalog
-import inkdrop_source_providers as source_providers
-import inkdrop_source_worker_adapters as source_adapters
-import inkdrop_source_worker_http as source_http
+from core import inkdrop_direct_downloader as downloader
+from core import inkdrop_source_catalog as catalog
+from core import inkdrop_source_providers as source_providers
+from core import inkdrop_source_worker_adapters as source_adapters
+from core import inkdrop_source_worker_http as source_http
 
 
 def fail(message):

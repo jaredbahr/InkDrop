@@ -3,14 +3,14 @@
 
 from pathlib import Path
 
-import inkdrop_library_frontends
+from core import inkdrop_library_frontends
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "inkdrop_web.py"
-IMPORTER = ROOT / "inkdrop_completed_import.py"
-PACK_IMPORT = ROOT / "inkdrop_pack_import.py"
-RECONCILE = ROOT / "inkdrop_reconcile_imports.py"
+WEB = ROOT / "core" / "inkdrop_web.py"
+IMPORTER = ROOT / "core" / "inkdrop_completed_import.py"
+PACK_IMPORT = ROOT / "core" / "inkdrop_pack_import.py"
+RECONCILE = ROOT / "core" / "inkdrop_reconcile_imports.py"
 PLAN = ROOT / "docs" / "inkdrop" / "folder-based-completion-plan.md"
 
 
@@ -440,7 +440,7 @@ def main():
     pack_import = PACK_IMPORT.read_text(encoding="utf-8")
     reconcile = RECONCILE.read_text(encoding="utf-8")
     plan = PLAN.read_text(encoding="utf-8")
-    frontends = (ROOT / "inkdrop_library_frontends.py").read_text(encoding="utf-8")
+    frontends = (ROOT / "core" / "inkdrop_library_frontends.py").read_text(encoding="utf-8")
     require(importer, "import inkdrop_library_frontends", "completed-import frontend helper import")
     require(importer, "def sync_library_frontend_folders", "completed-import frontend sync wrapper")
     require(importer, "def kavita_file_visible_for_host_path", "completed-import Kavita visibility adapter")

@@ -14,7 +14,7 @@ rows never made the cut.
 
 import time
 
-import inkdrop_slskd_source_probe as probe
+from core import inkdrop_slskd_source_probe as probe
 
 
 def require(condition, message):
