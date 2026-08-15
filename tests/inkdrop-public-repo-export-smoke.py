@@ -407,8 +407,34 @@ def assert_exported_readme_is_approved(root, result):
         shipped.strip() in approved,
         "exported README drifted from the approved source text",
     )
-    require("all rights reserved" in shipped.lower(), "exported README should carry the resolved license")
+    require("GNU General Public License, version 3 or later" in shipped, "exported README should carry the GPL-3.0-or-later license")
+    require("all rights reserved" not in shipped.lower(), "exported README should not carry the superseded proprietary license text")
     require("a license has not been selected" not in shipped.lower(), "exported README license placeholder should be resolved")
+    for link, label in (
+        ("github.com/jaredbahr/InkDrop/releases", "public prereleases"),
+        ("github.com/users/jaredbahr/packages/container/package/inkdrop", "public GHCR package"),
+        ("img.shields.io/badge/license-GPL--3.0--or--later-blue.svg", "GPL badge"),
+        ('href="LICENSE"', "GPL license"),
+    ):
+        require(link in shipped, f"exported README should link to the {label}")
+    require("- **" not in shipped, "exported README feature lists should use plain bullets")
+    require("Updates are currently manual." in shipped, "exported README should state the manual-update limitation plainly")
+    for statement, label in (
+        ("when it finds one clear match", "conditional metadata linking"),
+        ("when automation is on and the series is monitored", "conditional automatic search"),
+        ("With automation on, an enabled provider, and the series monitored", "conditional search retry"),
+        ("A ComicVine API key is optional because InkDrop can use local metadata.", "optional ComicVine metadata"),
+        ("if you want automatic acquisition", "optional download source"),
+        ("Open Activity to see current work.", "current Activity state"),
+        ("Open History to see completed results.", "completed History state"),
+        ("Keep InkDrop on a trusted LAN or VPN. The default endpoint uses plain HTTP.", "private-network boundary"),
+        ("Do not publish port 8796 directly to the internet.", "direct-exposure warning"),
+        ("Put remote access behind a trusted HTTPS reverse proxy", "remote-access boundary"),
+        ("create the admin login before other clients can reach InkDrop", "bootstrap ordering"),
+    ):
+        require(statement in shipped, f"exported README should state {label} plainly")
+    require("- A free ComicVine API key" not in shipped, "exported README should not make ComicVine mandatory")
+    require("for a few seconds" not in shipped, "exported README should not invent an import slowdown duration")
     require(
         "ghcr.io/jaredbahr/inkdrop:latest" in shipped,
         "exported README should carry the public inkdrop:latest reference",

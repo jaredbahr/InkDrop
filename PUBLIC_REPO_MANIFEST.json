@@ -33,8 +33,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "ba741329e950d025745ad8deda08db88ca64d3d89b14407ff00bee7ea91797b6",
-      "size_bytes": 5717
+      "sha256": "a3408edccdcda9e7a0e1ab09193a78aa6ec0dbd40c18bfe6dcc2828c49e92844",
+      "size_bytes": 6253
     },
     {
       "path": "core/__init__.py",
@@ -1073,8 +1073,8 @@
     },
     {
       "path": "tests/inkdrop-public-repo-export-smoke.py",
-      "sha256": "9ab2d0997cc281c47e8c783de4dbc5f06e8ed4373873e8214bd0f69087680107",
-      "size_bytes": 27869
+      "sha256": "0982925290b9c963e67785ddcfd6332aeaa4151bfba42ad658218fb013faa26b",
+      "size_bytes": 30027
     },
     {
       "path": "tests/inkdrop-public-security-smoke.py",
@@ -1819,5 +1819,5 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "total_size_bytes": 19445450
+  "total_size_bytes": 19448144
 }
