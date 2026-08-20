@@ -273,7 +273,7 @@ function IssueRowView({
 }) {
   const status = seriesDetailIssueStatus(row);
   const detail = seriesDetailIssueDetailText(row);
-  const title = seriesDetailIssueDisplayTitle(row, detail);
+  const title = seriesDetailIssueDisplayTitle(row);
   const issueLabel = row.issue_number ? `#${row.issue_number}` : String(row.normalized_number || "Issue");
   const meta = [row.issue_metadata_provider || row.metadata_provider || "", row.issue_metadata_id ? `ID ${row.issue_metadata_id}` : ""]
     .filter(Boolean)

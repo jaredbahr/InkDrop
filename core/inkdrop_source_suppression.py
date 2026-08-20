@@ -12,6 +12,7 @@ import json
 import re
 import time
 
+from core import inkdrop_records
 from core import inkdrop_source_providers as providers
 from core import inkdrop_state
 from core import inkdrop_sources
@@ -20,6 +21,135 @@ from core import inkdrop_sources
 CONTRACT_VERSION = 2
 
 SOURCE_MEMORY_REASON = "known_bad_source_candidate"
+
+# Memoization of settled refusals.
+#
+# The blocklist decides correctly every time it is asked. It is asked far too
+# often: 24,300 known_bad_candidate_skipped rows on production in the 7 days to
+# 2026-08-15, across 87 distinct (queue row, release) decisions. `Powers 016
+# (2001) (Digital) (Zone-Empire).cbr` alone was re-offered and re-refused 1,431
+# times over 12.9 days -- 4.6 an hour, correct every single time -- and each of
+# those refusals re-ran the full lookup, which materialises 3.5 MB of raw_json
+# to answer a question we had already answered.
+#
+# Only *refusals* are memoized. A cached refusal can only ever cause more
+# blocking, never less, so a stale one errs in the safe direction. A cached
+# "nothing known" would be a bypass window -- a release blocked one second ago
+# would sail through until the entry expired -- so a negative result is always
+# recomputed against the database.
+DECISION_MEMO_MAX_ENTRIES = 4096
+# Sized against what it has to outlive, not picked round. Production repeats of
+# the same (queue row, release) refusal arrive on a median 841s gap (p10 659s,
+# p90 1052s, 7 days to 2026-08-15). A 300s ceiling would absorb 2.5% of them and
+# read as a fix while changing nothing; 3600s absorbs 99.6%. Safe to set loosely
+# because it is only a backstop -- _memo_get() re-checks the block row itself on
+# every hit, so the ceiling is never what keeps a refusal honest.
+DECISION_MEMO_TTL_SECONDS = 3600.0
+
+_DECISION_MEMO = {}
+
+
+def invalidate_source_memory_memo(db_path=None):
+    """Drop memoized refusals. Belt-and-braces next to the per-hit revalidation."""
+    if not db_path:
+        _DECISION_MEMO.clear()
+        return
+    key = str(db_path)
+    for memo_key in [entry for entry in _DECISION_MEMO if entry[0] == key]:
+        _DECISION_MEMO.pop(memo_key, None)
+
+
+def _memo_key(db_path, payload, cooldown_seconds):
+    return (
+        str(db_path),
+        str(cooldown_seconds if cooldown_seconds not in (None, "") else ""),
+        tuple(
+            str(payload.get(field) or "")
+            for field in (
+                "source", "provider", "protocol", "scope_key", "series",
+                "title", "download_url_hash", "source_path", "reason",
+            )
+        ),
+    )
+
+
+def _cooldown_deadline(last_seen_at, cooldown_seconds):
+    try:
+        return float(last_seen_at or 0) + max(0, float(cooldown_seconds or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _memo_get(db_path, memo_key, now, cooldown_seconds):
+    """Return a still-valid memoized refusal, or None.
+
+    Validity is re-derived from the block row this refusal was built on, via one
+    primary-key probe. That is deliberately not the same as "has the blocklist
+    changed at all": production writes a blocklist row roughly every 205s while
+    the same refusal comes back on a median 841s gap, so any table-wide
+    invalidation signal would discard most entries this memo exists to serve,
+    because some unrelated release was blocked in between. An unrelated write is
+    not a reason to re-derive *this* refusal, and a newly recorded block can only
+    add refusals, never turn one into an acceptance.
+
+    What the probe does catch is everything that can actually change this
+    answer: the row being deleted (which is how a user's unblock lands), its
+    reason changing, and -- via the live last_seen_at -- the cooldown deadline
+    moving. The deadline is recomputed here rather than trusted from the cached
+    decision, because a memo that skipped that could go on refusing past the
+    point the cooldown had released the candidate, which is exactly the "a
+    bad_source_candidates row suppresses its candidate forever" failure the
+    default cooldown exists to end.
+    """
+    entry = _DECISION_MEMO.get(memo_key)
+    if not entry:
+        return None
+    expires_at, block_id, block_reason, decision = entry
+    if now >= expires_at:
+        _DECISION_MEMO.pop(memo_key, None)
+        return None
+    live = inkdrop_state.bad_source_candidate_validity_token(db_path, block_id)
+    if live is None:
+        _DECISION_MEMO.pop(memo_key, None)
+        return None
+    live_reason, live_last_seen_at = live
+    if live_reason != block_reason:
+        _DECISION_MEMO.pop(memo_key, None)
+        return None
+    retry_after = _cooldown_deadline(live_last_seen_at, cooldown_seconds)
+    if retry_after and now >= retry_after:
+        _DECISION_MEMO.pop(memo_key, None)
+        return None
+    decision = dict(decision)
+    decision["source_memory_memoized"] = True
+    if retry_after:
+        decision["retry_after"] = retry_after
+        decision["retry_after_iso"] = inkdrop_state.utc_stamp(retry_after)
+    return decision
+
+
+def _memo_put(memo_key, now, decision):
+    if not decision.get("suppressed"):
+        return
+    block = decision.get("bad_source_candidate") or {}
+    block_id = str(block.get("id") or "").strip()
+    if not block_id:
+        return
+    expires_at = now + DECISION_MEMO_TTL_SECONDS
+    retry_after = decision.get("retry_after")
+    if retry_after:
+        expires_at = min(expires_at, float(retry_after))
+    if expires_at <= now:
+        return
+    if len(_DECISION_MEMO) >= DECISION_MEMO_MAX_ENTRIES:
+        for stale_key, stale_entry in list(_DECISION_MEMO.items()):
+            if stale_entry[0] <= now:
+                _DECISION_MEMO.pop(stale_key, None)
+        if len(_DECISION_MEMO) >= DECISION_MEMO_MAX_ENTRIES:
+            _DECISION_MEMO.pop(next(iter(_DECISION_MEMO)), None)
+    _DECISION_MEMO[memo_key] = (
+        expires_at, block_id, str(block.get("reason") or ""), dict(decision),
+    )
 
 # source_memory_decision() only applies a cooldown when a caller passes
 # cooldown_seconds; every real caller threads that value from
@@ -290,7 +420,7 @@ def _owned_task_identity_matches(candidate, download_task):
     task_identity = str(task.get("candidate_identity") or "").strip().lower()
     external_id = str(task.get("external_id") or "").strip().lower()
     recorded_identity = str(task_candidate.get("candidate_identity") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{24}", identity):
+    if not inkdrop_records.is_candidate_identity(identity):
         return False
     if not identity == task_identity == external_id == recorded_identity:
         return False
@@ -501,7 +631,7 @@ def _safe_alternate_candidate_matches_task(candidate, task, wanted_item=None):
     if str(candidate.get("auto_grab_verdict") or "").strip().lower() != "auto_grab_safe":
         return False
     current_identity = str(candidate.get("candidate_identity") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{24}", current_identity):
+    if not inkdrop_records.is_candidate_identity(current_identity):
         return False
     provider_values = (
         inkdrop_sources.provider_key(candidate.get("provider_id")),
@@ -611,6 +741,15 @@ def source_memory_decision(
     cooldown_seconds=None,
 ):
     payload = bad_source_payload_from_candidate(candidate, registry_row, wanted_item, reason=reason, seen_at=now)
+    resolved_now = time.time() if now is None else float(now)
+    effective_cooldown = (
+        cooldown_seconds if cooldown_seconds not in (None, "") else DEFAULT_SOURCE_MEMORY_COOLDOWN_SECONDS
+    )
+    memo_key = _memo_key(db_path, payload, cooldown_seconds)
+    memoized = _memo_get(db_path, memo_key, resolved_now, effective_cooldown)
+    if memoized is not None:
+        return memoized
+
     found = inkdrop_state.find_bad_source_candidate(
         db_path,
         title=payload.get("title"),
@@ -655,11 +794,8 @@ def source_memory_decision(
         )
         return decision
 
-    now = time.time() if now is None else float(now)
-    effective_cooldown_seconds = (
-        cooldown_seconds if cooldown_seconds not in (None, "") else DEFAULT_SOURCE_MEMORY_COOLDOWN_SECONDS
-    )
-    retry_after = float(found.get("last_seen_at") or 0) + max(0, float(effective_cooldown_seconds or 0))
+    now = resolved_now
+    retry_after = _cooldown_deadline(found.get("last_seen_at"), effective_cooldown)
     decision["retry_after"] = retry_after
     decision["retry_after_iso"] = inkdrop_state.utc_stamp(retry_after) if retry_after else ""
     if retry_after and now >= retry_after:
@@ -667,6 +803,7 @@ def source_memory_decision(
         return decision
 
     decision.update({"reason": SOURCE_MEMORY_REASON, "suppressed": True})
+    _memo_put(memo_key, now, decision)
     return decision
 
 

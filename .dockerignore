@@ -8,6 +8,7 @@
 !/Dockerfile
 !/requirements.txt
 !/inkdrop-logo-mark.png
+!/inkdrop-logo-mark-mobile.png
 !/web/
 !/web/static/
 !/web/static/css/
@@ -47,16 +48,17 @@
 # inside the image; a locally-built copy on the host must not leak into
 # the context, or a pre-build-then-measure workflow silently doubles it.
 /web/static/dist/
-!/inkdrop-completion-identity-audit-diff-alert.sh
-!/inkdrop-completion-identity-audit-diff-check.sh
+!/scripts/
+!/scripts/inkdrop-completion-identity-audit-diff-alert.sh
+!/scripts/inkdrop-completion-identity-audit-diff-check.sh
 !/inkdrop-docker-entrypoint.sh
-!/inkdrop-import-ready-worker.sh
-!/inkdrop-series-autopilot-cron.sh
-!/inkdrop-source-worker-mangadex-cron.sh
-!/inkdrop-source-worker-suwayomi-cron.sh
-!/inkdrop-source-worker.sh
-!/inkdrop-state-path-contract-sync-regression-alert.sh
-!/inkdrop-state-path-contract-sync-regression-check.sh
+!/scripts/inkdrop-import-ready-worker.sh
+!/scripts/inkdrop-series-autopilot-cron.sh
+!/scripts/inkdrop-source-worker-mangadex-cron.sh
+!/scripts/inkdrop-source-worker-suwayomi-cron.sh
+!/scripts/inkdrop-source-worker.sh
+!/scripts/inkdrop-state-path-contract-sync-regression-alert.sh
+!/scripts/inkdrop-state-path-contract-sync-regression-check.sh
 !/core/
 !/core/inkdrop_acquire_adapter.py
 !/core/inkdrop_archive_conversion.py
@@ -120,6 +122,8 @@
 !/core/inkdrop_preflight.py
 !/core/inkdrop_public_contracts.py
 !/core/inkdrop_reconcile_imports.py
+!/core/inkdrop_release_dates.py
+!/core/inkdrop_records.py
 !/core/inkdrop_release_calendar.py
 !/core/inkdrop_runtime_config.py
 !/core/inkdrop_settings_registry.py

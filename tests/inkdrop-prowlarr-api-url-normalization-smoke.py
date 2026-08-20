@@ -180,6 +180,10 @@ def test_prowlarr_api_health_normalizes_stored_base_url():
                 requested_urls == [
                     "http://127.0.0.1:9696/api/v1/system/status",
                     "http://127.0.0.1:9696/api/v1/indexer",
+                    # The health probe also reads per-indexer availability now:
+                    # "N indexers enabled" stays true while some of them are in
+                    # failure backoff and answering nothing.
+                    "http://127.0.0.1:9696/api/v1/indexerstatus",
                 ],
                 f"stored base_url {stored_base_url!r} produced wrong request URLs: {requested_urls}",
             )

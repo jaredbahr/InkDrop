@@ -188,10 +188,20 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-target-unit-") as temp:
     collected = matching.apply_compatibility(
         {"title": "Fullmetal Alchemist Omnibus Volume 17.cbz"}, stored
     )
+    # Re-pinned 2026-08-18 alongside the acquisition-policy change, and not to
+    # make anything pass. This omnibus IS the wanted volume 17 -- positive
+    # evidence is exact_volume_number -- and edition was the only objection.
+    # The product rule is content first, edition does not matter, so edition
+    # alone no longer refuses. It is surfaced instead, and the safety half is
+    # asserted right below: it still must not auto-satisfy the target.
     require(
-        "collected_edition_disallowed" in collected["block_reasons"]
+        "collected_edition_disallowed" in collected["review_reasons"]
         or "wrong_unit_type" in collected["block_reasons"],
         collected,
+    )
+    require(
+        not collected.get("candidate_safe") and collected.get("auto_grab_verdict") != "auto_grab_safe",
+        f"a collected edition must never auto-satisfy an exact volume target: {collected}",
     )
 
     with inkdrop_state.connect_read(db) as con:

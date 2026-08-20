@@ -1989,6 +1989,9 @@ def _qbit_poll_source(cfg, *, instance_id=None, db_path=None):
                     "category": category,
                     "tags": raw_tags,
                     "progress": progress,
+                    # qBittorrent's progress is already 0-1; naming the unit
+                    # explicitly keeps this off the guess-by-magnitude path.
+                    "progress_fraction": progress,
                     "state": state,
                     "bytes_total": torrent.get("total_size") or torrent.get("size"),
                     "bytes_completed": torrent.get("downloaded"),
@@ -2145,6 +2148,21 @@ def classify_sab_history_slot(slot):
     return None, None, raw_text
 
 
+def sab_progress_fraction(percentage):
+    """SABnzbd reports `percentage` as 0-100; every sibling here is 0-1.
+
+    Assigning it straight through was a live defect: `progress` is compared
+    against 0.999 downstream, so a SABnzbd job at 1% ("percentage": "1") read
+    as a finished download. The conversion belongs here, at the one place the
+    provider's number enters InkDrop.
+    """
+    try:
+        value = float(str(percentage).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, value / 100.0))
+
+
 def sab_items():
     settings = sab_settings()
     if not settings:
@@ -2166,7 +2184,8 @@ def sab_items():
                     "nzo_id": slot.get("nzo_id"),
                     "category": category,
                     "status": slot.get("status"),
-                    "progress": slot.get("percentage"),
+                    "progress": sab_progress_fraction(slot.get("percentage")),
+                    "progress_fraction": sab_progress_fraction(slot.get("percentage")),
                     "mb": slot.get("mb"),
                     "mbleft": slot.get("mbleft"),
                     "speed": slot.get("speed"),
@@ -2209,7 +2228,8 @@ def sab_items():
                     "nzo_id": slot.get("nzo_id"),
                     "category": category,
                     "status": slot.get("status"),
-                    "progress": slot.get("percentage"),
+                    "progress": sab_progress_fraction(slot.get("percentage")),
+                    "progress_fraction": sab_progress_fraction(slot.get("percentage")),
                     "mb": slot.get("mb"),
                     "mbleft": slot.get("mbleft"),
                     "completed_at": slot.get("completed"),
@@ -8598,6 +8618,26 @@ def failed_import_reason_from_skips(skipped):
     return "importer_skipped_without_import"
 
 
+def importer_left_no_verdict(parsed, returncode=0):
+    """True when a non-zero importer exited without saying what it did.
+
+    An importer that rejects an artifact says so: it names the file under
+    "skipped" with a reason. An importer that dies partway names nothing at
+    all -- and because the copy runs before the summary is emitted, "nothing
+    reported" is not the same claim as "nothing landed". Live proof from
+    2026-08-14: the page-pack import of "Choujin X - Chapter 72.3.cbz" exited
+    1 with an empty summary, yet the byte-identical file was already sitting
+    in the library folder. The staged copy was still in staging, so the work
+    was recoverable -- it just was never retried.
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    if not returncode:
+        return False
+    imported = parsed.get("imported") if isinstance(parsed.get("imported"), list) else []
+    skipped = parsed.get("skipped") if isinstance(parsed.get("skipped"), list) else []
+    return not imported and not skipped
+
+
 def terminal_import_artifact_rejection(parsed):
     parsed = parsed if isinstance(parsed, dict) else {}
     skipped = parsed.get("skipped") if isinstance(parsed.get("skipped"), list) else []
@@ -8842,10 +8882,19 @@ def record_inkdrop_import_attempt(record, parsed, returncode=0):
             "download_task_id": task_id,
         }
     if state == "failed_import":
+        # Only a verdict makes a failure terminal. When the importer named no
+        # imported and no skipped file, it never judged this artifact, so
+        # retiring the staged copy throws away work that may already be
+        # finished on disk: the file gets left in the library with no
+        # media_files row, no import_result and no history event, while the
+        # wanted item goes back to chasing a chapter it already has. Handing
+        # the staged artifact back as import_ready lets the next pass re-run
+        # the importer, which reports an already-present destination file as
+        # skipped-existing and settles the item instead of re-downloading it.
         release = release_inkdrop_import_attempt(
             record,
             reason,
-            retry_staged=False,
+            retry_staged=importer_left_no_verdict(parsed, returncode),
             artifact_retry_blocked=terminal_import_artifact_rejection(parsed),
         )
         return {"ok": False, "reason": reason, "skipped": "failed_import", "release": release}

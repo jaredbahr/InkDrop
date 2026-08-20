@@ -7,6 +7,7 @@
       --panel-3: #2b323a;
       --line: #343c46;
       --line-soft: #2b333c;
+      --border: var(--line);
       --text: #dce4ec;
       --muted: #9aa7b4;
       --accent: #36a9d6;
@@ -10183,21 +10184,52 @@
       padding: 18px;
       background: rgba(0, 0, 0, .72);
     }
+    /* The dialog is a column whose BODY scrolls -- the head and the action
+       footer are never part of the scrolled content. It used to be a plain
+       `display: grid; overflow: auto` box, which made the whole stack
+       (including the footer) the scroll content: once the content exceeded
+       `100vh - 36px` the action row rendered past the dialog's own clip
+       boundary. The clipped part is not hit-testable, so a tap on a visible
+       action button landed on the `.series-remove-modal` backdrop behind it
+       -- and the backdrop's click handler CLOSES the dialog. The decision
+       looked like it did nothing. Buttons below the fold were unreachable
+       outright. Only the >=1100px docked Manual Review panel had this fixed
+       (it sets the same flex/scroll-body rules on its own dialog); every
+       narrow viewport still fell back to this shared rule, which is why it
+       read as a phone-only bug. Applies to every dialog on this markup
+       (Manual Review decision, confirm, text prompt, remove/move series),
+       because the trap is the shared box, not one panel. */
     .series-remove-dialog {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       width: min(620px, calc(100vw - 24px));
       max-height: calc(100vh - 36px);
-      overflow: auto;
+      overflow: hidden;
       border: 1px solid rgba(255, 125, 125, .42);
       border-radius: 4px;
       background: #22272e;
       box-shadow: 0 18px 42px rgba(0, 0, 0, .45);
+    }
+    /* Head, footer and the prev/next nav keep their natural height; only the
+       body absorbs the leftover space and scrolls. `min-height: 0` is what
+       lets a flex item shrink below its content size -- without it the body
+       refuses to shrink and pushes the footer back out of the box. */
+    .series-remove-dialog > * {
+      flex: 0 0 auto;
+    }
+    .series-remove-dialog > .series-remove-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
     }
     .series-remove-dialog.warn {
       border-color: rgba(247, 201, 111, .48);
     }
     .series-remove-dialog.good {
       border-color: rgba(120, 217, 155, .38);
+    }
+    .series-remove-dialog.info {
+      border-color: rgba(114, 210, 255, .38);
     }
     .series-remove-head,
     .series-remove-foot {
@@ -10255,6 +10287,13 @@
     .series-remove-alert.good {
       border-color: rgba(120, 217, 155, .34);
       background: rgba(10, 43, 37, .24);
+    }
+    /* The base alert is red because this dialog was built for destructive
+       confirmations. A read-only view borrows the same shell and must not
+       inherit the danger framing. */
+    .series-remove-alert.info {
+      border-color: rgba(114, 210, 255, .32);
+      background: rgba(12, 34, 48, .24);
     }
     .manual-review-decision-dialog {
       width: min(860px, calc(100vw - 24px));
@@ -10364,6 +10403,30 @@
       font-size: 13px;
       line-height: 1.4;
     }
+    /* Pinned between the scrolling body and the action row, so a failed
+       decision is reported where the person is already looking -- the toast
+       is behind this overlay on narrow viewports. */
+    .manual-review-decision-status[hidden] {
+      display: none;
+    }
+    .manual-review-decision-status {
+      padding: 10px 16px;
+      border-top: 1px solid rgba(255, 255, 255, .14);
+      background: rgba(74, 24, 24, .3);
+      color: var(--bad);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .manual-review-decision-status.warn {
+      background: rgba(58, 41, 13, .3);
+      color: var(--warn);
+    }
+    .manual-review-decision-status.good {
+      background: rgba(18, 48, 30, .3);
+      color: var(--good);
+    }
     .manual-review-decision-actions {
       flex-wrap: wrap;
       align-items: stretch;
@@ -10426,6 +10489,7 @@
     }
     .series-remove-alert.warn strong { color: var(--warn); }
     .series-remove-alert.good strong { color: var(--good); }
+    .series-remove-alert.info strong { color: var(--text); }
     .series-remove-alert span,
     .series-remove-copy {
       color: var(--muted);
@@ -10533,6 +10597,10 @@
     .series-remove-confirm.warn {
       color: var(--warn);
       border-color: rgba(247, 201, 111, .48);
+    }
+    .series-remove-confirm.info {
+      color: var(--text);
+      border-color: rgba(114, 210, 255, .38);
     }
     .series-remove-confirm.good {
       color: var(--good);
@@ -19272,11 +19340,35 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
   background: var(--panel-2);
 }
 
+/* A switched-off connection used to differ from a working one by a single
+   small chip, which meant a disabled Discord and an enabled Pushover read as
+   the same card at a glance. Recessing the card and quieting its heading give
+   the state something to land on before you get to the chip; the muted trigger
+   pills the JS switches to do the rest.
+
+   Two things this deliberately does not do. It does not dim the card with
+   opacity -- that would drag Configure/Test/Delete down with it and make
+   working buttons look dead, when a disabled connection is still fully
+   editable and testable. And it stays solid-bordered: dashed already means
+   "empty slot" on the Add Connection tile below, and a disabled connector is
+   configured, not absent. */
+.notifications-channel-card.is-disabled {
+  background: var(--panel);
+}
+
+.notifications-channel-card.is-disabled h3 {
+  color: var(--muted);
+}
+
 .notifications-channel-card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.notifications-channel-off-note {
+  margin: 0;
 }
 
 .notifications-channel-card-head h3 {
@@ -19401,6 +19493,31 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
 .library-adoption-panel > button,
 .archive-conversion-panel > button {
   justify-self: start;
+}
+
+/* Check and Convert are two steps of one job, so they sit on one row. Stacked,
+   with a progress bar rendering below them, it read as three unrelated
+   controls and it was never obvious which one was live. */
+.archive-conversion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+/* When a stored result was taken. Muted while it is merely old; warm once the
+   library has moved under it, because that is when acting on it is a mistake. */
+.scan-run-age {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.scan-run-age.stale {
+  padding: 8px 10px;
+  border: 1px solid rgba(230, 162, 62, .4);
+  border-radius: 4px;
+  background: rgba(230, 162, 62, .1);
+  color: #e6a23e;
 }
 
 .library-adoption-form {
@@ -19917,6 +20034,44 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
 .download-client-delete-warning p {
   margin: 4px 0 0;
   color: var(--muted);
+}
+
+/* A legacy client card whose config now lives on a real instance must stay
+   gone. hideMigratedLegacyCards() sets the `hidden` property, but
+   applyInkdropSettingsSearch() clears `hidden` on every .settings-card whenever
+   the search box is empty -- which is most of the time -- so the superseded card
+   came straight back and the page showed the same client twice. The data
+   attribute is the durable signal: only the manager writes it, and no filter
+   pass touches it. */
+.settings-card[data-download-client-legacy-fallback="hidden-by-instance"] {
+  display: none !important;
+}
+
+/* Labelled break between the clients a user connects InkDrop to and the
+   sources already built into it. Spans the settings grid so the two groups
+   read as two groups rather than one long list of cards. */
+.settings-subsection-divider {
+  grid-column: 1 / -1;
+  min-width: 0;
+  margin: 6px 0 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line, #2a2f3a);
+}
+
+.settings-subsection-divider h3 {
+  margin: 0;
+}
+
+.settings-subsection-divider p {
+  margin: 4px 0 0;
+  max-width: 68ch;
+  color: var(--muted);
+}
+
+/* Keeps the clients-vs-built-in-sources explainer to a readable measure
+   instead of stretching across a wide settings column. */
+.download-client-manager-copy {
+  max-width: 68ch;
 }
 
 .download-client-manager-actions,
@@ -20799,6 +20954,48 @@ button.missing-recovery-metric:focus-visible {
 .provider-test-button[data-test-state="ok"]::before { content: "\2713"; }
 .provider-test-button[data-test-state="err"]::before { content: "\2715"; }
 @keyframes provider-test-spin { to { transform: rotate(360deg); } }
+
+/* Delivery history is the one .series-remove-dialog that holds an
+   arbitrarily long list. The base dialog puts overflow:auto on itself, which
+   is right for a short confirm box but scrolls the title and the close button
+   out of reach here once "Load more" has been used a few times -- leaving
+   Escape or a backdrop click as the only way out. Give this one a fixed frame
+   and scroll the body instead, with the column labels pinned so a row 200
+   deep still says which column is which. */
+.notifications-history-list-modal .series-remove-dialog {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* Neutral, not the base dialog's destructive red -- nothing here deletes
+     anything. */
+  border-color: rgba(255, 255, 255, .16);
+}
+
+.notifications-history-list-modal .series-remove-head {
+  flex: 0 0 auto;
+}
+
+.notifications-history-list-modal .series-remove-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  align-content: start;
+  /* No top padding: a sticky header pins to the scrollport's padding edge,
+     so any padding here becomes a transparent strip that scrolled rows show
+     through above the pinned column labels. The table's own cell padding
+     already gives the first row its breathing room. */
+  padding-top: 0;
+}
+
+.notifications-history-list-modal .notifications-history-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  /* Opaque, matching .series-remove-dialog's background -- a translucent
+     header would show the rows sliding underneath it. */
+  background: #22272e;
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, .14);
+}
     .calendar-page-head {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -22222,19 +22419,45 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
    the same as every other status surface in the app; nothing here introduces a
    new palette. */
 
+/* --inkdrop-island-fill-height is the real distance from the top of the rows
+   box to the bottom of the window, measured live by the React bridge
+   (web/frontend/src/viewportFill.ts) and published on the mount container.
+
+   It replaces a flat `calc(100vh - 220px)`: the chrome above the rows box
+   measures ~104px, not 220px, so the pane used to overshoot the fold by ~150px,
+   the document grew a second scrollbar behind the pane's own, and whichever row
+   straddled the fold was left sliced through its cover art. The literal below
+   is only the one frame before the first measurement lands.
+
+   Any island that wants a self-scrolling pane should size off this variable
+   rather than doing its own viewport arithmetic. */
 .inkdrop-series-poster-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  /* One row, allowed to shrink: the grid pane and the alphabet rail both live
+     inside the pane's height instead of the taller of the two setting it.
+     The rail is 26 buttons tall and used to win, which is what pushed the
+     container past the fold and left dead space under the clipped row. */
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
+  height: var(--inkdrop-island-fill-height, calc(100vh - 220px));
+  min-height: 320px;
 }
 
 /* Virtuoso scroller: own real height (useWindowScroll collapses to ~1 row
    in this app's auto-height layout). !important beats its inline style. */
-.inkdrop-series-grid-scroller,
+.inkdrop-series-grid-scroller {
+  min-width: 0;
+  height: 100% !important;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* The table view has no rail beside it, so it is its own fill-height pane. */
 .inkdrop-series-virtual-scroller {
   min-width: 0;
-  height: calc(100vh - 220px) !important;
+  height: var(--inkdrop-island-fill-height, calc(100vh - 220px)) !important;
   min-height: 320px;
   overflow-y: auto;
 }
@@ -22366,15 +22589,25 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
 /* Kept exposed down the right-hand edge of the grid rather than tucked into a
    menu: 378 series with no fast jump is a long scroll. */
 .inkdrop-series-alpha-rail {
-  position: sticky;
-  top: 8px;
   display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 1px;
   justify-items: center;
+  /* Sits inside the pane's height now, so a 26-letter rail can never be what
+     decides how tall the pane is. If it ever does outgrow the pane (a very
+     short window), it scrolls itself rather than pushing the grid off-screen. */
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .inkdrop-series-alpha-rail button {
   min-width: 20px;
+  /* `height`, not just `min-height`: the global `input, select, button` rule
+     sets a hard height: 38px, which min-height alone does not override. That
+     made every rail button 38px instead of 17px and the whole rail 1013px --
+     the height that was displacing the grid. */
+  height: auto;
   min-height: 17px;
   padding: 0 3px;
   border: 0;
@@ -22465,7 +22698,11 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
    than disappearing -- the jump is the point of it. */
 @media (max-width: 760px) {
   .inkdrop-series-poster-layout {
+    /* Grid pane takes the room the strip leaves, so both stay on screen --
+       before this the strip was laid out under a pane that already reached
+       the bottom of the window, i.e. always past the fold. */
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
   }
 
   .inkdrop-series-grid {
@@ -22474,11 +22711,13 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
   }
 
   .inkdrop-series-alpha-rail {
-    position: static;
     grid-auto-flow: column;
+    grid-auto-columns: max-content;
+    align-content: center;
     justify-content: start;
     gap: 2px;
     overflow-x: auto;
+    overflow-y: hidden;
     padding-bottom: 4px;
   }
 
@@ -22500,6 +22739,12 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
   font-weight: var(--weight-semibold, 700);
   letter-spacing: .08em;
   text-transform: uppercase;
+  background: var(--panel-2);
+}
+.history-row {
+  cursor: pointer;
+}
+.history-row:hover {
   background: var(--panel-2);
 }
 .history-col-time {
@@ -22723,9 +22968,8 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
   }
   /* History card specifics: the day header row is a section divider, not a
      card; the expanded detail row reads as part of its parent card. The
-     chevron is the only disclosure control (rows themselves aren't
-     clickable, desktop or mobile), so it must stay visible and tappable
-     here -- keep it right-aligned as its own line rather than hiding it. */
+     whole card is clickable (see .history-row above), but the chevron stays
+     as a visible tap target of its own rather than hiding it. */
   .history-day-row {
     margin: 0 0 8px;
     padding: 0 2px 4px;
@@ -23370,6 +23614,82 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
 .reliability-rollup-card.tone-warn .reliability-rollup-count { color: var(--warn); }
 .reliability-rollup-card.tone-bad .reliability-rollup-count { color: var(--bad); }
 
+/* Health signals strip. Quiet by default; a signal only takes colour once it
+   crosses the threshold defined alongside it in inkdrop_state.py, so a row of
+   neutral tiles genuinely means "nothing to see". */
+.reliability-signal-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.reliability-signal {
+  display: grid;
+  gap: 1px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.reliability-signal-value {
+  font-size: var(--font-lg, 20px);
+  font-weight: var(--weight-bold, 800);
+  color: var(--text);
+}
+.reliability-signal-label {
+  font-size: var(--font-xs, 11px);
+  color: var(--text);
+}
+.reliability-signal-detail {
+  font-size: var(--font-xs, 11px);
+  color: var(--muted);
+}
+.reliability-signal.tone-warn {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--line-soft));
+}
+.reliability-signal.tone-warn .reliability-signal-value { color: var(--warn); }
+
+/* Bands. The header carries the judgment ("does this need attention?") so the
+   twelve counts underneath do not have to be interpreted one by one. */
+.reliability-band-row {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 14px;
+}
+.reliability-band-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: var(--font-sm, 13px);
+  font-weight: var(--weight-semibold, 700);
+  color: var(--text);
+}
+.reliability-band-count {
+  font-size: var(--font-xs, 11px);
+  font-weight: var(--weight-regular, 400);
+  color: var(--muted);
+}
+.reliability-band.tone-bad .reliability-band-header { color: var(--bad); }
+.reliability-band.tone-warn .reliability-band-header { color: var(--warn); }
+.reliability-band.tone-good .reliability-band-header { color: var(--good); }
+.reliability-band .reliability-rollup-row {
+  margin: 0;
+}
+
+.reliability-bucket-explainer {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-left-width: 3px;
+  border-left-color: var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 13px);
+  line-height: 1.5;
+}
+
 .reliability-item-list {
   display: grid;
   gap: 10px;
@@ -23472,6 +23792,128 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
   gap: 10px;
   color: var(--muted);
   font-size: var(--font-xs, 11px);
+}
+
+/* The "Why?" toggle sits in the meta line, so it must not inherit the
+   sitewide 38px button height or it pushes that row out of alignment. */
+.reliability-item-expand {
+  height: auto;
+  min-height: 0;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: var(--font-xs, 11px);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.reliability-evidence {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--bg, #000) 8%);
+  font-size: var(--font-xs, 11px);
+}
+.reliability-evidence.loading,
+.reliability-evidence.error {
+  color: var(--muted);
+}
+.reliability-evidence h4 {
+  margin: 4px 0 0;
+  font-size: var(--font-sm, 12px);
+  color: var(--text);
+}
+/* The query editor. Monospace on purpose: the failures this exists to fix are
+   punctuation -- a stray comma, a trailing period, a publisher prefix -- and a
+   proportional font hides exactly those. */
+.reliability-query-editor {
+  display: grid;
+  gap: 4px;
+}
+.reliability-query-editor label {
+  color: var(--muted);
+}
+.reliability-query-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.reliability-query-row input {
+  flex: 1 1 240px;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--font-xs, 11px);
+}
+.reliability-query-row button {
+  height: 30px;
+  min-height: 0;
+  padding: 0 10px;
+  font-size: var(--font-xs, 11px);
+  white-space: nowrap;
+}
+.reliability-query-error {
+  color: var(--bad);
+}
+
+.reliability-evidence-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+}
+.reliability-evidence-facts dt {
+  color: var(--muted);
+}
+.reliability-evidence-facts dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+/* Wide evidence tables scroll inside their own box; the page itself must never
+   scroll sideways. */
+.reliability-evidence-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.reliability-evidence-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.reliability-evidence-table th,
+.reliability-evidence-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+}
+.reliability-evidence-table th {
+  color: var(--muted);
+  font-weight: var(--weight-semibold, 700);
+  white-space: nowrap;
+}
+.reliability-evidence-table .mini {
+  display: block;
+  color: var(--muted);
+}
+.reliability-evidence-query {
+  font-style: italic;
+}
+.reliability-evidence-table button {
+  height: 26px;
+  min-height: 0;
+  padding: 0 8px;
+  font-size: var(--font-xs, 11px);
+  white-space: nowrap;
 }
 
 .reliability-item-actions {

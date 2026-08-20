@@ -279,6 +279,33 @@ def archive_metadata(identifier="jobs-example-comics"):
 
 def fake_http_get(request):
     url = request["url"]
+    if url.endswith("/api/v1/indexer"):
+        # Capability probe behind category resolution (#198). Declaring the full
+        # Books subtree means 7030 stays 7030 for these fixtures, so the cases
+        # below keep asserting on the categories they were written for.
+        return {
+            "json": [
+                {
+                    "id": indexer_id,
+                    "name": f"Fixture {indexer_id}",
+                    "capabilities": {
+                        "categories": [
+                            {
+                                "id": 7000,
+                                "name": "Books",
+                                "subCategories": [
+                                    {"id": 7020, "name": "Books/EBook"},
+                                    {"id": 7030, "name": "Books/Comics"},
+                                ],
+                            },
+                            {"id": 8000, "name": "Other", "subCategories": [{"id": 8010, "name": "Other/Misc"}]},
+                        ]
+                    },
+                }
+                for indexer_id in (6, 15, 45, 46, 47)
+            ],
+            "headers": {"Content-Type": "application/json"},
+        }
     if url == "https://standardebooks.org/feeds/opds":
         return {
             "text": """<?xml version="1.0" encoding="utf-8"?>
@@ -1405,6 +1432,14 @@ def suwayomi_persisted_source_error_rotating_probe_http_get(request):
 def fake_http_get_nyaa_categoryless_fallback(request):
     url = request["url"]
     params = request.get("params") or {}
+    if url == "http://prowlarr.local/api/v1/indexer":
+        # Answering with no declared capabilities keeps category resolution a
+        # no-op, which is what this case is for: the categoryless fallback is
+        # the recovery path for exactly the state where we cannot read what an
+        # indexer declares. When capabilities *are* readable, 7030 resolves to
+        # the 7000 Nyaa actually publishes and the fallback never fires --
+        # that path is covered in inkdrop_prowlarr_indexer_health_smoke.
+        return {"json": [], "headers": {"Content-Type": "application/json"}}
     if url != "http://prowlarr.local/api/v1/search":
         fail(f"unexpected Nyaa categoryless fallback URL: {request}")
     if params.get("indexerIds") in (["6", "46"], "6,46") and params.get("categories") == ["7030"]:
@@ -2991,6 +3026,13 @@ def main():
             "Absolute DC weekly pack priority uses the single allowed detail fetch on the useful weekly-release row",
         )
         def fake_nohit_prowlarr(request):
+            # A search that comes back empty now asks /indexerstatus whether one
+            # of its own indexers was in failure backoff -- a silent skip there
+            # is indistinguishable from "nobody has this" in the search body.
+            # Answering with no backed-off indexers keeps this case a genuine
+            # zero, which is what the assertions below expect.
+            if request["url"].endswith("/api/v1/indexerstatus"):
+                return {"json": [], "headers": {"Content-Type": "application/json"}}
             assert_equal(request["url"], "http://prowlarr.local/api/v1/search", "no-hit Prowlarr still uses native aggregate endpoint")
             return {"json": [], "headers": {"Content-Type": "application/json"}}
 

@@ -48,6 +48,15 @@ RECONCILE_SCRIPT = script_path("inkdrop_reconcile_imports.py", env_var="INKDROP_
 DB_PATH = inkdrop_runtime_config.imported_files_db_path()
 STATE_DB_PATH = inkdrop_runtime_config.state_db_path()
 
+# Exit codes, matching inkdrop_container_scheduler.completion_schedule: 0 is a
+# real success, 1 is a real failure (counted, backed off), and 78 means the pass
+# is blocked on operator configuration (surfaced, but not retried on a failure
+# backoff). Anything this job cannot actually do has to leave through one of the
+# last two.
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_CONFIGURATION_NEEDED = 78
+
 INKDROP_CATEGORIES = {"comics", "manga", "mylar", "kapowarr"}
 # How far back a download_tasks row can still prove SAB-job ownership.
 OWNERSHIP_MAX_AGE_SECONDS = float(os.environ.get("INKDROP_SAB_OWNERSHIP_MAX_AGE_SECONDS", 30 * 24 * 3600))
@@ -340,6 +349,7 @@ def load_owned_external_ids() -> tuple[dict[str, str], dict[str, Any]]:
     if not STATE_DB_PATH.exists():
         diagnostics["source"] = "unavailable"
         diagnostics["reason"] = "state_db_missing"
+        diagnostics["unavailable_class"] = "dependency"
         return owned, diagnostics
     try:
         con = sqlite3.connect(f"file:{STATE_DB_PATH}?mode=ro", uri=True)
@@ -351,6 +361,7 @@ def load_owned_external_ids() -> tuple[dict[str, str], dict[str, Any]]:
             if not exists:
                 diagnostics["source"] = "unavailable"
                 diagnostics["reason"] = "download_tasks_table_missing"
+                diagnostics["unavailable_class"] = "dependency"
                 return owned, diagnostics
             rows = con.execute(
                 # SAB tasks only, on purpose: this map AUTHORIZES del_files=1
@@ -388,6 +399,7 @@ def load_owned_external_ids() -> tuple[dict[str, str], dict[str, Any]]:
     except sqlite3.Error as exc:
         diagnostics["source"] = "unavailable"
         diagnostics["reason"] = f"{type(exc).__name__}: {exc}"
+        diagnostics["unavailable_class"] = "error"
         return {}, diagnostics
     diagnostics["owned_id_count"] = len(owned)
     return owned, diagnostics
@@ -669,6 +681,39 @@ def write_status(data: dict[str, Any]) -> None:
     tmp.replace(STATUS_PATH)
 
 
+def finish(status: dict[str, Any], exit_code: int) -> int:
+    """Publish the status report and return the code that matches it.
+
+    The status file and the exit code have to agree. This job used to write a
+    detailed "cannot run" report and then exit 0 regardless, so the scheduler
+    recorded rc=0 success for a pass that did nothing -- most visibly when
+    Remove Failed/Completed were on and SABnzbd had no API key saved.
+    """
+    status["exit_code"] = int(exit_code)
+    # Single point where the report and the code are reconciled, so no future
+    # early return can reintroduce a cheerful "ok" on a pass that did nothing.
+    status["ok"] = int(exit_code) == EXIT_OK
+    write_status(status)
+    print(json.dumps(status, indent=2, sort_keys=True))
+    return int(exit_code)
+
+
+def skip_exit_code(status: dict[str, Any], would_clear: bool) -> int:
+    """Idle-because-unused is success; idle-because-unusable is not.
+
+    An install that simply does not run SABnzbd should never be reported as
+    broken. An install where the operator switched cleanup ON and the adapter
+    cannot honour it is a configuration problem, and the scheduler already has
+    a code for exactly that (78 -> "configuration_needed", no failure backoff).
+
+    `would_clear` is what THIS invocation was going to do, which is not the same
+    as the saved policy: inkdrop-import-ready-worker.sh passes --no-clear-* on a
+    box whose settings do want cleanup, and a run told to clear nothing has no
+    business complaining about a missing API key it was never going to use.
+    """
+    return EXIT_CONFIGURATION_NEEDED if status.get("cleanup_requested") and would_clear else EXIT_OK
+
+
 def unconfigured_adapter_status(cleanup_settings: dict[str, Any], reason: str) -> dict[str, Any]:
     # "Not configured" and "half configured" look the same from here, and they
     # are very different to the operator: someone who turned Remove Completed on
@@ -704,7 +749,7 @@ def unconfigured_adapter_status(cleanup_settings: dict[str, Any], reason: str) -
     }
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="Clean old InkDrop-owned failed SAB NZB history rows")
     parser.add_argument("--dry-run", action="store_true", help="report eligible rows without deleting")
     parser.add_argument("--min-age-hours", type=float, default=None)
@@ -719,6 +764,20 @@ def main() -> None:
     args = parser.parse_args()
 
     cleanup_settings = load_sab_cleanup_settings()
+    # The stored settings could not be read, so every policy value below is a
+    # shipped default rather than the operator's actual choice -- and those
+    # defaults deliberately fail closed to "delete nothing". Running the pass
+    # anyway would report a tidy zero-deletion success for a configuration this
+    # job never actually saw.
+    if cleanup_settings.get("settings_error"):
+        status = unconfigured_adapter_status(cleanup_settings, "settings_unreadable")
+        status["detail"] = (
+            "SABnzbd cleanup settings could not be read, so this pass would have run on "
+            f"shipped defaults instead of your saved policy: {cleanup_settings.get('settings_error')}"
+        )
+        status["settings_error"] = cleanup_settings.get("settings_error")
+        return finish(status, EXIT_FAILED)
+
     min_age_hours = (
         max(0.0, args.min_age_hours)
         if args.min_age_hours is not None
@@ -752,9 +811,7 @@ def main() -> None:
     # SABnzbd provider must disable this job too, not just the handoff path.
     if "provider_enabled" in cleanup_settings and not boolish(cleanup_settings.get("provider_enabled"), False):
         status = unconfigured_adapter_status(cleanup_settings, "sab_provider_disabled")
-        write_status(status)
-        print(json.dumps(status, indent=2, sort_keys=True))
-        return
+        return finish(status, skip_exit_code(status, clear_failed or clear_completed))
 
     sab = load_sab_helper()
     try:
@@ -763,9 +820,7 @@ def main() -> None:
         if "api key is not configured" not in str(exc).lower():
             raise
         status = unconfigured_adapter_status(cleanup_settings, "adapter_not_configured")
-        write_status(status)
-        print(json.dumps(status, indent=2, sort_keys=True))
-        return
+        return finish(status, skip_exit_code(status, clear_failed or clear_completed))
 
     # Removal fully off means ZERO SAB network traffic: authenticating and
     # paging history just to run a suppressed delete loop is still touching a
@@ -774,9 +829,10 @@ def main() -> None:
     # adapter_not_configured, which is the more useful diagnosis.
     if not clear_failed and not clear_completed:
         status = unconfigured_adapter_status(cleanup_settings, "sab_cleanup_disabled")
-        write_status(status)
-        print(json.dumps(status, indent=2, sort_keys=True))
-        return
+        # Success, both ways in: either the operator turned both toggles off and
+        # there is nothing to do, or this invocation passed --no-clear-*, which
+        # is the caller's own choice rather than a misconfiguration.
+        return finish(status, EXIT_OK)
     reconcile = {"skipped": True, "reason": "dry_run"} if args.dry_run else (
         {"skipped": True, "reason": "skip_reconcile"} if args.skip_reconcile else run_reconcile()
     )
@@ -841,9 +897,24 @@ def main() -> None:
         "completed_eligible_samples": completed_eligible[:15],
         "results": results,
     }
-    write_status(status)
-    print(json.dumps(status, indent=2, sort_keys=True))
+
+    exit_code = EXIT_OK
+    # No ownership map means nothing could be proven InkDrop-owned, so the pass
+    # was incapable of deleting anything no matter what SAB history held. That
+    # is not a clean zero-deletion run, and the diagnostics block existed to
+    # make it visible -- it just never reached the exit code.
+    if ownership.get("source") == "unavailable":
+        exit_code = (
+            EXIT_CONFIGURATION_NEEDED
+            if ownership.get("unavailable_class") == "dependency"
+            else EXIT_FAILED
+        )
+    # Deletions that raised are already recorded per row as "delete_failed";
+    # this is the same fact, said where the scheduler can hear it.
+    if status["failed_count"]:
+        exit_code = EXIT_FAILED
+    return finish(status, exit_code)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

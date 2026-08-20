@@ -22,6 +22,42 @@ SLOT_DEADLINE_MIN_RUN_SECONDS="${INKDROP_SOURCE_WORKER_SLOT_DEADLINE_MIN_RUN_SEC
 SLOT_DEADLINE_TIMEOUT_GRACE_SECONDS="${INKDROP_SOURCE_WORKER_SLOT_DEADLINE_TIMEOUT_GRACE_SECONDS:-15}"
 INKDROP_SOURCE_WORKER_DONE_LOGGED=0
 
+# Say when a job's intended sizing was overridden by the environment.
+#
+# `${VAR:-default}` in a cron wrapper yields the environment's value whenever
+# one is set, which is the precedence an operator override should have. What it
+# should not be is silent: the wrapper still *reads* as if its numbers apply, so
+# a per-job tuning change can be made, deployed, and have no effect, with
+# nothing anywhere reporting that. Measured on this deployment 2026-08-16: the
+# suwayomi job asks for queue/eligible 60/60 and gets 50/10, and the mangadex
+# job asks for 80/80 and gets the same 50/10.
+#
+# This only reports. It deliberately does not change precedence -- an operator
+# who sets these in the environment means it.
+inkdrop_report_intent_overrides() {
+  local intent="${INKDROP_SOURCE_WORKER_JOB_INTENT:-}"
+  [ -n "$intent" ] || return 0
+  local entry name want got overridden=""
+  local old_ifs="$IFS"
+  IFS=','
+  for entry in $intent; do
+    IFS="$old_ifs"
+    name="${entry%%=*}"
+    want="${entry#*=}"
+    [ -n "$name" ] && [ "$name" != "$entry" ] || { IFS=','; continue; }
+    got="$(printenv "$name" 2>/dev/null || true)"
+    if [ -n "$got" ] && [ "$got" != "$want" ]; then
+      overridden="${overridden}${overridden:+, }${name}: job asked for ${want}, environment set ${got}"
+    fi
+    IFS=','
+  done
+  IFS="$old_ifs"
+  if [ -n "$overridden" ]; then
+    echo "inkdrop-source-worker: per-job sizing overridden by the environment -- ${overridden}" >&2
+  fi
+}
+inkdrop_report_intent_overrides
+
 case "$LOCK_SCOPE" in
   ''|*[!a-zA-Z0-9_-]*)
     echo "invalid source worker lock scope: $LOCK_SCOPE" >&2

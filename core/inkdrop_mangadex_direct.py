@@ -42,6 +42,13 @@ STATE_DIR = inkdrop_runtime_config.state_dir()
 CONFIG_DIR = inkdrop_runtime_config.config_dir()
 LOG_DIR = inkdrop_runtime_config.log_dir()
 INKDROP_STATE_DB = STATE_DIR / (inkdrop_state.STATE_DB_NAME if inkdrop_state else "inkdrop-state.sqlite3")
+# See inkdrop_series_autopilot.PURSUIT_ACTIVE_SQL -- same predicate, same
+# fallback, pinned identical by the same smoke.
+PURSUIT_ACTIVE_SQL = (
+    inkdrop_state.wanted_pursuit_active_sql("w")
+    if inkdrop_state
+    else "coalesce(json_extract(w.raw_json, '$.pursuit_paused'), 0) = 0"
+)
 KAVITA_DB = inkdrop_runtime_config.kavita_db_path()
 MANGA_ROOT = Path(os.environ.get("INKDROP_MANGA_ROOT") or "/library/manga")
 KAVITA_MANGA_ROOT = os.environ.get("INKDROP_KAVITA_MANGA_ROOT") or "/data/manga"
@@ -97,6 +104,10 @@ def load_rows(series_filter=None, max_total=10, force=False):
         "q.active = 1",
         "lower(coalesce(s.metadata_provider, '')) = 'mangadex'",
         "coalesce(w.status, 'wanted') not in ('satisfied', 'ignored', 'suppressed')",
+        # Same pause the autopilot honours. A pause that stops one of three
+        # acquisition paths keeps burning capacity while telling the operator
+        # it stopped, which is worse than not offering the button.
+        PURSUIT_ACTIVE_SQL,
     ]
     params = []
     if not force:

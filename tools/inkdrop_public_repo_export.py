@@ -25,11 +25,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools import inkdrop_docker_context_manifest
+from tools.inkdrop_text_output import write_text_lf
 
 
 PUBLIC_REPO_EXTRA_PATHS = (
     "README.md",
     "LICENSE",
+    "CONTRIBUTING.md",
     ".dockerignore",
     ".env.example",
     ".github/workflows/inkdrop-public-release.yml",
@@ -69,7 +71,6 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop-comicvine-optional-scheduler-smoke.py",
     "inkdrop-cover-proxy-redirect-safety-smoke.py",
     "inkdrop-deferred-sync-smoke.py",
-    "inkdrop-diagnostic-artifacts-smoke.py",
     "inkdrop-download-client-routing-smoke.py",
     "inkdrop-download-clients-round2-smoke.py",
     "inkdrop-duplicate-live-task-audit-smoke.py",
@@ -99,6 +100,8 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop-slskd-completed-transfer-truth-smoke.py",
     "inkdrop-slskd-coverage-selection-smoke.py",
     "inkdrop-slskd-root-health-smoke.py",
+    "inkdrop-slskd-incomplete-root-env-smoke.py",
+    "inkdrop-incoming-root-env-smoke.py",
     "inkdrop-slskd-failover-smoke.py",
     "inkdrop-slskd-query-rotation-smoke.py",
     "inkdrop-slskd-series-run-handoff-smoke.py",
@@ -112,11 +115,11 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "core/inkdrop_opds.py",
     "inkdrop-opds-smoke.py",
     "core/inkdrop_backup_restore.py",
+    "core/inkdrop_bounded_read.py",
     "core/inkdrop_comicscodes_discovery.py",
     "core/inkdrop_container_healthcheck.py",
     "core/inkdrop_download_client_api.py",
     "core/inkdrop_download_client_config.py",
-    "core/inkdrop_diagnostic_artifacts.py",
     "core/inkdrop_incident_recovery.py",
     "core/inkdrop_internal_jobs.py",
     "core/inkdrop_mangadex_direct.py",
@@ -150,6 +153,7 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop_download_client_ownership_smoke.py",
     "inkdrop-download-client-instance-store-smoke.py",
     "inkdrop-download-client-instance-api-smoke.py",
+    "inkdrop-download-client-add-first-model-smoke.py",
     "inkdrop-download-client-ui-smoke.py",
     "inkdrop-download-client-secret-store-smoke.py",
     "inkdrop-queue-claim-smoke.py",
@@ -232,6 +236,7 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "tools/inkdrop_settings_api_surface_audit.py",
     "tools/inkdrop_settings_sync_smoke.py",
     "tools/inkdrop_state_schema_audit.py",
+    "tools/inkdrop_text_output.py",
     "tools/inkdrop_web_surface_audit.py",
 )
 
@@ -317,14 +322,41 @@ def open_placeholders(text_bytes):
 PRIVATE_IGNORE_RULE_MARKERS = ("co" + "dex", "agents.md")
 
 
-def _filtered_ignore_bytes(root, name):
+def public_dockerignore_bytes(root: Path = ROOT):
+    """The build-context half of the cron-script relocation.
+
+    public_dockerfile_bytes() re-points the Dockerfile's COPY sources at
+    scripts/, but .dockerignore is a default-deny allowlist: a path Docker
+    never sends to the daemon cannot be COPYed no matter what the Dockerfile
+    says. Exporting the working tree's root-relative `!/name.sh` entries
+    unchanged left all nine scripts outside the public build context while the
+    Dockerfile asked for them from scripts/, so `docker build` failed on the
+    first of them. Rewrite the entries alongside the COPY paths, and un-ignore
+    the scripts/ directory itself -- Docker will not descend into a directory
+    that is still excluded, so the per-file entries alone do nothing.
+    """
+    lines = _filtered_ignore_lines(root, ".dockerignore")
+    relocated = {f"!/{name}" for name in RELOCATABLE_SCRIPTS_DIR_FILES}
+    rewritten = []
+    directory_emitted = False
+    for line in lines:
+        if line.strip() in relocated:
+            if not directory_emitted:
+                rewritten.append("!/scripts/")
+                directory_emitted = True
+            rewritten.append(f"!/scripts/{line.strip()[2:]}")
+            continue
+        rewritten.append(line)
+    return ("\n".join(rewritten).rstrip("\n") + "\n").encode("utf-8")
+
+
+def _filtered_ignore_lines(root, name):
     lines = (root / name).read_text(encoding="utf-8").splitlines()
-    kept = [
+    return [
         line
         for line in lines
         if not any(marker in line.lower() for marker in PRIVATE_IGNORE_RULE_MARKERS)
     ]
-    return ("\n".join(kept).rstrip("\n") + "\n").encode("utf-8")
 
 
 # The public repository gets its own .gitignore. The development tree uses a
@@ -375,7 +407,7 @@ def export_content_overrides(root: Path = ROOT):
         "docker-compose.yml": public_compose_bytes(root),
         "Dockerfile": public_dockerfile_bytes(root),
         ".gitignore": PUBLIC_GITIGNORE.encode("utf-8"),
-        ".dockerignore": _filtered_ignore_bytes(root, ".dockerignore"),
+        ".dockerignore": public_dockerignore_bytes(root),
         PUBLIC_WORKFLOW_PATH: public_workflow_bytes(root),
     }
     # Relocated scripts need their repo-root resolution re-pointed. This runs
@@ -778,7 +810,12 @@ def export_tree(target, paths, *, force=False):
         else:
             shutil.copy2(resolve_source(ROOT, relative), dest)
     manifest = build_manifest(paths, overrides)
-    (target / "PUBLIC_REPO_MANIFEST.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    # write_text_lf, not write_text: this file is committed to the public repo,
+    # so a Windows publish run writing CRLF would rewrite all 1822 of its line
+    # endings and show up as a ~3600-line diff for a release that changed
+    # nothing. Every shipped file above is copied byte for byte (copy2 /
+    # write_bytes); this manifest was the one place text mode could touch.
+    write_text_lf(target / "PUBLIC_REPO_MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True))
     return manifest
 
 

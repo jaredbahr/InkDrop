@@ -210,10 +210,14 @@ def _safe_relative_name(name):
     cleaned = str(name).replace("\\", "/").strip()
     if not cleaned or cleaned.endswith("/"):
         return None
+    if "\x00" in cleaned:
+        # A NUL never survives the open() that follows; refuse the member here
+        # rather than let it raise from inside the extraction loop.
+        return None
     if cleaned.startswith("/") or re.match(r"^[A-Za-z]:", cleaned):
         return None
     parts = [part for part in cleaned.split("/") if part not in ("", ".")]
-    if any(part == ".." for part in parts):
+    if any(set(part) == {"."} for part in parts):
         return None
     return "/".join(parts) if parts else None
 
@@ -619,33 +623,56 @@ def build_cbz(source, dest_tmp, workdir):
     }
 
 
-def _write_page_archive(pages, dest_tmp, base_dir, comicinfo_file):
+def _write_page_archive(pages, dest_tmp, base_dir, comicinfo_file, leading_pages=None, extra_members=None):
     """Write `pages` into a CBZ at `dest_tmp` and return the page manifest.
 
-    Shared by both conversion entry points so page ordering, zero-padded stored
+    Shared by every conversion entry point so page ordering, zero-padded stored
     names and the hash manifest can never drift between them.
+
+    ``leading_pages`` are written ahead of every discovered page and are
+    deliberately NOT sorted in with them -- that is how the cover injector makes
+    an image page one. It has to be done here, by position, rather than by
+    giving the cover a filename that sorts first: measured against Komga, a
+    ``!``-prefixed name sorts *after* every numeric page, so the obvious
+    ``!0000_cover.png`` lands last and the injection silently does nothing.
+    Renumbering through this function is what makes the order a fact instead of
+    a bet on someone else's comparator.
+
+    ``extra_members`` are literal ``(name, bytes)`` pairs written verbatim --
+    the injector's provenance marker, which must travel inside the archive so
+    it survives a move, a re-adoption or a restore.
     """
     pages.sort(key=lambda item: natural_sort_key(item.relative_to(base_dir).as_posix()))
-    width = max(4, len(str(len(pages))))
+    ordered = list(leading_pages or []) + list(pages)
+    width = max(4, len(str(len(ordered))))
+
+    def _source_name(page):
+        try:
+            return page.relative_to(base_dir).as_posix()
+        except ValueError:
+            # A leading page is staged outside the extraction dir.
+            return page.name
 
     manifest = []
     dest_tmp.parent.mkdir(parents=True, exist_ok=True)
     if dest_tmp.exists():
         dest_tmp.unlink()
     with zipfile.ZipFile(dest_tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for index, page in enumerate(pages, 1):
+        for index, page in enumerate(ordered, 1):
             stored = f"{index:0{width}d}{page.suffix.lower()}"
             archive.write(page, stored)
             manifest.append(
                 {
                     "stored_name": stored,
-                    "source_name": page.relative_to(base_dir).as_posix(),
+                    "source_name": _source_name(page),
                     "sha256": _sha256(page),
                     "bytes": page.stat().st_size,
                 }
             )
         if comicinfo_file is not None:
             archive.writestr("ComicInfo.xml", comicinfo_file.read_bytes())
+        for name, data in list(extra_members or []):
+            archive.writestr(name, data)
     return manifest
 
 

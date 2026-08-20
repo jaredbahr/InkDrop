@@ -16,8 +16,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
+from core import inkdrop_records
 from core import inkdrop_source_providers as providers
 from core import inkdrop_sources
+from core import inkdrop_source_worker_http as source_worker_http
 
 
 CONTRACT_VERSION = 2
@@ -314,7 +316,7 @@ def owned_page_pack_rebase_target(download_task, staging_root):
     identity = str(candidate.get("candidate_identity") or "").strip().lower()
     task_identity = str(task.get("candidate_identity") or "").strip().lower()
     external_id = str(task.get("external_id") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{24}", identity) or task_identity != identity or external_id != identity:
+    if not inkdrop_records.is_candidate_identity(identity) or task_identity != identity or external_id != identity:
         return None
     provider_id = inkdrop_sources.provider_key(candidate.get("provider_id"))
     task_provider_id = inkdrop_sources.provider_key(task.get("provider_id") or task.get("source"))
@@ -432,9 +434,7 @@ def _image_extension_for_bytes(data):
 
 
 def _host_allowed(url, allowed_hosts):
-    host = _url_host(url)
-    allowed = set(_host_values(allowed_hosts))
-    return bool(host and (not allowed or host in allowed))
+    return source_worker_http.host_allowed(url, allowed_hosts)
 
 
 def _unsafe_host(host):
@@ -582,11 +582,6 @@ def page_image_urls_from_task(download_task):
     candidate = _candidate_from_task(download_task)
     urls = candidate.get("page_image_urls") if isinstance(candidate.get("page_image_urls"), list) else []
     return [str(url or "").strip() for url in urls if str(url or "").strip()]
-
-
-def _url_host(url):
-    host = str(urlparse(str(url or "")).hostname or "").strip().lower()
-    return host.strip("[]")
 
 
 def _host_values(value):

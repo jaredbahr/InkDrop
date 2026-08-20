@@ -17,6 +17,9 @@ from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 import xmlrpc.client
 
+from core.inkdrop_records import require_transfer_state
+from core.inkdrop_transfer import nzbget_health_verdict
+
 try:
     import requests
 except ImportError:  # pragma: no cover - exercised by runtime guards
@@ -28,36 +31,49 @@ SECRET_KEYS = {"password", "api_key", "token", "secret"}
 TRANSMISSION_STATUS = {
     0: "paused",
     1: "queued",
-    2: "active",
+    2: "downloading",
     3: "queued",
-    4: "active",
+    4: "downloading",
     5: "queued",
     6: "seeding",
 }
 
 DELUGE_STATUS = {
     "queued": "queued",
-    "checking": "active",
-    "downloading": "active",
+    "checking": "downloading",
+    "downloading": "downloading",
     "seeding": "seeding",
     "paused": "paused",
     "error": "failed",
     "warning": "stalled",
-    "allocating": "active",
-    "moving": "active",
+    "allocating": "downloading",
+    "moving": "downloading",
 }
 
+# Keys are normalized to lowercase with "-" separators, so NZBGet's own
+# spellings (PP_QUEUED, VERIFYING_SOURCES) and the older hyphenated forms both
+# land here. Missing a post-processing spelling used to read as "unknown",
+# which now carries real weight.
 NZBGET_QUEUE_STATUS = {
     "queued": "queued",
     "paused": "paused",
-    "downloading": "active",
-    "fetching": "active",
+    "downloading": "downloading",
+    "fetching": "downloading",
     "pp-queued": "queued",
-    "post-processing": "active",
-    "loading pars": "active",
-    "verifying sources": "active",
-    "repairing": "active",
-    "moving": "active",
+    "post-queued": "queued",
+    "pp-finished": "downloading",
+    "post-processing": "downloading",
+    "loading-pars": "downloading",
+    "loading pars": "downloading",
+    "verifying-sources": "downloading",
+    "verifying sources": "downloading",
+    "verifying-repaired": "downloading",
+    "repairing": "downloading",
+    "renaming": "downloading",
+    "unpacking": "downloading",
+    "executing-script": "downloading",
+    "moving": "downloading",
+    "deleting": "downloading",
 }
 
 
@@ -518,6 +534,7 @@ def deluge_status(torrent, settings=None, now=None):
         state = "seeding"
     added = _integer(torrent.get("time_added"))
     message = _text(torrent.get("message"))
+    state = require_transfer_state(state)
     return {
         "client": "deluge",
         "client_item_id": torrent.get("hash"),
@@ -711,9 +728,11 @@ def nzbget_find_existing(client, handoff_key):
     for row in history_rows:
         if _text(row.get("DupeKey")) != handoff_key:
             continue
-        status = _text(row.get("Status")).lower()
-        delete_status = _text(row.get("DeleteStatus")).lower()
-        if status.startswith("failure") or delete_status in {"manual", "dupe", "bad", "health", "scan"}:
+        # Only a genuinely clean history row counts as an existing download.
+        # Reusing a damaged or unverified one would hand back a "finished"
+        # item that was never actually good.
+        verdict, _reason = nzbget_health_verdict(row)
+        if verdict != "clean":
             continue
         return row
     return None
@@ -739,19 +758,29 @@ def nzbget_status(row, settings=None, now=None):
     settings = settings if isinstance(settings, dict) else {}
     now = time.time() if now is None else float(now)
     section = _text(row.get("_inkdrop_section"), "queue")
-    raw_status = _text(row.get("Status") or row.get("Kind") or row.get("NZBName") or "unknown")
-    state_key = raw_status.lower()
+    # Deliberately not falling back to Kind or NZBName: an item's *name* is not
+    # a status, and treating one as a status is what let unrecognized rows
+    # match no prefix and fall through to "completed".
+    raw_status = _text(row.get("Status"), "unknown")
+    state_key = raw_status.lower().replace("_", "-")
+    verdict = ""
+    health_reason = ""
     if section == "history":
-        if raw_status.startswith("SUCCESS"):
-            state = "completed"
-        elif raw_status.startswith("DELETED"):
+        # A history row is only a completion if NZBGet's own post-processing
+        # says so. Damaged, force-marked, and unrecognized outcomes fail
+        # closed here - importing an unverified download is worse than
+        # parking it for review.
+        verdict, health_reason = nzbget_health_verdict(row)
+        if raw_status.startswith("DELETED"):
             state = "removed"
-        elif raw_status.startswith("FAILURE"):
-            state = "failed"
-        elif raw_status.startswith("WARNING"):
-            state = "stalled"
-        else:
+        elif verdict == "clean":
             state = "completed"
+        else:
+            # A history row is terminal: NZBGet is finished with it and no
+            # later poll will resolve it. So an unknown outcome is a failure to
+            # review, not an in-flight "unknown" that leaves the task looking
+            # live until a stale-orphan sweep eventually reaps it.
+            state = "failed"
     else:
         state = NZBGET_QUEUE_STATUS.get(state_key, "unknown")
         if bool(row.get("Paused")):
@@ -769,9 +798,15 @@ def nzbget_status(row, settings=None, now=None):
     if state == "completed":
         percent = 100.0 if percent is None else percent
     added = _integer(row.get("MinPostTime") or row.get("HistoryTime"))
-    error = _text(row.get("Status")) if state in {"failed", "stalled"} else ""
+    error = ""
+    if state in {"failed", "stalled"}:
+        error = _text(row.get("Status")) or health_reason
+    state = require_transfer_state(state)
     return {
         "client": "nzbget",
+        "health_verdict": verdict if section == "history" else None,
+        "health_reason": health_reason or None,
+        "needs_review": section == "history" and state in {"failed", "unknown"},
         "client_item_id": row.get("NZBID") or row.get("ID"),
         "transfer_state": state,
         "native_state": raw_status,
@@ -1050,12 +1085,13 @@ def transmission_status(torrent, settings=None, now=None):
     state = TRANSMISSION_STATUS.get(native_status, "unknown")
     if torrent.get("error"):
         state = "failed"
-    elif torrent.get("isStalled") and state in {"active", "queued"}:
+    elif torrent.get("isStalled") and state in {"downloading", "queued"}:
         state = "stalled"
     elif percent is not None and percent >= 100 and state != "seeding":
         state = "completed"
     added = _integer(torrent.get("addedDate"))
     done = _integer(torrent.get("doneDate"))
+    state = require_transfer_state(state)
     return {
         "client": "transmission",
         "client_item_id": torrent.get("hashString") or torrent.get("id"),
@@ -1160,14 +1196,50 @@ def transmission_control(settings, torrent_id, action, *, http=None):
 
 
 def _bounded_response(response, limit):
+    """Read at most `limit` bytes, refusing anything larger.
+
+    This used to read `response.content` in full and then measure it, which
+    checks the bound after the allocation it is supposed to prevent -- by the
+    time the length was compared, the whole body was already resident. A
+    download locator comes from an indexer candidate, so an oversized or
+    hostile endpoint could spend the process's memory before the configured
+    `max_torrent_bytes` / `max_response_bytes` was ever consulted.
+
+    Now the declared length is rejected up front, and the body is accumulated
+    in chunks that stop the moment the bound is crossed. Callers pass
+    `stream=True` so `iter_content` yields as the socket is read rather than
+    replaying a buffer that was already downloaded in full.
+    """
+    limit = max(0, int(limit))
     status = int(getattr(response, "status_code", 200) or 200)
     if 300 <= status < 400:
         raise RuntimeError("redirects are not permitted for download-client endpoints")
     response.raise_for_status()
-    content = bytes(getattr(response, "content", b"") or b"")
-    if len(content) > int(limit):
+    try:
+        declared = int((getattr(response, "headers", {}) or {}).get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > limit:
         raise RuntimeError("download-client response exceeded the configured bound")
-    return content
+    stream = getattr(response, "iter_content", None)
+    if not callable(stream):
+        # A transport with no streaming support (a test double, or a client
+        # library that only exposes a buffer) still gets the bound enforced,
+        # it just cannot avoid the allocation first.
+        content = bytes(getattr(response, "content", b"") or b"")
+        if len(content) > limit:
+            raise RuntimeError("download-client response exceeded the configured bound")
+        return content
+    body = bytearray()
+    for chunk in stream(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > limit:
+            # Stop pulling immediately; never hold more than one chunk beyond
+            # the bound.
+            raise RuntimeError("download-client response exceeded the configured bound")
+    return bytes(body)
 
 
 def _fetch_metainfo(download_url, settings, http=None):
@@ -1178,7 +1250,8 @@ def _fetch_metainfo(download_url, settings, http=None):
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("torrent locator must be a credential-free HTTP(S) URL or magnet")
     transport = http or _require_requests()
-    response = transport.get(text, timeout=settings["timeout_seconds"], verify=settings["verify_tls"], allow_redirects=False)
+    response = transport.get(text, timeout=settings["timeout_seconds"], verify=settings["verify_tls"],
+        allow_redirects=False, stream=True)
     blob = _bounded_response(response, settings["max_torrent_bytes"])
     return torrent_info_hash(blob), blob
 
@@ -1194,7 +1267,8 @@ class UTorrentWebUi:
 
     def authenticate(self):
         response = self.http.get(self.settings["host"] + "/gui/token.html", auth=self._auth(),
-            timeout=self.settings["timeout_seconds"], verify=self.settings["verify_tls"], allow_redirects=False)
+            timeout=self.settings["timeout_seconds"], verify=self.settings["verify_tls"],
+            allow_redirects=False, stream=True)
         if int(getattr(response, "status_code", 200) or 200) in {401, 403}:
             raise PermissionError("uTorrent WebUI authentication failed")
         body = _bounded_response(response, 64 * 1024).decode("utf-8", "replace")
@@ -1210,7 +1284,7 @@ class UTorrentWebUi:
         query = {"token": self.token, **dict(params or {})}
         request = self.http.post if files else self.http.get
         kwargs = {"params": query, "auth": self._auth(), "timeout": self.settings["timeout_seconds"],
-            "verify": self.settings["verify_tls"], "allow_redirects": False}
+            "verify": self.settings["verify_tls"], "allow_redirects": False, "stream": True}
         if files:
             kwargs["files"] = files
         response = request(self.settings["host"] + "/gui/", **kwargs)
@@ -1249,9 +1323,10 @@ def utorrent_status(row, settings=None):
     elif flags & 64:
         state = "queued"
     elif flags & 1:
-        state = "active"
+        state = "downloading"
     else:
         state = "paused"
+    state = require_transfer_state(state)
     remote = _text(row.get("save_path"))
     local = map_remote_path(remote, settings.get("path_mappings")) if remote else None
     return {"client": "utorrent", "external_id": _text(row.get("hash")).lower(), "name": _text(row.get("name")),
@@ -1328,7 +1403,8 @@ class RTorrentXmlRpc:
             raise RuntimeError("rTorrent XML-RPC request exceeded the configured bound")
         auth = (self.settings["username"], self.settings["password"]) if self.settings["username"] else None
         response = self.http.post(self.settings["host"], data=body, headers={"Content-Type": "text/xml"}, auth=auth,
-            timeout=self.settings["timeout_seconds"], verify=self.settings["verify_tls"], allow_redirects=False)
+            timeout=self.settings["timeout_seconds"], verify=self.settings["verify_tls"],
+            allow_redirects=False, stream=True)
         payload = _bounded_response(response, self.settings["max_response_bytes"])
         values, _method = xmlrpc.client.loads(payload)
         return values[0] if len(values) == 1 else values
@@ -1354,7 +1430,12 @@ def rtorrent_status(row, settings=None):
     row = _rtorrent_row(row) if not isinstance(row, dict) else dict(row)
     size, completed = int(row.get("size") or 0), int(row.get("completed") or 0)
     progress = 100.0 if row.get("complete") else (completed * 100.0 / size if size else 0.0)
-    state = "seeding" if row.get("complete") and row.get("state") else "completed" if row.get("complete") else "active" if row.get("state") else "paused"
+    state = require_transfer_state(
+        "seeding" if row.get("complete") and row.get("state")
+        else "completed" if row.get("complete")
+        else "downloading" if row.get("state")
+        else "paused"
+    )
     remote = _text(row.get("directory")); local = map_remote_path(remote, settings.get("path_mappings")) if remote else None
     return {"client": "rtorrent", "external_id": _text(row.get("hash")).lower(), "name": _text(row.get("name")),
         "status": state, "state": state, "transfer_state": state, "percent_complete": progress, "size_bytes": size,

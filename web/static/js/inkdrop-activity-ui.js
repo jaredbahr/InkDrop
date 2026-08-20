@@ -275,9 +275,15 @@
     return issue ? `${series} ${issue}` : series;
   }
 
-  function renderProgress(model) {
+  // Every bar used to announce itself as "Transfer progress", so three
+  // concurrent transfers were three identical bars to a screen reader with no
+  // way to tell which was which. The bar is named by the row's own title cell
+  // instead, and aria-valuetext carries the same facts the sighted meta line
+  // shows -- a bare "42" is not what the number means.
+  function renderProgress(model, labelId) {
     if (model.kind === "determinate") {
-      return `<div class="inkdrop-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${model.percent}"><span style="width:${model.percent}%"></span></div><div>${model.percent}%${model.detail ? ` · ${escapeHtml(model.detail)}` : ""}</div>`;
+      const valueText = [`${model.percent}%`, model.detail].filter(Boolean).join(", ");
+      return `<div class="inkdrop-progress" role="progressbar" aria-labelledby="${escapeHtml(labelId)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${model.percent}" aria-valuetext="${escapeHtml(valueText)}"><span style="width:${model.percent}%"></span></div><div>${model.percent}%${model.detail ? ` · ${escapeHtml(model.detail)}` : ""}</div>`;
     }
     return `<div class="inkdrop-progress-stage">${escapeHtml(model.label)}</div><div class="muted">${escapeHtml(model.detail || "")}</div>`;
   }
@@ -328,10 +334,10 @@
             const progress = progressModel(row);
             const completion = completionLabel(row);
             return `<tr class="inkdrop-activity-row" data-activity-id="${escapeHtml(id)}">
-              <td data-label="Series / Issue"><strong title="${escapeHtml(title(row))}">${escapeHtml(title(row))}</strong><span>${escapeHtml(scrub(first(row, ["subtitle", "description", "issue_title"]) || ""))}</span></td>
+              <td data-label="Series / Issue"><strong id="inkdrop-activity-title-${escapeHtml(id)}" title="${escapeHtml(title(row))}">${escapeHtml(title(row))}</strong><span>${escapeHtml(scrub(first(row, ["subtitle", "description", "issue_title"]) || ""))}</span></td>
               <td data-label="Stage"><span class="inkdrop-stage">${escapeHtml(stageLabel(row))}</span>${completion ? `<span class="inkdrop-completion">${escapeHtml(completion)}</span>` : ""}</td>
               <td data-label="Source / Client">${escapeHtml(sourceClient(row))}</td>
-              <td data-label="Progress">${renderProgress(progress)}</td>
+              <td data-label="Progress">${renderProgress(progress, `inkdrop-activity-title-${id}`)}</td>
               <td data-label="ETA / Age">${escapeHtml(etaAge(row) || "Not reported")}</td>
               <td data-label="Next">${escapeHtml(nextText(row))}</td>
               <td data-label="Actions"><button type="button" class="inkdrop-activity-expand" aria-expanded="false" aria-controls="inkdrop-activity-detail-${escapeHtml(id)}">Details</button></td>

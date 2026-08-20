@@ -29,6 +29,7 @@ from collections import namedtuple
 
 import requests
 
+from core import inkdrop_bounded_read
 from core import inkdrop_manual_search
 from core import inkdrop_notification_store as store
 
@@ -156,6 +157,7 @@ class DiscordWebhookProvider(NotificationProvider):
         if not url:
             return SendResult(False, "not configured", False)
         payload = {"content": f"**{title}**\n{message}"}
+        response = None
         try:
             # wait=true is load-bearing, not cosmetic: Discord's webhook execute
             # endpoint is fire-and-forget by default -- it returns 204 the
@@ -170,35 +172,54 @@ class DiscordWebhookProvider(NotificationProvider):
             # with no corresponding message ever appearing in the target
             # Discord channel.
             response = requests.post(
-                url, json=payload, params={"wait": "true"}, timeout=REQUEST_TIMEOUT_SECONDS
+                url,
+                json=payload,
+                params={"wait": "true"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                stream=True,
             )
             status_code = _response_status(response)
         except Exception as exc:
+            if response is not None:
+                response.close()
             retryable = _is_retryable_exception(exc)
             logger.warning("discord notify error (%s)", _failure_type(exc))
             return SendResult(False, f"send failed ({_failure_type(exc)})", retryable)
-        if status_code is None:
-            return SendResult(False, "send failed (invalid response)", True)
-        if status_code >= 400:
-            logger.warning("discord notify failed (HTTP %d)", status_code)
-            retryable = status_code >= 500 or status_code == 429
-            return SendResult(
-                False,
-                f"send failed (HTTP {status_code})",
-                retryable,
-                _retry_after_seconds(response) if status_code == 429 else None,
-            )
         try:
-            message_id = (response.json() or {}).get("id")
-        except (AttributeError, ValueError):
-            message_id = None
-        if not message_id:
-            # A 2xx with no message id back means Discord accepted the
-            # request but did not confirm the message was created -- treat
-            # that the same as a failure rather than a silent false "sent".
-            logger.warning("discord notify: no message id in wait=true response")
-            return SendResult(False, "send failed (no delivery confirmation)", True)
-        return SendResult(True, "sent", False)
+            if status_code is None:
+                return SendResult(False, "send failed (invalid response)", True)
+            if status_code >= 400:
+                logger.warning("discord notify failed (HTTP %d)", status_code)
+                retryable = status_code >= 500 or status_code == 429
+                return SendResult(
+                    False,
+                    f"send failed (HTTP {status_code})",
+                    retryable,
+                    _retry_after_seconds(response) if status_code == 429 else None,
+                )
+            try:
+                message_id = (inkdrop_bounded_read.bounded_read_json(
+                    response,
+                    inkdrop_bounded_read.NOTIFICATION_RESPONSE_MAX_BYTES,
+                    label="Discord webhook",
+                    default={},
+                ) or {}).get("id")
+            except (AttributeError, ValueError, inkdrop_bounded_read.ResponseTooLarge):
+                # An ack too large to be a webhook ack is not a delivery
+                # confirmation, so it falls through to the same retry as a
+                # missing id rather than being trusted or raised.
+                message_id = None
+            if not message_id:
+                # A 2xx with no message id back means Discord accepted the
+                # request but did not confirm the message was created -- treat
+                # that the same as a failure rather than a silent false "sent".
+                logger.warning("discord notify: no message id in wait=true response")
+                return SendResult(False, "send failed (no delivery confirmation)", True)
+            return SendResult(True, "sent", False)
+        finally:
+            # stream=True holds the connection until the body is read or the
+            # response is closed; every early return above skips the read.
+            response.close()
 
 
 class PushoverProvider(NotificationProvider):
@@ -229,31 +250,46 @@ class PushoverProvider(NotificationProvider):
         if not token or not user_key:
             return SendResult(False, "not configured", False)
         payload = {"token": token, "user": user_key, "title": title, "message": message}
+        response = None
         try:
-            response = requests.post(self.API_URL, data=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            response = requests.post(
+                self.API_URL, data=payload, timeout=REQUEST_TIMEOUT_SECONDS, stream=True
+            )
             status_code = _response_status(response)
         except Exception as exc:
+            if response is not None:
+                response.close()
             retryable = _is_retryable_exception(exc)
             logger.warning("pushover notify error (%s)", _failure_type(exc))
             return SendResult(False, f"send failed ({_failure_type(exc)})", retryable)
-        if status_code is None:
-            return SendResult(False, "send failed (invalid response)", True)
-        if status_code >= 400:
-            logger.warning("pushover notify failed (HTTP %d)", status_code)
-            retryable = status_code >= 500 or status_code == 429
-            return SendResult(
-                False,
-                f"send failed (HTTP {status_code})",
-                retryable,
-                _pushover_quota_reset_seconds(response) if status_code == 429 else None,
-            )
         try:
-            accepted = int((response.json() or {}).get("status")) == 1
-        except (AttributeError, TypeError, ValueError):
-            accepted = False
-        if not accepted:
-            return SendResult(False, "send failed (provider rejected request)", False)
-        return SendResult(True, "sent", False)
+            if status_code is None:
+                return SendResult(False, "send failed (invalid response)", True)
+            if status_code >= 400:
+                logger.warning("pushover notify failed (HTTP %d)", status_code)
+                retryable = status_code >= 500 or status_code == 429
+                return SendResult(
+                    False,
+                    f"send failed (HTTP {status_code})",
+                    retryable,
+                    _pushover_quota_reset_seconds(response) if status_code == 429 else None,
+                )
+            try:
+                accepted = int((inkdrop_bounded_read.bounded_read_json(
+                    response,
+                    inkdrop_bounded_read.NOTIFICATION_RESPONSE_MAX_BYTES,
+                    label="Pushover API",
+                    default={},
+                ) or {}).get("status")) == 1
+            except (AttributeError, TypeError, ValueError, inkdrop_bounded_read.ResponseTooLarge):
+                accepted = False
+            if not accepted:
+                return SendResult(False, "send failed (provider rejected request)", False)
+            return SendResult(True, "sent", False)
+        finally:
+            # stream=True holds the connection until the body is read or the
+            # response is closed; every early return above skips the read.
+            response.close()
 
 
 PROVIDER_CLASSES = {
@@ -317,11 +353,18 @@ def connector_types_catalog():
     ]
 
 
+def master_switch_enabled(db_path):
+    """The subsystem-wide notifications on/off switch (the `enabled` column on
+    the legacy provider_configs row). Not settable from Settings today, but a
+    restored backup can carry it in off, and everything stays silent when it
+    is -- so the Connect page needs to be able to say so."""
+    return bool((_provider_config_row(db_path) or {}).get("enabled", True))
+
+
 def public_channel_status(db_path):
     """Masked, frontend-safe view of every configured connector: whether
-    each secret field is configured (never the value itself), effective
+    each secret field is configured (never the value itself), its own
     enabled state, and its event-trigger/series-filter preferences."""
-    master_enabled = bool((_provider_config_row(db_path) or {}).get("enabled", True))
     result = []
     for connector in store.list_connectors(db_path):
         cls = PROVIDER_CLASSES.get(connector["type"])
@@ -337,7 +380,15 @@ def public_channel_status(db_path):
             "type": connector["type"],
             "name": connector["name"],
             "display_name": cls.display_name if cls else connector["type"].title(),
-            "enabled": master_enabled and connector["enabled"],
+            # This connector's own switch, deliberately not folded together
+            # with the master switch. The Configure modal binds its Enabled
+            # toggle to this field and writes it straight back on Save, so
+            # reporting the effective state here would silently turn a
+            # perfectly good connector off the first time anyone opened and
+            # saved it while notifications were globally off. The card pairs
+            # this with the config-level notifications_enabled to explain a
+            # connector that is on but still not sending.
+            "enabled": connector["enabled"],
             "secret_fields": secret_fields,
             "events": connector["events"],
             "series_filter": connector["series_filter"],
@@ -658,16 +709,35 @@ def process_due_retries(db_path, *, now=None, limit=100):
     return {"attempted": attempted}
 
 
-def _test_connector_row(connector):
+def _test_connector_row(connector, settings_override=None):
     """Send one real test message to one connector row (a
     inkdrop_notification_store connector dict, not the dispatch-shaped view
     _load_connectors returns) and report the outcome. Shared by test_all
-    (every connector) and test_connector (exactly one)."""
+    (every connector) and test_connector (exactly one).
+
+    `settings_override` carries credentials the operator has typed but not
+    saved yet, layered over what's stored, and is deliberately never
+    persisted -- testing must not be a back door that writes config. Without
+    it, "Send Test Notification" sitting next to an edited webhook field
+    tested the *stored* value instead: a freshly-added connector reported
+    "not configured" with the URL visibly filled in, and -- worse -- editing
+    a working connector to a new, broken URL reported "sent", because the old
+    URL was what actually got tested. Blank fields are dropped rather than
+    overriding, matching update_connector()'s leave-blank-to-keep contract,
+    so an untouched masked secret input still tests the saved credential.
+    """
     cls = PROVIDER_CLASSES.get(connector["type"])
     name = connector.get("name") or connector["type"]
     if cls is None:
         return {"id": connector["id"], "name": name, "configured": False, "sent": False, "detail": "unknown connector type"}
-    instance = cls(connector["settings"])
+    settings = dict(connector["settings"])
+    if settings_override:
+        allowed = {field["key"] for field in cls.config_fields}
+        settings.update({
+            str(key): value for key, value in dict(settings_override).items()
+            if str(key) in allowed and value not in (None, "")
+        })
+    instance = cls(settings)
     if not instance.is_configured():
         return {"id": connector["id"], "name": name, "configured": False, "sent": False, "detail": "not configured"}
     try:
@@ -697,15 +767,17 @@ def test_all(db_path):
     return [_test_connector_row(connector) for connector in connectors]
 
 
-def test_connector(db_path, connector_id):
+def test_connector(db_path, connector_id, settings_override=None):
     """Send a real test message to exactly one connector, ignoring its
     enable toggle and event-trigger matrix, the same "test before you have
-    to save and flip switches" reasoning as test_all. Returns a single
-    result dict, or {"ok": False, "reason": ...} if the id doesn't exist."""
+    to save and flip switches" reasoning as test_all -- and, via
+    settings_override, testing the credentials currently on screen rather
+    than only the ones already saved. Returns a single result dict, or
+    {"ok": False, "reason": ...} if the id doesn't exist."""
     connector = store.get_connector(db_path, connector_id)
     if connector is None:
         return {"ok": False, "reason": "unknown_connector", "id": connector_id}
-    return {"ok": True, **_test_connector_row(connector)}
+    return {"ok": True, **_test_connector_row(connector, settings_override)}
 
 
 # --------------------------------------------------------------------------
@@ -765,6 +837,41 @@ def notify_manual_review(db_path, *, reason, series=None, source=None, detail=No
         series_id=series_id, issue_id=issue_id,
         occurrence_key=_occurrence_key("manual_action_required", series_id or series, reason, source),
     )
+
+
+def notify_manual_review_from_payload(db_path, reason, payload, *, fallback_db_path=None):
+    """Fire manual_action_required for one persisted Manual Review row.
+
+    Every module that appends to manual-review.jsonl needs the identical
+    payload-key mapping, and each one that grew its own copy is a place a
+    later writer can forget: four of the six writers reached production with
+    no notify call at all, so an "unsafe or missing target folder" row (1,040
+    of them in live history) was written to Manual Review and silently never
+    announced. One shared mapping means a new writer wires up in a single
+    line and can't quietly drift.
+
+    Only ever call this for a row that was *actually persisted* -- the soft
+    review reasons several writers gate behind INKDROP_PERSIST_SOFT_REVIEWS
+    are diagnostic noise, not operator-attention events.
+
+    Never raises: a notification failing must not take down the import or
+    acquisition pass that produced the row.
+    """
+    payload = payload or {}
+    try:
+        return notify_manual_review(
+            db_path if db_path is not None else fallback_db_path,
+            reason=reason,
+            series=payload.get("series") or payload.get("matched_series"),
+            source=payload.get("source"),
+            detail=payload.get("detail"),
+            note=payload.get("note"),
+            series_id=payload.get("series_id") or payload.get("native_series_id"),
+            issue_id=payload.get("issue_id"),
+        )
+    except Exception:
+        logger.exception("manual review notification for %r raised", reason)
+        return {"sent": [], "settled": False, "recorded": 0, "channels": 0, "reason": "notify_error"}
 
 
 def notify_grabbed(db_path, *, series, issue_label=None, series_id=None, issue_id=None, task_id=None):

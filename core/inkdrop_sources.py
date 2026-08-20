@@ -539,10 +539,58 @@ def candidate_identity(attempt):
     return stable_id("candidate", provider_id, username, issue, identity)
 
 
+# Every alias a provider has ever used for "the string we sent upstream".
+# Callers reach record_source_attempt() from a dozen modules and each grew its
+# own spelling, so the canonical `query` column was populated on only 47.3% of
+# provider attempts measured live 2026-08-15 -- slskd 34.5%, tokyo_toshokan
+# 20.1%, suwayomi 11.4%. That gap is why diagnosing a search failure required
+# joining the production database by hand: without the outbound query you
+# cannot tell a bad query from a bad matcher. Order is preference order.
+SEARCH_QUERY_ALIASES = (
+    "query",
+    "search_query",
+    "searchQuery",
+    "query_variant",
+    "_inkdrop_query_variant",
+    "source_search_query",
+    "search_term",
+    "searchTerm",
+    "term",
+)
+
+
+def search_query_text(attempt):
+    """Return the outbound search string an attempt was made with, or ""."""
+    attempt = attempt if isinstance(attempt, dict) else {}
+    for key in SEARCH_QUERY_ALIASES:
+        value = attempt.get(key)
+        if isinstance(value, (list, tuple)):
+            value = next((item for item in value if str(item or "").strip()), None)
+        text = str(value or "").strip()
+        if text:
+            return text
+    # Some providers nest the request under the plan/target they built it from
+    # rather than putting it on the attempt itself.
+    for container_key in ("request", "search", "plan", "target", "wanted", "wanted_item"):
+        container = attempt.get(container_key)
+        if isinstance(container, dict):
+            text = search_query_text(container)
+            if text:
+                return text
+    return ""
+
+
 def normalize_source_attempt(attempt):
     if not isinstance(attempt, dict):
         return attempt
     out = dict(attempt)
+    # Promote whatever spelling the caller used into the canonical `query` so
+    # the persisted raw_json always carries it. Never overwrite a value the
+    # caller set deliberately.
+    if not str(out.get("query") or "").strip():
+        query_text = search_query_text(out)
+        if query_text:
+            out["query"] = query_text
     provider_id = provider_key(out.get("provider_id") or attempt_provider_id(out))
     source = provider_key(out.get("source") or provider_id)
     status = str(out.get("status") or "").strip().lower()

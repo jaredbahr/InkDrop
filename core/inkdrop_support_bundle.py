@@ -90,6 +90,43 @@ _SAFE_STRING_KEYS = {
     "orgopencontainersimagerevision", "orgopencontainersimagetitle",
     "orgopencontainersimageversion",
 }
+
+# The fields a bundle is actually collected for. Every string below still goes
+# through SupportRedactor.text() first, which strips exact inventory values and
+# their encodings, URLs, auth headers and key=value credential pairs -- the
+# allowlist only decides whether that already-scrubbed text is kept or replaced
+# with the sentinel. Leaving these off it meant the scrubbed text was computed
+# and then discarded: a 2026-08-16 field bundle carried 2,141 `error` values of
+# which 2,112 were the sentinel and the other 29 were null, so it recorded that
+# something threw without recording what.
+#
+# Scope is deliberately diagnostics only. Paths, library titles and search
+# queries stay redacted -- those are a privacy decision, not over-redaction.
+_SAFE_DIAGNOSTIC_KEYS = {
+    # Failure text and where it came from.
+    "error", "errors", "errortext", "errorcode", "errordetail", "errormessage",
+    "lasterror", "exception", "exceptiontype", "failure", "failurereason",
+    "traceback", "tracebacktail", "stacktrace",
+    # Lifecycle position: what the row was doing and what it did before.
+    "statuses", "states", "previousstate", "nextstate", "laststate",
+    "queuestate", "displaystate", "displayqueuestate", "displayphase",
+    "lifecyclephase", "phase", "stage", "lastevent", "outcome", "decision",
+    "transferstate", "transferstatus",
+    # Correlation ids. Opaque row handles, not credentials -- without them a
+    # repeated event cannot be tied to the item it repeated for. Deliberately
+    # the qualified names only: a bare "id" is the one key likely to carry
+    # something like an OAuth client id, and the qualified forms cover the
+    # diagnostic need without reaching for it.
+    "queueid", "reviewid", "eventid", "taskid", "downloadtaskid", "attemptid",
+    "sourceattemptid", "seriesid", "issueid", "wantedid", "transferid",
+    "requestid", "correlationid", "runid", "jobid", "candidateid",
+    # The ISO stamps beside the numeric ones already allowed, plus the labels
+    # that say which loop emitted the line.
+    "tsiso", "createdatiso", "updatedatiso", "startedatiso", "completedatiso",
+    "kind", "worker", "operation", "component", "category",
+}
+_SAFE_STRING_KEYS |= _SAFE_DIAGNOSTIC_KEYS
+
 _SAFE_HEADER_KEYS = {"contenttype", "contentlength", "accept"}
 
 _SAFE_CONFIG_STRING_KEYS = {

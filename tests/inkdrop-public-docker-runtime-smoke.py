@@ -472,7 +472,12 @@ def assert_public_release_workflow_contract():
         "Build Docker image": 30,
         "Run strict container preflight": 5,
         "Verify container install support summary": 5,
-        "Verify release-ready JSON gate": 35,
+        # 10, not 35: the gate runs --docker-only, so the Docker-free half
+        # of the release check no longer repeats there (the step above it
+        # already ran it from the same commit). Three Docker checks are
+        # seconds of work, and the ceiling decides how long a wedged one
+        # bills before Actions kills it.
+        "Verify release-ready JSON gate": 10,
     }
     for step_name, timeout_minutes in expected_step_timeouts.items():
         require(step_timeouts.get(step_name) == timeout_minutes, f"public-release workflow should bound {step_name}")
@@ -495,7 +500,16 @@ def assert_public_release_workflow_contract():
         'assert payload["preflight_schema_version"] == 1',
         'assert payload["preflight"]["ok"] is True',
         'assert "effective_config" not in payload["preflight"]',
-        "python -B tools/inkdrop_public_release_check.py --docker --require-docker --skip-docker-build --json",
+        # --docker-only, not --docker: plain --docker means "everything, plus
+        # Docker", so the gate step re-ran all 119 local smokes + host
+        # preflight + install-support summary that "Run static public-release
+        # checks" had just run from the same commit in the same job. Pin the
+        # deduplicated form so that regression cannot come back quietly.
+        # (The README/install-doc contract below still requires the plain
+        # --docker --require-docker --skip-docker-build spelling, because a
+        # human running the check from scratch has *not* already run the
+        # Docker-free half and does need it.)
+        "python -B tools/inkdrop_public_release_check.py --docker-only --skip-docker-build --json",
         "inkdrop-release-check.json",
         "actions/upload-artifact@v4",
         "inkdrop-public-release-evidence",

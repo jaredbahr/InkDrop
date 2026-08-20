@@ -528,6 +528,253 @@ def smoke_progress_and_failure_normalization():
     require(generic_nzb["transfer_state"] == "completed", f"generic nzbget completed telemetry regressed: {generic_nzb}")
 
 
+def nzbget_history_row(**overrides):
+    row = {
+        "_inkdrop_section": "history",
+        "NZBID": 4242,
+        "NZBName": "Health Probe",
+        "Status": "SUCCESS/ALL",
+        "FileSizeMB": 10,
+        "DownloadedSizeMB": 10,
+        "DestDir": "/remote/comics/Health",
+        "HistoryTime": 100,
+    }
+    row.update(overrides)
+    return {key: value for key, value in row.items() if value is not None}
+
+
+def smoke_nzbget_damaged_history_never_imports():
+    """Damaged, force-marked, and unknown NZBGet outcomes must fail closed.
+
+    Every case here landed as a clean `completed` with a derived output path
+    before the health verdict existed, which handed unverified bytes to the
+    importer.
+    """
+    settings = nzbget_settings()
+
+    clean = clients.nzbget_status(nzbget_history_row(), settings, now=500)
+    require(clean["transfer_state"] == "completed", f"clean success regressed: {clean}")
+    require(
+        clean["completed_output_path"] == "/mnt/downloads/comics/Health",
+        f"clean success lost its path: {clean}",
+    )
+    require(not clean["needs_review"], f"clean success should not need review: {clean}")
+
+    # 1. Par repair is possible but was never performed - damaged bytes.
+    repairable = clients.nzbget_status(
+        nzbget_history_row(ParStatus="REPAIR_POSSIBLE"), settings, now=500
+    )
+    require(
+        repairable["transfer_state"] == "failed",
+        f"REPAIR_POSSIBLE must not be a completion: {repairable}",
+    )
+    require(
+        repairable["completed_output_path"] is None,
+        f"REPAIR_POSSIBLE must not expose an import path: {repairable}",
+    )
+    require(repairable["needs_review"], f"REPAIR_POSSIBLE must be reviewable: {repairable}")
+
+    # 2. A human force-marked a damaged download as good.
+    marked = clients.nzbget_status(nzbget_history_row(Status="SUCCESS/MARK"), settings, now=500)
+    require(
+        marked["transfer_state"] == "failed",
+        f"SUCCESS/MARK must not be a completion: {marked}",
+    )
+    require(
+        marked["completed_output_path"] is None,
+        f"SUCCESS/MARK must not expose an import path: {marked}",
+    )
+
+    mark_status = clients.nzbget_status(nzbget_history_row(MarkStatus="GOOD"), settings, now=500)
+    require(
+        mark_status["transfer_state"] == "failed",
+        f"MarkStatus GOOD must not be a completion: {mark_status}",
+    )
+
+    # 3. A history row with no Status at all - a genuinely unknown outcome.
+    headless = clients.nzbget_status(
+        nzbget_history_row(Status=None, Kind="NZB"), settings, now=500
+    )
+    require(
+        headless["transfer_state"] == "failed",
+        f"absent Status must not be a completion: {headless}",
+    )
+    require(
+        headless["completed_output_path"] is None,
+        f"absent Status must not expose an import path: {headless}",
+    )
+    require(headless["needs_review"], f"absent Status must be reviewable: {headless}")
+
+    # The per-script array must be what produces the verdict, not a
+    # coincidental fallthrough - pin the reason to the failing script's name.
+    scripted = clients.nzbget_status(
+        nzbget_history_row(ScriptStatuses=[{"Name": "cleanup", "Status": "FAILURE"}]),
+        settings,
+        now=500,
+    )
+    require(
+        scripted["health_verdict"] == "damaged"
+        and "cleanup" in (scripted["health_reason"] or ""),
+        f"ScriptStatuses array must drive the verdict: {scripted}",
+    )
+
+    # 4. The rest of the damaged range, not just the two named values.
+    damaged_cases = [
+        {"ParStatus": "FAILURE"},
+        {"ParStatus": "MANUAL"},
+        {"UnpackStatus": "FAILURE"},
+        {"UnpackStatus": "PASSWORD"},
+        {"UnpackStatus": "SPACE"},
+        {"MoveStatus": "FAILURE"},
+        {"ScriptStatus": "FAILURE"},
+        {"Status": "WARNING/DAMAGED"},
+        {"Status": "WARNING/REPAIRABLE"},
+        {"Status": "WARNING/HEALTH"},
+        {"Status": "FAILURE/HEALTH"},
+        {"Status": "FAILURE/BAD"},
+        {"Health": 200, "CriticalHealth": 900},
+        # Partial download with no CriticalHealth reported at all.
+        {"Health": 940},
+        # Articles lost and nothing says they were repaired.
+        {"FailedArticles": 12},
+        # NZBGet documents SUCCESS/GOOD as "marked as good by user" - the same
+        # operator override as SUCCESS/MARK, not a verification result.
+        {"Status": "SUCCESS/GOOD"},
+        # Per-script array; the scalar ScriptStatus can be absent.
+        {"ScriptStatuses": [{"Name": "cleanup", "Status": "FAILURE"}]},
+    ]
+    for overrides in damaged_cases:
+        row = nzbget_history_row(**overrides)
+        status = clients.nzbget_status(row, settings, now=500)
+        require(
+            status["transfer_state"] != "completed",
+            f"damaged row treated as completion {overrides}: {status}",
+        )
+        require(
+            status["completed_output_path"] is None,
+            f"damaged row exposed an import path {overrides}: {status}",
+        )
+        require(
+            status["health_reason"],
+            f"damaged row gave no reason {overrides}: {status}",
+        )
+
+    # 5. Genuinely clean variants must still import.
+    for overrides in (
+        {"Status": "SUCCESS/UNPACK"},
+        {"Status": "SUCCESS/PAR"},
+        {"ParStatus": "SUCCESS", "UnpackStatus": "SUCCESS"},
+        {"ParStatus": "NONE", "UnpackStatus": "NONE", "ScriptStatus": "NONE"},
+        {"Health": 1000, "CriticalHealth": 900},
+        # Articles were lost but par2 put them back - that is what repair is.
+        {"Health": 940, "ParStatus": "SUCCESS"},
+        {"FailedArticles": 12, "ParStatus": "SUCCESS"},
+        {"ScriptStatuses": [{"Name": "cleanup", "Status": "SUCCESS"}]},
+    ):
+        status = clients.nzbget_status(nzbget_history_row(**overrides), settings, now=500)
+        require(
+            status["transfer_state"] == "completed",
+            f"clean row must still complete {overrides}: {status}",
+        )
+
+
+def smoke_nzbget_queue_post_processing_is_active():
+    """NZBGet's real queue spellings must not read as `unknown`.
+
+    The expected token is `downloading`, not `active`: `active` was a spelling
+    only this module used, and the telemetry normalizer that consumes these
+    rows never understood it, so a row this test called correct still reached
+    the operator as `unknown`.
+    """
+    settings = nzbget_settings()
+    for status, expected in (
+        ("PP_QUEUED", "queued"),
+        ("POST_QUEUED", "queued"),
+        ("UNPACKING", "downloading"),
+        ("VERIFYING_SOURCES", "downloading"),
+        ("VERIFYING_REPAIRED", "downloading"),
+        ("EXECUTING_SCRIPT", "downloading"),
+        ("LOADING_PARS", "downloading"),
+        ("RENAMING", "downloading"),
+        ("REPAIRING", "downloading"),
+        ("MOVING", "downloading"),
+        ("DOWNLOADING", "downloading"),
+        ("QUEUED", "queued"),
+    ):
+        row = {"_inkdrop_section": "queue", "NZBID": 1, "Status": status}
+        state = clients.nzbget_status(row, settings)["transfer_state"]
+        require(
+            state == expected,
+            f"queue status {status} read as {state}, expected {expected}",
+        )
+
+
+def smoke_nzbget_damaged_history_is_not_reused():
+    """A damaged history row must not satisfy an idempotency lookup."""
+    key = "inkdrop-nzb-reuse"
+
+    class FakeClient:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def call(self, method, _params=None):
+            return [] if method == "listgroups" else self.rows
+
+    clean_row = nzbget_history_row(DupeKey=key)
+    require(
+        clients.nzbget_find_existing(FakeClient([clean_row]), key) is not None,
+        "a clean history row should still count as existing",
+    )
+
+    for overrides in (
+        {"ParStatus": "REPAIR_POSSIBLE"},
+        {"Status": "SUCCESS/MARK"},
+        {"Status": None, "Kind": "NZB"},
+        {"UnpackStatus": "FAILURE"},
+    ):
+        row = nzbget_history_row(DupeKey=key, **overrides)
+        require(
+            clients.nzbget_find_existing(FakeClient([row]), key) is None,
+            f"damaged history row was reused as existing {overrides}: {row}",
+        )
+
+
+def smoke_nzbget_unknown_is_not_relaundered():
+    """Downstream telemetry must not upgrade `unknown` back into a completion."""
+    relaundered = inkdrop_transfer.normalize_transfer_status(
+        {"download_client": "nzbget"},
+        {"client_state": "unknown", "percent_complete": 100.0},
+    )
+    require(
+        relaundered["transfer_state"] == "unknown",
+        f"100% bytes must not upgrade unknown to completed: {relaundered}",
+    )
+
+    damaged = inkdrop_transfer.normalize_transfer_status(
+        {"download_client": "nzbget"},
+        {
+            "_inkdrop_section": "history",
+            "status": "SUCCESS/ALL",
+            "ParStatus": "REPAIR_POSSIBLE",
+            "FileSizeMB": 5,
+            "DownloadedSizeMB": 5,
+        },
+    )
+    require(
+        damaged["transfer_state"] == "failed",
+        f"generic telemetry laundered a damaged row: {damaged}",
+    )
+
+    headless = inkdrop_transfer.normalize_transfer_status(
+        {"download_client": "nzbget"},
+        {"_inkdrop_section": "history", "Kind": "NZB", "FileSizeMB": 5, "DownloadedSizeMB": 5},
+    )
+    require(
+        headless["transfer_state"] == "failed",
+        f"generic telemetry laundered a status-less row: {headless}",
+    )
+
+
 def smoke_transmission_controls_are_safe():
     fake = FakeTransmissionHttp()
     result = clients.transmission_control(transmission_settings(), "hash-new", "remove", http=fake)
@@ -693,6 +940,10 @@ def main():
     smoke_nzbget_new_handoff_and_mapping()
     smoke_nzbget_history_reconciliation()
     smoke_progress_and_failure_normalization()
+    smoke_nzbget_damaged_history_never_imports()
+    smoke_nzbget_queue_post_processing_is_active()
+    smoke_nzbget_damaged_history_is_not_reused()
+    smoke_nzbget_unknown_is_not_relaundered()
     smoke_transmission_controls_are_safe()
     smoke_deluge_controls_are_safe()
     smoke_nzbget_controls_are_safe()

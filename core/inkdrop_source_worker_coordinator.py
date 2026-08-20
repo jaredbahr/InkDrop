@@ -21,6 +21,7 @@ from core import inkdrop_missing_recovery_policy
 from core import inkdrop_page_pack_downloader as page_pack_downloader
 from core import inkdrop_source_providers
 from core import inkdrop_source_worker_jobs as source_jobs
+from core import inkdrop_source_worker_phase_timing as phase_timing
 from core import inkdrop_source_worker_recorder as recorder
 from core import inkdrop_source_registry
 from core import inkdrop_sources
@@ -49,6 +50,35 @@ FAILED_HANDOFF_RETRY_STATUSES = {
 VOLUME_TITLE_RE = re.compile(r"(?i)^\s*(?:vol(?:ume)?|v)\.?\s*(\d+(?:\.\d+)?)\s*$")
 VOLUME_QUERY_RE = re.compile(r"(?i)(?:^|\b)(?:vol(?:ume)?|v)\.?\s*(\d+(?:\.\d+)?)(?:\b|$)")
 CHAPTER_QUERY_RE = re.compile(r"(?i)(?:^|\b)(?:chapter|chap|ch|c)\.?\s*\d")
+# A work that has no unit number because it has no unit: the file *is* the
+# whole work. These read the ISSUE title only, never the series title -- a
+# series called "... The Graphic Novel" is a title, while an issue whose whole
+# title is "GN" is ComicVine saying this volume holds one indivisible work.
+#
+# Positive signals only, and deliberately not "the series has one issue row".
+# Saga of the Swamp Thing has exactly one issue row and it is titled "Vol. 1":
+# volume one of a numbered trade run, not a standalone. A count-only or
+# row-shape inference admits it, and admitting it means a file called
+# "Saga of the Swamp Thing.cbz" -- which in the wild is as likely to be volume
+# three -- satisfies the wanted row and the book is silently lost. Every
+# signal below names the work's form; none of them counts rows.
+UNITLESS_WORK_ISSUE_TITLE_PATTERNS = (
+    re.compile(r"(?i)^\s*(?:gn|ogn)\s*$"),
+    re.compile(r"(?i)^\s*(?:original\s+)?graphic\s+novel\s*$"),
+    re.compile(r"(?i)^\s*one[-\s]?shot\s*$"),
+)
+UNITLESS_WORK_UNIT_TYPES = {"oneshot"}
+
+
+def unitless_work_issue_title(value):
+    """Whether an issue title states the work has no unit of its own."""
+
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in UNITLESS_WORK_ISSUE_TITLE_PATTERNS)
+
+
 COLLECTED_SINGLETON_PATTERNS = (
     ("complete_collection", re.compile(r"(?i)\bcomplete\s+(?:series|collection|edition)\b")),
     ("omnibus", re.compile(r"(?i)\bomnibus\b")),
@@ -60,6 +90,19 @@ COLLECTED_SINGLETON_PATTERNS = (
     ("hardcover", re.compile(r"(?i)\b(?:hardcover|hc)\b")),
     ("volume", re.compile(r"(?i)^\s*(?:vol(?:ume)?|v)\.?\s*\d*\s*$")),
 )
+# Markers that may NOT on their own establish a collected-singleton proof.
+#
+# This pattern is anchored, and _collected_singleton_markers() searches the
+# series title and the issue title joined into one string, so with a series
+# title present -- always -- it could never fire. Evaluating it per-value the
+# way it reads makes it fire, and every live row it reaches is one it must not
+# prove: the six issue titles it matches are "Vol. 1"/"Vol. 2"/"Vol. 3", and
+# a bare volume marker is evidence the work IS numbered, which is the opposite
+# of the singleton claim. Verified against the live library 2026-08-18:
+# enabling it flips Saga of the Swamp Thing from review to compatible on a
+# candidate carrying no year at all. So the pattern keeps its reachability fix
+# and loses its authority, rather than being deleted and silently regrown.
+NON_ESTABLISHING_SINGLETON_MARKERS = {"volume"}
 
 
 def _dict(value):
@@ -241,13 +284,37 @@ def _project_authoritative_comicvine_issue_rows(issue_rows, wanted_rows):
     return projected_issues, projected_wanted, len(alias_to_authoritative)
 
 
-def _collected_singleton_markers(*values):
+def _detected_singleton_markers(*values):
+    """Every format marker these titles carry, before any authority filter.
+
+    Detection and authority are separated so each can be asserted on its own.
+    Folded together, the anchored-pattern fix below is invisible: `volume` is
+    the only anchored pattern and it is also the only non-establishing one, so
+    a test on the filtered result passes whether or not the fix is present.
+    """
+
     markers = []
-    text = " ".join(str(value or "") for value in values if str(value or "").strip())
+    parts = [str(value or "") for value in values if str(value or "").strip()]
+    text = " ".join(parts)
     for marker, pattern in COLLECTED_SINGLETON_PATTERNS:
-        if pattern.search(text):
+        # An anchored pattern asks "is this whole value nothing but the
+        # marker", so it has to see each value on its own; searching the
+        # joined string can only ever answer no.
+        if pattern.pattern.startswith("(?i)^"):
+            matched = any(pattern.search(part) for part in parts)
+        else:
+            matched = bool(pattern.search(text))
+        if matched:
             markers.append(marker)
     return markers
+
+
+def _collected_singleton_markers(*values):
+    return [
+        marker
+        for marker in _detected_singleton_markers(*values)
+        if marker not in NON_ESTABLISHING_SINGLETON_MARKERS
+    ]
 
 
 def _volume_number_from_queue_text(queue, raw):
@@ -429,14 +496,40 @@ def _singleton_issue_context_from_rows(
         metadata_issue_count in (None, "")
         and collected_singleton_proof
     )
-    singleton_issue_proof = bool(singleton_issue_proof or inferred_singleton_issue_proof)
+    # A standalone graphic novel or one-shot: the work has no unit because
+    # there is no unit, so no filename can ever carry a unit number and the
+    # unit contract can never be satisfied. It needs the same durable identity
+    # every other proof here needs -- one canonical issue row, one positive
+    # ComicVine id, stable provider identity, fresh metadata -- and on top of
+    # that a positive statement of the work's form from the issue title. It
+    # deliberately does not accept "the series has one issue row"; that shape
+    # is also what a partially-ingested numbered run looks like.
+    authoritative_issue_title = (
+        str(target_issue_rows[0]["title"] or "") if len(target_issue_rows) == 1 else ""
+    )
+    unitless_work_proof = bool(
+        stable_provider_identity
+        and metadata_fresh
+        and trusted_issue_identity
+        and canonical_issue_count == 1
+        and canonical_one_row_count == 1
+        and not _metadata_declares_multiple_issues(metadata_issue_count)
+        and unitless_work_issue_title(authoritative_issue_title)
+    )
+    singleton_issue_proof = bool(
+        singleton_issue_proof or inferred_singleton_issue_proof or unitless_work_proof
+    )
     singleton_issue_proof_source = (
         "comicvine_authoritative_count_and_canonical_issue_identity"
         if metadata_issue_count == 1 and singleton_issue_proof
         else (
             "comicvine_collected_single_wanted_identity_without_declared_count"
             if inferred_singleton_issue_proof
-            else ""
+            else (
+                "comicvine_unitless_work_issue_form"
+                if unitless_work_proof
+                else ""
+            )
         )
     )
     authoritative_issue = target_issue_rows[0] if len(target_issue_rows) == 1 else None
@@ -464,6 +557,8 @@ def _singleton_issue_context_from_rows(
         "singleton_issue_metadata_trusted": trusted_issue_identity,
         "singleton_issue_proof": singleton_issue_proof,
         "singleton_issue_proof_source": singleton_issue_proof_source,
+        "unitless_work_proof": unitless_work_proof,
+        "unitless_work_issue_title": authoritative_issue_title if unitless_work_proof else "",
         "collected_singleton_wanted_count": len(collected_wanted_rows),
         "collected_singleton_wanted_count_before_replay_projection": raw_collected_wanted_count,
         "collected_singleton_markers": collected_markers,
@@ -2595,6 +2690,23 @@ def persisted_exact_pack_replay_result(
     return {}
 
 
+@contextlib.contextmanager
+def _phase(accumulator, name):
+    """Time one phase, or do nothing at all when timing is off.
+
+    Written as a null-object rather than an `if` at each call site so the
+    instrumented control flow is the same shape as the code it replaced --
+    the phases stay plain sequential calls. A phase that raises still records
+    the time it spent before raising, because "died after 40s" is exactly the
+    observation that reconstructing from timestamps could never recover.
+    """
+    if accumulator is None:
+        yield
+        return
+    with accumulator.span(name):
+        yield
+
+
 def run_source_worker_for_queue(
     db_path,
     queue_id,
@@ -2620,70 +2732,81 @@ def run_source_worker_for_queue(
     fetch_deadline=None,
     now=None,
 ):
-    planned = source_jobs_for_queue(
-        db_path,
-        queue_id,
-        include_operator=include_operator,
-        include_blocked=include_blocked,
-        provider_ids=provider_ids,
-        job_limit=job_limit,
-    )
+    # Phase spans for this item. The accumulator is inert when phase timing is
+    # disabled, so the control flow below is identical either way; the caller
+    # flushes it once, alongside the runtime-calibration observation.
+    phases = phase_timing.PhaseAccumulator() if phase_timing.enabled() else None
+    with _phase(phases, "plan"):
+        planned = source_jobs_for_queue(
+            db_path,
+            queue_id,
+            include_operator=include_operator,
+            include_blocked=include_blocked,
+            provider_ids=provider_ids,
+            job_limit=job_limit,
+        )
     if not planned.get("ok"):
         return planned
     selected_jobs = _select_jobs(planned.get("jobs") or [], limit=run_limit)
-    replay = persisted_exact_pack_replay_result(
-        db_path,
-        queue_id,
-        planned.get("wanted_item"),
-        provider_ids=provider_ids,
-        claim=not dry_run,
-        now=now,
-    )
-    results = [replay] if replay else source_jobs.run_source_jobs(
-        selected_jobs,
-        http_get=source_http_get,
-        operator_payloads=operator_payloads,
-        candidate_headers_by_provider=candidate_headers_by_provider,
-        source_memory_db_path=source_memory_db_path,
-        source_memory_cooldown_seconds=source_memory_cooldown_seconds,
-        staging_root=staging_root,
-        fetch_deadline=fetch_deadline,
-        now=now,
-    )
-    recorded = recorder.record_source_job_results(
-        db_path,
-        queue_id,
-        results,
-        jobs_by_provider_id=_jobs_by_provider_id(selected_jobs),
-        source_memory_db_path=source_memory_db_path,
-        source_memory_cooldown_seconds=source_memory_cooldown_seconds,
-        dry_run=dry_run,
-        record_lock_retry_attempts=record_lock_retry_attempts,
-        record_lock_retry_initial_delay=record_lock_retry_initial_delay,
-        now=now,
-    )
+    with _phase(phases, "replay_check"):
+        replay = persisted_exact_pack_replay_result(
+            db_path,
+            queue_id,
+            planned.get("wanted_item"),
+            provider_ids=provider_ids,
+            claim=not dry_run,
+            now=now,
+        )
+    with _phase(phases, "fetch"):
+        results = [replay] if replay else source_jobs.run_source_jobs(
+            selected_jobs,
+            http_get=source_http_get,
+            operator_payloads=operator_payloads,
+            candidate_headers_by_provider=candidate_headers_by_provider,
+            source_memory_db_path=source_memory_db_path,
+            source_memory_cooldown_seconds=source_memory_cooldown_seconds,
+            staging_root=staging_root,
+            fetch_deadline=fetch_deadline,
+            phase_accumulator=phases,
+            now=now,
+        )
+    with _phase(phases, "record"):
+        recorded = recorder.record_source_job_results(
+            db_path,
+            queue_id,
+            results,
+            jobs_by_provider_id=_jobs_by_provider_id(selected_jobs),
+            source_memory_db_path=source_memory_db_path,
+            source_memory_cooldown_seconds=source_memory_cooldown_seconds,
+            dry_run=dry_run,
+            record_lock_retry_attempts=record_lock_retry_attempts,
+            record_lock_retry_initial_delay=record_lock_retry_initial_delay,
+            now=now,
+        )
     direct_stage = {}
     if stage_direct:
-        direct_stage = stage_direct_download_tasks(
-            db_path,
-            queue_id,
-            http_get=direct_http_get,
-            staging_root=staging_root,
-            source_memory_db_path=source_memory_db_path,
-            dry_run=dry_run,
-            limit=job_limit,
-            now=now,
-        )
+        with _phase(phases, "direct_stage"):
+            direct_stage = stage_direct_download_tasks(
+                db_path,
+                queue_id,
+                http_get=direct_http_get,
+                staging_root=staging_root,
+                source_memory_db_path=source_memory_db_path,
+                dry_run=dry_run,
+                limit=job_limit,
+                now=now,
+            )
     download_client_handoff = {}
     if handoff_download_clients:
-        download_client_handoff = handoff_download_client_tasks(
-            db_path,
-            queue_id,
-            add_download_client=download_client_adder,
-            dry_run=dry_run,
-            limit=job_limit,
-            now=now,
-        )
+        with _phase(phases, "handoff"):
+            download_client_handoff = handoff_download_client_tasks(
+                db_path,
+                queue_id,
+                add_download_client=download_client_adder,
+                dry_run=dry_run,
+                limit=job_limit,
+                now=now,
+            )
     return {
         "source_worker_coordinator_contract_version": CONTRACT_VERSION,
         "ok": (
@@ -2701,4 +2824,8 @@ def run_source_worker_for_queue(
         "recording": recorded,
         "direct_stage": direct_stage,
         "download_client_handoff": download_client_handoff,
+        # Handed back rather than written here: the caller owns the run
+        # boundary (and knows dry_run/truncation), and it already flushes the
+        # runtime-calibration observation at exactly that point.
+        "phase_timing": phases.snapshot() if phases is not None else None,
     }

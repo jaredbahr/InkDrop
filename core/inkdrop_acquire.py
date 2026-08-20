@@ -128,6 +128,18 @@ def protocol_rank(protocol, order=None):
         return len(order)
 
 
+# NOT the timeout a search runs under. This is only the fallback used when the
+# provider config carries no timeout_seconds of its own, and the live config
+# does carry one, so in practice this value never applies. Three modules read
+# INKDROP_PROWLARR_SEARCH_TIMEOUT_SECONDS with two different defaults -- 45
+# here, 12 in inkdrop_series_autopilot.DEFAULT_PROWLARR_TIMEOUT_SECONDS and in
+# inkdrop_missing_acquire.prowlarr_search_with_budget() -- and prowlarr_search()
+# then takes the *minimum* of whatever it is passed and the configured value,
+# so the effective timeout can only ever be smaller than any of them.
+#
+# Measured 2026-08-18: this constant reported 45.0 in the running container
+# while searches were actually cut off at 12.0. Anything measuring Prowlarr
+# should call effective_prowlarr_search_timeout_seconds() and not read this.
 PROWLARR_SEARCH_TIMEOUT_SECONDS = max(
     5.0,
     min(env_float("INKDROP_PROWLARR_SEARCH_TIMEOUT_SECONDS", 45), 45.0),
@@ -701,6 +713,22 @@ def load_prowlarr_settings(media_type):
         "source": config.get("source") or "fallback",
         "apikey_query_param_fallback": prowlarr_apikey_query_param_fallback_enabled(settings),
     }
+
+
+def effective_prowlarr_search_timeout_seconds(media_type="comics", requested=None):
+    """The timeout a Prowlarr search will actually run under.
+
+    prowlarr_search() clamps whatever it is handed down to the configured
+    value, so neither the module constant nor a caller's argument tells you on
+    its own what a search gets. This resolves the same way the search does.
+    """
+    configured = load_prowlarr_settings(media_type)["timeout_seconds"]
+    if requested is None:
+        return configured
+    try:
+        return max(1.0, min(float(requested), configured))
+    except (TypeError, ValueError):
+        return configured
 
 
 def load_qbit_settings():

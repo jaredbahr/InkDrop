@@ -68,6 +68,19 @@ def main():
     with tempfile.TemporaryDirectory(prefix="inkdrop-settings-section-contract-", ignore_cleanup_errors=True) as tmp:
         db_path = Path(tmp) / inkdrop_state.STATE_DB_NAME
         inkdrop_state.ensure_schema(db_path)
+        # Download clients are no longer seeded onto installs that never ran
+        # one, so this fixture stands in for an install upgraded from before
+        # that change -- which is what keeps the sibling-visibility regression
+        # below (saving qBittorrent used to hide SLSKD and SABnzbd) covered.
+        # A fresh install seeing none of these three is asserted separately, in
+        # inkdrop-download-client-add-first-model-smoke.py.
+        with sqlite3.connect(db_path) as seed_con:
+            for provider_id, display_name in (("qbittorrent", "qBittorrent"), ("sabnzbd", "SABnzbd"), ("slskd", "SLSKD")):
+                seed_con.execute(
+                    "insert into provider_configs(id,provider_type,display_name,enabled,settings_json,source,created_at,updated_at)"
+                    " values(?,?,?,0,'{}','user',0,0)",
+                    (provider_id, "download_client", display_name),
+                )
         old_db = web.INKDROP_STATE_DB
         web.INKDROP_STATE_DB = db_path
         try:

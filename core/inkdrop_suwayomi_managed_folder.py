@@ -24,6 +24,7 @@ import time
 import unicodedata
 from pathlib import Path
 
+from core import inkdrop_records
 from core import inkdrop_state
 from core import inkdrop_source_catalog
 from core import inkdrop_sources
@@ -321,7 +322,12 @@ def _promotion_attempt_payload(provider_id, evidence, match, copy_result, *, now
         "source_path": str(source_path),
         "external_id": path_id,
         "download_url_hash": path_id,
-        "candidate_identity": f"{provider_id}:{match.get('queue_id')}:{path_id}",
+        # Was an f-string of the same three parts. It read fine but it is not
+        # a candidate identity: every ownership gate requires a 24-hex digest
+        # and failed closed on it. Same inputs, declared shape.
+        "candidate_identity": inkdrop_records.candidate_identity_digest(
+            "suwayomi_managed_folder", provider_id, match.get("queue_id"), path_id
+        ),
         "lifecycle_phase": "import_ready",
         "status": "staged_file_ready",
         "reason": "Suwayomi managed folder staged file ready",

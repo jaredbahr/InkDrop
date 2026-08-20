@@ -16,6 +16,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.inkdrop_text_output import write_text_lf
+
 SCHEMA_VERSION = 1
 DEFAULT_PREFIX = "inkdrop-public-release-evidence"
 
@@ -79,7 +84,7 @@ def run_json(command, *, output_path, timeout):
     )
     stdout = redact_public_text(started.stdout)
     stderr = redact_public_text(started.stderr)
-    output_path.write_text(stdout, encoding="utf-8")
+    write_text_lf(output_path, stdout)
     payload = None
     if stdout.strip():
         try:
@@ -107,7 +112,7 @@ def run_text(command, *, output_path, timeout):
         timeout=timeout,
     )
     stdout = redact_public_text(started.stdout)
-    output_path.write_text(stdout, encoding="utf-8")
+    write_text_lf(output_path, stdout)
     return {
         "command": display_command(command),
         "returncode": started.returncode,
@@ -197,7 +202,7 @@ def run_remote_docker_only(*, host, tar_path, output_dir, remote_dir, timeout):
         timeout=timeout,
     )
     if fetch_result.returncode != 0:
-        local_result.write_text(stdout, encoding="utf-8")
+        write_text_lf(local_result, stdout)
         stderr = "\n".join(part for part in (stderr, fetch_result.stderr.strip()) if part)
     payload = None
     result_text = local_result.read_text(encoding="utf-8") if local_result.exists() else ""
@@ -297,7 +302,9 @@ def main(argv=None):
     tar_path = output_dir / "inkdrop-docker-only-release-context.tar.gz"
     docker_context = create_docker_only_context(manifest, tar_path)
     command_path = output_dir / "remote-docker-only-command.sh"
-    command_path.write_text(docker_only_command(tar_path.name) + "\n", encoding="utf-8")
+    # A shell script above all: a CRLF shebang line makes Linux reject this
+    # with "bad interpreter: /bin/sh^M" when the bundle is built on Windows.
+    write_text_lf(command_path, docker_only_command(tar_path.name) + "\n")
     remote_result = None
     if args.remote_host:
         remote_dir = args.remote_dir or f"/tmp/inkdrop-release-evidence-{stamp}"
@@ -346,7 +353,7 @@ def main(argv=None):
             "then preserve inkdrop-docker-only-release.json beside the local evidence."
         ),
     }
-    (output_dir / "release-evidence-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    write_text_lf(output_dir / "release-evidence-summary.json", json.dumps(summary, indent=2, sort_keys=True))
     print(json.dumps(summary, indent=2, sort_keys=True))
     ok = all(result.get("ok") for result in results.values())
     if remote_result is not None:

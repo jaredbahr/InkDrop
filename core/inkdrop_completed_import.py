@@ -116,7 +116,9 @@ INTERNAL_IMPORT_DIR_NAMES = {
     "_processed",
     "_failed",
 }
-COMIC_DEST = Path(os.environ.get("INKDROP_COMIC_INCOMING_ROOT") or Path(os.environ.get("INKDROP_COMIC_ROOT") or "/library/comics") / "_Incoming")
+COMIC_INCOMING_ROOT_ENV = (os.environ.get("INKDROP_COMIC_INCOMING_ROOT") or "").strip()
+EBOOK_INCOMING_ROOT_ENV = (os.environ.get("INKDROP_EBOOK_INCOMING_ROOT") or "").strip()
+COMIC_DEST = Path(COMIC_INCOMING_ROOT_ENV or Path(os.environ.get("INKDROP_COMIC_ROOT") or "/library/comics") / "_Incoming")
 COMIC_ROOT = Path(os.environ.get("INKDROP_COMIC_ROOT") or "/library/comics")
 MANGA_ROOT = Path(os.environ.get("INKDROP_MANGA_ROOT") or "/library/manga")
 KAPOWARR_COMIC_ROOT = "/comics"
@@ -132,7 +134,7 @@ EBOOK_SOURCES = [
 MANUAL_EBOOK_SOURCES = [
     Path(os.environ.get("INKDROP_MANUAL_EBOOKS_INBOX") or MANUAL_INBOX_DIR / "ebooks"),
 ]
-EBOOK_DEST = Path(os.environ.get("INKDROP_EBOOK_INCOMING_ROOT") or "/library/ebooks/_Incoming")
+EBOOK_DEST = Path(EBOOK_INCOMING_ROOT_ENV or "/library/ebooks/_Incoming")
 
 EXT_TO_KIND = {
     ".cbz": "comics",
@@ -541,20 +543,96 @@ def related_subseries_source_blocker(
                 for publication_tail in publication_tails
             ):
                 continue
-            # This blanket "any unrecognized bracket group is untrusted" rule
-            # is deliberately strict for its original, post-download call
-            # site: by the time it runs there, exactly one candidate already
-            # survived every other SLSKD-side match/score heuristic, so a
-            # false reject there just means re-attempting. Applied to every
-            # not-yet-downloaded candidate during scoring, the same rule
-            # rejects real scanlator/scene/printing-variant tags -- ordinary
-            # noise SLSKD's own matching is intentionally tolerant of -- on
-            # series that never even had a competing wrong-subseries file.
-            # The bare-word check below (a real, un-bracketed title word in
-            # the tail) is this guard's actual defense against a franchise
-            # spin-off; skip only this narrower bracket rule pre-download.
-            if strict_bracket_tail and re.search(r"[\[(][^\[\]()]+[\])]", tail_text):
-                return "related subseries or untrusted publication suffix"
+            # An unexplained bracket group in the tail is a second book being
+            # named. What counts as explained differs by segment.
+            #
+            # On the file's own name, a group is explained if it describes the
+            # release (annotation_group_shape: dates, ranges, counts, formats,
+            # imprints) or credits whoever made it (release_credit_group: the
+            # welded-case and hyphen/plus-joined handles). This used to be a
+            # blanket "any bracket group is untrusted", gated behind a
+            # strict_bracket_tail flag the SLSKD probe passed False and the
+            # post-download callers left True -- so a leaf could pass scoring,
+            # transfer in full, and then be refused for the
+            # (Son of Ultron-Empire) on the end of its name.
+            #
+            # The comment that stood here said a false reject post-download
+            # "just means re-attempting". It does not: the refused file stays
+            # in staging and shadows its own queue row, the probe reports
+            # staged_file_ready with candidate_count 0, the replacement search
+            # defers until staged files reconcile, and the next pass fetches
+            # the same file to refuse it again. A 2026-08-16 field bundle had
+            # six Sandman trade paperbacks doing that 542-591 times each with
+            # the accepted files already on disk. The rule it broke: a gate
+            # that runs after an irreversible action must never be stricter
+            # than the gate that authorised it.
+            #
+            # Credits are recognised by shape, so this covers the hyphenated
+            # scene vocabulary -- "(Son of Ultron-Empire)", "(Zone-Empire)",
+            # "(The Last Kryptonian-DCP)", "(Mixx-HaCsA)" -- and deliberately
+            # NOT the hyphenless handles "(Treebeard)", "(1r0n)", "(Shizu)",
+            # "(Mangascreener)", "(VIZ)", which stay untrusted unless they are
+            # in release_credit_group's closed handle list. That is the safe
+            # direction: a plain word is indistinguishable from a second title
+            # ("(Conan)", "(Brotherhood)"), so those keep blocking. This is
+            # not complete release-group coverage and is not meant to be.
+            #
+            # Folder segments keep the blanket rule. They reach here only
+            # after the benign-organizational-folder escape above, so a
+            # bracket still standing on an ancestor is naming something the
+            # pack does not contain -- "Batman - White Knight 001-008
+            # (2017-2018)" holding issue 099 -- and that is a real mis-import
+            # this clause is the only thing catching.
+            if not strict_bracket_tail:
+                pass
+            elif segment_index > 0:
+                if re.search(r"[\[(][^\[\]()]+[\])]", tail_text):
+                    return "related subseries or untrusted publication suffix"
+            else:
+                # A leaf that names a different unit than the one being
+                # imported is the wrong book however well-formed its tail is.
+                # The blanket bracket rule used to catch these by accident --
+                # "Akira 07 (1989)" offered for issue 3 was rejected for the
+                # "(1989)", not for the 07 -- so once bracket content is read
+                # properly the unit has to be checked on its own terms. It is
+                # the more honest signal anyway, and it is what the wrong-unit
+                # cases in the pack-folder and subtitle-tail suites are about.
+                #
+                # Read only outside the bracket groups, and only when the tail
+                # names exactly one unit. "Love and Rockets v1 #19" names two
+                # -- a print run and an issue -- and which one answers the want
+                # is not decidable here; that belongs to the unit-compatibility
+                # contract, which already routes it to review. Guessing picked
+                # the volume and called a correct issue 19 "unit 1, not 19".
+                unbracketed_tail = re.sub(r"[\[(][^\[\]()]*[\])]", " ", tail_text)
+                declared_unit = re.match(
+                    r"^[\s:._\-]*(?:(?:#|no\.?|num(?:ber)?\.?|issue|iss|v|vol(?:ume)?"
+                    r"|book|ch(?:ap(?:ter)?)?|part|pt)[\s._\-]*)?0*(?P<number>\d+(?:\.\d+)?)\b",
+                    unbracketed_tail,
+                    re.I,
+                )
+                wanted_unit = str(issue_number or "").strip()
+                second_unit = re.search(
+                    r"(?:#|no\.?|num(?:ber)?\.?|issue|iss|v|vol(?:ume)?|book"
+                    r"|ch(?:ap(?:ter)?)?|part|pt)[\s._\-]*0*\d",
+                    unbracketed_tail[declared_unit.end():] if declared_unit else "",
+                    re.I,
+                )
+                if declared_unit and wanted_unit and not second_unit:
+                    try:
+                        if float(declared_unit.group("number")) != float(wanted_unit):
+                            return (
+                                "publication tail declares unit "
+                                f"{declared_unit.group('number')}, not {wanted_unit}"
+                            )
+                    except ValueError:
+                        pass
+                for group in re.findall(r"[\[(]([^\[\]()]+)[\])]", tail_text):
+                    if inkdrop_artifact_acceptance.annotation_group_shape(group):
+                        continue
+                    if inkdrop_artifact_acceptance.release_credit_group(group):
+                        continue
+                    return "related subseries or untrusted publication suffix"
         suspicious = []
         for index, word in enumerate(words):
             if word in stop_words or word in edition_words or word in title_words:
@@ -714,6 +792,26 @@ def normalize_manga_number(value):
     whole, _, frac = raw.partition(".")
     frac = frac.rstrip("0") or "0"
     return f"{int(whole):03d}.{frac}"
+
+
+def manga_display_number(number):
+    """A normalized manga number written the way a person reads it.
+
+    normalize_manga_number() deliberately keeps a split chapter's fraction and
+    zero-pads the whole part, so it returns "072.3" for chapter 72.3. Callers
+    that want the unpadded form reached for int(), which raises ValueError on
+    every decimal chapter -- a deterministic crash, not a rare one. Strip the
+    padding without losing the fraction.
+    """
+    text = str(number or "").strip()
+    if not text:
+        return ""
+    whole, dot, frac = text.partition(".")
+    try:
+        whole = str(int(whole))
+    except ValueError:
+        return text
+    return f"{whole}.{frac}" if dot and frac else whole
 
 
 def comicinfo_status(path):
@@ -3107,6 +3205,17 @@ def load_path_settings():
     return {
         "comic_root": comic_root,
         "manga_root": manga_root,
+        # Stored setting, then env var, then derived from the library root.
+        # Deriving unconditionally discarded both INKDROP_COMIC_INCOMING_ROOT
+        # and the path.comic_incoming_root setting: the module constants above
+        # resolved the env vars at import, then apply_path_provider_settings()
+        # overwrote COMIC_DEST with comic_root/_Incoming on every import pass.
+        "comic_incoming_root": path_setting(
+            library, "comic_incoming_root", Path(COMIC_INCOMING_ROOT_ENV) if COMIC_INCOMING_ROOT_ENV else comic_root / "_Incoming"
+        ),
+        "ebook_incoming_root": path_setting(
+            library, "ebook_incoming_root", EBOOK_DEST
+        ),
         "kavita_comic_root": text_setting(library, "kavita_comic_root", KAVITA_COMIC_ROOT).rstrip("/"),
         "kavita_manga_root": text_setting(library, "kavita_manga_root", KAVITA_MANGA_ROOT).rstrip("/"),
         "manual_comics_inbox": path_setting(inboxes, "manual_comics_inbox", MANUAL_COMIC_SOURCES[0]),
@@ -3118,19 +3227,22 @@ def load_path_settings():
 
 def apply_path_provider_settings():
     global COMIC_ROOT, MANGA_ROOT, KAVITA_COMIC_ROOT, KAVITA_MANGA_ROOT
-    global COMIC_DEST, MANUAL_COMIC_SOURCES, MANUAL_EBOOK_SOURCES
+    global COMIC_DEST, EBOOK_DEST, MANUAL_COMIC_SOURCES, MANUAL_EBOOK_SOURCES
     settings = load_path_settings()
     COMIC_ROOT = settings["comic_root"]
     MANGA_ROOT = settings["manga_root"]
     KAVITA_COMIC_ROOT = settings["kavita_comic_root"]
     KAVITA_MANGA_ROOT = settings["kavita_manga_root"]
-    COMIC_DEST = COMIC_ROOT / "_Incoming"
+    COMIC_DEST = settings["comic_incoming_root"]
+    EBOOK_DEST = settings["ebook_incoming_root"]
     MANUAL_COMIC_SOURCES = [settings["manual_comics_inbox"]]
     MANUAL_EBOOK_SOURCES = [settings["manual_ebooks_inbox"]]
     log({
         "event": "path_provider_settings_loaded",
         "comic_root": str(COMIC_ROOT),
         "manga_root": str(MANGA_ROOT),
+        "comic_incoming_root": str(COMIC_DEST),
+        "ebook_incoming_root": str(EBOOK_DEST),
         "kavita_comic_root": KAVITA_COMIC_ROOT,
         "kavita_manga_root": KAVITA_MANGA_ROOT,
         "manual_comics_inbox": str(MANUAL_COMIC_SOURCES[0]),
@@ -3336,19 +3448,12 @@ def append_manual_review(reason, payload, db_path=None):
     try:
         from core import inkdrop_notifications
         # Callers should pass db_path explicitly (every real call site now does),
-        # but this fallback is what actually prevents a silent no-delivery repeat
-        # of the bug this replaced -- notify_manual_review() no-ops on db_path=None
-        # with no error, so an eventual new call site that forgets db_path would
+        # but fallback_db_path is what actually prevents a silent no-delivery
+        # repeat of the bug this replaced -- dispatch no-ops on db_path=None with
+        # no error, so an eventual new call site that forgets db_path would
         # otherwise fail exactly as silently as every existing one did.
-        inkdrop_notifications.notify_manual_review(
-            db_path if db_path is not None else INKDROP_STATE_DB,
-            reason=reason,
-            series=payload.get("series") or payload.get("matched_series"),
-            source=payload.get("source"),
-            detail=payload.get("detail"),
-            note=payload.get("note"),
-            series_id=payload.get("series_id") or payload.get("native_series_id"),
-            issue_id=payload.get("issue_id"),
+        inkdrop_notifications.notify_manual_review_from_payload(
+            db_path, reason, payload, fallback_db_path=INKDROP_STATE_DB
         )
     except Exception:
         pass
@@ -4094,7 +4199,7 @@ def write_manga_chapter_comicinfo(path, target, chapter_number, title=None):
     series = safe_filename_part((target or {}).get("title") or path.parent.name)
     year = str((target or {}).get("year") or "").strip()
     publisher = str((target or {}).get("publisher") or "").strip()
-    display_number = str(int(number))
+    display_number = manga_display_number(number)
     chapter_title = title or f"Chapter {display_number}"
     comicinfo = (
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
@@ -4512,6 +4617,60 @@ def trigger_kavita_scan_folder(host_folder, force_library_scan=False):
         force_library_scan=force_library_scan,
         series_ids_for_folder=kavita_series_ids_for_folder,
         library_id_for_folder=kavita_library_id_for_folder,
+    )
+
+
+def maybe_inject_covers_after_import(folders):
+    """Move or write series covers into the archives the readers read them from.
+
+    Isolated behind its own try/except on purpose: cover art is cosmetic, and a
+    failure here must never fail an import that has already placed its files
+    correctly. Returns the folders whose archives actually changed so the caller
+    can refresh exactly those.
+    """
+    try:
+        from core import inkdrop_cover_injection
+
+        result = inkdrop_cover_injection.maybe_inject_for_folders(
+            sorted(folders or []), reason="import", refresh=False
+        )
+    except Exception as exc:
+        log({"event": "cover_injection_after_import_failed",
+             "error": f"{type(exc).__name__}: {exc}"})
+        return {"changed_folders": [], "ok": False}
+    if result.get("changed_folders"):
+        log({
+            "event": "cover_injection_after_import",
+            "changed_folders": result["changed_folders"],
+            "series": [
+                {"series_id": row.get("series_id"), "title": row.get("title"),
+                 "reason": row.get("reason")}
+                for row in result.get("results") or []
+                if row.get("changed")
+            ],
+        })
+    return result
+
+
+def trigger_komga_empty_trash_folder(host_folder):
+    return inkdrop_library_frontends.trigger_komga_empty_trash(
+        host_folder,
+        settings=load_komga_settings(),
+        comic_root=COMIC_ROOT,
+        manga_root=MANGA_ROOT,
+    )
+
+
+def trigger_kavita_cover_refresh_folder(host_folder, force=True):
+    return inkdrop_library_frontends.trigger_kavita_cover_refresh(
+        host_folder,
+        settings=load_kavita_settings(),
+        library_id_for_folder=kavita_library_id_for_folder,
+        comic_root=COMIC_ROOT,
+        manga_root=MANGA_ROOT,
+        kavita_comic_root=KAVITA_COMIC_ROOT,
+        kavita_manga_root=KAVITA_MANGA_ROOT,
+        force=force,
     )
 
 
@@ -5950,16 +6109,42 @@ def extract_issue_number(path):
         rf"\b(?:volume|vol|v)[\s._-]*(?!(?:19|20)\d{{2}}\b)(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
         rf"(?:^|[\s._-])0*(\d{{1,5}}(?:\.\d+)?){no_alnum_after}",
     ]
+    # A year-shaped token that is part of the TITLE is not an issue number.
+    # "The Wicked + The Divine - 1923 (2018).cbr" parsed as issue 1923 and then
+    # failed trusted_issue_mismatch:1923!=001 on every copy from every peer;
+    # "1985 (2008)" and "Superman 1978 (2021)" parse the same way. The rule is
+    # structural rather than a floor year, which would have to be wrong for
+    # somebody: a release filename states its year in brackets or parentheses,
+    # so a BARE year-shaped token in text that also carries a DELIMITED year is
+    # part of the title. With no delimited year present nothing is skipped, so
+    # a bare "(1988)"-less scan still behaves exactly as before.
+    # A leading "YYYY-MM" / "YYYY-MM-DD" cover-date prefix is a date, not an
+    # issue number -- real slskd share: "2018-02 The Wicked + The Divine 1923
+    # (2018).cbr", where the "02" would otherwise be read as issue 2.
+    text = re.sub(r"^\s*(?:19|20)\d{2}-\d{1,2}(?:-\d{1,2})?(?=[\s._-]|$)", " ", text)
+
+    delimited_year = re.search(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]", text)
+
+    def is_title_year(match):
+        if not delimited_year:
+            return False
+        token = match.group(1)
+        if not re.fullmatch(r"(?:19|20)\d{2}", token):
+            return False
+        # The delimited year itself is a legitimate match for this test only
+        # when it is the same span; a second, bare occurrence is the title's.
+        return not (match.start(1) == delimited_year.start(1))
+
     for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if not match:
-            continue
-        try:
-            number = float(match.group(1))
-        except ValueError:
-            continue
-        if number >= 0:
-            return number
+        for match in re.finditer(pattern, text, re.I):
+            if is_title_year(match):
+                continue
+            try:
+                number = float(match.group(1))
+            except ValueError:
+                continue
+            if number >= 0:
+                return number
     return None
 
 
@@ -6480,7 +6665,10 @@ def manga_import_guard(
 def suwayomi_chapter_dest(target_dir, target, source, chapter_number):
     series = safe_filename_part((target or {}).get("title") or Path(source).parent.name)
     number = normalize_manga_number(chapter_number)
-    filename = f"{series} - Chapter {int(number):03d}.cbz"
+    # normalize_manga_number() already zero-pads the whole part, so this is the
+    # same string int() produced for whole chapters -- and unlike int() it does
+    # not raise on a split chapter like 72.3.
+    filename = f"{series} - Chapter {number}.cbz"
     if target:
         base_dir = kavita_manga_series_dir(target)
     else:
@@ -7255,6 +7443,85 @@ def media_management_space_check(planned_path, source_path=None, settings=None, 
     }
 
 
+def media_management_planned_path_for_series_folder(planned_text, current_folder, new_folder):
+    """Re-point a planned destination at a different series folder.
+
+    Returns "" when the planned path does not actually sit directly inside the
+    folder the preview reported -- series folders turned off, an
+    adapter-supplied directory, or a nested layout. The caller fails closed
+    there rather than guessing which component to rewrite.
+    """
+    planned = str(planned_text or "").replace("\\", "/").strip()
+    current = str(current_folder or "").strip()
+    replacement = str(new_folder or "").strip()
+    if not planned or not current or not replacement:
+        return ""
+    parent, sep, leaf = planned.rpartition("/")
+    if not sep or not leaf:
+        return ""
+    grandparent, parent_sep, parent_leaf = parent.rpartition("/")
+    if not parent_sep or parent_leaf != current:
+        return ""
+    return f"{grandparent}/{replacement}/{leaf}"
+
+
+def media_management_planned_destination_gates(planned, preview, decision, *, settings, source_path, legacy, override):
+    """Absolute / configured-root / free-space gates for a planned destination.
+
+    Returns the triple the caller should return early, or None when the path
+    clears every gate. This runs a second time after a canonical-folder
+    recompute: the authoritative folder can sit under a different configured
+    root, or on a volume that no longer has room, and a path that was only ever
+    checked in its pre-convergence form would skip both.
+    """
+    if not planned.is_absolute():
+        decision["reason"] = "planned_path_not_absolute"
+        preview["planned_path_apply_status"] = "blocked_not_absolute"
+        preview["planned_path_applied"] = False
+        preview["apply_planned_path_override"] = override
+        preview["selected_import_dest_path"] = decision["selected_dest_path"]
+        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
+        return legacy, preview, decision
+    if not media_management_path_under_root(planned, media_management_import_roots(settings)):
+        decision["reason"] = "planned_path_outside_configured_roots"
+        preview["planned_path_apply_status"] = "blocked_outside_configured_roots"
+        preview["planned_path_applied"] = False
+        preview["apply_planned_path_override"] = override
+        preview["selected_import_dest_path"] = decision["selected_dest_path"]
+        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
+        return legacy, preview, decision
+    roots = media_management_import_roots(settings)
+    matching_root = media_management_matching_root(planned, roots)
+    if matching_root is None or not Path(matching_root).exists():
+        decision["reason"] = "planned_path_root_missing"
+        preview["planned_path_apply_status"] = "blocked_root_missing"
+        preview["planned_path_applied"] = False
+        preview["apply_planned_path_override"] = override
+        preview["selected_import_dest_path"] = decision["selected_dest_path"]
+        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
+        preview["root_exists"] = False
+        preview["minimum_free_space_gb"] = media_management_minimum_free_space_gb(settings)
+        return legacy, preview, decision
+    space_check = media_management_space_check(planned, source_path=source_path, settings=settings, root_path=matching_root)
+    preview["free_space_ok"] = bool(space_check.get("ok"))
+    preview["free_space_status"] = "ok" if space_check.get("ok") else "blocked"
+    preview["free_space_gb"] = space_check.get("free_space_gb")
+    preview["free_space_probe_path"] = space_check.get("probe_path")
+    preview["minimum_free_space_gb"] = space_check.get("minimum_free_space_gb")
+    preview["required_free_space_gb"] = space_check.get("required_free_space_gb")
+    preview["source_size_bytes"] = space_check.get("source_size_bytes")
+    if not space_check.get("ok"):
+        decision["reason"] = "planned_path_minimum_free_space_floor"
+        preview["planned_path_apply_status"] = "blocked_free_space_floor"
+        preview["planned_path_applied"] = False
+        preview["apply_planned_path_override"] = override
+        preview["selected_import_dest_path"] = decision["selected_dest_path"]
+        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
+        preview["free_space_block_reason"] = space_check.get("reason") or "minimum_free_space_floor"
+        return legacy, preview, decision
+    return None
+
+
 def media_management_import_destination_decision(target=None, event=None, source_path=None, legacy_dest=None, kind="comics", settings=None):
     settings = settings if isinstance(settings, dict) else {}
     legacy = Path(legacy_dest) if legacy_dest else None
@@ -7304,51 +7571,12 @@ def media_management_import_destination_decision(target=None, event=None, source
         preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
         return legacy, preview, decision
     planned = Path(planned_text)
-    if not planned.is_absolute():
-        decision["reason"] = "planned_path_not_absolute"
-        preview["planned_path_apply_status"] = "blocked_not_absolute"
-        preview["planned_path_applied"] = False
-        preview["apply_planned_path_override"] = override
-        preview["selected_import_dest_path"] = decision["selected_dest_path"]
-        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
-        return legacy, preview, decision
-    if not media_management_path_under_root(planned, media_management_import_roots(settings)):
-        decision["reason"] = "planned_path_outside_configured_roots"
-        preview["planned_path_apply_status"] = "blocked_outside_configured_roots"
-        preview["planned_path_applied"] = False
-        preview["apply_planned_path_override"] = override
-        preview["selected_import_dest_path"] = decision["selected_dest_path"]
-        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
-        return legacy, preview, decision
-    roots = media_management_import_roots(settings)
-    matching_root = media_management_matching_root(planned, roots)
-    if matching_root is None or not Path(matching_root).exists():
-        decision["reason"] = "planned_path_root_missing"
-        preview["planned_path_apply_status"] = "blocked_root_missing"
-        preview["planned_path_applied"] = False
-        preview["apply_planned_path_override"] = override
-        preview["selected_import_dest_path"] = decision["selected_dest_path"]
-        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
-        preview["root_exists"] = False
-        preview["minimum_free_space_gb"] = media_management_minimum_free_space_gb(settings)
-        return legacy, preview, decision
-    space_check = media_management_space_check(planned, source_path=source_path, settings=settings, root_path=matching_root)
-    preview["free_space_ok"] = bool(space_check.get("ok"))
-    preview["free_space_status"] = "ok" if space_check.get("ok") else "blocked"
-    preview["free_space_gb"] = space_check.get("free_space_gb")
-    preview["free_space_probe_path"] = space_check.get("probe_path")
-    preview["minimum_free_space_gb"] = space_check.get("minimum_free_space_gb")
-    preview["required_free_space_gb"] = space_check.get("required_free_space_gb")
-    preview["source_size_bytes"] = space_check.get("source_size_bytes")
-    if not space_check.get("ok"):
-        decision["reason"] = "planned_path_minimum_free_space_floor"
-        preview["planned_path_apply_status"] = "blocked_free_space_floor"
-        preview["planned_path_applied"] = False
-        preview["apply_planned_path_override"] = override
-        preview["selected_import_dest_path"] = decision["selected_dest_path"]
-        preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
-        preview["free_space_block_reason"] = space_check.get("reason") or "minimum_free_space_floor"
-        return legacy, preview, decision
+    gated = media_management_planned_destination_gates(
+        planned, preview, decision,
+        settings=settings, source_path=source_path, legacy=legacy, override=override,
+    )
+    if gated is not None:
+        return gated
     work_id = completion_native_series_id(target) or event.get("native_series_id") if isinstance(event, dict) else completion_native_series_id(target)
     persistence = inkdrop_state.persist_series_folder_identity(
         INKDROP_STATE_DB,
@@ -7363,6 +7591,69 @@ def media_management_import_destination_decision(target=None, event=None, source
         preview["planned_path_applied"] = False
         preview["selected_import_dest_path"] = ""
         return None, preview, decision
+    # persist_series_folder_identity() takes a write lock and is the authority on
+    # which folder this work owns. It can hand back a different folder than the
+    # preview computed -- a companion following its canonical series
+    # (companion_follows_canonical_folder), or a first lock seeded from where the
+    # files already are. The preview above was rendered before that call, so
+    # using it now writes the file into the folder state just stopped claiming:
+    # state records convergence while the disk re-splits the library.
+    authoritative_folder = str(persistence.get("series_folder") or "").strip()
+    previewed_folder = str(preview.get("series_folder") or "").strip()
+    folder_changed = bool(authoritative_folder) and (
+        inkdrop_state.normalized_library_folder_identity(authoritative_folder)
+        != inkdrop_state.normalized_library_folder_identity(previewed_folder)
+        if inkdrop_state is not None
+        else authoritative_folder.casefold() != previewed_folder.casefold()
+    )
+    if folder_changed:
+        recomputed = media_management_planned_path_for_series_folder(
+            str(planned), previewed_folder, authoritative_folder
+        )
+        if not recomputed:
+            # The planned path is not a plain <root>/<series folder>/<file>, so
+            # there is no single component to re-point. Fail closed: writing the
+            # pre-convergence path is exactly the split this guards against.
+            decision.update({"blocked": True, "reason": "canonical_series_folder_recompute_failed"})
+            preview["planned_path_apply_status"] = "blocked_canonical_folder_recompute"
+            preview["planned_path_applied"] = False
+            preview["selected_import_dest_path"] = ""
+            preview["canonical_folder_convergence"] = {
+                "converged": False,
+                "reason": persistence.get("reason"),
+                "preview_series_folder": previewed_folder,
+                "authoritative_series_folder": authoritative_folder,
+                "planned_path_before": str(planned),
+                "recomputed": False,
+            }
+            return None, preview, decision
+        convergence = {
+            "converged": True,
+            "reason": persistence.get("reason"),
+            "preview_series_folder": previewed_folder,
+            "authoritative_series_folder": authoritative_folder,
+            "planned_path_before": str(planned),
+            "planned_path_after": recomputed,
+            "recomputed": True,
+            "canonical_series_id": persistence.get("canonical_series_id"),
+            "folder_converged": persistence.get("folder_converged"),
+        }
+        planned = Path(recomputed)
+        planned_text = recomputed
+        preview["series_folder"] = authoritative_folder
+        preview["planned_path"] = recomputed
+        preview["planned_dir"] = recomputed.rsplit("/", 1)[0]
+        preview["planned_dir_source"] = "canonical_series_folder_identity"
+        preview["canonical_folder_convergence"] = convergence
+        decision["canonical_folder_convergence"] = convergence
+        decision["planned_path"] = recomputed
+        # The gates above only ever saw the pre-convergence path.
+        gated = media_management_planned_destination_gates(
+            planned, preview, decision,
+            settings=settings, source_path=source_path, legacy=legacy, override=override,
+        )
+        if gated is not None:
+            return gated
     existing_text = str((preview or {}).get("existing_dest_path") or "").strip()
     if existing_text:
         existing_path = Path(existing_text)
@@ -10045,11 +10336,42 @@ def verify_last_status():
     # issues against or queue a rescan for.
     missing_before = {}
     kapowarr_scan_tasks = []
+    # Before the readers are told anything. If this import made a lower volume
+    # the series' new first book, the cover has to move to it now -- otherwise
+    # the scan below hands the reader the new book's real first page and the
+    # series' cover silently changes. No-op unless the user enabled it.
+    cover_injection = maybe_inject_covers_after_import(folders)
     frontend_sync = sync_library_frontend_folders(
         folders,
         force_library_scan_folders=force_library_scan_folders,
         event_prefix="verify_",
     )
+    # Kavita keeps its cached cover through a scan, even a forced one, so a
+    # rewritten archive needs its metadata refresh on top of the sync above.
+    for folder in cover_injection.get("changed_folders") or []:
+        try:
+            trigger_kavita_cover_refresh_folder(folder)
+        except Exception as exc:
+            log({
+                "event": "cover_injection_kavita_refresh_failed",
+                "folder": folder,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    # A republished CBR lands under a new .cbz name. Komga soft-deletes the old
+    # book rather than forgetting it, and of two books with the same name the
+    # stale one can still win as the series' first book -- so the rename needs
+    # its trash emptied on top of the scan above. cover injection has always
+    # reported `renamed_folders` for exactly this; nothing consumed it, so the
+    # scan ran and the stale book stayed authoritative.
+    for folder in cover_injection.get("renamed_folders") or []:
+        try:
+            trigger_komga_empty_trash_folder(folder)
+        except Exception as exc:
+            log({
+                "event": "cover_injection_komga_empty_trash_failed",
+                "folder": folder,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
     kavita_scan_tasks = frontend_sync.get("kavita") or []
     komga_scan_tasks = frontend_sync.get("komga") or []
     library_scan_tasks = frontend_sync.get("library_scan_tasks") or {

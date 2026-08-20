@@ -45,9 +45,6 @@ _URL_RE = re.compile(r"(?i)\b(?:https?|ftp|file)://[^\s<>\"']+")
 _IP_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _PATH_RE = re.compile(r"(?i)(?:\b[a-z]:\\[^\s,;]+|(?<![:\w])\/(?:[^/\s]+/)+[^\s,;]+)")
 _YEAR_RE = re.compile(r"(?<!\d)((?:18|19|20)\d{2})(?!\d)")
-_RANGE_RE = re.compile(
-    r"(?i)\b(?:issues?|chapters?|ch\.?|volumes?|vols?\.?|v)?\s*#?0*(\d+(?:\.\d+)?)\s*[-–]\s*#?0*(\d+(?:\.\d+)?)\b"
-)
 _ISSUE_RE = re.compile(r"(?i)(?:\bissue\s*|(?<!\w)#)0*(\d+(?:\.\d+)?)\b")
 _CHAPTER_RE = re.compile(r"(?i)\b(?:chapter|ch)\.?\s*0*(\d+(?:\.\d+)?)\b")
 _VOLUME_RE = re.compile(r"(?i)\b(?:volume|vol|v)\.?\s*0*(\d+(?:\.\d+)?)\b")
@@ -91,6 +88,20 @@ _TRUSTED_VOLUME_WORD_TITLE_SUFFIX_RE = re.compile(
 _ARCHIVE_EXTENSIONS = {".cbz", ".cbr", ".zip", ".rar", ".7z", ".tar", ".gz"}
 
 REJECTION_EXPLANATIONS = {
+    "pack_membership_not_proven": (
+        "This looked like a multi-item archive, so InkDrop wanted a file list proving the "
+        "wanted issue is inside before taking it -- and no file list was available. A single "
+        "file sitting in a folder alongside others can land here even though it is exactly "
+        "what you asked for."
+    ),
+    "source_did_not_mark_candidate_acceptable": (
+        "The source returned this release but never marked it safe to take, and did not say "
+        "what stopped it."
+    ),
+    "not_accepted_reason_unrecorded": (
+        "This was not accepted and nothing recorded why. That is a bug in InkDrop rather than "
+        "anything wrong with the release -- please report it."
+    ),
     "candidate_not_safe": "The existing provider safety verdict did not accept this candidate.",
     "language_rejected": "The candidate language is outside the series or source language policy.",
     "title_mismatch": "The release title does not safely match the requested work.",
@@ -564,12 +575,76 @@ def build_query_variants(
     return variants
 
 
+def _credible_declared_range(text: str, start: str, end: str) -> bool:
+    """Whether a parsed coverage range is one this title actually declares.
+
+    `parse_release_title` is deliberately generous about what a unit number can
+    look like, because on its own surface a loose read costs a comparison. Used
+    as a *pack* trigger it costs an acquisition, so three of its reads have to
+    be refused here:
+
+      `Casanova 010 - Seventeen (Oct 2007).cbr`   -> 10-17  (a word, not a bound)
+      `The Climber - Chapter 13 - # 13`           -> 13-13  (one issue, twice)
+      `Dai Dark v09_639199692169212259.cbz`       -> 9-...  (a snowflake id)
+
+    Each is a single issue that would be classified a pack and refused, which
+    is the same harm as the date stamps this classifier just stopped
+    committing. So a range must run upwards, and both of its endpoints must
+    appear in the title as digits -- which is what "the title declares a
+    range" means. The endpoint test also catches the snowflake id, whose value
+    does not survive the float round-trip and so no longer matches its own
+    title.
+
+    These are guards at this boundary, not a re-implementation: the three
+    parser reads above are wrong on the scheduled path too and want fixing
+    there.
+    """
+
+    if not (start and end):
+        return False
+    try:
+        low, high = float(start), float(end)
+    except (TypeError, ValueError):
+        return False
+    if high <= low:
+        return False
+    return all(
+        re.search(rf"(?<!\d)0*{re.escape(bound)}(?!\d)", text)
+        for bound in (start, end)
+    )
+
+
 def classify_pack(title: Any, *, extension: Any = "", raw: dict[str, Any] | None = None) -> dict[str, Any]:
     text = _text(title)
     lowered = text.lower()
     raw = raw if isinstance(raw, dict) else {}
     pack_type = "single_issue_chapter"
-    range_match = _RANGE_RE.search(text)
+    # "Does this title declare a coverage range?" is read off the shared
+    # release parser rather than a regex local to this module.
+    #
+    # The local `_RANGE_RE` matched any two hyphen-separated numbers, so a
+    # publication date stamp became an issue range: `Giant.Days.[2015-06].004`
+    # was classified `issue_range` (issues 2015-6), and `Akira #12 - Enter
+    # Sakaki (1989-11).cbz` became a pack while the undated `Akira #12 - Enter
+    # Sakaki.cbz` was accepted -- the same book, two verdicts.
+    #
+    # `parse_release_title` already decides this correctly, in three layers:
+    # publication dates are masked out of the text before ranges are read, a
+    # bare year-to-year span carrying no unit prefix is dropped, and an
+    # explicit unit prefix (`Issues 1989-2011`) overrides that drop. Those are
+    # the same guards added for `(N covers)` and for the `(Digital-1920)`
+    # roman-numeral word tail. Reading it here means this classifier does not
+    # have to be taught that family one shape at a time.
+    coverage = inkdrop_candidate_matching.parse_release_title(text)
+    range_start = _text(coverage.get("coverage_start"))
+    range_end = _text(coverage.get("coverage_end"))
+    declared_range = _credible_declared_range(text, range_start, range_end)
+    if not declared_range:
+        # A range this classifier refused to believe is not one it may go on to
+        # publish: `range_start`/`range_end` describe a *declared* range, and a
+        # consumer reading them without re-deriving `pack_candidate` would act
+        # on the bound we just rejected.
+        range_start = range_end = ""
     likely_members = _int(_first(raw.get("estimated_pack_members"), raw.get("pack_member_count")))
     if re.search(r"\bweekly(?:\s+comics?)?\s+pack\b|\bweek\s+\d{1,2}\b", lowered):
         pack_type = "weekly_pack"
@@ -579,11 +654,35 @@ def classify_pack(title: Any, *, extension: Any = "", raw: dict[str, Any] | None
         pack_type = "omnibus_collected_edition"
     elif re.search(r"\b(?:complete|full)\s+(?:series|collection|run)\b|\bcomplete\b", lowered):
         pack_type = "complete_series_pack"
-    elif range_match:
-        pack_type = "volume_pack" if re.search(r"(?i)\b(?:volumes?|vols?\.?|v)\b", text) else "issue_range"
+    elif declared_range:
+        # `\bv\b` cannot match `v01`: the digit is a word character, so there
+        # is no boundary after the `v`. Every compact manga range is written
+        # that way -- `Vagabond v01-v37`, `Kingdom v01-v70`, `Dorohedoro
+        # v01-v23` -- so all of them were labelled `issue_range` while the
+        # spaced spellings (`Vol. 1-37`, `Volumes 01-33`) were labelled
+        # correctly. The range NUMBERS were right either way; only the unit
+        # label was wrong.
+        #
+        # The volume-ness of a declared range is not a new question, so this
+        # does not answer it with a fourth regex. COMPACT_VOLUME_RANGE_RE is
+        # the shared predicate `parse_release_title` already uses to decide
+        # that `v01-v37` is a volume span, and it is deliberately narrower
+        # than "the text contains a volume word somewhere": it requires the
+        # marker to be ON the range. That is what keeps `Powers v1 (001 -
+        # 037 + Annual)` an issue_range -- there `v1` names the print RUN and
+        # `001-037` are issues, and a looser test would relabel it as a
+        # volume pack and claim 37 volumes that do not exist.
+        pack_type = (
+            "volume_pack"
+            if (
+                inkdrop_candidate_matching.COMPACT_VOLUME_RANGE_RE.search(text)
+                or re.search(r"(?i)\b(?:volumes?|vols?\.?|v)\b", text)
+            )
+            else "issue_range"
+        )
         if likely_members is None:
             try:
-                likely_members = max(1, int(float(range_match.group(2))) - int(float(range_match.group(1))) + 1)
+                likely_members = max(1, int(float(range_end)) - int(float(range_start)) + 1)
             except (TypeError, ValueError):
                 pass
     elif re.search(r"(?i)\bvolumes?\s+\d+(?:\s*[,/&+]\s*\d+)+", text):
@@ -598,8 +697,8 @@ def classify_pack(title: Any, *, extension: Any = "", raw: dict[str, Any] | None
         "pack_candidate": pack_type != "single_issue_chapter",
         "pack_type": pack_type,
         "estimated_pack_members": likely_members,
-        "range_start": range_match.group(1) if range_match else "",
-        "range_end": range_match.group(2) if range_match else "",
+        "range_start": range_start,
+        "range_end": range_end,
         "manifest_evidence_available": bool(
             _first(raw.get("pack_detail_entries"), raw.get("files"), raw.get("manifest"), raw.get("nfo"))
         ),
@@ -610,7 +709,14 @@ def _pack_evidence(candidate: dict[str, Any], raw: dict[str, Any]) -> tuple[bool
     containers = [candidate, raw]
     if isinstance(raw.get("result"), dict):
         containers.append(raw["result"])
-    explicit = any(bool(row.get("pack") or row.get("is_pack") or row.get("pack_candidate")) for row in containers)
+    # `pack` and `is_pack` are claims a *provider* made about the release.
+    # `pack_candidate` is this module's own verdict, and reading it back here
+    # made the gate its own witness: once anything set it, every later
+    # normalization saw it, re-flipped `single_issue_chapter` to
+    # `unknown_archive`, and re-asserted it. A candidate could enter that state
+    # but never leave it, and the manifest it was then asked for is one a
+    # single file cannot produce. Provider evidence only.
+    explicit = any(bool(row.get("pack") or row.get("is_pack")) for row in containers)
     manifest_keys = (
         "files", "pack_detail_entries", "manifest", "nfo",
         "pack_contents_match", "pack_contents_matching_entry", "pack_contents_entry_count",
@@ -1119,6 +1225,22 @@ def normalize_candidate(
             )
         )
     accepted = bool(explicit_accepted) and not rejection_codes and pack_verified
+    # Three conjuncts decide acceptance and only one of them explains itself.
+    # `rejection_codes` is self-documenting; the other two were not, so a
+    # candidate could be refused with an empty reason set and the operator was
+    # shown "Rejected by policy" -- the interface's fall-through label -- for
+    # what was really "no decision was reached".
+    #
+    # Observed live on All Star Superman #1: the top-ranked candidate scored
+    # 96, the matcher returned `auto_grab_safe`, and the release was still
+    # dropped because a single .cbr inside a multi-file peer folder was
+    # classified `unknown_archive`, which made it a pack candidate, which
+    # demanded a manifest a single file cannot have. Nothing recorded any of
+    # that. Thirteen further candidates were then marked
+    # `lower_ranked_autopick_candidate` for losing to it.
+    #
+    # Naming the reason changes no verdict -- `accepted` is computed above and
+    # is untouched. It only makes a silent refusal impossible.
     confidence = _confidence(candidate, bool(rejection_codes))
     capability, assisted_only = _capability(
         provider_id,
@@ -1175,6 +1297,18 @@ def normalize_candidate(
             protocol == "direct"
             and _first(candidate.get("download_url_hash"), candidate.get("direct_artifact_key"))
         )
+    # Reporting only, and deliberately placed after _confidence() and
+    # _capability(): both key on whether any reason exists, so synthesising one
+    # earlier silently changed their answers -- it flipped GetComics out of
+    # assisted the first time this was written. Naming why a candidate was
+    # refused must never change what InkDrop does about it, only what it says.
+    if not accepted and not rejection_codes:
+        if not pack_verified:
+            rejection_codes = ["pack_membership_not_proven"]
+        elif not explicit_accepted:
+            rejection_codes = ["source_did_not_mark_candidate_acceptable"]
+        else:
+            rejection_codes = ["not_accepted_reason_unrecorded"]
     rejection_explanations = [
         REJECTION_EXPLANATIONS.get(code, _text(code).replace("_", " ").capitalize() + ".")
         for code in rejection_codes

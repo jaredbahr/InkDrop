@@ -25,6 +25,14 @@ DEFAULT_BUILD_DATE = "unknown"
 DEFAULT_RELEASE_CHANNEL = "dev"
 CANDIDATE_MANIFEST_SCHEMA = "inkdrop.qa_candidate.v1"
 CANDIDATE_MANIFEST_SCHEMA_VERSION = 1
+# Channels whose images are built on the deploy host and never published to a
+# registry (tools/inkdrop_local_qa_deploy_build.sh). No CI candidate manifest
+# can describe those bytes, so comparing one against them is meaningless --
+# "stale" would claim an older CI candidate does describe them, which is a
+# stronger and false statement. Report not_applicable and carry the local
+# identity instead. The manifest on disk is never rewritten with CI identity
+# for bytes that were not deployed; this is a read-side distinction only.
+LOCAL_BUILD_CHANNELS = frozenset({"qa-local"})
 UPDATE_MANIFEST_SCHEMA_VERSION = 1
 UPDATE_STATUS_SCHEMA = "inkdrop.update_status.v1"
 UPDATE_STATUS_SCHEMA_VERSION = 1
@@ -153,6 +161,11 @@ def build_metadata(environ=None):
         if manifest_mismatches:
             manifest_status = "stale" if "commit_sha" in manifest_mismatches else "mismatch"
     manifest_matches = manifest_status == "loaded" and not manifest_mismatches
+    local_build = release_channel in LOCAL_BUILD_CHANNELS
+    if local_build:
+        manifest_status = "not_applicable"
+        manifest_mismatches = []
+        manifest_matches = False
     development = release_channel == "dev" or version.lower() in {"dev", "development"}
     short_sha = commit_sha[:7] if commit_sha != DEFAULT_COMMIT_SHA else ""
     if development:
@@ -176,6 +189,7 @@ def build_metadata(environ=None):
         "image_digest": image_digest,
         "image_repository": image_repository,
         "candidate_manifest_status": "matched" if manifest_matches else manifest_status,
+        "local_build": local_build,
         "oci": {
             "org.opencontainers.image.title": PRODUCT_NAME,
             "org.opencontainers.image.version": version,
@@ -184,6 +198,18 @@ def build_metadata(environ=None):
             "io.inkdrop.qa.build-number": str(qa_build_number or ""),
         },
     }
+    if local_build:
+        # The identity record for bytes no registry can vouch for. It reports
+        # the image's own content id, not a registry digest, and says so.
+        metadata["local_identity"] = {
+            "release_channel": release_channel,
+            "commit_sha": commit_sha,
+            "version": version,
+            "build_date": build_date,
+            "build_number": qa_build_number,
+            "image_id": image_digest,
+            "image_digest_is_registry_digest": False,
+        }
     if manifest_matches:
         metadata["candidate_manifest"] = {
             key: candidate_manifest.get(key)

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import requests
 
+from core import inkdrop_bounded_read
 from core import inkdrop_cloudflare_bypass_proxy as cloudflare_bypass_proxy
 from core import inkdrop_runtime_config
 
@@ -216,6 +217,14 @@ def review(reason, payload):
         return record
     with REVIEW_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
+    # Only rows that actually persisted announce -- should_persist_review()
+    # above already dropped the soft/diagnostic reasons. Imported lazily
+    # because inkdrop_notifications reaches back into this package.
+    try:
+        from core import inkdrop_notifications
+        inkdrop_notifications.notify_manual_review_from_payload(INKDROP_STATE_DB, reason, payload)
+    except Exception:
+        pass
     return record
 
 
@@ -688,29 +697,46 @@ def fetch_feed(cache, args):
     if not args.force_feed and feed_state.get("last_modified"):
         headers["If-Modified-Since"] = feed_state["last_modified"]
     try:
-        response = requests.get(FEED_URL, headers=headers, timeout=30)
-        if response.status_code == 304:
-            feed_state["last_status"] = 304
-            feed_state["last_poll"] = now
-            feed_state["last_fetch_at"] = now
-            feed_state["failure_count"] = 0
-            return "", "not_modified"
-        if cloudflare_bypass_proxy.cloudflare_challenge_detected(response.status_code, response.headers, response.text):
-            proxied_text, proxy_failure_reason = _fetch_feed_via_cloudflare_bypass_proxy()
-            if proxied_text is not None:
-                feed_state.update({
-                    "last_status": 200,
-                    "last_poll": now,
-                    "last_fetch_at": now,
-                    "last_xml": proxied_text,
-                    "last_error": None,
-                    "failure_count": 0,
-                    "backoff_until": 0,
-                })
-                return proxied_text, "fetched_via_cloudflare_bypass_proxy"
-            if proxy_failure_reason:
-                raise RuntimeError(proxy_failure_reason)
-        response.raise_for_status()
+        response = requests.get(FEED_URL, headers=headers, timeout=30, stream=True)
+        try:
+            if response.status_code == 304:
+                feed_state["last_status"] = 304
+                feed_state["last_poll"] = now
+                feed_state["last_fetch_at"] = now
+                feed_state["failure_count"] = 0
+                return "", "not_modified"
+            # One bounded read serves the challenge probe, the cache write and
+            # the return value. Reaching for `response.text` here would pull the
+            # whole body down again with no cap -- and this body does not just
+            # live for the length of the call: it is stored as `last_xml` in
+            # rss-discovery-cache.json and re-read on every subsequent run, so
+            # one oversized fetch would be a standing cost, not a spike.
+            body = inkdrop_bounded_read.bounded_read_text(
+                response,
+                inkdrop_bounded_read.RSS_FEED_MAX_BYTES,
+                label="RSS feed",
+            )
+            if cloudflare_bypass_proxy.cloudflare_challenge_detected(response.status_code, response.headers, body):
+                proxied_text, proxy_failure_reason = _fetch_feed_via_cloudflare_bypass_proxy()
+                if proxied_text is not None:
+                    feed_state.update({
+                        "last_status": 200,
+                        "last_poll": now,
+                        "last_fetch_at": now,
+                        "last_xml": proxied_text,
+                        "last_error": None,
+                        "failure_count": 0,
+                        "backoff_until": 0,
+                    })
+                    return proxied_text, "fetched_via_cloudflare_bypass_proxy"
+                if proxy_failure_reason:
+                    raise RuntimeError(proxy_failure_reason)
+            response.raise_for_status()
+        finally:
+            # stream=True holds the connection until the body is consumed or
+            # the response is closed; the 304 and challenge paths return
+            # without draining it.
+            response.close()
     except Exception as exc:
         failures = int(feed_state.get("failure_count") or 0) + 1
         backoff = min(MAX_BACKOFF_SECONDS, 900 * failures)
@@ -728,12 +754,12 @@ def fetch_feed(cache, args):
         "last_status": response.status_code,
         "last_poll": now,
         "last_fetch_at": now,
-        "last_xml": response.text,
+        "last_xml": body,
         "last_error": None,
         "failure_count": 0,
         "backoff_until": 0,
     })
-    return response.text, "fetched"
+    return body, "fetched"
 
 
 def xml_text(node, name):

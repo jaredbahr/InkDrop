@@ -14,6 +14,7 @@ import sqlite3
 import time
 from datetime import date, datetime, timedelta
 
+from core import inkdrop_prowlarr_indexer_health as indexer_health
 from core import inkdrop_source_providers as providers
 from core import inkdrop_source_registry as registry
 from core import inkdrop_source_worker_adapters as adapters
@@ -1846,6 +1847,26 @@ def _fetch_payload_list(fetch_result, key):
     return list(payload.get(key) or []) if isinstance(payload.get(key), list) else []
 
 
+def _indexer_unavailable_provider_wait_reason(job, fetch_result, evaluations):
+    """A zero-result search whose own indexers were in backoff is not a finding.
+
+    Prowlarr answers 200 with a flat array and no per-indexer envelope, so a
+    lane that was skipped for being in failure backoff is invisible in the
+    response body -- the search reads as a clean "nobody has this". Recording
+    that as `searched_no_candidates` is what manufactures false "no source
+    found" rows out of pure infrastructure downtime, so the coverage evidence
+    the adapter attached decides it instead.
+
+    A search that produced candidates is left alone: the outcome stands on its
+    own however many unrelated lanes were missing.
+    """
+    coverage = _dict(fetch_result).get("indexer_coverage")
+    if not isinstance(coverage, dict):
+        return ""
+    candidate_count = sum(int((row or {}).get("candidate_count") or 0) for row in evaluations or [])
+    return indexer_health.coverage_wait_reason(coverage, candidate_count=candidate_count)
+
+
 def _partial_indexer_provider_wait_reason(job, fetch_result, evaluations):
     job = _dict(job)
     fetch_plan = _dict(job.get("fetch_plan"))
@@ -2033,7 +2054,8 @@ def _partial_rss_detail_provider_wait_reason(job, fetch_result, evaluations):
 
 def _partial_provider_wait_reason(job, fetch_result, evaluations):
     return (
-        _partial_indexer_provider_wait_reason(job, fetch_result, evaluations)
+        _indexer_unavailable_provider_wait_reason(job, fetch_result, evaluations)
+        or _partial_indexer_provider_wait_reason(job, fetch_result, evaluations)
         or _partial_suwayomi_provider_wait_reason(job, fetch_result, evaluations)
         or _partial_mangadex_deadline_wait_reason(job, fetch_result, evaluations)
         or _partial_rss_detail_provider_wait_reason(job, fetch_result, evaluations)
@@ -2538,6 +2560,7 @@ def run_source_jobs(
     source_memory_cooldown_seconds=None,
     staging_root=None,
     fetch_deadline=None,
+    phase_accumulator=None,
     now=None,
 ):
     operator_payloads = operator_payloads if isinstance(operator_payloads, dict) else {}
@@ -2545,20 +2568,31 @@ def run_source_jobs(
     results = []
     for job in jobs or []:
         provider_id = (job or {}).get("provider_id")
-        results.append(
-            run_source_job(
-                job,
-                http_get=http_get,
-                tool_runner=tool_runner,
-                operator_payload=operator_payloads.get(provider_id),
-                candidate_headers=headers_by_provider.get(provider_id),
-                source_memory_db_path=source_memory_db_path,
-                source_memory_cooldown_seconds=source_memory_cooldown_seconds,
-                staging_root=staging_root,
-                fetch_deadline=fetch_deadline,
-                now=now,
+        # One job is one provider, so this loop is the only place a
+        # per-provider timer can exist -- the calibration module splits a
+        # run's elapsed time evenly across providers precisely because it had
+        # no such timer to read.
+        job_started = time.monotonic() if phase_accumulator is not None else None
+        try:
+            results.append(
+                run_source_job(
+                    job,
+                    http_get=http_get,
+                    tool_runner=tool_runner,
+                    operator_payload=operator_payloads.get(provider_id),
+                    candidate_headers=headers_by_provider.get(provider_id),
+                    source_memory_db_path=source_memory_db_path,
+                    source_memory_cooldown_seconds=source_memory_cooldown_seconds,
+                    staging_root=staging_root,
+                    fetch_deadline=fetch_deadline,
+                    now=now,
+                )
             )
-        )
+        finally:
+            if job_started is not None:
+                phase_accumulator.add_provider(
+                    provider_id, time.monotonic() - job_started
+                )
     return results
 
 

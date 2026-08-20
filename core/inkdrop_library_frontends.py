@@ -302,6 +302,62 @@ def komga_candidate_library_ids_for_host_folder(host_folder, settings, *, comic_
     return matches
 
 
+def trigger_komga_empty_trash(host_folder, *, settings, comic_root, manga_root):
+    """Drop Komga's record of files that are gone from disk.
+
+    Komga soft-deletes: a book whose file disappears stays in the database until
+    the library's trash is emptied. That is normally harmless, but it breaks a
+    cover injection that changes a file's extension -- rewriting `v01.cbr` as
+    `v01.cbz` leaves two books with the same name, and Komga picked the stale
+    `.cbr` as the series' first book and kept serving its old cover. Measured:
+    the covers were still wrong after a scan and correct immediately after this
+    call. Kavita has no equivalent problem.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    result = {"provider": "komga", "folder": str(host_folder), "mode": "empty_trash", "skipped": False}
+    if not settings.get("enabled"):
+        result.update({"skipped": True, "reason": "komga_disabled"})
+        return result
+    if not settings.get("username") or not settings.get("password"):
+        result.update({"skipped": True, "reason": "komga_credentials_missing"})
+        return result
+    library_ids, media_type = library_ids_for_host_folder(
+        host_folder, settings, comic_root=comic_root, manga_root=manga_root
+    )
+    result["media_type"] = media_type
+    if not library_ids:
+        library_ids = komga_candidate_library_ids_for_host_folder(
+            host_folder, settings, comic_root=comic_root, manga_root=manga_root
+        )
+    if not library_ids:
+        result.update({"skipped": True, "reason": f"komga_{media_type}_library_ids_missing"})
+        return result
+    statuses, errors = [], []
+    for library_id in library_ids:
+        library_id = str(library_id).strip()
+        if not library_id:
+            continue
+        try:
+            response = http_requests().post(
+                settings["base_url"].rstrip("/") + f"/libraries/{quote(library_id, safe='')}/empty-trash",
+                auth=(settings["username"], settings["password"]),
+                timeout=settings.get("timeout_seconds") or 8,
+            )
+            if response.status_code in {200, 202, 204}:
+                statuses.append({"library_id": library_id, "status_code": response.status_code})
+            else:
+                errors.append({"library_id": library_id, "status_code": response.status_code})
+        except Exception as exc:
+            errors.append({
+                "library_id": library_id,
+                "error": safe_error_text(exc, (settings.get("username"), settings.get("password"))),
+            })
+    result["statuses"] = statuses
+    if errors:
+        result["errors"] = errors[:3]
+    return result
+
+
 def trigger_komga_scan_folder(host_folder, *, settings, comic_root, manga_root):
     settings = settings if isinstance(settings, dict) else {}
     result = {
@@ -971,6 +1027,70 @@ def trigger_kavita_library_scan(
     if isinstance(details, dict):
         result.update(details)
     return result
+
+
+def trigger_kavita_cover_refresh(
+    folder,
+    *,
+    settings,
+    library_id_for_folder,
+    comic_root=None,
+    manga_root=None,
+    kavita_comic_root=None,
+    kavita_manga_root=None,
+    force=True,
+):
+    """Make Kavita re-derive its cached cover images for a folder's library.
+
+    A scan is not enough, and neither is a forced scan. Measured against a real
+    Kavita: after an archive gained a new first page, a `force=true` library
+    scan re-read the file -- the stored page count went up -- while the series
+    kept serving the cover it had already generated. Only the metadata refresh
+    regenerates the image.
+
+    That makes this call load-bearing for cover injection rather than an
+    optimisation: without it the archive on disk is correct and every Kavita
+    shelf still shows the old picture, which reads as the feature not working.
+    """
+    if not callable(library_id_for_folder):
+        raise RuntimeError("Kavita library id adapter is unavailable")
+    settings = settings if isinstance(settings, dict) else {}
+    # Kavita's FolderPath table stores the paths *Kavita* sees (/data/manga),
+    # not the host path the operator mounted there. Resolving the library from
+    # an untranslated host path matches nothing, so every refresh failed with
+    # "no Kavita library found" -- which is exactly what happened in production:
+    # correct injections, stale covers, and an error only visible if someone
+    # read the return value. The scan path has always translated first.
+    lookup_folder = folder
+    if comic_root and manga_root:
+        try:
+            lookup_folder = host_path_to_frontend_path(
+                folder,
+                comic_root=comic_root,
+                manga_root=manga_root,
+                frontend_comic_root=kavita_comic_root or settings.get("kavita_comic_root", "/data/comics"),
+                frontend_manga_root=kavita_manga_root or settings.get("kavita_manga_root", "/data/manga"),
+            )
+        except ValueError:
+            raise RuntimeError(f"folder is outside the configured Kavita roots: {folder}")
+    library_id = library_id_for_folder(lookup_folder)
+    if not library_id:
+        raise RuntimeError(f"no Kavita library found for {lookup_folder}")
+    token = kavita_plugin_token(settings)
+    response = http_requests().post(
+        settings["base_url"].rstrip("/") + "/library/refresh-metadata",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"libraryId": library_id, "force": "true" if force else "false"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return {
+        "folder": folder,
+        "status_code": response.status_code,
+        "library_id": library_id,
+        "mode": "cover_refresh",
+        "force": bool(force),
+    }
 
 
 def trigger_kavita_scan_folder(

@@ -59,6 +59,82 @@
 .reliability-rollup-card.tone-warn .reliability-rollup-count { color: var(--warn); }
 .reliability-rollup-card.tone-bad .reliability-rollup-count { color: var(--bad); }
 
+/* Health signals strip. Quiet by default; a signal only takes colour once it
+   crosses the threshold defined alongside it in inkdrop_state.py, so a row of
+   neutral tiles genuinely means "nothing to see". */
+.reliability-signal-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.reliability-signal {
+  display: grid;
+  gap: 1px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.reliability-signal-value {
+  font-size: var(--font-lg, 20px);
+  font-weight: var(--weight-bold, 800);
+  color: var(--text);
+}
+.reliability-signal-label {
+  font-size: var(--font-xs, 11px);
+  color: var(--text);
+}
+.reliability-signal-detail {
+  font-size: var(--font-xs, 11px);
+  color: var(--muted);
+}
+.reliability-signal.tone-warn {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--line-soft));
+}
+.reliability-signal.tone-warn .reliability-signal-value { color: var(--warn); }
+
+/* Bands. The header carries the judgment ("does this need attention?") so the
+   twelve counts underneath do not have to be interpreted one by one. */
+.reliability-band-row {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 14px;
+}
+.reliability-band-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: var(--font-sm, 13px);
+  font-weight: var(--weight-semibold, 700);
+  color: var(--text);
+}
+.reliability-band-count {
+  font-size: var(--font-xs, 11px);
+  font-weight: var(--weight-regular, 400);
+  color: var(--muted);
+}
+.reliability-band.tone-bad .reliability-band-header { color: var(--bad); }
+.reliability-band.tone-warn .reliability-band-header { color: var(--warn); }
+.reliability-band.tone-good .reliability-band-header { color: var(--good); }
+.reliability-band .reliability-rollup-row {
+  margin: 0;
+}
+
+.reliability-bucket-explainer {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-left-width: 3px;
+  border-left-color: var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-sm, 13px);
+  line-height: 1.5;
+}
+
 .reliability-item-list {
   display: grid;
   gap: 10px;
@@ -161,6 +237,128 @@
   gap: 10px;
   color: var(--muted);
   font-size: var(--font-xs, 11px);
+}
+
+/* The "Why?" toggle sits in the meta line, so it must not inherit the
+   sitewide 38px button height or it pushes that row out of alignment. */
+.reliability-item-expand {
+  height: auto;
+  min-height: 0;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: var(--font-xs, 11px);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.reliability-evidence {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--bg, #000) 8%);
+  font-size: var(--font-xs, 11px);
+}
+.reliability-evidence.loading,
+.reliability-evidence.error {
+  color: var(--muted);
+}
+.reliability-evidence h4 {
+  margin: 4px 0 0;
+  font-size: var(--font-sm, 12px);
+  color: var(--text);
+}
+/* The query editor. Monospace on purpose: the failures this exists to fix are
+   punctuation -- a stray comma, a trailing period, a publisher prefix -- and a
+   proportional font hides exactly those. */
+.reliability-query-editor {
+  display: grid;
+  gap: 4px;
+}
+.reliability-query-editor label {
+  color: var(--muted);
+}
+.reliability-query-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.reliability-query-row input {
+  flex: 1 1 240px;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--font-xs, 11px);
+}
+.reliability-query-row button {
+  height: 30px;
+  min-height: 0;
+  padding: 0 10px;
+  font-size: var(--font-xs, 11px);
+  white-space: nowrap;
+}
+.reliability-query-error {
+  color: var(--bad);
+}
+
+.reliability-evidence-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+}
+.reliability-evidence-facts dt {
+  color: var(--muted);
+}
+.reliability-evidence-facts dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+/* Wide evidence tables scroll inside their own box; the page itself must never
+   scroll sideways. */
+.reliability-evidence-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.reliability-evidence-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.reliability-evidence-table th,
+.reliability-evidence-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+}
+.reliability-evidence-table th {
+  color: var(--muted);
+  font-weight: var(--weight-semibold, 700);
+  white-space: nowrap;
+}
+.reliability-evidence-table .mini {
+  display: block;
+  color: var(--muted);
+}
+.reliability-evidence-query {
+  font-style: italic;
+}
+.reliability-evidence-table button {
+  height: 26px;
+  min-height: 0;
+  padding: 0 8px;
+  font-size: var(--font-xs, 11px);
+  white-space: nowrap;
 }
 
 .reliability-item-actions {

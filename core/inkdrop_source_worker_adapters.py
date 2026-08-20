@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from urllib.parse import quote, quote_plus, urlparse
 
+from core import inkdrop_prowlarr_indexer_health as indexer_health
 from core import inkdrop_sources
 from core import inkdrop_source_providers as providers
 
@@ -1525,18 +1526,6 @@ def internet_archive_metadata_request(identifier):
         headers={"Accept": "application/json", "Accept-Encoding": "gzip, deflate"},
         purpose="fetch_archive_item_metadata",
     )
-
-
-def _policy_list(row, key, default):
-    wanted = (row or {}).get("policy") if isinstance((row or {}).get("policy"), dict) else {}
-    value = wanted.get(key)
-    if isinstance(value, str):
-        rows = [part.strip() for part in value.split(",") if part.strip()]
-    elif isinstance(value, (list, tuple, set)):
-        rows = [str(part).strip() for part in value if str(part or "").strip()]
-    else:
-        rows = []
-    return rows or list(default)
 
 
 def _mangadex_languages(row, wanted_item=None):
@@ -4262,6 +4251,142 @@ def _indexer_error_should_try_ascii_fallback(query, requests, request_offset):
     return False
 
 
+# Indexer capabilities change only when an operator edits Prowlarr, so this is
+# cached per base URL rather than re-fetched per search. Keyed on the URL, not
+# the provider, because every child provider points at the same instance.
+_INDEXER_CAPABILITIES_CACHE = {}
+INDEXER_CAPABILITIES_TTL_SECONDS = 900
+
+
+def _prowlarr_indexer_capabilities(row, http_get):
+    """Declared category ids per indexer, cached. Empty dict when unknown."""
+    if not callable(http_get):
+        return {}
+    list_url = indexer_health.indexer_list_request_path(_base_url(row))
+    if not list_url:
+        return {}
+    cached = _INDEXER_CAPABILITIES_CACHE.get(list_url)
+    if cached and (time.time() - cached[0]) <= INDEXER_CAPABILITIES_TTL_SECONDS:
+        return cached[1]
+    probe = _request(
+        "prowlarr_indexer_capabilities",
+        "GET",
+        list_url,
+        params={},
+        headers={"Accept": "application/json", **_secret_header(row)},
+        purpose="probe_prowlarr_indexer_capabilities",
+    )
+    response, error = _safe_response_payload(http_get, probe)
+    if error:
+        # Unknown capabilities must leave the request exactly as configured --
+        # resolve_categories() treats an empty map as "change nothing", so a
+        # failed probe degrades to today's behaviour rather than to a guess.
+        return {}
+    capabilities = indexer_health.capabilities_by_indexer_id(response.get("payload"))
+    if capabilities:
+        # Only positive results are cached. Caching an empty map would pin the
+        # no-op behaviour in place for the whole TTL after one bad answer, and
+        # would let one caller's empty result leak into another's.
+        _INDEXER_CAPABILITIES_CACHE[list_url] = (time.time(), capabilities)
+    return capabilities
+
+
+def _apply_resolved_categories(row, requests, http_get, fetch_result):
+    """Rewrite each search request's categories to ones the indexers declare.
+
+    Prowlarr filters on the category ids we send, so asking an indexer for a
+    subcategory it never declares returns zero without the indexer ever being
+    queried. Nyaa and Tokyo Toshokan declare Books as 7000 and no 7030, which
+    is why manga searches came back empty in ~25ms.
+    """
+    search_requests = [
+        request
+        for request in requests or []
+        if isinstance(request, dict)
+        and str(request.get("purpose") or "").startswith("search_prowlarr")
+        and (request.get("params") or {}).get("categories")
+    ]
+    if not search_requests:
+        return
+    capabilities = _prowlarr_indexer_capabilities(row, http_get)
+    if not capabilities:
+        return
+    applied = None
+    for request in search_requests:
+        params = request.get("params") or {}
+        indexer_ids = indexer_health.selected_indexer_ids(params) or []
+        resolved, substitutions = indexer_health.resolve_categories(
+            params.get("categories") or [], indexer_ids, capabilities
+        )
+        if not substitutions:
+            continue
+        if resolved:
+            params["categories"] = resolved
+        else:
+            # Every requested category was unmatchable and had no usable
+            # ancestor. Drop the filter rather than send a guaranteed zero.
+            params.pop("categories", None)
+        request["params"] = params
+        request["categories_resolved"] = list(resolved)
+        applied = {"resolved_categories": resolved, "substitutions": substitutions}
+    if applied:
+        fetch_result["category_resolution"] = applied
+
+
+def _prowlarr_indexer_coverage(row, requests, combined_results, http_get, fetch_result):
+    """Which indexers a just-completed Prowlarr search actually covered.
+
+    Called only when the search returned nothing, because that is the only
+    outcome the answer can change. Every failure mode here degrades to "no
+    coverage claim" rather than to a wrong one: if we cannot establish that an
+    indexer was down, we must not manufacture a wait state, and equally we must
+    not let a probe failure turn into a fetch failure for a search that already
+    completed fine.
+    """
+    if not callable(http_get):
+        return {}
+    search_request = None
+    for request in requests or []:
+        if isinstance(request, dict) and str(request.get("purpose") or "").startswith("search_prowlarr"):
+            search_request = request
+            break
+    if not search_request:
+        return {}
+    status_url = indexer_health.indexer_status_request_path(_base_url(row))
+    if not status_url:
+        return {}
+    probe = _request(
+        "prowlarr_indexer_status",
+        "GET",
+        status_url,
+        params={},
+        headers={"Accept": "application/json", **_secret_header(row)},
+        purpose="probe_prowlarr_indexer_status",
+    )
+    response, error = _safe_response_payload(http_get, probe)
+    # Recorded under its own key, deliberately NOT appended to requests_made:
+    # that list feeds requests_made_count / completed_call_count, which are the
+    # operator-facing "how much searching happened" numbers. An availability
+    # probe is not a search, and quietly inflating those counters is the same
+    # class of defect as the attempt counter in #191.
+    fetch_result["indexer_status_probe"] = {
+        "request_id": probe.get("request_id"),
+        "purpose": probe.get("purpose"),
+        "url_hash": providers.url_hash(str(probe.get("url") or "")),
+        "ok": not error,
+    }
+    if error:
+        # Deliberately not a partial_error: the search itself succeeded, and
+        # an unreachable status endpoint is not evidence about the search.
+        return {"probe_error": providers.clipped_text(error, 200)}
+    unavailable = indexer_health.unavailable_indexer_ids(response.get("payload"))
+    if not unavailable:
+        return {}
+    selected = indexer_health.selected_indexer_ids(search_request.get("params") or {})
+    answered = indexer_health.answered_indexer_ids(combined_results)
+    return indexer_health.indexer_coverage(selected, unavailable, answered)
+
+
 def _record_partial_fetch_error(fetch_result, payload, request, error, *, stage=""):
     if not error:
         return
@@ -5551,6 +5676,8 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
         abort_after_request_error_count = max(0, min(abort_after_request_error_count, 10))
         consecutive_request_errors = 0
         requests = list(fetch_plan.get("requests") or [])
+        if adapter_family == "prowlarr_indexer":
+            _apply_resolved_categories(row, requests, http_get, result)
         for request_offset, request in enumerate(requests):
             request_index = len(variant_counts)
             response, error = _safe_response_payload(http_get, request)
@@ -5640,6 +5767,8 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
                 item["_inkdrop_pack_query"] = bool(request.get("pack_query"))
                 item["_inkdrop_query_index"] = request_index
                 item["_inkdrop_query_result_index"] = result_index
+                if request.get("categories_resolved"):
+                    item["_inkdrop_resolved_categories"] = list(request["categories_resolved"])
                 combined_results.append(item)
             if (
                 request.get("pack_query")
@@ -5773,17 +5902,37 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
                     item["_inkdrop_query_index"] = request_index
                     item["_inkdrop_query_result_index"] = result_index
                     item["_inkdrop_query_expansion"] = True
+                    if request.get("categories_resolved"):
+                        item["_inkdrop_resolved_categories"] = list(request["categories_resolved"])
                     combined_results.append(item)
         if not variant_counts and partial_errors:
             result["reason"] = "http_request_failed"
             result["error"] = partial_errors[0].get("error")
             result["partial_errors"] = partial_errors
             return result
+        # A Prowlarr search that came back empty cannot, on its own, tell
+        # "nobody has this" apart from "the indexer that would have had it was
+        # in failure backoff and got skipped" -- the 200 looks identical either
+        # way. Ask /indexerstatus, but only here, on the zero-result path: a
+        # search that found something needs no alibi, and the probe would
+        # otherwise cost a round-trip on every happy-path search.
+        if adapter_family == "prowlarr_indexer" and not combined_results:
+            coverage = _prowlarr_indexer_coverage(row, requests, combined_results, http_get, result)
+            if coverage:
+                result["indexer_coverage"] = coverage
         payload = {
             "results": combined_results,
             "query_variants": list(fetch_plan.get("query_variants") or []),
             "variant_result_counts": variant_counts,
         }
+        if result.get("indexer_coverage"):
+            payload["indexer_coverage"] = result["indexer_coverage"]
+        if result.get("category_resolution"):
+            # Carried onto the payload so the candidate gate can admit releases
+            # under the categories we actually asked for. Without this the gate
+            # still holds the unresolved 7030 and rejects them category_not_allowed
+            # -- the same zero under a different name. See tracker #198.
+            payload["category_resolution"] = result["category_resolution"]
         if fetch_plan.get("categoryless_fallback_requests"):
             payload["categoryless_fallback_indexer_ids"] = list(fetch_plan.get("categoryless_fallback_indexer_ids") or [])
             payload["categoryless_fallback_request_count"] = len(fetch_plan.get("categoryless_fallback_requests") or [])

@@ -41,7 +41,7 @@ services:
       INKDROP_IMAGE_DIGEST: ${INKDROP_IMAGE_DIGEST:?}
       INKDROP_IMAGE_REPOSITORY: ${INKDROP_IMAGE_REPOSITORY:?}
       INKDROP_WORKER_IMAGE_DIGEST: ${INKDROP_IMAGE_DIGEST:?}
-      INKDROP_STATE_SCHEMA_VERSION: "17"
+      INKDROP_STATE_SCHEMA_VERSION: "${INKDROP_EXPECTED_SCHEMA:?}"
       INKDROP_CANDIDATE_MANIFEST_PATH: /state/release/qa-candidate.json
       INKDROP_CONFIG_DIR: /config
       INKDROP_STATE_DIR: /state
@@ -96,6 +96,13 @@ write_release_identity() {
 import json, os, subprocess
 image = os.environ["IMAGE"]
 labels = json.loads(subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{json .Config.Labels}}"], text=True))
+# Ask the image itself rather than pinning a constant: the two images under
+# rehearsal can legitimately carry different state schema versions, and a
+# constant here silently rots every time the schema moves.
+schema_version = int(subprocess.check_output(
+    ["docker", "run", "--rm", "--entrypoint", "python", image, "-B", "-c",
+     "from core import inkdrop_state; print(inkdrop_state.SCHEMA_VERSION)"],
+    text=True).strip())
 repository, digest = image.rsplit("@", 1)
 commit = labels["org.opencontainers.image.revision"]
 payload = {
@@ -106,7 +113,7 @@ payload = {
     "version": labels["org.opencontainers.image.version"],
     "build_date": labels["org.opencontainers.image.created"],
     "qa_build_number": int(labels["io.inkdrop.qa.build-number"]),
-    "state_schema_version": 17, "workflow_run_id": "rehearsal",
+    "state_schema_version": schema_version, "workflow_run_id": "rehearsal",
 }
 open("state/release/qa-candidate.json", "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 release_values = {
@@ -129,6 +136,7 @@ PY
 verify_identity_and_state() {
   docker compose exec -T inkdrop python -B - <<'PY'
 import json, os, sqlite3, urllib.request
+from core import inkdrop_state
 p = json.load(urllib.request.urlopen("http://127.0.0.1:8796/api/system/version", timeout=10))
 assert p["candidate_manifest_status"] == "matched", p
 assert p["image_digest"] == os.environ["INKDROP_IMAGE_DIGEST"], p
@@ -138,12 +146,12 @@ assert int(p["qa_build_number"]) == int(os.environ["INKDROP_QA_BUILD_NUMBER"]), 
 con = sqlite3.connect("/state/inkdrop-state.sqlite3")
 assert con.execute("pragma quick_check").fetchone()[0] == "ok"
 assert not con.execute("pragma foreign_key_check").fetchall()
-assert int(con.execute("select value from schema_meta where key='schema_version'").fetchone()[0]) == 17
+assert int(con.execute("select value from schema_meta where key='schema_version'").fetchone()[0]) == inkdrop_state.SCHEMA_VERSION
 assert con.execute("select count(*) from series where id='series:update-rehearsal'").fetchone()[0] == 1
 assert con.execute("select value_json from app_settings where key='rehearsal.sentinel'").fetchone()[0] == '"preserved"'
 auth = json.load(urllib.request.urlopen("http://127.0.0.1:8796/api/auth/status", timeout=10))
 assert ((auth.get("auth") or {}).get("built_in_auth") or {}).get("bootstrap_required") is False, auth
-print(json.dumps({"version": p["version"], "commit": p["commit_sha"], "digest": p["image_digest"], "schema": 17, "state": "preserved"}, sort_keys=True))
+print(json.dumps({"version": p["version"], "commit": p["commit_sha"], "digest": p["image_digest"], "schema": inkdrop_state.SCHEMA_VERSION, "state": "preserved"}, sort_keys=True))
 PY
   docker compose exec -T inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90 </dev/null >/dev/null
   expected="$(docker image inspect "$(docker compose config --images | sort -u)" --format '{{.Id}}')"
@@ -169,7 +177,8 @@ request=urllib.request.Request("http://127.0.0.1:8796/api/auth/bootstrap", data=
 with urllib.request.urlopen(request, timeout=10) as response: assert 200 <= response.status < 300
 PY
 docker compose exec -T inkdrop python -B - <<'PY'
-import sqlite3, time, inkdrop_state
+import time
+from core import inkdrop_state
 db="/state/inkdrop-state.sqlite3"
 inkdrop_state.sync_settings(db, settings=[{"key":"rehearsal.sentinel","value":"preserved","source":"user"}])
 with inkdrop_state.connect(db) as con:
@@ -179,7 +188,7 @@ with inkdrop_state.connect(db) as con:
     con.commit()
 PY
 
-docker compose exec -T inkdrop python -B inkdrop_backup_restore.py backup --label update-rehearsal </dev/null > pre-update-backup.json
+docker compose exec -T inkdrop python -B core/inkdrop_backup_restore.py backup --label update-rehearsal </dev/null > pre-update-backup.json
 BACKUP_PATH="$(python3 -c 'import json; print(json.load(open("pre-update-backup.json"))["archive_path"])')"
 docker compose exec -T inkdrop sh -c 'cat "$1"' sh "$BACKUP_PATH" </dev/null > rehearsal-backup/pre-update.zip
 
@@ -198,8 +207,8 @@ write_release_identity "$PREVIOUS_IMAGE"
 grep -qx 'REHEARSAL_OPERATOR_SENTINEL=preserved' .env
 grep -qx 'INKDROP_PROWLARR_URL=http://disposable-provider.invalid' .env
 grep -qx 'INKDROP_PROWLARR_API_KEY=disposable-rehearsal-only' .env
-docker compose run --rm --no-deps inkdrop python -B inkdrop_backup_restore.py restore /rehearsal-backup/pre-update.zip --target-config-dir /config --target-state-dir /state </dev/null >/dev/null
-docker compose run --rm --no-deps inkdrop python -B inkdrop_backup_restore.py restore /rehearsal-backup/pre-update.zip --target-config-dir /config --target-state-dir /state --apply </dev/null >/dev/null
+docker compose run --rm --no-deps inkdrop python -B core/inkdrop_backup_restore.py restore /rehearsal-backup/pre-update.zip --target-config-dir /config --target-state-dir /state </dev/null >/dev/null
+docker compose run --rm --no-deps inkdrop python -B core/inkdrop_backup_restore.py restore /rehearsal-backup/pre-update.zip --target-config-dir /config --target-state-dir /state --apply </dev/null >/dev/null
 write_release_identity "$PREVIOUS_IMAGE"
 docker compose up -d --force-recreate --wait --wait-timeout 120 inkdrop inkdrop-worker
 verify_identity_and_state > restore-result.json

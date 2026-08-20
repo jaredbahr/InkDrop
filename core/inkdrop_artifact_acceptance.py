@@ -500,6 +500,27 @@ def classify_target(target=None, event=None, row=None, collection=None):
     }
 
 
+UNIT_TOKEN_PATTERNS = (
+    (r"\b(?:chapter|ch)[\s._-]*\d+", "chapter"),
+    (r"\b(?:volume|vol|v)[\s._-]*0*\d+", "volume"),
+    (r"(?:^|[\s._\-\(\[])#\s*\d|\bissue[\s._-]*\d", "single_issue"),
+)
+
+
+def unit_token_type(text):
+    """Which unit does this text name outright, if any?
+
+    Used to let a filename that states its own unit outrank the folder it
+    happens to sit in. Returns "" when the text carries no unit token, which
+    is the signal to fall back to the wider path context.
+    """
+    text = _norm(text)
+    for pattern, unit in UNIT_TOKEN_PATTERNS:
+        if re.search(pattern, text):
+            return unit
+    return ""
+
+
 def artifact_number_from_text(text):
     text = str(text or "")
     patterns = [
@@ -852,11 +873,17 @@ def classify_artifact(path, archive_check=None, source_unit=None, collection=Non
         return "chapter"
     if semantic_unit == "conflicting":
         return "unknown"
-    if source_unit == "chapter" or re.search(r"\b(?:chapter|ch)[\s._-]*\d+", text):
+    # A file that names its own unit outranks the folder it happens to sit in.
+    # "Love & Rockets #11.zip" filed under ".../Love and Rockets v1 #1-29/" is
+    # issue 11, not volume 1 -- reading the folder's "v1" as this file's unit
+    # is how a correct single issue gets classified as a volume. Only consult
+    # the wider path text when the filename itself states no unit at all.
+    unit_text = _norm(path.stem) if unit_token_type(path.stem) else text
+    if source_unit == "chapter" or re.search(r"\b(?:chapter|ch)[\s._-]*\d+", unit_text):
         return "chapter"
-    if source_unit == "volume" or re.search(r"\b(?:volume|vol|v)[\s._-]*0*\d+", text):
+    if source_unit == "volume" or re.search(r"\b(?:volume|vol|v)[\s._-]*0*\d+", unit_text):
         return "volume"
-    if re.search(r"(?:^|[\s._\-\(\[])#\s*\d|\bissue[\s._-]*\d", text):
+    if re.search(r"(?:^|[\s._\-\(\[])#\s*\d|\bissue[\s._-]*\d", unit_text):
         return "single_issue"
     if re.search(r"\b(?:page pack|page-pack|partial)\b", text):
         return "partial_page_pack"
@@ -939,7 +966,16 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
     page_count = int(archive_check.get("page_count") or 0)
     payload_size = int(archive_check.get("payload_size") or 0)
     text = source_text_for_path(path)
-    artifact_number = artifact_number_from_text(text)
+    # The number in the file's own name is what this file is; the numbers in
+    # its containing folder describe the shelf it came off. Reading them as
+    # equal evidence is how "The Spectre 027 (1995).cbr", sitting in
+    # ".../1992 The Spectre v3 (00 - 62 +extra)/", got interpreted as unit 3
+    # and rejected against issue 27 -- the folder's "v3" matched the volume
+    # pattern earlier in the concatenated text than the filename's own number.
+    # Fall back to the wider path text only when the filename has no number.
+    artifact_number = artifact_number_from_text(path.stem)
+    if artifact_number is None:
+        artifact_number = artifact_number_from_text(text)
     decision = "accepted"
     reasons = []
     quarantine = False

@@ -75,6 +75,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY inkdrop-logo-mark.png ./
+COPY inkdrop-logo-mark-mobile.png ./
 COPY web/static/css/inkdrop.css ./web/static/css/inkdrop.css
 COPY web/static/css/mobile.css ./web/static/css/mobile.css
 COPY web/static/img/inkdrop-auth-backdrop.webp ./web/static/img/inkdrop-auth-backdrop.webp

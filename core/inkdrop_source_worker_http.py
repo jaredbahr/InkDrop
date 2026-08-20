@@ -269,6 +269,8 @@ def _split_host_cap(values):
     'request host policy has no globally allowed hosts' because the node host
     could never intersect the static global cap).
     """
+    if isinstance(values, str):
+        values = values.split(",")
     exact_hosts = set()
     suffix_hosts = set()
     for value in values or []:
@@ -298,29 +300,68 @@ def _host_in_cap(host, exact_hosts, suffix_hosts):
     return any(host.endswith(suffix) for suffix in suffix_hosts)
 
 
-def _effective_host_cap(global_hosts, request_hosts, *, request=None):
-    """Apply a request route cap without allowing global configuration to widen it."""
+def host_allowed(url, allowed_hosts):
+    """True if url's host is allowed by allowed_hosts (an empty cap allows all).
+
+    Shared by the source-worker, direct-download and page-pack-download paths
+    so '*.domain'/'.domain' family entries mean the same thing everywhere --
+    see _split_host_cap for why the family form exists.
+    """
+    host = str(parse.urlsplit(str(url or "")).hostname or "").strip().lower()
+    if not host:
+        return False
+    exact_hosts, suffix_hosts = _split_host_cap(allowed_hosts)
+    if not (exact_hosts or suffix_hosts):
+        return True
+    return _host_in_cap(host, exact_hosts, suffix_hosts)
+
+
+def _intersect_host_cap(global_hosts, request_hosts):
+    """Narrow a request/route host cap to what the global cap authorizes.
+
+    Returns (exact_hosts, suffix_hosts, narrowed). narrowed is True only when
+    both a global and a request cap were present, so an empty result means a
+    real refusal; when either side was empty (no restriction on that side),
+    narrowed is False and an empty result just means "no cap", not a refusal.
+
+    An exact host must be allowed exactly or fall under a global family; a
+    family is kept only when the global cap grants the same family or a
+    wider one -- a single global exact host never authorizes a whole request
+    family.
+    """
     global_exact, global_suffix = _split_host_cap(global_hosts)
     request_exact, request_suffix = _split_host_cap(request_hosts)
     if not (request_exact or request_suffix):
-        return sorted(global_exact | global_suffix)
+        return global_exact, global_suffix, False
     if not (global_exact or global_suffix):
-        return sorted(request_exact | request_suffix)
-    # Keep only request-cap entries the global cap authorizes: an exact host
-    # allowed exactly or under a global family; a family only when the global
-    # cap grants the same family or a wider one. A single global exact host
-    # never authorizes a whole request family.
-    effective = {
+        return request_exact, request_suffix, False
+    effective_exact = {
         host
         for host in request_exact
         if host in global_exact or any(host.endswith(suffix) for suffix in global_suffix)
     }
-    effective |= {
+    effective_suffix = {
         suffix
         for suffix in request_suffix
         if suffix in global_suffix or any(suffix.endswith(parent) for parent in global_suffix if suffix != parent)
     }
-    if not effective:
+    return effective_exact, effective_suffix, True
+
+
+def effective_host_cap_or_none(global_hosts, request_hosts):
+    """Like _effective_host_cap but returns None instead of raising when narrowed to empty."""
+    effective_exact, effective_suffix, narrowed = _intersect_host_cap(global_hosts, request_hosts)
+    effective = effective_exact | effective_suffix
+    if not effective and narrowed:
+        return None
+    return sorted(effective)
+
+
+def _effective_host_cap(global_hosts, request_hosts, *, request=None):
+    """Apply a request route cap without allowing global configuration to widen it."""
+    effective_exact, effective_suffix, narrowed = _intersect_host_cap(global_hosts, request_hosts)
+    effective = effective_exact | effective_suffix
+    if not effective and narrowed:
         raise SourceHttpError(
             "disallowed_host",
             "source HTTP request host policy has no globally allowed hosts",

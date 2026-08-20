@@ -13,7 +13,9 @@ import re
 from datetime import date
 from pathlib import PurePath, PurePosixPath
 
+from core import inkdrop_acquisition_policy
 from core import inkdrop_artifact_acceptance
+from core import inkdrop_title_identity
 
 
 CONTRACT_VERSION = 2
@@ -21,6 +23,19 @@ CONTRACT_VERSION = 2
 VOLUME_UNITS = {"volume", "vol", "book_volume", "manga_volume"}
 ISSUE_UNITS = {"issue", "comic_issue"}
 CHAPTER_UNITS = {"chapter", "manga_chapter"}
+COMIC_MEDIA_TYPES = {
+    "comic",
+    "comics",
+    "comic_issue",
+    "graphic novel",
+    "graphic_novel",
+    "western comic",
+    "western_comic",
+}
+# Rejection reasons that report that something is wrong without reporting
+# what. Ordered least specific last; see the reordering in
+# candidate_compatibility().
+GENERIC_REJECTION_ORDER = ("ambiguous_unit_identity", "candidate_title_mismatch")
 COLLECTED_MARKERS = {
     "collected_edition",
     "complete_collection",
@@ -84,15 +99,54 @@ PREVIEW_RE = re.compile(r"(?i)\b(?:preview|sample|excerpt|teaser)\b")
 # ambiguous with anything; a Roman-numeral token after a bare "v" now
 # requires an actual separator (a period or whitespace), which real Roman
 # volume markers ("V. IX", "V IX") already carry.
+# The marker words each unit axis answers to, named once so the abbreviations
+# below can be derived from them instead of listed beside them.
+VOLUME_MARKER_WORDS = ("vol", "volume", "tome", "band")
+BOOK_MARKER_WORDS = ("book",)
+CHAPTER_MARKER_WORDS = ("chapter", "chap", "ch", "c")
+ISSUE_MARKER_WORDS = ("issue", "iss", "no", "number")
+
+
+def _unambiguous_axis_initials(words, *other_axes):
+    """First letters of this axis's markers that no other axis also claims.
+
+    ``T01`` is a French volume marker -- T for *tome* -- and ``tome`` is
+    already a word this grammar knows, so the abbreviation is derivable from
+    the vocabulary rather than from a translation table. Add a marker word in
+    any language later and its abbreviation comes free; nothing here knows
+    what language anything is in. This is the same move as generating
+    acronyms from tracked titles rather than storing them.
+
+    An initial two axes share is not usable: ``band`` (volume) and ``book``
+    both begin with B, so a bare ``B01`` names two different axes and the
+    honest answer is that it names neither. That collision is discovered from
+    the vocabulary, not remembered.
+    """
+    claimed = {word[0].lower() for axis in other_axes for word in axis}
+    return sorted({word[0].lower() for word in words} - claimed)
+
+
+VOLUME_BARE_INITIALS = _unambiguous_axis_initials(
+    VOLUME_MARKER_WORDS, BOOK_MARKER_WORDS, CHAPTER_MARKER_WORDS, ISSUE_MARKER_WORDS
+)
+_VOLUME_INITIAL_CLASS = "".join(VOLUME_BARE_INITIALS)
 VOLUME_RE = re.compile(
     rf"(?i)\b(?:vol(?:ume)?|tome|band)\.?\s*0*({NUMBER_TOKEN})\b"
-    rf"|\bv(?:\.?\s*0*({NUMBER_TOKEN_NO_ROMAN})|[.\s]\s*0*({ROMAN_ONLY_TOKEN}))\b"
+    rf"|\b[{_VOLUME_INITIAL_CLASS}](?:\.?\s*0*({NUMBER_TOKEN_NO_ROMAN})|[.\s]\s*0*({ROMAN_ONLY_TOKEN}))\b"
 )
 BOOK_RE = re.compile(rf"(?i)\bbook\s+0*({NUMBER_TOKEN})\b")
 CHAPTER_RE = re.compile(rf"(?i)\b(?:chapter|chap|ch|c)\.?\s*#?\s*0*({NUMBER_TOKEN})\b")
 ISSUE_RE = re.compile(rf"(?i)(?:\b(?:issue|iss|no|number)\.?\s*#?\s*|#)0*({NUMBER_TOKEN})\b")
+# Same as NUMBER_TOKEN, but the roman-numeral branch may not begin mid-word.
+# Unanchored, "[ivxlc]+" eats the tail of an ordinary word: the "l" of
+# "Digital" reads as 50, so "(Digital-1920)" parsed as a range of issues
+# 50-1920 and "Fairy Tail - 100 Years" as 49-100. Both turned a single book
+# into a pack and refused it with coverage_not_unit_number. The digit branch
+# stays unanchored on purpose -- "ch1-249" and "c129-131" are real chapter
+# ranges whose prefix letter sits directly against the number.
+COVERAGE_NUMBER_TOKEN = rf"(?:\d+(?:\.\d+)?|{WORD_TOKEN}|(?<![A-Za-z])[ivxlc]+)"
 COVERAGE_RE = re.compile(
-    rf"(?i)(?:\b(?:issues?|chapters?|chs?)\b\s*)?#?\s*0*({NUMBER_TOKEN})\s*"
+    rf"(?i)(?:\b(?:issues?|chapters?|chs?)\b\s*)?#?\s*0*({COVERAGE_NUMBER_TOKEN})\s*"
     rf"(?:-|\+|\bto\b|\bthrough\b)\s*#?\s*0*({NUMBER_TOKEN})\b"
 )
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
@@ -103,11 +157,42 @@ BRACKETED_MONTH_YEAR_RE = re.compile(
     r"(?P<open>[\[(])\s*(?P<month>\d{1,2})-(?P<year>(?:19|20)\d{2})\s*(?P<close>[\])])"
 )
 V_YEAR_RE = re.compile(r"(?i)\bv\.?\s*0*((?:19|20)\d{2})\b")
+# A year sitting next to one of these names which *printing* the artifact is,
+# not which run it belongs to: "The Sandman 001 (2023 Reprint)" is the 1989
+# issue on 2023 paper, so its year says nothing about series identity.
+REPRINT_MARKER_RE = re.compile(
+    r"(?i)\b(?:"
+    r"re-?print(?:ing|ings|s|ed)?"
+    r"|(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth)\s*print(?:ing|ings|s)?"
+    r"|facsimile"
+    r"|remaster(?:ed)?"
+    r")\b"
+)
 UNIT_PREFIX_TOKENS = {
     "book", "books", "c", "ch", "chap", "chapter", "chapters", "chs",
     "iss", "issue", "issues", "no", "number", "numbers", "tome", "tomes",
     "v", "vol", "volume", "volumes",
 }
+# How many variant covers the release packs, counted immediately before the
+# word: "Spawn.352.2024.2.covers.Digital-Empire" ships issue 352 with two
+# cover scans. The count is release metadata, and the bare-number scan below
+# only settles on a unit when every bare number it sees agrees -- so the "2"
+# outvoted the real "352" and the whole release was refused with
+# missing_required_unit_number. Only a count that *precedes* the word is
+# release metadata; "Covers 003" names a work called Covers and is untouched.
+COVER_COUNT_SUFFIX_RE = re.compile(r"(?i)^[\s._\-]*covers?(?![A-Za-z])")
+# How many issues the miniseries runs to, written in the standard comic form
+# "01 (of 03)". Same failure as the cover count above and the same cure: the
+# total is release metadata, not a unit, but the bare-number scan saw both "1"
+# and "3", found they disagreed, and settled on neither -- so
+# "Superman Smashes the Klan 01 (of 03) (2019)" was refused for
+# missing_required_unit_number while the identical file without the marker
+# matched. The enclosing bracket is optional, because "003 of 60" is as common
+# as "01 (of 03)" and means the same thing. What keeps that safe is not the
+# bracket but the rule at the scan below: a number after "of" is discarded
+# only when some other bare number survives to be the unit. So "Book of 5"
+# keeps its 5, while "Y The Last Man 003 of 60" keeps the 3 and drops the 60.
+OF_TOTAL_PREFIX_RE = re.compile(r"(?i)(?:^|[\s._\-\(\[])of\s*$")
 CREATOR_BYLINE_RE = re.compile(
     r"(?i)\bby\s+([A-Z][A-Za-z.'\u2019-]*(?:\s+[A-Z][A-Za-z.'\u2019-]*){1,4})"
     r"(?=\s+(?:#?\d|v(?:ol(?:ume)?)?\.?\s*\d|issues?\b|chapters?\b|"
@@ -139,6 +224,11 @@ SINGLETON_NEUTRAL_SUFFIX_TOKENS = {
     "retail",
     "web",
 }
+# Trailing tokens that name the RIPPER, not the work. "(digital) (Son of
+# Ultron-Empire)" says who scanned a file; it makes no claim about which book
+# is inside, so it cannot disqualify a release whose title already matched
+# exactly. Kept as a closed set of whole tuples rather than a token soup: any
+# unknown trailing word stays identity-bearing and still fails the match.
 TRUSTED_RELEASE_GROUP_SUFFIXES = {
     ("empire",),
     ("f", "son", "of", "ultron", "empire"),
@@ -146,6 +236,38 @@ TRUSTED_RELEASE_GROUP_SUFFIXES = {
     ("son", "of", "ultron", "empire"),
     ("zone", "empire"),
 }
+def release_group_suffix_only(suffix_tokens, target_year=""):
+    """Whether these trailing tokens are nothing but a known release-group tag.
+
+    Both singleton matchers ask this question. They used to answer it
+    differently: the collected one fell back to TRUSTED_RELEASE_GROUP_SUFFIXES
+    when its allowlist failed, the plain one did not, so an identical file
+    named "<work> (2021) (digital) (Zone-Empire).cbz" was acceptable evidence
+    for a proven collected singleton and not for a proven unitless work.
+    Measured 2026-08-18: 52.5% of real candidate filenames carry such a group,
+    and 0 of 7 newly-proven unitless rows accepted one. One predicate, read by
+    both, so the two cannot drift apart again.
+
+    This only ever runs after the caller's own identity checks have passed --
+    exact leading-title match, no unit number anywhere in the evidence, year
+    and publisher agreement. It answers the narrow question of whether what is
+    LEFT OVER is a scene tag, never whether the release is the right work.
+    """
+
+    tokens = [str(token or "").strip().lower() for token in (suffix_tokens or [])]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return True
+    year = str(target_year or "").strip()
+    if year and tokens and tokens[0] == year:
+        tokens = tokens[1:]
+    while tokens and tokens[0] in SINGLETON_NEUTRAL_SUFFIX_TOKENS:
+        tokens = tokens[1:]
+    if not tokens:
+        return True
+    return tuple(tokens) in TRUSTED_RELEASE_GROUP_SUFFIXES
+
+
 COLLECTED_ALIAS_NEUTRAL_GROUP_TOKENS = {
     "digital",
     "ebook",
@@ -168,7 +290,11 @@ COMPACT_VOLUME_RANGE_RE = re.compile(
 TRUSTED_SINGLETON_PROOF_SOURCES = {
     "comicvine_authoritative_count_and_canonical_issue_identity",
     "comicvine_collected_single_wanted_identity_without_declared_count",
+    # A standalone graphic novel / one-shot: no unit number exists to require.
+    # Established from the issue's stated form, never from a row count.
+    "comicvine_unitless_work_issue_form",
 }
+UNITLESS_WORK_PROOF_SOURCE = "comicvine_unitless_work_issue_form"
 TRUSTED_COLLECTED_SINGLETON_PROOF_SOURCES = {
     "comicvine_collected_single_wanted_identity",
 }
@@ -397,10 +523,22 @@ def parse_release_title(value):
     bare_number = ""
     if not any((volume, book, chapter, issue, coverage_start, coverage_end)):
         bare_values = []
+        of_totals = []
         for match in re.finditer(r"(?<![A-Za-z0-9])0*(\d{1,4})(?![A-Za-z0-9])", unit_text):
+            if COVER_COUNT_SUFFIX_RE.match(unit_text[match.end():]):
+                continue
             number = _number(match.group(1))
-            if number and not (number.isdigit() and 1900 <= int(number) <= 2099):
-                bare_values.append(number)
+            if not number or (number.isdigit() and 1900 <= int(number) <= 2099):
+                continue
+            if OF_TOTAL_PREFIX_RE.search(unit_text[:match.start()]):
+                of_totals.append(number)
+                continue
+            bare_values.append(number)
+        # A miniseries total is only a total when something else can be the
+        # unit. "Book of 5" has no other number, so its 5 is the unit, and
+        # discarding it would refuse the release for identifying no unit.
+        if not bare_values and of_totals:
+            bare_values = of_totals
         if len(set(bare_values)) == 1:
             issue = bare_number = bare_values[0]
     edition = ""
@@ -465,6 +603,81 @@ def parse_release_title(value):
         "publication_year_months": publication_year_months,
         "evidence": evidence,
     }
+
+
+def target_names_a_parent_not_itself(wanted_item):
+    """True when a row's title names the volume it lives in, not what it is.
+
+    A MangaDex chapter routinely carries a title like `Vol. 46 Omake` while the
+    row itself wants chapter 503.5. Read as text that is a volume target; read
+    as a unit it is a chapter that happens to know its parent. The collection
+    guard classifies on text, so it calls the second case a collection and then
+    refuses the exact chapter the row asked for.
+
+    The structured unit settles it. When the title names a volume and that
+    volume number is not the number this row actually wants, the title is
+    describing a container, not the target -- `Vol. 46 Omake` wanting 503.5.
+    When they agree it is a real volume target and stays one: `Vol. 1` wanting
+    1 is Dorohedoro volume 1, and a chapter does not satisfy it.
+
+    This decides *which targets are collections*. It does not touch what
+    satisfies one -- a part still never satisfies a collection.
+    """
+    wanted = wanted_item if isinstance(wanted_item, dict) else {}
+    title = _first(wanted.get("issue_title"), wanted.get("issueTitle"))
+    if not str(title or "").strip():
+        return False
+    title_volume = _number(parse_release_title(title).get("volume_number"))
+    if not title_volume:
+        return False
+    target_number = _number(
+        _first(
+            wanted.get("chapter_number"),
+            wanted.get("chapter"),
+            wanted.get("issue_number"),
+            wanted.get("normalized_number"),
+            wanted.get("issue"),
+        )
+    )
+    if not target_number:
+        return False
+    return str(title_volume) != str(target_number)
+
+
+def collection_target_conflicts_with_candidate(candidate, wanted_item):
+    """Would completion refuse this file for not satisfying a collection target?
+
+    Measured 2026-08-19: the matcher returned `compatible` on files that the
+    import-time guard then discarded after they had been fetched, previewed and
+    written to staging. A `compatible` verdict that completion will certainly
+    refuse is a claim about what happens next, and it was false -- every reader
+    of that verdict inherited it.
+
+    This asks the *same function* import asks
+    (inkdrop_state.collection_target_single_part_block_reason), so the two can
+    never drift into separate opinions. It cannot ask for more: at candidacy
+    there is no archive, so the proofs that clear this guard on a real file are
+    unavailable, and candidacy therefore sees strictly less evidence than
+    import. Returns the guard's own reason string, or "".
+
+    Fails open. If the import path cannot be reached, candidacy keeps its
+    previous behaviour rather than inventing a refusal of its own.
+    """
+    if target_names_a_parent_not_itself(wanted_item):
+        return ""
+    try:
+        from core import inkdrop_state
+    except Exception:
+        return ""
+    guard = getattr(inkdrop_state, "collection_target_single_part_block_reason", None)
+    record_of = getattr(inkdrop_state, "collection_guard_record_from_candidate", None)
+    context_of = getattr(inkdrop_state, "collection_guard_queue_context", None)
+    if not callable(guard) or not callable(record_of) or not callable(context_of):
+        return ""
+    try:
+        return str(guard(context_of(wanted_item), record_of(candidate)) or "")
+    except Exception:
+        return ""
 
 
 def target_context(wanted_item=None):
@@ -537,14 +750,23 @@ def target_context(wanted_item=None):
     except (TypeError, ValueError):
         metadata_issue_count = 0
     singleton_proof_source = str(wanted.get("singleton_issue_proof_source") or "")
-    singleton_count_supported = bool(
-        metadata_issue_count == 1
-        if singleton_proof_source == "comicvine_authoritative_count_and_canonical_issue_identity"
-        else (
+    if singleton_proof_source == "comicvine_authoritative_count_and_canonical_issue_identity":
+        singleton_count_supported = metadata_issue_count == 1
+    elif singleton_proof_source == UNITLESS_WORK_PROOF_SOURCE:
+        # The producer already refused any declared count above one. A work
+        # with no units may legitimately declare no count at all, so an
+        # absent count is not a reason to withhold the proof here -- but a
+        # declared count of exactly one still has to agree.
+        singleton_count_supported = bool(
+            wanted.get("unitless_work_proof") is True
+            and metadata_issue_count in (0, 1)
+        )
+    else:
+        singleton_count_supported = bool(
             metadata_issue_count == 0
             and singleton_proof_source == "comicvine_collected_single_wanted_identity_without_declared_count"
         )
-    )
+    singleton_count_supported = bool(singleton_count_supported)
     singleton_issue_proof = bool(
         wanted.get("singleton_issue_proof")
         and singleton_proof_source in TRUSTED_SINGLETON_PROOF_SOURCES
@@ -584,9 +806,12 @@ def target_context(wanted_item=None):
         "issue_number": issue,
         "chapter_number": chapter,
         "volume_number": volume,
-        "allow_collected_edition": bool(
-            wanted.get("allow_collected_edition") or wanted.get("collected_editions_allowed")
-        ),
+        # Resolved, never read raw. The predecessor of this line asked the
+        # wanted row for `allow_collected_edition`, a key no producer ever
+        # wrote, so it was always falsy and the edition gate was permanently
+        # on -- 127 items refused in silence. The resolver always returns a
+        # complete policy, so "nobody set it" can no longer mean "refuse".
+        "acquisition_policy": inkdrop_acquisition_policy.resolve(wanted),
         "unit_type_explicit": bool(explicit_unit_type),
         "media_type": media_type,
         "canonical_issue_count": canonical_issue_count,
@@ -701,7 +926,15 @@ def _singleton_exact_title_match(candidate, wanted_item, target, evidence, *, al
     if target_year:
         allowed_suffix.add(target_year)
     allowed_suffix.update(target_publisher.split())
-    return bool(all(token in allowed_suffix for token in release_tokens[len(target_tokens) :]))
+    suffix_tokens = release_tokens[len(target_tokens) :]
+    if all(token in allowed_suffix for token in suffix_tokens):
+        return True
+    # Every identity check above has already passed: the leading tokens are
+    # this work's title exactly, no source carries a unit number, no edition
+    # marker is present, and year and publisher agree. What is left can only
+    # be a scanner credit -- and it is judged by the same predicate the
+    # collected sibling uses, not a second copy of the rule.
+    return release_group_suffix_only(suffix_tokens, target_year)
 
 
 def _collected_singleton_exact_title_match(candidate, wanted_item, target, evidence):
@@ -795,12 +1028,7 @@ def _collected_singleton_exact_title_match(candidate, wanted_item, target, evide
             allowed_suffix.add(candidate_year)
     if all(token in allowed_suffix for token in suffix_tokens):
         return True
-    release_suffix = list(suffix_tokens)
-    if release_suffix and target_year and release_suffix[0] == target_year:
-        release_suffix.pop(0)
-    while release_suffix and release_suffix[0] in SINGLETON_NEUTRAL_SUFFIX_TOKENS:
-        release_suffix.pop(0)
-    return tuple(release_suffix) in TRUSTED_RELEASE_GROUP_SUFFIXES
+    return release_group_suffix_only(suffix_tokens, target_year)
 
 
 def _collected_singleton_alias_volume_match(candidate, wanted_item, target, evidence):
@@ -981,6 +1209,88 @@ def _collected_singleton_alias_exact_title_match(candidate, wanted_item, target,
     return all(token in allowed_suffix for token in suffix)
 
 
+# ---------------------------------------------------------------------------
+# Numbers in a filename that are not this artifact's unit.
+#
+# A release name often carries several numbers, and only some of them are a
+# claim about *this file's* unit. The rest belong to something else -- the
+# miniseries it is part of, its position in someone's reading order, the
+# volume slot its parent series occupies. Reading one of those as the unit
+# produces a confident, entirely wrong verdict: a wrong-issue refusal, or a
+# wrong-unit-type refusal, against a file that is exactly what was asked for.
+#
+# Confirmed shapes, each measured on a real refusal:
+#
+#   miniseries total       "Klan 01 (of 03)"                 -> the 3 is a total
+#   reading-order position "08. Nemo - Roses of Berlin"      -> the 8 is a slot
+#   series position        "(Avatar - The Last Airbender V11)" -> the 11 is the
+#                                                              parent series'
+#
+# They are one category and belong together. When a fourth shape turns up --
+# and it will -- add it here rather than starting a fourth patch somewhere
+# else. Each rule must stay narrow enough to name in one line, and each must
+# leave genuine unit claims alone: "Berserk v11", "Akira Volume 3" and
+# "Monster v09" are this artifact's unit and must keep parsing that way.
+# ---------------------------------------------------------------------------
+
+# A trailing bracketed group that names the wanted series and then a unit
+# token. The number belongs to the series, not to the file: "Ashes of the
+# Academy (2025) (Avatar - The Last Airbender V11)" is volume 11 OF the
+# franchise and is itself a titled one-shot with no unit of its own. Requires
+# the series words to be present, so a bare "(v11)" -- which is a real unit
+# claim -- is untouched.
+_SERIES_POSITION_GROUP_RE = re.compile(
+    r"[\(\[]\s*(?P<body>[^()\[\]]*?)\s*[\)\]]"
+)
+_SERIES_POSITION_UNIT_TAIL_RE = re.compile(
+    rf"(?i)(?:{'|'.join(VOLUME_MARKER_WORDS + BOOK_MARKER_WORDS)}|v)\s*\.?\s*0*\d{{1,4}}\s*$"
+)
+
+
+def _series_token_sequence(wanted_item=None):
+    wanted = wanted_item if isinstance(wanted_item, dict) else {}
+    series = str(_first(wanted.get("series_title"), wanted.get("series"), wanted.get("manga_title"))).strip()
+    return tuple(re.findall(r"[a-z0-9]+", series.lower()))
+
+
+def _names_the_wanted_series(text, series_tokens):
+    """True when these words are a run of the wanted series' own title.
+
+    An ordered contiguous run rather than a loose overlap, so a group that
+    merely shares a word with the series does not qualify.
+    """
+    words = tuple(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+    if len(words) < 2 or not series_tokens:
+        return False
+    for start in range(0, len(series_tokens) - len(words) + 1):
+        if series_tokens[start:start + len(words)] == words:
+            return True
+    return False
+
+
+def strip_series_position_group(value, wanted_item=None):
+    """Drop a bracketed group that states the parent series' volume slot.
+
+    Narrow on purpose: the group must name the wanted series *and* end in a
+    unit token, and only that group is removed. Everything else about the
+    release name, including any unit the artifact claims for itself, survives.
+    """
+    text = str(value or "").strip()
+    series_tokens = _series_token_sequence(wanted_item)
+    if not text or not series_tokens:
+        return text
+    out = text
+    for match in list(_SERIES_POSITION_GROUP_RE.finditer(text)):
+        body = match.group("body")
+        tail = _SERIES_POSITION_UNIT_TAIL_RE.search(body)
+        if not tail:
+            continue
+        if not _names_the_wanted_series(body[: tail.start()], series_tokens):
+            continue
+        out = out.replace(match.group(0), " ", 1)
+    return re.sub(r"\s{2,}", " ", out).strip() or text
+
+
 def _strip_series_prefix(value, wanted_item=None):
     text = str(value or "").strip()
     wanted = wanted_item if isinstance(wanted_item, dict) else {}
@@ -1071,6 +1381,10 @@ def _candidate_text_values(candidate, wanted_item=None):
             else text
         )
         if text and not any(existing[1] == text for existing in values):
+            # The series-position group goes before the prefix strip: it is a
+            # statement about the parent series, so it must not survive into
+            # the text the unit parser reads.
+            identity_text = strip_series_position_group(identity_text, wanted_item)
             values.append((label, text, _strip_series_prefix(identity_text, wanted_item)))
     return values
 
@@ -1173,6 +1487,7 @@ def _reinterpret_vyear_run_for_issue_target(candidate, target, evidence):
     if not volume_sources:
         return
     separate_numbers = set()
+    numbers_by_source = []
     for source in sources:
         text = str(source.get("parsed_identity_text") or source.get("unit_identity_title") or "")
         year_matches = list(V_YEAR_RE.finditer(text))
@@ -1197,23 +1512,34 @@ def _reinterpret_vyear_run_for_issue_target(candidate, target, evidence):
             if number and not (number.isdigit() and 1900 <= int(number) <= 2099):
                 source_numbers.append(number)
                 separate_numbers.add(number)
-        # Each asserted source must carry at most one unit token, and a
-        # source carrying VYYYY must carry exactly one separate wanted issue.
-        # A set alone would collapse ``V1992 277 277`` into false certainty.
-        if len(source_numbers) > 1 or (source_numbers and source_numbers[0] != wanted):
+        # Each asserted source must carry at most one unit token. A set alone
+        # would collapse ``V1992 277 277`` into false certainty.
+        if len(source_numbers) > 1:
             return
-        if source.get("volume_number") and source_numbers != [wanted]:
-            return
+        numbers_by_source.append((source, source_numbers))
     # More than one trailing number is ambiguous (for example ``V1992 277
-    # 278``); never pick the target number out of that larger claim.
-    if separate_numbers != {wanted}:
+    # 278``); never pick one number out of that larger claim.
+    #
+    # Which number it is, is deliberately not compared against the wanted
+    # issue. Whether ``V1992 278`` reads as "run year 1992, issue 278" is a
+    # question about the title's own shape, and the answer cannot depend on
+    # what happens to be wanted -- reading it as volume 1992 when the issue is
+    # wrong and as issue 278 when it is right made the same release report
+    # wrong_unit_type in one case and wrong_issue_number in the other. The
+    # guards above are what make the read safe; the wanted number never was.
+    if len(separate_numbers) != 1:
         return
-    if evidence.get("issue_number") and evidence.get("issue_number") != wanted:
+    unit_number = next(iter(separate_numbers))
+    # A source carrying VYYYY must carry exactly that one separate issue.
+    for source, source_numbers in numbers_by_source:
+        if source.get("volume_number") and source_numbers != [unit_number]:
+            return
+    if evidence.get("issue_number") and evidence.get("issue_number") != unit_number:
         return
 
     evidence["run_year"] = run_year
     evidence["volume_number"] = ""
-    evidence["issue_number"] = wanted
+    evidence["issue_number"] = unit_number
     evidence["unit_type"] = "issue"
     evidence["present_unit_fields"] = ["issue_number"]
     evidence["ambiguous"] = False
@@ -1224,9 +1550,59 @@ def _reinterpret_vyear_run_for_issue_target(candidate, target, evidence):
         if source.get("volume_number") == run_year:
             source["run_year"] = run_year
             source["volume_number"] = ""
-            source["issue_number"] = wanted
+            source["issue_number"] = unit_number
             source["unit_type"] = "issue"
             source["ambiguous"] = False
+
+
+def _relaunch_run_year_conflict(target, wanted_item, evidence, identity_values):
+    """Return whether a same-titled later run is being offered for run one's first issue.
+
+    A relaunch keeps the title and restarts the numbering, so the wanted issue
+    number matches exactly and every title check passes -- "Uncanny X-Men 001
+    (2018)" reads as a clean hit for Uncanny X-Men (1963) #1. The year is the
+    only thing that separates them, and it can only be compared soundly at
+    issue one: a run that began in 1963 published its first issue in 1963, so
+    a first issue stamped decades later belongs to a different run. For issue
+    N the wanted year pins nothing (issue 200 of a 1963 run ships in 1985),
+    and the year is not compared at all.
+
+    Deliberately one-directional and comic-only. An *earlier* year is left
+    alone because the common "Series (RunYear) NNN" naming puts the run's year
+    on every issue, so an earlier year is usually the right run rather than a
+    wrong one. Manga is excluded because its years are not the same quantity
+    on both sides -- a series' year is Japanese serialization while a release
+    carries the English edition -- which is the same mismatch that made the
+    library's folder-year guard blind whole shelves.
+    """
+
+    if target.get("media_type") not in COMIC_MEDIA_TYPES:
+        return False
+    if target.get("unit_type") not in ISSUE_UNITS or target.get("issue_number") != "1":
+        return False
+    wanted = wanted_item if isinstance(wanted_item, dict) else {}
+    wanted_year = _year(_first(wanted.get("year"), wanted.get("release_date"), wanted.get("date")))
+    if not wanted_year:
+        return False
+    # A collected edition or a reprint carries the year of *that* edition, not
+    # of the run -- "Batman Year One Deluxe Edition 2007" is the 1987 first
+    # issue in a 2007 hardcover. Whether such a release may satisfy the target
+    # is the collected-edition gate's decision, made below on real edition
+    # evidence; the year says nothing about which run this is.
+    if evidence.get("edition_markers") or evidence.get("edition_marker"):
+        return False
+    identity_text = " ".join(str(value or "") for value in identity_values if value)
+    if REPRINT_MARKER_RE.search(identity_text):
+        return False
+    declared_years = set(YEAR_RE.findall(identity_text))
+    # One year is a claim; two are a description ("001 (1963) (2018 digital
+    # scan)") and which one names the run is no longer decidable here.
+    if len(declared_years) != 1:
+        return False
+    declared_year = next(iter(declared_years))
+    # One year of slack: cover dates routinely run ahead of the recorded
+    # start year, so a 1963 run's first issue may be stamped 1964.
+    return int(declared_year) > int(wanted_year) + 1
 
 
 def collected_singleton_alias_exact_title_match(candidate, wanted_item=None):
@@ -1323,16 +1699,63 @@ def candidate_compatibility(candidate, wanted_item=None):
     )
 
     match_confidence = str(candidate.get("match_confidence") or "").strip().lower().replace("-", "_")
+    # "Absent" and "present and False" mean opposite things here. Only the
+    # provider path stamps this, so a candidate that never went through it
+    # keeps the old behaviour rather than being handed an outer-work match it
+    # never earned.
+    outer_work_match = candidate.get("outer_work_identity_match")
     if (
         match_confidence == "mismatch"
         and not collected_singleton_alias_exact_match
         and not singleton_exact_match
     ):
-        blocked.append("candidate_title_mismatch")
+        # Outer-work identity alone is not enough to drop the title reason.
+        # It is computed from a wide alias set that includes derived
+        # collected/contributor forms, so "Batman - The Court of Owls 001"
+        # satisfies it for a wanted "Absolute Batman: The Court of Owls" --
+        # a different work whose only distinguishing token is the one the
+        # candidate is missing. Dropping the title reason there made a
+        # wrong-work release compatible. So the canonical title must be
+        # wholly present as well: every token of it, in the observed title.
+        canonical_tokens = inkdrop_title_identity.normalized_tokens(
+            _first(
+                (wanted_item or {}).get("series_title"),
+                (wanted_item or {}).get("series"),
+                (wanted_item or {}).get("manga_title"),
+            )
+            if isinstance(wanted_item, dict)
+            else ""
+        )
+        observed_tokens = set(
+            inkdrop_title_identity.normalized_tokens(
+                _first(candidate.get("original_result_title"), candidate.get("title"))
+            )
+        )
+        canonical_fully_present = bool(canonical_tokens) and all(
+            token in observed_tokens for token in canonical_tokens
+        )
+        if outer_work_match is True and canonical_fully_present:
+            # The provider's own outer-work authority says this release names
+            # the wanted work; what it has not shown is that it holds the
+            # wanted unit. Measured 2026-08-18, 832 of 934 title-mismatch rows
+            # were in exactly that position, and 210 of the 213 where title
+            # was the *only* stated reason. Reporting those as a title
+            # mismatch sent every reader to title matching when the open
+            # question was containment. Settled after the unit gates below,
+            # where the precise reason is known.
+            pass
+        else:
+            blocked.append("candidate_title_mismatch")
     elif (
         match_confidence.startswith("related_series")
         or match_confidence in {"subseries", "related_title"}
     ) and not singleton_exact_match:
+        blocked.append("related_series_identity")
+    if not singleton_exact_match and _relaunch_run_year_conflict(
+        target, wanted_item, evidence, source_identity_values
+    ):
+        # Same carve-out the confidence-driven block above uses: a proven
+        # singleton whose title matched exactly is not second-guessed here.
         blocked.append("related_series_identity")
 
     wanted_creators = _trusted_wanted_creators(wanted_item)
@@ -1342,6 +1765,12 @@ def candidate_compatibility(candidate, wanted_item=None):
 
     if candidate.get("preview_or_sample"):
         blocked.append("preview_or_sample")
+    # Asked here so acceptance and completion agree before a transfer runs,
+    # not after. Review rather than block: candidacy cannot read the archive
+    # the import-time guard reads, so it must not turn "I cannot prove this
+    # satisfies the collection" into a refusal the file itself could clear.
+    if collection_target_conflicts_with_candidate(candidate, wanted_item):
+        review.append("collection_target_single_part")
     if candidate.get("known_bad_candidate") or str(candidate.get("source_memory_status") or "").lower() == "known_bad":
         blocked.append("known_bad_candidate")
     hierarchical_chapter_identity = bool(
@@ -1379,7 +1808,14 @@ def candidate_compatibility(candidate, wanted_item=None):
         and not evidence.get("coverage_end")
         and (not evidence_run_number or not target_run_number or evidence_run_number == target_run_number)
     )
-    if evidence.get("conflicts") or (
+    # Two different findings share this one code. Sources that contradict each
+    # other ("Saga 003" in the title, issue 4 from the provider) leave the
+    # unit genuinely unknowable, and this code is the precise answer. A single
+    # source naming two unit types at once ("Love and Rockets v2 #019") is
+    # readable -- the unit checks below say exactly which claim is wrong -- so
+    # there this code is only a placeholder for them.
+    source_identities_conflict = bool(evidence.get("conflicts"))
+    if source_identities_conflict or (
         evidence.get("ambiguous") and not hierarchical_chapter_identity and not hierarchical_issue_identity
     ):
         blocked.append("ambiguous_unit_identity")
@@ -1387,8 +1823,37 @@ def candidate_compatibility(candidate, wanted_item=None):
     edition = evidence.get("edition_marker") or ""
     target_unit = target.get("unit_type") or ""
     if edition in COLLECTED_MARKERS and target_unit in (VOLUME_UNITS | ISSUE_UNITS | CHAPTER_UNITS):
-        if not target.get("allow_collected_edition") and not collected_singleton_match and not singleton_exact_match:
-            blocked.append("collected_edition_disallowed")
+        if not collected_singleton_match and not singleton_exact_match:
+            # Severity, not a boolean. The old gate could only block or stay
+            # silent, so "show this to an operator" was unreachable and a
+            # collected edition holding the wanted unit simply vanished.
+            severity = inkdrop_acquisition_policy.severity_for(
+                target["acquisition_policy"], "collected_edition"
+            )
+            # A collected edition that spans a range is two questions, not
+            # one: "is this edition acceptable" and "does it actually contain
+            # the wanted unit". Only the first is settled -- the second is the
+            # pack-containment proof still on hold, and its range evidence is
+            # known to accept the wrong series. So a range-spanning release
+            # keeps the stricter of the two answers, and only a collected
+            # edition that IS the exact wanted unit follows the edition
+            # policy.
+            spans_a_range = bool(
+                evidence.get("pack_marker")
+                or evidence.get("coverage_start")
+                or evidence.get("coverage_end")
+            )
+            if spans_a_range:
+                severity = inkdrop_acquisition_policy.stricter(
+                    severity,
+                    inkdrop_acquisition_policy.severity_for(
+                        target["acquisition_policy"], "pack_containment"
+                    ),
+                )
+            if severity == inkdrop_acquisition_policy.REFUSE:
+                blocked.append("collected_edition_disallowed")
+            elif severity == inkdrop_acquisition_policy.REVIEW:
+                review.append("collected_edition_disallowed")
 
     if target_unit in VOLUME_UNITS:
         wanted = target.get("volume_number")
@@ -1494,6 +1959,24 @@ def candidate_compatibility(candidate, wanted_item=None):
             blocked.append("wrong_unit_type")
         elif evidence.get("chapter_number") and wanted and evidence.get("chapter_number") != wanted:
             blocked.append("wrong_chapter_number")
+        elif (
+            evidence.get("chapter_number")
+            and evidence.get("chapter_number") == wanted
+            and target_volume
+            and evidence_run_number
+            and evidence_run_number != target_volume
+        ):
+            # Same shape as the print-run check on the issue branch above. The
+            # chapter number matches, but the candidate files it under a
+            # different volume than the wanted chapter actually belongs to --
+            # "Vol 03 Ch 007" is not the volume 2 chapter 7 the target names,
+            # and chapter numbers repeat across a series' reissues often
+            # enough that a bare number match is not proof on its own. Only a
+            # volume the target itself confirmed is compared: a chapter whose
+            # own volume is unknown is left alone, because a manga chapter
+            # number is series-global and a volume marker beside it is
+            # ordinary context rather than a competing claim.
+            blocked.append("wrong_volume_number")
         elif evidence.get("chapter_number") and evidence.get("chapter_number") == wanted:
             positive.append("exact_chapter_number")
         elif wanted and manifest_exact_member:
@@ -1502,19 +1985,30 @@ def candidate_compatibility(candidate, wanted_item=None):
             review.append("missing_required_unit_number")
 
     blocked = list(dict.fromkeys(blocked))
-    # candidate_title_mismatch is the least specific reason this function ever
-    # appends -- it only says "match_confidence came back mismatch", not what
-    # was actually wrong. A broad series-title-only query evaluates every
-    # returned issue against one specific wanted issue, so "right series,
-    # wrong issue" is the constant, expected case, and candidate_title_mismatch
-    # gets appended (above) before the unit-specific checks even run. Left in
-    # position [0] it silently buried the real reason in the vast majority of
-    # real rejections (measured live: 36% of all candidate_title_mismatch rows
-    # also carried a specific reason here). Whenever anything more specific is
-    # also present, let that reason -- not this one -- be what gets displayed
-    # and explained.
-    if len(blocked) > 1 and "candidate_title_mismatch" in blocked:
-        blocked = [reason for reason in blocked if reason != "candidate_title_mismatch"] + ["candidate_title_mismatch"]
+    # Two of the reasons this function appends say only "something is wrong
+    # here", not what. candidate_title_mismatch reports that match_confidence
+    # came back mismatch; ambiguous_unit_identity reports that the title
+    # asserted more than one unit without saying which claim is the wrong one.
+    # Both get appended before the unit-specific checks below even run, so
+    # left where they land they take position [0] and bury the real reason.
+    # A broad series-title-only query evaluates every returned issue against
+    # one specific wanted issue, so "right series, wrong issue" is the
+    # constant case (measured live: 36% of all candidate_title_mismatch rows
+    # also carried a specific reason here), and "v2 #19" against a wanted v1
+    # #19 reads as ambiguous for exactly the reason the print-run check
+    # already names precisely. Whenever anything more specific is present, let
+    # that reason -- not these -- be what gets displayed and explained.
+    # Ordered least-specific-last so ambiguous_unit_identity still outranks
+    # candidate_title_mismatch when those two are all there is. When the
+    # sources actually contradict each other, ambiguous_unit_identity is the
+    # specific answer rather than a placeholder, so it keeps its place.
+    demotable = set(GENERIC_REJECTION_ORDER)
+    if source_identities_conflict:
+        demotable.discard("ambiguous_unit_identity")
+    if len(blocked) > len(demotable.intersection(blocked)):
+        blocked = [reason for reason in blocked if reason not in demotable] + [
+            reason for reason in GENERIC_REJECTION_ORDER if reason in demotable and reason in blocked
+        ]
     review = [reason for reason in dict.fromkeys(review) if reason not in blocked]
     status = "blocked" if blocked else ("review" if review else "compatible")
     return {

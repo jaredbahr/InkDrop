@@ -316,15 +316,36 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
         ],
     }
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
-    generated = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"])
+    generated = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     expected_published = datetime.fromtimestamp(NOW, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     require(generated["published_at"] == expected_published, generated["published_at"])
     require(generated["database_migration"] is False, generated)
+
+    # The fixture's evidence is frozen at NOW, and validate_update_manifest()
+    # refuses a manifest older than UPDATE_MANIFEST_MAX_AGE_SECONDS. Without a
+    # pinned clock this call inherits a shelf life equal to that limit and
+    # starts failing on a calendar date -- which is what happened on
+    # 2026-08-19T01:00:00Z, exactly 31 days after NOW, on PRs that touched none
+    # of this. Assert the dependency rather than leaving it to expire silently:
+    # the manifest is accepted at its own timestamp, still accepted one second
+    # inside the limit, and refused one second past it.
+    horizon = updates.UPDATE_MANIFEST_MAX_AGE_SECONDS
+    require(
+        updates.validate_update_manifest(generated, now=NOW + horizon - 1)["published_at"]
+        == expected_published,
+        "a manifest one second inside the age limit must still be accepted",
+    )
+    try:
+        updates.validate_update_manifest(generated, now=NOW + horizon + 1)
+    except ValueError as exc:
+        require("stale" in str(exc).lower(), exc)
+    else:
+        raise AssertionError("a manifest past the age limit must be refused as stale")
     candidate["state_schema_version"] += 1
     candidate_path.write_text(json.dumps(candidate, sort_keys=True) + "\n", encoding="utf-8")
     validation.update(target_state_schema_version=candidate["state_schema_version"], candidate_sha256=hashlib.sha256(candidate_path.read_bytes()).hexdigest())
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
-    changed = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"])
+    changed = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     require(changed["database_migration"] is True, changed)
     candidate["state_schema_version"] = contract["previous_state_schema_version"]
     candidate_path.write_text(json.dumps(candidate, sort_keys=True) + "\n", encoding="utf-8")
@@ -332,13 +353,13 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
     update_path = folder / "inkdrop-update-manifest.json"
     update_path.write_text(json.dumps(generated, sort_keys=True) + "\n", encoding="utf-8")
-    evidence = release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"])
+    evidence = release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     require("inkdrop-update-manifest.json" in evidence["assets"], evidence)
     tampered = dict(generated, image_digest="sha256:" + "9" * 64)
     tampered["manifest_identity"] = updates.update_manifest_identity(tampered)
     update_path.write_text(json.dumps(tampered), encoding="utf-8")
     try:
-        release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"])
+        release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     except RuntimeError as exc:
         require("evidence mismatch" in str(exc), exc)
     else:

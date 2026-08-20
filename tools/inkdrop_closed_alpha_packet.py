@@ -208,7 +208,7 @@ for path in config state staging manual-inbox library/comics library/manga; do
   test -w "$path"
 done
 read -rsp 'GitHub package token: ' CR_PAT
-printf '\n'
+printf '\\n'
 printf '%s' "$CR_PAT" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
 unset CR_PAT
 docker compose config --quiet
@@ -248,7 +248,7 @@ Create and verify an application backup before changing any files. The archive
 covers config and state, not media:
 
 ```bash
-docker compose exec -T inkdrop python -B inkdrop_backup_restore.py backup --label pre-update | tee pre-update-backup.json
+docker compose exec -T inkdrop python -B core/inkdrop_backup_restore.py backup --label pre-update | tee pre-update-backup.json
 python -c 'import json,sys; p=json.load(sys.stdin); assert p["ok"] and p["manifest"]["state_db_backup"]["ok"] and p["archive_path"]; print(p["archive_path"])' < pre-update-backup.json
 ```
 
@@ -290,8 +290,8 @@ kept = [line for line in existing if line.partition("=")[0].strip() not in relea
 rows = release_lines(packet)
 fd, temporary = tempfile.mkstemp(prefix=".env.", dir=os.path.dirname(os.path.abspath(target)), text=True)
 try:
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join([*kept, *(rows[key] for key in sorted(release_keys)), ""]))
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\\n") as handle:
+        handle.write("\\n".join([*kept, *(rows[key] for key in sorted(release_keys)), ""]))
     os.chmod(temporary, os.stat(target).st_mode)
     os.replace(temporary, target)
 finally:
@@ -322,7 +322,7 @@ test "$(docker inspect "$(docker compose ps -q inkdrop)" --format '{{{{.Image}}}
 test "$(docker inspect "$(docker compose ps -q inkdrop-worker)" --format '{{{{.Image}}}}')" = "$EXPECTED_IMAGE_ID"
 PUBLISHED_ADDRESS="$(docker compose port inkdrop 8796 | head -n 1)"
 curl -fsS "http://$PUBLISHED_ADDRESS/api/system/version" | python -c 'import json,sys; p=json.load(sys.stdin); c=json.load(open("state/release/qa-candidate.json", encoding="utf-8")); assert p["candidate_manifest_status"] == "matched", p; assert p["image_digest"] == c["image_digest"], p; assert p["commit_sha"] == c["full_commit_sha"], p; assert p["version"] == c["version"], p; assert p["release_channel"] == c["release_channel"], p; assert int(p["qa_build_number"]) == int(c["qa_build_number"]), p; assert int(p["state_schema_version"]) == int(c["state_schema_version"]), p; print(p["version"], p["commit_sha"])'
-docker compose exec -T inkdrop python -B -c 'import sqlite3,inkdrop_runtime_config,inkdrop_state; c=sqlite3.connect(inkdrop_runtime_config.state_db_path()); actual=int(c.execute("select value from schema_meta where key=?", ("schema_version",)).fetchone()[0]); assert c.execute("pragma quick_check").fetchone()[0] == "ok"; assert not c.execute("pragma foreign_key_check").fetchall(); assert actual == inkdrop_state.SCHEMA_VERSION, (actual, inkdrop_state.SCHEMA_VERSION); print(actual)'
+docker compose exec -T inkdrop python -B -c 'import sqlite3; from core import inkdrop_runtime_config, inkdrop_state; c=sqlite3.connect(inkdrop_runtime_config.state_db_path()); actual=int(c.execute("select value from schema_meta where key=?", ("schema_version",)).fetchone()[0]); assert c.execute("pragma quick_check").fetchone()[0] == "ok"; assert not c.execute("pragma foreign_key_check").fetchall(); assert actual == inkdrop_state.SCHEMA_VERSION, (actual, inkdrop_state.SCHEMA_VERSION); print(actual)'
 docker compose exec -T inkdrop-worker python -B core/inkdrop_container_healthcheck.py --worker --json --wait-seconds 90
 ```
 
@@ -362,10 +362,10 @@ cp "$PRIOR_PACKET/state/release/qa-candidate.json" "$INSTALL_ROOT/state/release/
 cd "$INSTALL_ROOT"
 docker compose config --quiet
 docker compose pull inkdrop inkdrop-worker
-docker compose run --rm --no-deps inkdrop python -B inkdrop_backup_restore.py restore \\
+docker compose run --rm --no-deps inkdrop python -B core/inkdrop_backup_restore.py restore \\
   /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-label.zip \\
   --target-config-dir /config --target-state-dir /state
-docker compose run --rm --no-deps inkdrop python -B inkdrop_backup_restore.py restore \\
+docker compose run --rm --no-deps inkdrop python -B core/inkdrop_backup_restore.py restore \\
   /state/backups/inkdrop-backup-YYYYMMDD-HHMMSS-label.zip \\
   --target-config-dir /config --target-state-dir /state --apply
 docker compose up -d --force-recreate --wait --wait-timeout 120 inkdrop inkdrop-worker

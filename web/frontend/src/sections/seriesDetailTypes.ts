@@ -527,11 +527,12 @@ function seriesDetailIssueLooksOperationalTitle(value: unknown): boolean {
   ].some((pattern) => pattern.test(text));
 }
 
-export function seriesDetailIssueDisplayTitle(row: IssueRow, detail: string): string {
+export function seriesDetailIssueDisplayTitle(row: IssueRow): string {
   const issueTitle = String(row.issue_title || "").trim();
   if (issueTitle && !seriesDetailIssueLooksOperationalTitle(issueTitle)) return issueTitle;
-  const detailTitle = String(detail || "").split(" · ")[0].trim();
-  if (detailTitle && !seriesDetailIssueLooksOperationalTitle(detailTitle)) return detailTitle;
+  // row.next_action/activity_summary (seriesDetailIssueDetailText's source
+  // material) are always operational/status text by construction -- never a
+  // real issue title -- so they are not used as a title-fallback source.
   const number = String(row.issue_number || row.normalized_number || "").trim();
   if (number) return number.startsWith("#") ? `Issue ${number}` : `Issue #${number}`;
   const releaseDate = String(row.release_date || "").trim();

@@ -154,6 +154,12 @@ def storage_payload(payload):
 
 
 def list_payload(db_path):
+    # This is the one request that has to answer "which download clients do I
+    # have?", so it is where an install upgraded from the forced-card era gets
+    # its legacy cards carried into real instances. Guarded and idempotent: once
+    # each client type is recorded as done, this costs two indexed reads. The
+    # settings sync runs it too, but a user can reach this page without one.
+    inkdrop_state.migrate_legacy_download_clients(db_path)
     payload = {"ok": True, "registry": implemented_registry(), **config_store.list_instances(db_path)}
     instances = payload.get("instances") or []
     if any(str(row.get("client_type") or "").lower() == "slskd" for row in instances):
@@ -169,6 +175,21 @@ def list_payload(db_path):
         for row in instances:
             if str(row.get("client_type") or "").lower() == "slskd":
                 row["is_active_slskd_source"] = row.get("id") == routed_id
+    # Which of the old forced cards are still on the page, and whether any of
+    # them actually hold a connection. A card with no endpoint and no credential
+    # is the state that started this: it renders "Enabled" while InkDrop has
+    # nothing to connect to, so the page has no way to tell the user whether
+    # they have that client or not. Reported here so the page can retire it
+    # instead of leaving it to be read as a configured client.
+    payload["legacy_client_cards"] = [
+        {
+            "client_type": row["client_type"],
+            "configured": bool(row["base_url_configured"]) or any(
+                field.get("configured") for field in (row.get("secret_fields") or {}).values()
+            ),
+        }
+        for row in config_store.legacy_instance_metadata(db_path).get("legacy_instances") or []
+    ]
     legacy_slskd = inkdrop_state.provider_config(db_path, "slskd")
     if legacy_slskd:
         # A brand-new SLSKD instance draft otherwise starts blank -- if a user

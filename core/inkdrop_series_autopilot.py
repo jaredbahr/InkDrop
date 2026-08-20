@@ -33,9 +33,11 @@ import requests
 
 from core.inkdrop_acquire import detect_pack_info
 
+from core import inkdrop_bounded_read
 from core import inkdrop_db
 from core import inkdrop_runtime_config
 from core import inkdrop_internal_jobs
+from core import inkdrop_slskd_refusal_vocabulary
 
 try:
     from core import inkdrop_state
@@ -82,6 +84,15 @@ STATE_DIR = inkdrop_runtime_config.state_dir()
 LOG_DIR = inkdrop_runtime_config.log_dir()
 STAGING_DIR = inkdrop_runtime_config.staging_dir()
 INKDROP_STATE_DB = STATE_DIR / (inkdrop_state.STATE_DB_NAME if inkdrop_state else "inkdrop-state.sqlite3")
+# The shared "is this item still being pursued" predicate. The literal fallback
+# exists only for the degraded import path above; a smoke asserts the two are
+# byte-identical, because a fallback that silently drifted would resume
+# searching for every paused item without saying so.
+PURSUIT_ACTIVE_SQL = (
+    inkdrop_state.wanted_pursuit_active_sql("w")
+    if inkdrop_state
+    else "coalesce(json_extract(w.raw_json, '$.pursuit_paused'), 0) = 0"
+)
 COMIC_SERIES_FILE = STATE_DIR / "comic-series-watches.json"
 QUEUE_FILE = STATE_DIR / "series-autopilot-queue.json"
 STATUS_FILE = STATE_DIR / "series-autopilot-status.json"
@@ -180,6 +191,9 @@ PACK_IMPORT_ACTIVE_SECONDS = 2 * 60 * 60
 DEFAULT_RETRY_SECONDS = 30 * 60
 DEFAULT_PROWLARR_LIMIT = 20
 DEFAULT_PROWLARR_MAX_QUERIES_PER_ISSUE = 6
+# One of three defaults for INKDROP_PROWLARR_SEARCH_TIMEOUT_SECONDS; see the
+# note on inkdrop_acquire.PROWLARR_SEARCH_TIMEOUT_SECONDS. The configured value
+# wins over this, and prowlarr_search() only ever narrows further.
 DEFAULT_PROWLARR_TIMEOUT_SECONDS = 12.0
 DEFAULT_PROWLARR_COMMAND_TIMEOUT_SECONDS = 60
 DEFAULT_PROWLARR_SEARCH_BUDGET_SECONDS = 45
@@ -293,6 +307,20 @@ RUNTIME_HARD_EXIT_GRACE_SECONDS = 90
 RUNTIME_BUDGET_CHILD_PROVIDER_SAMPLE_LIMIT = 12
 RUNTIME_BUDGET_CHILD_PROVIDER_JOB_LIMIT = 20
 PROWLARR_COMMAND_TIMEOUT_HEADROOM_SECONDS = 10
+# An abandoned search and a search we skipped for budget are the same thing to
+# the row: no one asked the indexers, so we know exactly as much as we did
+# before. That is a different state from a finished search that came back
+# empty, which is why it does not share that cooldown -- a finished empty
+# search is evidence of absence and worth waiting on, and this is not evidence
+# of anything. Sharing MIN_BUDGET_RETRY_SECONDS is deliberate: same epistemic
+# state, same wait. It is also comfortably longer than a full Prowlarr command
+# timeout, so a retry cannot re-enter while the original might still be alive.
+ABANDONED_SEARCH_RETRY_SECONDS = MIN_BUDGET_RETRY_SECONDS
+# A row we keep abandoning must not keep buying passes ahead of rows that have
+# never been searched at all. Measured 2026-08-18: single rows had coalesced
+# 295 restatements of one abandonment. The wait grows with consecutive
+# abandonments and stops at the ordinary retry interval.
+ABANDONED_SEARCH_RETRY_CEILING_SECONDS = DEFAULT_RETRY_SECONDS
 DEFAULT_SLSKD_SOURCE_LOCK_WAIT_SECONDS = 5
 INKDROP_STATE_FINAL_SYNC_TIMEOUT_SECONDS = 90
 INKDROP_STATE_FINAL_SYNC_BUSY_TIMEOUT_MS = 90000
@@ -3420,9 +3448,22 @@ def post_json(path, payload=None, timeout=120):
         json=payload or {},
         headers=inkdrop_runtime_config.worker_auth_headers(required=True),
         timeout=timeout,
+        stream=True,
     )
-    response.raise_for_status()
-    return response.json() if response.text else {}
+    try:
+        response.raise_for_status()
+        # `response.text` decided whether to parse, which read the whole body
+        # just to test it for emptiness; one bounded read now answers both.
+        return inkdrop_bounded_read.bounded_read_json(
+            response,
+            inkdrop_bounded_read.INTERNAL_JSON_MAX_BYTES,
+            label="autopilot web job",
+            default={},
+        )
+    finally:
+        # stream=True holds the connection until the body is read or the
+        # response is closed; raise_for_status returns without reading it.
+        response.close()
 
 
 def backfill_slskd_download_started_at(queue):
@@ -3598,6 +3639,89 @@ def clear_source_started_marker(item, source=None):
     return changed
 
 
+# Sources whose result is known by the time the ladder step returns.
+#
+# SLSKD is deliberately absent and must stay absent. Its probe result is
+# reconciled by a *later* pass, not this one -- that is why it carries a
+# four-hour marker threshold (STALE_SLSKD_SOURCE_MARKER_SECONDS) and its own
+# source_already_reported_result_since() check instead of the 180s the others
+# use. At the moment a pass ends, an SLSKD marker with no result is the normal,
+# expected state of a healthy search that is still running.
+#
+# So this is not a conservative default that could later be widened to "all
+# sources" as a simplification: adding SLSKD here would retract live searches
+# every pass, and the rows would look untouched rather than broken. Pinned by
+# tests/inkdrop-abandoned-search-not-provider-timeout-smoke.py.
+SYNCHRONOUS_MARKER_SOURCES = frozenset({"prowlarr", "rss", "comicscodes", "mangadex"})
+
+
+def retract_unsearched_source_started_markers(rows, source, mark_ts, now=None):
+    """Take back "searching X" on rows this pass marked but never searched.
+
+    record_source_started_attempts() marks the whole batch before the search
+    runs, so a pass that dies mid-step leaves every row it touched claiming a
+    search is in flight. Nothing clears those, and the reaper later reads them
+    as the provider having gone silent.
+
+    Only markers this pass wrote are eligible -- `mark_ts` is the exact stamp
+    from our own record_source_started_attempts() call, so a marker written by
+    a concurrent pass, or a newer one written after ours, is left alone. A
+    genuinely in-flight search always has a different stamp than the one we
+    are retracting, which is what keeps this from killing live work.
+
+    Nothing is recorded when a marker is retracted, because nothing happened:
+    no attempt row, no verdict, no retry reason. The row simply goes back to
+    looking unsearched, which is what it is.
+    """
+    source_key = source_order_attempt_key(source)
+    if source_key not in SYNCHRONOUS_MARKER_SOURCES:
+        # Load-bearing, not a stub. See SYNCHRONOUS_MARKER_SOURCES: a source
+        # that reports back on a later pass has a live search in flight here.
+        return 0
+    try:
+        mark_ts = float(mark_ts)
+    except (TypeError, ValueError):
+        return 0
+    now = now or time.time()
+    retracted = 0
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        if source_order_attempt_key(item.get("last_source_started_source")) != source_key:
+            continue
+        try:
+            started_at = float(item.get("last_source_started_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if started_at != mark_ts:
+            continue
+        if not clear_source_started_marker(item, source_key):
+            continue
+        # The marker also lives as a "searching" attempt row, and
+        # source_started_at() falls back to it. Leaving that behind retracts
+        # the claim in one place and leaves it standing in the other, so the
+        # reaper still finds a search that never ran.
+        attempts = item.get("attempts")
+        if isinstance(attempts, list):
+            item["attempts"] = [
+                attempt
+                for attempt in attempts
+                if not (
+                    isinstance(attempt, dict)
+                    and str(attempt.get("kind") or "").strip().lower() == "source_started"
+                    and source_order_attempt_key(
+                        attempt.get("source") or attempt.get("provider_id")
+                    ) == source_key
+                    and numeric_timestamp(attempt.get("ts") or attempt.get("started_at")) == mark_ts
+                )
+            ]
+        if source_order_attempt_key(item.get("current_source")) == source_key:
+            item["current_source"] = None
+        retracted += 1
+        touch_queue_item(item, now)
+    return retracted
+
+
 def source_started_stale_seconds(source, default_seconds=STALE_SEARCH_SOURCE_MARKER_SECONDS):
     try:
         default_seconds = max(60, int(default_seconds or STALE_SEARCH_SOURCE_MARKER_SECONDS))
@@ -3666,6 +3790,28 @@ def source_already_reported_result_since(item, source, started_at):
     return False
 
 
+def abandoned_search_age_phrase(seconds):
+    """How long a started search sat with nothing coming back, in words.
+
+    This goes in front of an operator, so a marker that sat six weeks has to
+    read as six weeks. Rounding it away is how "we never finished this" passed
+    for "the indexer was slow" for months.
+    """
+    try:
+        seconds = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        return ""
+    if seconds < 90:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes} minutes"
+    hours = minutes / 60.0
+    if hours < 36:
+        return f"{hours:.0f} hours"
+    return f"{hours / 24.0:.0f} days"
+
+
 def normalize_stale_source_started_attempts(queue, now=None, stale_seconds=STALE_SEARCH_SOURCE_MARKER_SECONDS):
     items = queue.get("items") if isinstance(queue, dict) else {}
     if not isinstance(items, dict):
@@ -3706,7 +3852,20 @@ def normalize_stale_source_started_attempts(queue, now=None, stale_seconds=STALE
         if item.get("last_slskd_waiting_review_id") or item.get("last_slskd_transfer_id"):
             continue
         label = public_source_name(source) or source
-        reason = f"{label} source started but did not report a result before the stale timeout"
+        # This row was marked as "searching {label}" and no result ever came
+        # back. That is not the same as {label} timing out -- measured
+        # 2026-08-18, markers reaped here had sat a median of 43 minutes and
+        # nearly a third of them over a day, against a 12s request timeout and
+        # a 60s command timeout. Nothing that slow was ever a live request. We
+        # started a search, lost the pass that was running it, and left the
+        # marker behind. Calling it a provider timeout blamed a healthy
+        # Prowlarr for our own dropped work, and the retry ladder then treated
+        # a search that never happened as a source that had answered.
+        age = abandoned_search_age_phrase(now - started_at)
+        reason = (
+            f"InkDrop started a {label} search for this row and never finished it"
+            + (f"; the search has been sitting for {age}" if age else "")
+        )
         item["state"] = "queued"
         item["current_source"] = None
         item["last_source_error_source"] = source
@@ -3720,8 +3879,16 @@ def normalize_stale_source_started_attempts(queue, now=None, stale_seconds=STALE
         item["stale_source_started_at_iso"] = now_iso(started_at)
         item["stale_source_started_normalized_at"] = now
         item["stale_source_started_normalized_at_iso"] = now_iso(now)
-        item["last_event"] = f"{label} source timed out; automatic retry scheduled"
-        retry_delay = SLSKD_TRANSIENT_RETRY_SECONDS if source == "slskd" else DEFAULT_RETRY_SECONDS
+        item["abandoned_search_source"] = source
+        item["abandoned_search_age_seconds"] = max(0, now - started_at)
+        item["abandoned_search_count"] = int(item.get("abandoned_search_count") or 0) + 1
+        record_source_verdict(item, source, "abandoned", now)
+        item["last_event"] = f"We never finished the last {label} search for this row; searching again"
+        retry_delay = (
+            SLSKD_TRANSIENT_RETRY_SECONDS
+            if source == "slskd"
+            else abandoned_search_retry_delay(item)
+        )
         schedule_retry_after(item, now, retry_delay)
         item.pop("needs_you_reason", None)
         title = " ".join(
@@ -4058,6 +4225,11 @@ def current_missing_from_inkdrop_state():
                   and q.state not in ('verified', 'superseded_duplicate')
                   and coalesce(s.monitored, 1) = 1
                   and coalesce(w.status, 'wanted') not in ('satisfied', 'ignored', 'suppressed', 'superseded_duplicate', 'awaiting_release')
+                  -- "Wanted, not pursued": the operator said stop searching for
+                  -- this one. Deliberately a raw_json flag rather than a status,
+                  -- so the item stays on the Wanted count it belongs to instead
+                  -- of vanishing from the backlog number.
+                  and """ + PURSUIT_ACTIVE_SQL + """
             ),
             attempt_counts as (
                 select
@@ -4171,8 +4343,16 @@ def current_missing_from_inkdrop_state():
             if nested:
                 chapter_payload.update(nested)
             chapter_payload.update(source_payload)
+        # A hand-corrected query outranks everything, including the queue row's
+        # own column. It has to: queue_items.query is rewritten wholesale by the
+        # metadata-replacement upsert, so an operator correction stored only
+        # there is discarded on the next refresh without anyone being told.
+        operator_query = " ".join(
+            str(wanted_raw.get("operator_query") or raw.get("operator_query") or "").split()
+        ).strip()
         query = (
-            row["query"]
+            operator_query
+            or row["query"]
             or chapter_payload.get("searchQuery")
             or raw.get("query")
             or f"{series} {issue_number}".strip()
@@ -4230,7 +4410,11 @@ def current_missing_from_inkdrop_state():
             "watch_year": row["watch_year"],
             "watch_publisher": row["watch_publisher"],
             "query": query,
-            "searchQuery": chapter_payload.get("searchQuery") or raw.get("searchQuery") or query,
+            # Carried separately as well as through `query`, because SLSKD does
+            # not read `query` at all -- it builds its own variants from the
+            # series/issue metadata. source_queries() leads with this instead.
+            "operator_query": operator_query,
+            "searchQuery": operator_query or chapter_payload.get("searchQuery") or raw.get("searchQuery") or query,
             "queue_created_at": numeric_timestamp(row["queue_created_at"]) or numeric_timestamp(raw.get("created_at")),
             "queue_updated_at": numeric_timestamp(row["queue_updated_at"]) or numeric_timestamp(raw.get("updated_at")),
             "source_attempt_counts": {
@@ -6133,18 +6317,28 @@ def effective_safe_slskd_count_for_row(row, item=None):
 
 
 def has_cached_safe_slskd_candidate(item):
+    """Prompt122: the scheduling half of the current_pickable_candidate proof
+    seam (current_pickable_candidate_reference(), core/inkdrop_state.py, is
+    the Reliability-display half -- same principle, different evidence
+    domain, since this one has to prove against the mutable SLSKD probe
+    cache rather than durable source_attempts history).
+
+    Previously fell back to the item's own mirrored last_slskd_auto_grab_safe_count/
+    last_slskd_candidate_count counters whenever cached_safe_slskd_entry_for_item()
+    found no real cache entry -- a missing, expired, or evicted cache entry
+    still read as "cached and safe" as long as the stale counter said so.
+    That is a real self-seal: has_due_cached_slskd_autopick() and every
+    Prowlarr/RSS/ComicsCodes/hot-retry/reprobe gate below treat this as
+    scheduling authority, so a stale counter could suppress every other
+    source while pointing at a candidate that no longer exists anywhere.
+    Missing/expired/evicted/wrong-identity cache entries now read as
+    evidence missing, not cached/pickable -- callers get False and fall
+    through to their existing alternate-source/reprobe paths unchanged.
+    """
     if not isinstance(item, dict):
         return False
     _review_id, entry = cached_safe_slskd_entry_for_item(item)
-    if isinstance(entry, dict) and effective_safe_slskd_candidate_count(entry, item=item) > 0:
-        return True
-    if safe_cached_slskd_candidate_count(item) <= 0:
-        return False
-    try:
-        candidate_count = int(item.get("last_slskd_candidate_count") or 0)
-    except (TypeError, ValueError):
-        candidate_count = 0
-    return candidate_count > 0
+    return isinstance(entry, dict) and effective_safe_slskd_candidate_count(entry, item=item) > 0
 
 
 def has_due_cached_slskd_autopick(item, now=None, lookahead_seconds=0):
@@ -6333,9 +6527,77 @@ def repeated_source_retry_should_cooldown(item, now, *, missing_source_results=N
     )
 
 
+SOURCE_VERDICT_KINDS = ("timeout", "busy", "api_hiccup", "error", "abandoned")
+SOURCE_VERDICT_OBSERVED = "observed"
+SOURCE_VERDICT_RESTATED = "restated"
+
+
+def classify_source_verdict_text(*values):
+    """Read a provider verdict out of prose.
+
+    This is the original classifier and it is kept for one reason only: rows
+    written before verdicts were structured carry nothing else. Everything
+    written from now on records its verdict as a field, because deriving one
+    here has a failure mode that is not obvious from the code -- the strings
+    it reads are strings this module also writes, so a verdict can be re-read
+    out of a sentence describing an earlier verdict, with no provider involved
+    at either step. Prefer `item["last_source_verdict"]`.
+    """
+    text = " ".join(str(value or "") for value in values).lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "busy" in text:
+        return "busy"
+    if "api hiccup" in text:
+        return "api_hiccup"
+    return "error"
+
+
+def record_source_verdict(item, source, kind, now=None, origin=SOURCE_VERDICT_OBSERVED):
+    """Write down what a source actually did, as a field rather than a sentence.
+
+    `origin` separates a verdict from someone who watched the source
+    (`observed`) from a later restatement of that same verdict (`restated`).
+    A restatement may only ever carry a kind it was handed; it cannot mint a
+    new one. Without that split, a cooldown that rewrites a row's prose and a
+    classifier that reads a row's prose form a loop in which the system
+    reaches a verdict about a provider by reading its own earlier sentence
+    about that provider.
+    """
+    if not isinstance(item, dict):
+        return ""
+    kind = str(kind or "").strip().lower()
+    if kind not in SOURCE_VERDICT_KINDS:
+        kind = "error"
+    item["last_source_verdict"] = kind
+    item["last_source_verdict_origin"] = (
+        SOURCE_VERDICT_RESTATED if origin == SOURCE_VERDICT_RESTATED else SOURCE_VERDICT_OBSERVED
+    )
+    source = source_order_attempt_key(source) or str(source or "").strip().lower()
+    if source:
+        item["last_source_verdict_source"] = source
+    if now is not None:
+        item["last_source_verdict_at"] = now
+        item["last_source_verdict_at_iso"] = now_iso(now)
+    return kind
+
+
+def source_verdict_kind(item):
+    """The recorded verdict, or nothing. Never a guess off display copy."""
+    kind = str((item or {}).get("last_source_verdict") or "").strip().lower()
+    return kind if kind in SOURCE_VERDICT_KINDS else ""
+
+
+def source_verdict_source(item):
+    return source_order_attempt_key((item or {}).get("last_source_verdict_source"))
+
+
 def provider_retry_source_from_event(item):
     if not isinstance(item, dict):
         return ""
+    recorded = source_verdict_source(item)
+    if recorded:
+        return recorded
     event = str(item.get("last_event") or "").strip().lower()
     event_markers = (
         ("slskd", ("slskd source errored", "slskd source timed out", "slskd download api hiccup")),
@@ -6374,17 +6636,42 @@ def provider_retry_source_from_event(item):
 
 
 def provider_retry_kind_from_event(item):
-    text = " ".join(
-        str((item or {}).get(key) or "")
-        for key in ("last_event", "last_source_error", "last_source_busy_reason")
-    ).lower()
-    if "timed out" in text or "timeout" in text:
-        return "timeout"
-    if "busy" in text:
-        return "busy"
-    if "api hiccup" in text:
-        return "api_hiccup"
-    return "error"
+    """What the source did, preferring the recorded verdict over the copy.
+
+    Rows written before `last_source_verdict` existed still only carry prose,
+    so they fall through to the old reader. New rows never do -- which is the
+    point: the prose on a cooldown row is a restatement this module wrote, and
+    reading a verdict back out of it is how a single silent pass became the
+    most common recorded refusal reason in the product.
+    """
+    recorded = source_verdict_kind(item)
+    if recorded:
+        return recorded
+    return classify_source_verdict_text(
+        *(
+            (item or {}).get(key)
+            for key in ("last_event", "last_source_error", "last_source_busy_reason")
+        )
+    )
+
+
+def abandoned_search_retry_delay(item):
+    """How long to wait before re-running a search that never actually ran.
+
+    Short, because we have no information -- not evidence of absence. A row
+    whose search was abandoned is in the same state as one that has never been
+    searched, and the ordinary 30-minute provider cooldown is a wait for a
+    provider to recover from something it never did.
+
+    It grows with repeated abandonment so a row we keep dropping cannot hold
+    the ladder open ahead of rows that have never been searched once. The pass
+    only carries a handful of rows, so this is real budget.
+    """
+    try:
+        count = max(1, int((item or {}).get("abandoned_search_count") or 1))
+    except (TypeError, ValueError):
+        count = 1
+    return min(ABANDONED_SEARCH_RETRY_SECONDS * count, ABANDONED_SEARCH_RETRY_CEILING_SECONDS)
 
 
 def provider_transient_retry_base_seconds(source):
@@ -6450,15 +6737,24 @@ def mark_provider_retry_cooldown(item, source, now, *, set_timer=True, missing_s
     source = str(source or provider_retry_source_from_event(item) or "source").strip().lower()
     label = public_source_name(source) or source
     retry_kind = provider_retry_kind_from_event(item)
-    retry_delay = provider_transient_retry_delay(
-        item,
-        source,
-        base_seconds=base_seconds,
-        missing_source_results=missing_source_results,
-    )
+    # A cooldown watched nothing. It restates the verdict it was handed, and
+    # records that it is a restatement, so the next reader cannot mistake this
+    # row's copy for a fresh observation of the provider.
+    record_source_verdict(item, source, retry_kind, now, origin=SOURCE_VERDICT_RESTATED)
+    if retry_kind == "abandoned" and source != "slskd":
+        retry_delay = abandoned_search_retry_delay(item)
+    else:
+        retry_delay = provider_transient_retry_delay(
+            item,
+            source,
+            base_seconds=base_seconds,
+            missing_source_results=missing_source_results,
+        )
     item["state"] = "queued"
     item["current_source"] = None
-    if retry_kind == "timeout":
+    if retry_kind == "abandoned":
+        event = f"We never finished the last {label} search for this row; searching again"
+    elif retry_kind == "timeout":
         event = f"{label} source timed out; automatic retry scheduled"
     elif retry_kind == "busy":
         event = f"{label} source busy; automatic retry scheduled"
@@ -6542,6 +6838,9 @@ def mark_source_error_retry(item, source, error, now, args):
     item["last_source_error_at_iso"] = now_iso(now)
     item["source_error_retry_at"] = now
     item["source_error_retry_at_iso"] = now_iso(now)
+    # First-hand: this ran the source and caught what it raised. A transport
+    # timeout here is a real one -- the request was made and did not answer.
+    record_source_verdict(item, source, classify_source_verdict_text(error), now)
     item["last_event"] = f"{label} source errored; automatic retry scheduled"
     item.pop("needs_you_reason", None)
     schedule_retry_after(item, now, retry_delay)
@@ -6574,6 +6873,7 @@ def mark_source_busy_retry(item, source, reason, now, args):
     item["last_source_busy_at_iso"] = now_iso(now)
     item["source_busy_retry_at"] = now
     item["source_busy_retry_at_iso"] = now_iso(now)
+    record_source_verdict(item, source, classify_source_verdict_text(reason), now)
     item["last_event"] = f"{label} source busy; automatic retry scheduled"
     item.pop("needs_you_reason", None)
     schedule_retry_after(item, now, retry_delay)
@@ -10460,6 +10760,26 @@ def slskd_checked_attempt_from_row(row, item, now):
         "query_offset": row.get("query_offset"),
         "query_total": row.get("query_total"),
     }
+    # Why slskd refused what it saw. The probe has computed this per query
+    # since it was written, but it only ever reached the probe's own cache --
+    # a rolling ~30-day file no ledger consumer reads -- so every refusal
+    # distribution taken off `source_attempts` has been a Prowlarr-only view.
+    # `ts` is the probe row's own checked_at, never the queue row's
+    # updated_at, which the retry machinery touches every pass.
+    query_rows = [attempt for attempt in (row.get("queries") or []) if isinstance(attempt, dict)]
+    refusal_evidence = inkdrop_slskd_refusal_vocabulary.merge_refusal_evidence(
+        [attempt.get("refusal_evidence") for attempt in query_rows]
+    )
+    if refusal_evidence:
+        attempt["refusal_evidence"] = refusal_evidence
+    # Kept in its own field, never folded into the line above: these files
+    # failed the extension gate before a candidate existed, so they are not
+    # decisions about a candidate and must not enter the refusal distribution.
+    media_filter_summary = inkdrop_slskd_refusal_vocabulary.merge_media_filter_summaries(
+        [attempt.get("media_filter_summary") for attempt in query_rows]
+    )
+    if media_filter_summary:
+        attempt["media_filter_summary"] = media_filter_summary
     if detected_file.get("path"):
         attempt["local_path"] = detected_file.get("path")
         attempt["staged_path"] = detected_file.get("path")
@@ -14139,6 +14459,9 @@ def process_series(queue, series, rows, args, progress=None, deadline=None, prov
                 "detail": reason,
                 "source": source,
             }
+        # Set before the try so the exception path can always ask whether this
+        # step got as far as marking anything.
+        source_mark_ts = None
         try:
             row_snapshots = {
                 id(item): {
@@ -14153,7 +14476,13 @@ def process_series(queue, series, rows, args, progress=None, deadline=None, prov
                 if isinstance(item, dict)
             }
             mark_series_searching(eligible, source)
-            started_attempts = record_source_started_attempts(eligible, source, start_note)
+            # Our own stamp for this batch. Retraction below only takes back
+            # markers carrying exactly this value, so a marker written by any
+            # other pass survives untouched.
+            source_mark_ts = time.time()
+            started_attempts = record_source_started_attempts(
+                eligible, source, start_note, now=source_mark_ts
+            )
             if started_attempts:
                 save_queue_progress_snapshot(queue)
             log(
@@ -14213,6 +14542,13 @@ def process_series(queue, series, rows, args, progress=None, deadline=None, prov
             if no_row_attempts:
                 summary["row_result_attempts"] = no_row_attempts
             result["sources"][source] = summary
+            # Every row that still claims this pass started a search for it was
+            # never accounted for by the result path. Take the claim back rather
+            # than leaving it for the reaper to read as a provider going silent.
+            retracted = retract_unsearched_source_started_markers(rows, source, source_mark_ts)
+            if retracted:
+                summary["retracted_unsearched_markers"] = retracted
+                log("source_markers_retracted", series=series, source=source, rows=retracted)
             eligible = refresh_after_source(source)
             if eligible:
                 publish(source, finish_note)
@@ -14227,6 +14563,10 @@ def process_series(queue, series, rows, args, progress=None, deadline=None, prov
             for item in eligible:
                 if item.get("state") not in ACTIVE_QUEUE_STATES | {"needs_you"} | TERMINAL_QUEUE_STATES:
                     mark_source_error_retry(item, source, error, now_error, args)
+            # These rows now carry a first-hand verdict from the exception we
+            # just caught. Leaving the started-marker behind would let the
+            # reaper add a second, invented one on top of it.
+            retract_unsearched_source_started_markers(rows, source, source_mark_ts, now=now_error)
             if timeout_note:
                 publish(source, timeout_note)
             else:

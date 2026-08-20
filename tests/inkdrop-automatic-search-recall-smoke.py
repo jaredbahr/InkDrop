@@ -399,6 +399,11 @@ partial_calls = 0
 
 def partial_response(_request):
     global partial_calls
+    # The capability probe behind category resolution (#198) is not a search and
+    # must not consume this fixture's call count, or the "first search succeeds,
+    # second times out" shape below silently inverts.
+    if str(_request.get("url") or "").endswith("/api/v1/indexer"):
+        return {"json": []}
     partial_calls += 1
     if partial_calls == 1:
         return {"json": [{
@@ -837,17 +842,21 @@ require(slskd.verdict_refresh_budget_seconds(10_000) <= 15, slskd.verdict_refres
 # at all. Only the alternate variant's later "complete"/"collection" forms
 # were reaching the plan.
 #
-# The de-prefixed alias getting a "manga"-qualified form too (PASS: manga
-# query priority, 2026-08-02) turned out to be a stale comparison once the
-# fix above landed: it was only ever measured against the badly-mismatched
-# canonical title (1 file), never against the bare alias itself. Once the
-# bare alias started being generated, live slskd data showed it strictly
-# beats its own qualified form -- 2,405+ files/180 peers bare vs. 982
-# files/20 peers qualified, zero peers unique to the qualified query -- the
-# same pattern real data confirmed for every other series checked (Monster,
-# Kingdom, On a Sunbeam, Deadman Wonderland). The qualified form is no
-# longer generated for an already-good title; it remains for the canonical
-# (still known-bad) title just below, which is a different case.
+# The de-prefixed alias also gets media-marker forms (2026-08-16). The
+# 2026-08-02 revision removed them on a raw-file-count comparison -- 2,405+
+# files/180 peers bare vs. 982/20 qualified -- and raw file counts are not a
+# recall measure here: Soulseek matches whole tokens against a peer's full
+# shared path, so a bare title query saturates the 250-peer response ceiling
+# with whoever answers first, measured at 67% audio and video on this
+# deployment. Scored on book-shaped files the comparison inverts across the
+# board, and three of eleven sampled wanted rows went from zero usable
+# candidates bare to eleven, sixteen and nineteen qualified.
+# The peer-diff half of the 2026-08-02 evidence did hold, with a boundary it
+# lacked: the marker adds no peers when the bare query stays under the
+# ceiling, and a near-disjoint peer set when it saturates.
+# The bare alias still leads and is never displaced -- a fifth of the
+# book-shaped files a bare query finds carry no type marker in the path at
+# all, and only the bare query reaches those peers.
 authored = {"series": "Naoki Urasawa's 20th Century Boys", "issue": "6",
             "issue_title": "Volume 6", "media_type": "manga"}
 authored_queries = slskd.source_queries(authored)
@@ -855,8 +864,12 @@ stripped = [q for q in authored_queries if "naoki" not in slskd.normalize(q)]
 require(any(slskd.normalize(q) == "20th century boys" for q in stripped),
         ("bare alternate title must be searchable", authored_queries[:12]))
 require(
-    not any(slskd.normalize(q) == "20th century boys manga" for q in stripped),
-    ("an already-good promoted title must not waste a slot on the redundant qualifier", authored_queries[:12]),
+    slskd.normalize(authored_queries[0]) == "20th century boys",
+    ("the bare promoted alias must still lead the plan", authored_queries[:12]),
+)
+require(
+    any(slskd.normalize(q) == "20th century boys manga" for q in stripped),
+    ("the promoted alias must get its media marker too", authored_queries[:12]),
 )
 require(
     "Naoki Urasawa's 20th Century Boys manga" in authored_queries,
@@ -866,15 +879,28 @@ require(
 # fires two queries, so finding the issue has to keep leading.
 require(any("6" in query for query in authored_queries[1:4]),
         ("a numbered query must stay near the front", authored_queries[:6]))
-# A series with a single title variant must be unchanged by any of this,
-# except that its guaranteed early slot goes to a numbered query instead of
-# the media qualifier -- real data shows a bare title beats its own
-# qualified form in every case tested, so that slot is worth more spent
-# elsewhere (PASS: manga query priority, 2026-08-02).
+# A series with a single title variant gets the bare title, then a numbered
+# query, then its media markers -- in that order. Vagabond is the case that
+# made the 2026-08-02 reading untenable when it was re-measured live on
+# 2026-08-16: bare "Vagabond" returns 1,263 files of which SIX are
+# book-shaped and none score as a candidate, because Soulseek matches the
+# full shared path and the 250-peer ceiling fills with music. "Vagabond
+# manga" returns 2,240 files, 1,472 book-shaped, 16 candidates.
 plain = slskd.source_queries({"series": "Vagabond", "issue": "5",
                               "issue_title": "Volume 5", "media_type": "manga"})
 require(plain[0] == "Vagabond", plain[:4])
-require("Vagabond manga" not in plain, plain)
+require("Vagabond manga" in plain, plain[:8])
+require(
+    plain.index("Vagabond") < plain.index("Vagabond manga"),
+    ("the bare title must still lead its own marker", plain[:8]),
+)
+# The markers never displace the bare title, because a fifth of the
+# book-shaped files a bare query finds sit in paths with no type marker at
+# all -- only the bare query reaches those peers.
+require(
+    plain.index("Vagabond manga") < plain.index("Vagabond complete"),
+    ("markers outrank the collected suffixes", plain[:10]),
+)
 
 # An automatic pass must not re-ask Soulseek a question it asked an hour ago.
 # One series can hold ~100 wanted rows that all build the same broad series

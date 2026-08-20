@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 
+from core import inkdrop_backup_restore
 from core import inkdrop_preflight
 from core import inkdrop_public_contracts
 from core import inkdrop_runtime_config
@@ -108,6 +109,19 @@ def main() -> int:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # A backup killed mid-run (redeploy, OOM, container recreate) cannot clean
+    # up after itself -- SIGKILL skips the exception handler that would have --
+    # and nothing else sweeps what it leaves behind, because prune only ever
+    # considers finished archives. On a multi-gigabyte database each abandoned
+    # staging directory holds a full uncompressed copy, so this is a real leak
+    # rather than clutter. Age-gated inside, so a backup running right now in
+    # the sibling container is never touched. Best-effort, like the cleanup
+    # above: a failure here must not keep the web process from starting.
+    try:
+        inkdrop_backup_restore.sweep_stale_backup_workspaces()
+    except Exception:
         pass
 
     if embedded_scheduler_enabled():

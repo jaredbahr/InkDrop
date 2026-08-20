@@ -198,17 +198,35 @@ jobs:
         timeout-minutes: 2
         run: docker compose config --quiet
 
+      # Everything from here to the release-ready gate is the container half of
+      # this job: build the image, boot it, and ask the gate whether the built
+      # artifact is shippable. That question only has a consumer on a branch
+      # that can actually ship -- qa feeding beta promotion, and public main
+      # cutting the release. On a pull request into qa there is no artifact
+      # downstream of it, so the same ~3 minutes bought nothing and ran on all
+      # 94 of the pull-request runs this repo saw on 2026-08-15.
+      #
+      # The Docker-free half above still runs on every pull request: the 119
+      # host smokes, the staged-export runnable check, and the Compose config
+      # validation are the signal that a change broke packaging, and they are
+      # what makes a merge into qa safe. Only the container half is deferred.
+      #
+      # The job name does not change, so the checks reported on a pull request
+      # keep the same context string and no branch-protection edit is needed.
       - name: Build Docker image
+        if: github.event_name != 'pull_request'
         timeout-minutes: 30
         run: docker compose build inkdrop
 
       - name: Run strict container preflight
+        if: github.event_name != 'pull_request'
         timeout-minutes: 5
         run: |
           docker compose run --rm -T inkdrop python -B core/inkdrop_preflight.py --create --quiet --strict-dependencies --strict-runtime-tools
           docker compose run --rm -T inkdrop python -B core/inkdrop_container_healthcheck.py --preflight-only
 
       - name: Verify container install support summary
+        if: github.event_name != 'pull_request'
         timeout-minutes: 5
         run: |
           docker compose run --rm -T inkdrop python -B tools/inkdrop_install_support_summary.py --create --json | tee inkdrop-install-support-summary.json
@@ -224,8 +242,27 @@ jobs:
           assert "effective_config" not in payload["preflight"], payload
           PY
 
+      # --docker-only, not --docker: the Docker-free half of this check
+      # (119 local smokes, host preflight, install-support summary) already
+      # ran from this same commit in "Run static public-release checks"
+      # above. Passing plain --docker re-ran every one of them a second
+      # time inside the same job -- 121 checks where 118 were verbatim
+      # repeats, ~2.5 minutes of the job's ~6.7. --docker-only is the flag
+      # the tool documents for exactly this ("assumes Docker-free checks
+      # were already run from the same revision"), and it still emits the
+      # same release_ready/docker_gate_status payload the asserts below
+      # read, so the gate's verdict is unchanged -- only the duplication is
+      # gone. The one check --docker-only drops that the earlier step does
+      # not name identically is host_preflight; the earlier step runs
+      # strict_host_preflight, the same core/inkdrop_preflight.py call plus
+      # --strict-dependencies, so coverage is a superset, not a gap.
       - name: Verify release-ready JSON gate
-        timeout-minutes: 35
+        if: github.event_name != 'pull_request'
+        # Was 35: with the Docker-free half no longer repeated, the three
+        # remaining Docker checks are seconds of work. A tight ceiling here
+        # is the point -- a wedged Docker check used to be able to bill 35
+        # minutes on its own.
+        timeout-minutes: 10
         run: |
           export INKDROP_CONFIG_DIR="$RUNNER_TEMP/inkdrop/config"
           export INKDROP_STATE_DIR="$RUNNER_TEMP/inkdrop/state"
@@ -237,7 +274,7 @@ jobs:
           export INKDROP_MANUAL_INBOX_DIR="$RUNNER_TEMP/inkdrop/manual-inbox"
           export INKDROP_QUARANTINE_DIR="$RUNNER_TEMP/inkdrop/state/quarantine"
           mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
-          python -B tools/inkdrop_public_release_check.py --docker --require-docker --skip-docker-build --json | tee inkdrop-release-check.json
+          python -B tools/inkdrop_public_release_check.py --docker-only --skip-docker-build --json | tee inkdrop-release-check.json
           python - <<'PY'
           import json
           from pathlib import Path
@@ -280,6 +317,21 @@ jobs:
   # means the build must not ship.
   full_smoke_suite:
     name: Full smoke suite
+    # main is in this condition because of where this file ends up, not because
+    # of anything it does here. tools/inkdrop_public_repo_export.py copies this
+    # workflow into the public repo, and there the release commit lands on
+    # main -- so a qa-only condition would have read as false on every public
+    # release and skipped the suite that is supposed to be gating it. The
+    # public copy predates the qa-only gate (#682) and still has no condition
+    # at all, which is why public releases are still running the suite today;
+    # the next export is what would have carried the regression over.
+    #
+    # Skipping on pull_request is the part that saves money and is deliberate:
+    # a pull request into qa is not a shippable artifact. Skipping on a branch
+    # that ships is not something this condition should ever be able to do.
+    if: >-
+      github.event_name != 'pull_request'
+      && (github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:

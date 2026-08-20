@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 
+from core import inkdrop_queue_fairness
 from core import inkdrop_source_registry
 from core import inkdrop_source_worker_coordinator as coordinator
 from core import inkdrop_sources
@@ -51,6 +52,17 @@ TERMINAL_OR_PROBLEM_HANDOFF_STATUSES = {
     "failed",
     "failed_download",
     "preview_not_importable",
+    # A waiting SLSKD candidate whose staged file never matched -- see
+    # inkdrop_state.DOWNLOAD_TASK_DUPLICATE_CANDIDATE_MISMATCH_STATUSES,
+    # which already treats this exact status as "a real record of a real
+    # attempt that never left InkDrop" for duplicate-row cleanup. It was
+    # absent here, so a completed row in this shape (state='queued', a
+    # legitimately-active handoff state) never stopped counting as an
+    # active handoff -- confirmed live 2026-08-18 (Prompt121 audit) for
+    # The Wicked + The Divine: 1831 #1, blocking both the autopilot due-
+    # series path and this module's own _classify_queue_plan() with no
+    # claim, no client, nothing left to wait for.
+    "staged_filename_mismatch",
     "staged_file_missing_path",
     "stale_no_local_file",
     "superseded_active_candidate",
@@ -259,6 +271,21 @@ def _provider_scope_excluded_media_types(provider_ids):
     return []
 
 
+# Only a row that can still be acquired may claim a reserved lane slot. A
+# blocked or superseded row would spend the reservation and then be filtered
+# out downstream, which is the reservation failing quietly.
+LANE_ELIGIBLE_STATES = ("queued", "searching")
+LANE_ELIGIBLE_STATES_SQL = "(%s)" % ",".join("'%s'" % state for state in LANE_ELIGIBLE_STATES)
+
+
+def _utc_date(epoch_seconds):
+    """UTC calendar date for an epoch stamp, safe below the epoch."""
+    try:
+        return time.strftime("%Y-%m-%d", time.gmtime(max(0.0, float(epoch_seconds or 0.0))))
+    except (OSError, OverflowError, ValueError):
+        return "1970-01-01"
+
+
 def _queue_rows(
     db_path,
     *,
@@ -317,9 +344,39 @@ def _queue_rows(
         params.extend(retryable_statuses)
         params.extend(retryable_clients)
         params.append(now - RETRYABLE_FAILED_HANDOFF_RECOVERY_SECONDS)
+    bounded_limit = _bounded_limit(limit)
+    lane_quotas = inkdrop_queue_fairness.lane_quotas(bounded_limit)
+    fast_quota = max(1, int(lane_quotas[inkdrop_queue_fairness.LANE_FAST]))
+    aged_quota = max(1, int(lane_quotas[inkdrop_queue_fairness.LANE_AGED]))
+    steady_quota = max(1, int(lane_quotas[inkdrop_queue_fairness.LANE_STEADY]))
+    age_window_seconds = max(
+        1.0, float(inkdrop_queue_fairness.AGE_SATURATION_DAYS) * inkdrop_queue_fairness.DAY_SECONDS
+    )
+    aged_min_stall_seconds = max(
+        0.0, float(inkdrop_queue_fairness.AGED_LANE_MIN_STALL_DAYS) * inkdrop_queue_fairness.DAY_SECONDS
+    )
+    decay_start = int(inkdrop_queue_fairness.AGE_DECAY_START_ATTEMPTS)
+    retry_ceiling = int(inkdrop_queue_fairness.retry_ceiling_real_attempts())
+    if retry_ceiling <= decay_start:
+        retry_ceiling = decay_start + 1
+    fast_attempt_budget = int(inkdrop_queue_fairness.FAST_LANE_ATTEMPT_BUDGET)
+    new_series_cutoff = float(now) - float(inkdrop_queue_fairness.NEW_SERIES_DAYS) * inkdrop_queue_fairness.DAY_SECONDS
+    # Fixtures and replays run with small synthetic clocks, where subtracting
+    # the window lands before the epoch and gmtime raises rather than clamping.
+    new_issue_cutoff_date = _utc_date(
+        float(now) - float(inkdrop_queue_fairness.NEW_ISSUE_DAYS) * inkdrop_queue_fairness.DAY_SECONDS
+    )
+    today_date = _utc_date(float(now))
+    # Both facts the ordering needs from the ledger -- how many genuine
+    # attempts a row has made and when the last one was -- come from one
+    # grouped pass restricted to the schedulable set. As two correlated
+    # subqueries the same answers cost 2.2s against the live database; grouped,
+    # 1.4s, because each row's attempt history is walked once instead of twice.
+    real_attempt_predicate = inkdrop_state.real_attempt_predicate_sql("sa")
     ordered_cte = f"""
         with series_initial_search_priority as (
-        select series_id, max(created_at) as series_initial_search_priority_at
+        select series_id, max(created_at) as series_initial_search_priority_at,
+               min(created_at) as series_first_added_at
         from history_events
         where lower(event_type)='series_added'
         group by series_id
@@ -327,6 +384,19 @@ def _queue_rows(
         select series_id, max(coalesce(completed_at, started_at, 0)) as series_latest_source_attempt_at
         from source_attempts
         group by series_id
+        ), schedulable_queue as (
+        select q.id from queue_items q
+        left join series s on s.id=q.series_id
+        left join wanted_items w on w.id=q.wanted_id
+        where {" and ".join(clauses)}
+        ), real_attempts as (
+        select sa.queue_id,
+               count(*) as real_attempt_count,
+               max(coalesce(sa.completed_at, sa.started_at, 0)) as last_real_attempt_at
+        from source_attempts sa
+        join schedulable_queue sq on sq.id = sa.queue_id
+        where {real_attempt_predicate}
+        group by sa.queue_id
         ), ranked_queue as (
         select q.id, q.wanted_id, q.series_id, q.issue_id, q.state,
                q.current_source, q.query, q.last_event, q.active,
@@ -341,8 +411,21 @@ def _queue_rows(
                i.metadata_id as issue_metadata_id,
                i.kapowarr_issue_id,
                w.status as wanted_status, w.priority as wanted_priority,
-               sisp.series_initial_search_priority_at,
-               slsa.series_latest_source_attempt_at
+               coalesce(sisp.series_initial_search_priority_at, s.created_at)
+                   as series_initial_search_priority_at,
+               slsa.series_latest_source_attempt_at,
+               -- Earliest evidence the series exists at all. The series_added
+               -- history row is pruned at 30 days by diagnostic retention
+               -- (#151) and is rewritten on re-add, so it cannot carry this on
+               -- its own; series.created_at is durable and never moves back.
+               case
+                 when sisp.series_first_added_at is null then s.created_at
+                 when s.created_at is null then sisp.series_first_added_at
+                 else min(sisp.series_first_added_at, s.created_at)
+               end as series_first_seen_at,
+               coalesce(ra.real_attempt_count, 0) as real_attempt_count,
+               coalesce(ra.last_real_attempt_at, 0) as last_real_attempt_at,
+               coalesce(nullif(trim(q.series_id), ''), q.id) as series_key
                , row_number() over (
                    partition by coalesce(nullif(trim(q.series_id), ''), q.id)
                    order by
@@ -356,41 +439,211 @@ def _queue_rows(
         left join wanted_items w on w.id=q.wanted_id
         left join series_initial_search_priority sisp on sisp.series_id=q.series_id
         left join series_latest_source_attempt slsa on slsa.series_id=q.series_id
+        left join real_attempts ra on ra.queue_id=q.id
         where {" and ".join(clauses)}
+        ), stalled_queue as (
+        select *,
+               -- Never queue_items.updated_at: bookkeeping refreshes it, so a
+               -- stall measured on it reports every row as recently active.
+               -- The download-task fallback is only reached by rows that have
+               -- never had a real attempt (222 of 2,172 live), so it sits
+               -- inside the CASE rather than in a coalesce that would evaluate
+               -- it for everything.
+               max(0.0, {float(now)!r} - case
+                 when coalesce(last_real_attempt_at, 0) > 0 then last_real_attempt_at
+                 else coalesce(
+                   nullif((select min(coalesce(dt.completed_at, dt.started_at, 0))
+                             from download_tasks dt
+                            where dt.queue_id=rq.id
+                              and coalesce(dt.completed_at, dt.started_at, 0)>0), 0),
+                   created_at,
+                   {float(now)!r})
+               end) as stall_seconds
+        from ranked_queue rq
+        ), scored_queue as (
+        select *,
+               case
+                 when real_attempt_count < {fast_attempt_budget}
+                  and lower(coalesce(state, '')) in {LANE_ELIGIBLE_STATES_SQL}
+                  and (
+                       (series_first_seen_at is not null
+                        and series_first_seen_at >= {new_series_cutoff!r})
+                    or (issue_release_date is not null
+                        and substr(issue_release_date, 1, 10) >= '{new_issue_cutoff_date}'
+                        and substr(issue_release_date, 1, 10) <= '{today_date}')
+                  )
+                 then 1 else 0
+               end as is_new_work
+        from stalled_queue sq
+        ), aged_queue as (
+        select *,
+               -- Bounded on both axes: the time term saturates so nothing
+               -- climbs forever, the attempt term decays to exactly zero at
+               -- the retry ceiling so the rows least likely to succeed stop
+               -- competing for the capacity they keep spending.
+               case when stall_seconds < {aged_min_stall_seconds!r}
+                      or lower(coalesce(state, '')) not in {LANE_ELIGIBLE_STATES_SQL}
+                    then 0.0 else 1.0 end *
+               min(1.0, stall_seconds / {age_window_seconds!r}) *
+               case
+                 when coalesce(real_attempt_count, 0) <= {decay_start} then 1.0
+                 when coalesce(real_attempt_count, 0) >= {retry_ceiling} then 0.0
+                 else ({retry_ceiling} - coalesce(real_attempt_count, 0)) * 1.0
+                      / ({retry_ceiling} - {decay_start})
+               end as ageing_score
+        from scored_queue
+        ), laned_queue as (
+        select *,
+               -- Both reserved lanes rank by series round first, so a single
+               -- deep backlog cannot take the whole lane. Without this the
+               -- aged lane hands its entire quota to whichever series happens
+               -- to hold the oldest rows -- the same head-of-line failure this
+               -- change exists to remove, just relocated into the fix.
+               row_number() over (
+                 partition by is_new_work, series_key
+                 order by real_attempt_count asc, stall_seconds desc,
+                          coalesce(created_at, 0) asc, id asc
+               ) as fast_series_round,
+               row_number() over (
+                 order by
+                   series_queue_round asc,
+                   case
+                     when retry_after<=? then 0
+                     when retry_after is null then 1
+                     else 2
+                   end asc,
+                   coalesce(retry_after, updated_at, created_at, 0) asc,
+                   coalesce(updated_at, created_at, 0) asc,
+                   id asc
+               ) as steady_lane_rank
+        from aged_queue
+        ), fast_ranked_queue as (
+        select *,
+               row_number() over (
+                 -- Newest series first, after the per-series round. Ordering
+                 -- this lane by wait instead would put a series added a minute
+                 -- ago at the back of it: live there are 174 eligible rows
+                 -- across 15 series against a 12-row quota, so "queue behind
+                 -- everything else recently added" is a real outcome, and it
+                 -- is the one being ruled out.
+                 partition by is_new_work
+                 order by fast_series_round asc,
+                          real_attempt_count asc,
+                          series_first_seen_at desc,
+                          stall_seconds desc,
+                          id asc
+               ) as fast_lane_rank
+        from laned_queue
+        ), aged_eligible_queue as (
+        -- Eligible for the aged lane only when the other two lanes are not
+        -- already carrying the row. Ranking the lane over everything would let
+        -- rows that were going to be served anyway consume the reserved slots,
+        -- and it would reach no further down the backlog than today does.
+        select *,
+               case
+                 when ageing_score > 0
+                  and steady_lane_rank > {steady_quota}
+                  and not (is_new_work=1 and fast_lane_rank <= {fast_quota})
+                 then 1 else 0
+               end as aged_lane_eligible
+        from fast_ranked_queue
+        ), aged_ranked_queue as (
+        select *,
+               row_number() over (
+                 partition by aged_lane_eligible, series_key
+                 order by ageing_score desc, stall_seconds desc, id asc
+               ) as aged_series_round
+        from aged_eligible_queue
+        ), aged_lane_queue as (
+        select *,
+               row_number() over (
+                 partition by aged_lane_eligible
+                 order by aged_series_round asc, ageing_score desc,
+                          stall_seconds desc, id asc
+               ) as aged_lane_rank
+        from aged_ranked_queue
+        ), assigned_queue as (
+        select *,
+               case
+                 when is_new_work=1 and fast_lane_rank <= {fast_quota} then 'fast'
+                 when aged_lane_eligible=1 and aged_lane_rank <= {aged_quota} then 'aged'
+                 else 'steady'
+               end as queue_lane,
+               case
+                 when is_new_work=1 and fast_lane_rank <= {fast_quota} then fast_lane_rank
+                 when aged_lane_eligible=1 and aged_lane_rank <= {aged_quota} then aged_lane_rank
+                 else steady_lane_rank
+               end as queue_lane_rank
+        from aged_lane_queue
         ), ordered_queue as (
         select *, row_number() over (
+          -- Interleave by fractional position within each lane's own quota, so
+          -- any prefix of the scan carries the intended mix. Taking the head of
+          -- one lane and then the head of the next would give the short lanes
+          -- the front of every pass, which is the failure this replaces.
           order by
-            series_queue_round asc,
-            case
-              when retry_after<=? then 0
-              when retry_after is null then 1
-              else 2
+            (queue_lane_rank - 0.5) / case queue_lane
+              when 'fast' then {fast_quota}.0
+              when 'aged' then {aged_quota}.0
+              else {steady_quota}.0
             end asc,
-            coalesce(retry_after, updated_at, created_at, 0) asc,
-            coalesce(updated_at, created_at, 0) asc,
+            case queue_lane when 'fast' then 0 when 'steady' then 1 else 2 end asc,
             id asc
         ) as scheduler_rank
-        from ranked_queue
+        from assigned_queue
         )
     """
-    bounded_limit = _bounded_limit(limit)
+    # The clause set is interpolated twice -- once to narrow the attempt
+    # aggregate to schedulable rows, once for the scan itself -- so its
+    # parameters are bound twice, in that order.
     sql = ordered_cte + " select * from ordered_queue order by scheduler_rank limit ?"
-    params.extend([now, bounded_limit])
+    scan_params = [*params, *params, now, bounded_limit]
     with _borrowed_or_read_con(db_path, con) as scan_con:
         if not inkdrop_state.table_exists(scan_con, "queue_items"):
             return []
-        rows = scan_con.execute(sql, params).fetchall()
+        rows = scan_con.execute(sql, scan_params).fetchall()
         if not queue_ids and due_only:
-            reserve_params = list(params[:-1])
-            reserve_params.extend([bounded_limit, now - 86400])
-            reserve_sql = ordered_cte + """
-                select * from ordered_queue oq
-                where oq.scheduler_rank > ?
-                  and lower(coalesce(oq.state,''))='queued'
-                  and coalesce(oq.created_at, oq.updated_at, 0) <= ?
+            # "Outside the scan" is exactly "not one of the rows we just took",
+            # so the reserve tests that directly instead of re-running the whole
+            # ordering to recover a rank it then only compares against the
+            # limit. Against the live database the CTE costs ~1.5s; running it
+            # twice per pass to find at most one extra row was most of what the
+            # ordering change added to the pass.
+            scanned_ids = [row["id"] for row in rows]
+            reserve_params = [*params, now - 86400, *scanned_ids]
+            reserve_sql = f"""
+                select q.id, q.wanted_id, q.series_id, q.issue_id, q.state,
+                       q.current_source, q.query, q.last_event, q.active,
+                       q.created_at, q.updated_at, q.retry_after, q.retry_after_iso,
+                       q.display_phase, q.outcome, q.provider_status_state,
+                       q.provider_status_phase, q.provider_status_provider,
+                       q.provider_status_actionability, q.raw_json,
+                       s.title as series, s.media_type, s.year, s.publisher,
+                       s.metadata_provider, s.metadata_id, s.kapowarr_id,
+                       i.issue_number, i.title as issue_title, i.release_date as issue_release_date,
+                       i.metadata_provider as issue_metadata_provider,
+                       i.metadata_id as issue_metadata_id,
+                       i.kapowarr_issue_id,
+                       w.status as wanted_status, w.priority as wanted_priority,
+                       (select count(*) from queue_items q2
+                         where q2.active=1
+                           and coalesce(nullif(trim(q2.series_id), ''), q2.id)
+                               = coalesce(nullif(trim(q.series_id), ''), q.id)
+                           and coalesce(q2.retry_after, q2.updated_at, q2.created_at, 0)
+                               < coalesce(q.retry_after, q.updated_at, q.created_at, 0)
+                       ) + 1 as series_queue_round,
+                       {bounded_limit + 1} as scheduler_rank
+                from queue_items q
+                left join series s on s.id=q.series_id
+                left join issues i on i.id=q.issue_id
+                left join wanted_items w on w.id=q.wanted_id
+                where {" and ".join(clauses)}
+                  and lower(coalesce(q.state,''))='queued'
+                  and coalesce(q.created_at, q.updated_at, 0) <= ?
+                  and q.id not in ({",".join("?" for _ in scanned_ids) or "''"})
                   and not exists (
                       select 1 from download_tasks dt
-                      where dt.queue_id=oq.id
+                      where dt.queue_id=q.id
                         and lower(coalesce(dt.state,'')) in ('queued','downloading','import_ready','importing')
                         and lower(coalesce(dt.status,'')) not in (
                             'bad_archive','failed','failed_download','retired','superseded_duplicate',
@@ -399,11 +652,11 @@ def _queue_rows(
                   )
                   and not exists (
                       select 1 from source_attempts sa
-                      where sa.queue_id=oq.id
+                      where sa.queue_id=q.id
                         and lower(coalesce(nullif(sa.provider_id,''), nullif(sa.source,''), nullif(sa.provider,''), ''))
                             not in ('', 'queue', 'source_ladder', 'autopilot', 'importer', 'kavita')
                   )
-                order by coalesce(oq.created_at, oq.updated_at, 0) asc, oq.scheduler_rank asc
+                order by coalesce(q.created_at, q.updated_at, 0) asc, q.id asc
                 limit 1
             """
             reserve = scan_con.execute(reserve_sql, reserve_params).fetchone()
@@ -436,6 +689,18 @@ def active_handoff_tasks(
     now=None,
     stale_seconds=DEFAULT_ACTIVE_HANDOFF_STALE_SECONDS,
 ):
+    """Rows this scheduler treats as "something is still handing this off".
+
+    `completed_at is null` is required on purpose: a task can finish (and get
+    `completed_at` written once, permanently) while its `state` column stays
+    on an ACTIVE_HANDOFF_STATES value like 'queued' -- state and completion
+    are two different columns that do not always move together. Without this
+    guard a completed task with an unrecognized terminal status blocks
+    _classify_queue_plan() forever, since nothing about "done" was ever
+    checked, only the status vocabulary. Confirmed live 2026-08-18 (Prompt121
+    audit): a `staged_filename_mismatch` task completed 2+ weeks earlier kept
+    reading as an active handoff on every pass.
+    """
     queue_id = str(queue_id or "").strip()
     if not queue_id:
         return []
@@ -460,6 +725,7 @@ def active_handoff_tasks(
                failure_reason, local_path, progress, started_at, updated_at
         from download_tasks
         where queue_id=?
+          and completed_at is null
           and lower(coalesce(state,'')) in ({placeholders_states})
           and lower(coalesce(status,'')) not in ({placeholders_terminal})
           and not (
@@ -649,7 +915,12 @@ def active_handoff_tasks_by_queue_id(
     now=None,
     stale_seconds=DEFAULT_ACTIVE_HANDOFF_STALE_SECONDS,
 ):
-    """Batched active_handoff_tasks: one indexed scan covering every queue row."""
+    """Batched active_handoff_tasks: one indexed scan covering every queue row.
+
+    See active_handoff_tasks()'s docstring for why `completed_at is null` is
+    required here too -- the same fix, kept in step rather than only applied
+    to the single-queue path this one was cloned from.
+    """
 
     queue_ids = _clean_queue_ids(queue_ids)
     if not queue_ids or not inkdrop_state.table_exists(con, "download_tasks"):
@@ -681,6 +952,7 @@ def active_handoff_tasks_by_queue_id(
                    ) as per_queue_rank
             from download_tasks
             where queue_id in ({placeholders_queue})
+              and completed_at is null
               and lower(coalesce(state,'')) in ({placeholders_states})
               and lower(coalesce(status,'')) not in ({placeholders_terminal})
               and not (
@@ -2375,6 +2647,11 @@ def source_worker_queue_plan(
                     "provider_status_state": row.get("provider_status_state"),
                     "last_event": row.get("last_event"),
                     "series_initial_search_priority_at": row.get("series_initial_search_priority_at"),
+                    inkdrop_queue_fairness.LANE_FIELD: row.get("queue_lane"),
+                    inkdrop_queue_fairness.LANE_RANK_FIELD: row.get("queue_lane_rank"),
+                    inkdrop_queue_fairness.AGEING_SCORE_FIELD: row.get("ageing_score"),
+                    inkdrop_queue_fairness.STALL_SECONDS_FIELD: row.get("stall_seconds"),
+                    inkdrop_queue_fairness.REAL_ATTEMPT_FIELD: row.get("real_attempt_count"),
                     "series_latest_source_attempt_at": row.get("series_latest_source_attempt_at"),
                     "scheduler_rank": row.get("scheduler_rank"),
                     "series_queue_round": row.get("series_queue_round"),

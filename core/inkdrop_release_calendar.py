@@ -116,14 +116,29 @@ def _unit_label(media_type, issue_number, issue_raw):
     return f"Issue #{number}" if number else "Issue"
 
 
-def window_bounds(now=None, days_back=DEFAULT_DAYS_BACK, days_ahead=DEFAULT_DAYS_AHEAD, start=None, end=None):
+def window_bounds(now=None, days_back=DEFAULT_DAYS_BACK, days_ahead=DEFAULT_DAYS_AHEAD, start=None, end=None, today=None):
     """Resolve the calendar window to (today, start, end) as date objects.
 
     Explicit ``start``/``end`` win over the day counts, so a UI can page month
     by month without translating months into offsets.
+
+    ``today`` is the operator's own calendar date, and a caller that knows it
+    should say so. Release dates are stored as bare ``YYYY-MM-DD`` wall-clock
+    dates -- the day a comic reaches shops, not an instant -- so the day they
+    belong to is the reader's day, and there is no server-side timezone
+    setting to derive it from. Falling back to the server's UTC date means an
+    operator east of UTC sees "today" land on yesterday's column for their
+    whole morning, and one west of UTC sees it jump to tomorrow after their
+    early evening. Absent an explicit value this keeps the old UTC behavior,
+    so callers that genuinely have no operator context (the CLI) are unchanged.
     """
     now = time.time() if now is None else float(now)
-    today = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date()
+    explicit_today = _iso_day(today)
+    today = (
+        datetime.date.fromisoformat(explicit_today)
+        if explicit_today
+        else datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date()
+    )
     explicit_start = _iso_day(start)
     explicit_end = _iso_day(end)
     if explicit_start or explicit_end:
@@ -323,6 +338,7 @@ def release_calendar(
     series_id=None,
     include_unmonitored=False,
     limit=MAX_ENTRIES,
+    today=None,
 ):
     """Build the calendar document for a window.
 
@@ -332,7 +348,9 @@ def release_calendar(
     """
     now = time.time() if now is None else float(now)
     limit = _clamp(limit, MAX_ENTRIES, 1, MAX_ENTRIES)
-    today, first, last = window_bounds(now=now, days_back=days_back, days_ahead=days_ahead, start=start, end=end)
+    today, first, last = window_bounds(
+        now=now, days_back=days_back, days_ahead=days_ahead, start=start, end=end, today=today
+    )
 
     days = {}
     status_counts = {}

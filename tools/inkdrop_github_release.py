@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 from core import inkdrop_version
 from tools import inkdrop_closed_alpha_packet
+from tools.inkdrop_text_output import write_text_lf
 
 
 DEFAULT_CONTRACT = ROOT / "docs" / "inkdrop" / "releases" / "current.json"
@@ -220,7 +221,7 @@ def resolved_tag_commit(api, tag):
     raise RuntimeError("release tag does not resolve directly to a commit")
 
 
-def load_verified_evidence(candidate_path, validation_path, contract, repository, commit, workflow_run_id, update_manifest_path=None, image_repository=None):
+def load_verified_evidence(candidate_path, validation_path, contract, repository, commit, workflow_run_id, update_manifest_path=None, image_repository=None, now=None):
     candidate_path = Path(candidate_path)
     validation_path = Path(validation_path)
     candidate_bytes = candidate_path.read_bytes()
@@ -327,7 +328,7 @@ def load_verified_evidence(candidate_path, validation_path, contract, repository
         if not update_bytes or len(update_bytes) > inkdrop_version.UPDATE_MANIFEST_MAX_BYTES:
             raise RuntimeError("update manifest asset is empty or exceeds 64 KiB")
         try:
-            update = inkdrop_version.validate_update_manifest(json.loads(update_bytes.decode("utf-8")))
+            update = inkdrop_version.validate_update_manifest(json.loads(update_bytes.decode("utf-8")), now=now)
         except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"update manifest asset is invalid: {exc}") from exc
         expected_update = {
@@ -350,8 +351,18 @@ def load_verified_evidence(candidate_path, validation_path, contract, repository
     }
 
 
-def build_update_manifest(candidate_path, validation_path, contract, repository, commit, workflow_run_id, image_repository=None):
-    evidence = load_verified_evidence(candidate_path, validation_path, contract, repository, commit, workflow_run_id, image_repository=image_repository)
+def build_update_manifest(candidate_path, validation_path, contract, repository, commit, workflow_run_id, image_repository=None, now=None):
+    """Build and validate the update manifest for a release.
+
+    `now` exists so a caller can pin the clock the staleness check reads.
+    validate_update_manifest() refuses a manifest whose published_at is more
+    than UPDATE_MANIFEST_MAX_AGE_SECONDS old, and published_at comes from the
+    validation evidence -- so a test that freezes its evidence at a fixed
+    timestamp acquires a shelf life equal to that limit and starts failing on
+    a calendar date, with an error about staleness that has nothing to do with
+    what it was asserting. Production passes nothing and keeps the real clock.
+    """
+    evidence = load_verified_evidence(candidate_path, validation_path, contract, repository, commit, workflow_run_id, image_repository=image_repository, now=now)
     candidate = json.loads(Path(candidate_path).read_text(encoding="utf-8"))
     validation = json.loads(Path(validation_path).read_text(encoding="utf-8"))
     # _bounded_manifest_text() strips whatever we hand it before validating the
@@ -382,7 +393,7 @@ def build_update_manifest(candidate_path, validation_path, contract, repository,
         "rollback_notes": "Keep the previous immutable digest and a pre-update backup; recreate both services with that digest if verification fails.",
     }
     payload["manifest_identity"] = inkdrop_version.update_manifest_identity(payload)
-    return inkdrop_version.validate_update_manifest(payload)
+    return inkdrop_version.validate_update_manifest(payload, now=now)
 
 
 def sync_release_assets(api, release, assets):
@@ -517,7 +528,7 @@ def main(argv=None):
             )
             output = Path(args.generate_update_manifest_output)
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps(update_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            write_text_lf(output, json.dumps(update_payload, indent=2, sort_keys=True) + "\n")
     elif args.generate_update_manifest_output:
         raise ValueError("verified candidate and validation evidence are required to generate update metadata")
     if args.publish:

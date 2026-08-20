@@ -13,6 +13,7 @@ verification.
 import tempfile
 import time
 from pathlib import Path
+import json
 from unittest import mock
 
 from core import inkdrop_state
@@ -236,10 +237,16 @@ with tempfile.TemporaryDirectory() as temp_dir:
             self.text = text
             self._body = body
 
-        def json(self):
-            if self._body is None:
-                raise ValueError("no body")
-            return self._body
+        def json(self):  # pragma: no cover - the provider reads the body instead
+            raise AssertionError("the provider must read the body under a bound, not call .json()")
+
+        # The provider reads the body under a size bound now, so a faithful
+        # fake serves bytes and is closable. No body stays no body.
+        def iter_content(self, chunk_size=None):
+            yield b"" if self._body is None else json.dumps(self._body).encode("utf-8")
+
+        def close(self):
+            self.closed = True
 
     no_connectors = inkdrop_notifications.test_all(str(db_path))
     require(no_connectors == [], f"nothing configured yet -- expected no rows to test, got {no_connectors}")

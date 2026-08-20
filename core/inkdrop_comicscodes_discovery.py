@@ -26,6 +26,7 @@ from pathlib import Path
 
 import requests
 
+from core import inkdrop_bounded_read
 from core import inkdrop_cloudflare_bypass_proxy as cloudflare_bypass_proxy
 from core import inkdrop_runtime_config
 
@@ -146,11 +147,15 @@ def source_key(url):
     return rss.stable_hash(url)
 
 
-def blocked_by_challenge(response):
+def blocked_by_challenge(response, body=None):
+    """`body` is the already-read response text. The caller reads the body under
+    a size bound, so falling back to `response.text` here would re-read it
+    uncapped and undo that."""
     if response.status_code in {401, 403, 429, 503}:
         mitigated = response.headers.get("Cf-Mitigated", "")
         server = response.headers.get("Server", "")
-        text = response.text[:1000].lower() if response.text else ""
+        raw = body if body is not None else response.text
+        text = raw[:1000].lower() if raw else ""
         return (
             "challenge" in mitigated.lower()
             or "cloudflare" in server.lower() and "challenge" in text
@@ -198,7 +203,7 @@ def fetch_url(url, cache, args):
         headers["If-Modified-Since"] = state["last_modified"]
 
     try:
-        response = requests.get(url, headers=headers, timeout=25)
+        response = requests.get(url, headers=headers, timeout=25, stream=True)
     except Exception as exc:
         failures = int(state.get("failure_count") or 0) + 1
         backoff = min(MAX_BACKOFF_SECONDS, 1800 * failures)
@@ -210,51 +215,78 @@ def fetch_url(url, cache, args):
         })
         return None, "error", state
 
-    state["last_poll"] = now
-    state["last_status"] = response.status_code
-    if response.status_code == 304:
-        state["failure_count"] = 0
-        state["last_error"] = None
-        return "", "not_modified", state
-    if blocked_by_challenge(response):
-        proxied_text, proxy_failure_reason = _fetch_via_cloudflare_bypass_proxy(url)
-        if proxied_text is not None:
+    try:
+        state["last_poll"] = now
+        state["last_status"] = response.status_code
+        if response.status_code == 304:
+            state["failure_count"] = 0
+            state["last_error"] = None
+            return "", "not_modified", state
+        # This is a scrape target: the page size is the remote host's choice,
+        # not InkDrop's. Read it once under a bound and reuse that one string
+        # for the challenge probe and the return value.
+        try:
+            body = inkdrop_bounded_read.bounded_read_text(
+                response,
+                inkdrop_bounded_read.SCRAPE_PAGE_MAX_BYTES,
+                label="ComicsCodes page",
+            )
+        except Exception as exc:
+            # An oversized page is a fetch failure like any other, and takes the
+            # same backoff -- not an exception escaping through fetch_url's
+            # (text, status, state) contract.
+            failures = int(state.get("failure_count") or 0) + 1
+            backoff = min(MAX_BACKOFF_SECONDS, 1800 * failures)
             state.update({
-                "etag": None,
-                "last_modified": None,
-                "failure_count": 0,
-                "last_error": None,
-                "backoff_until": 0,
-                "content_type": "text/html",
+                "failure_count": failures,
+                "last_error": rss.redact_text(exc),
+                "backoff_until": now + backoff,
             })
-            return proxied_text, "fetched_via_cloudflare_bypass_proxy", state
-        failures = int(state.get("failure_count") or 0) + 1
-        backoff = min(MAX_BACKOFF_SECONDS, 3600 * failures)
-        state.update({
-            "failure_count": failures,
-            "last_error": proxy_failure_reason or "cloudflare_or_host_challenge",
-            "backoff_until": now + backoff,
-        })
-        return None, "blocked_by_challenge", state
-    if response.status_code >= 400:
-        failures = int(state.get("failure_count") or 0) + 1
-        backoff = min(MAX_BACKOFF_SECONDS, 1800 * failures)
-        state.update({
-            "failure_count": failures,
-            "last_error": f"http_{response.status_code}",
-            "backoff_until": now + backoff,
-        })
-        return None, "error", state
+            return None, "error", state
+        if blocked_by_challenge(response, body):
+            proxied_text, proxy_failure_reason = _fetch_via_cloudflare_bypass_proxy(url)
+            if proxied_text is not None:
+                state.update({
+                    "etag": None,
+                    "last_modified": None,
+                    "failure_count": 0,
+                    "last_error": None,
+                    "backoff_until": 0,
+                    "content_type": "text/html",
+                })
+                return proxied_text, "fetched_via_cloudflare_bypass_proxy", state
+            failures = int(state.get("failure_count") or 0) + 1
+            backoff = min(MAX_BACKOFF_SECONDS, 3600 * failures)
+            state.update({
+                "failure_count": failures,
+                "last_error": proxy_failure_reason or "cloudflare_or_host_challenge",
+                "backoff_until": now + backoff,
+            })
+            return None, "blocked_by_challenge", state
+        if response.status_code >= 400:
+            failures = int(state.get("failure_count") or 0) + 1
+            backoff = min(MAX_BACKOFF_SECONDS, 1800 * failures)
+            state.update({
+                "failure_count": failures,
+                "last_error": f"http_{response.status_code}",
+                "backoff_until": now + backoff,
+            })
+            return None, "error", state
 
-    state.update({
-        "etag": response.headers.get("ETag") or state.get("etag"),
-        "last_modified": response.headers.get("Last-Modified") or state.get("last_modified"),
-        "failure_count": 0,
-        "last_error": None,
-        "backoff_until": 0,
-        "content_type": response.headers.get("Content-Type"),
-    })
-    return response.text, "fetched", state
+        state.update({
+            "etag": response.headers.get("ETag") or state.get("etag"),
+            "last_modified": response.headers.get("Last-Modified") or state.get("last_modified"),
+            "failure_count": 0,
+            "last_error": None,
+            "backoff_until": 0,
+            "content_type": response.headers.get("Content-Type"),
+        })
+        return body, "fetched", state
+    finally:
+        # stream=True holds the connection until the body is drained or the
+        # response is closed; the 304 and challenge paths return without
+        # draining it.
+        response.close()
 
 
 class LinkExtractor(html.parser.HTMLParser):
@@ -375,6 +407,14 @@ def review(reason, payload):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with rss.REVIEW_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
+    # Only rows that actually persisted announce -- the gate above already
+    # dropped the soft/diagnostic reasons. Imported lazily because
+    # inkdrop_notifications reaches back into this package.
+    try:
+        from core import inkdrop_notifications
+        inkdrop_notifications.notify_manual_review_from_payload(rss.INKDROP_STATE_DB, reason, payload)
+    except Exception:
+        pass
     return record
 
 

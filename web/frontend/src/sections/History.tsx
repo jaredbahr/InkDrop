@@ -271,7 +271,10 @@ export function History({ payload }: { payload: HistoryViewPayload }) {
                     <td colSpan={7}>{day}</td>
                   </tr>
                 )}
-                <tr className={`history-row ${expanded ? "expanded" : ""}`}>
+                <tr
+                  className={`history-row ${expanded ? "expanded" : ""}`}
+                  onClick={() => setExpandedId(expanded ? null : row.id)}
+                >
                   <td data-label="Time" className="history-col-time">{rowTime(row)}</td>
                   <td data-label="Event">
                     <span className="history-event">

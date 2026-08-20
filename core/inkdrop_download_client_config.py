@@ -45,6 +45,43 @@ DEFAULT_TYPE_SCHEMAS = {
 }
 
 
+LEGACY_MIGRATION_KEY_PREFIX = "legacy_provider_card_to_instance.v1:"
+
+# What each legacy provider card kept, and where it lives on an instance. Only
+# the three clients that ever had a forced card are listed; the other five
+# client types were always add-only, so they have nothing to carry across.
+LEGACY_CLIENT_FIELDS = {
+    "qbittorrent": {
+        "secrets": ("password", "api_key"),
+        "username_field": "username",
+        "categories": {"comics": "comics_category", "manga": "manga_category", "ebooks": "ebooks_category"},
+        "download_paths": {"comics": "comics_save_path", "manga": "manga_save_path", "ebooks": "ebooks_save_path"},
+        "carry": ("torrent_cleanup_policy", "verify_tls"),
+    },
+    "sabnzbd": {
+        "secrets": ("api_key",),
+        "categories": {"comics": "comics_category"},
+        "carry": (
+            "failure_categories", "remove_completed_downloads", "remove_failed_downloads",
+            "completed_history_min_age_hours", "failed_history_min_age_hours", "sab_history_limit",
+            "max_failed_history_delete", "max_completed_history_delete", "verify_tls",
+        ),
+    },
+    "slskd": {
+        "secrets": ("api_key",),
+        "download_path_field": "download_root",
+        "download_paths": {"comics": "download_root"},
+        "carry": (
+            "download_root", "incomplete_root", "max_total", "max_per_series", "wait_seconds",
+            "max_queries", "auto_grab_max", "probe_budget_seconds", "cooldown_hours",
+            "max_active_per_user", "preferred_exact_min_bytes", "delete_search_history",
+            "search_history_keep", "search_history_max_delete", "search_history_min_age_minutes",
+            "verify_tls",
+        ),
+    },
+}
+
+
 SCHEMA_SQL = """
 create table if not exists download_client_instances (
     id text primary key,
@@ -816,6 +853,198 @@ def cleanup_orphan_secrets(db_path, *, secret_root=None, max_delete=50, min_age_
         min_age_seconds=min_age_seconds,
         now=now,
     )
+
+
+def _legacy_rows(db_path, client_types):
+    """Read the legacy provider-card rows for the given client types."""
+    path = Path(db_path)
+    if not path.exists():
+        return {}
+    uri = f"file:{path}?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=3.0)) as con:
+        con.row_factory = sqlite3.Row
+        table = con.execute("select 1 from sqlite_master where type='table' and name='provider_configs'").fetchone()
+        if not table:
+            return {}
+        rows = {}
+        for client_type in client_types:
+            row = con.execute(
+                "select id,display_name,enabled,base_url,settings_json from provider_configs where id=?",
+                (client_type,),
+            ).fetchone()
+            if row is not None:
+                rows[client_type] = dict(row)
+        return rows
+
+
+def _migration_states(con, client_types):
+    states = {}
+    for client_type in client_types:
+        row = con.execute(
+            "select status from download_client_instance_migrations where migration_key=?",
+            (f"{LEGACY_MIGRATION_KEY_PREFIX}{client_type}",),
+        ).fetchone()
+        if row is not None:
+            states[client_type] = str(row["status"] or "")
+    return states
+
+
+def _record_migration(db_path, client_type, status, detail):
+    now = time.time()
+    with _connection(db_path) as con:
+        con.execute(
+            """insert into download_client_instance_migrations(migration_key,status,detail_json,created_at,updated_at)
+               values(?,?,?,?,?)
+               on conflict(migration_key) do update set
+                   status=excluded.status, detail_json=excluded.detail_json, updated_at=excluded.updated_at""",
+            (f"{LEGACY_MIGRATION_KEY_PREFIX}{client_type}", status, _dump(detail or {}), now, now),
+        )
+        con.commit()
+
+
+def _legacy_payload(client_type, row):
+    """Build a create_instance() payload from one legacy provider-card row.
+
+    Returns None when the card holds nothing worth carrying across -- a
+    never-configured card is exactly the forced default this migration exists
+    to stop showing, so materializing it would recreate the confusion.
+    """
+    plan = LEGACY_CLIENT_FIELDS.get(client_type) or {}
+    settings = _json(row.get("settings_json"), {})
+    base_url = str(row.get("base_url") or settings.get("base_url") or settings.get("host") or "").strip()
+    secrets = {}
+    for field in plan.get("secrets") or ():
+        value = str(settings.get(field) or "").strip()
+        if value:
+            secrets[field] = value
+    if not base_url and not secrets:
+        return None
+    payload = {
+        "name": str(row.get("display_name") or client_type).strip() or client_type,
+        "client_type": client_type,
+        # A legacy card could be marked enabled with nothing behind it (SLSKD's
+        # card was enabled purely because a script file shipped in the image).
+        # Enablement is re-derived from what actually got carried across, and
+        # _validate_ready() still has the final say below.
+        "enabled": bool(row.get("enabled")) and bool(base_url) and bool(secrets),
+        "base_url": base_url,
+        "source": "legacy_provider_config",
+    }
+    username_field = plan.get("username_field")
+    if username_field:
+        payload["username"] = str(settings.get(username_field) or "").strip()
+    if secrets:
+        payload["secrets"] = secrets
+    categories = {}
+    for media, field in (plan.get("categories") or {}).items():
+        value = str(settings.get(field) or "").strip()
+        if value:
+            categories[media] = value
+    if categories:
+        payload["categories"] = categories
+    download_paths = {}
+    for media, field in (plan.get("download_paths") or {}).items():
+        value = str(settings.get(field) or "").strip()
+        if value:
+            download_paths[media] = value
+    if download_paths:
+        payload["download_paths"] = download_paths
+    default_path = str(settings.get(plan.get("download_path_field") or "") or "").strip()
+    if default_path:
+        payload["download_path"] = default_path
+    carried = {}
+    for field in plan.get("carry") or ():
+        if field in settings and settings[field] not in (None, ""):
+            carried[field] = settings[field]
+    if carried:
+        payload["settings"] = carried
+    mappings = settings.get("path_mappings") or settings.get("remote_path_mappings")
+    if isinstance(mappings, list) and mappings:
+        try:
+            payload["path_mappings"] = normalize_path_mappings(mappings)
+        except ValueError:
+            # A malformed legacy mapping must not cost the user the whole
+            # connection; the rest of the config still migrates.
+            payload["path_mappings"] = []
+    return payload
+
+
+def materialize_legacy_instances(db_path, *, secret_root=None, history_writer=None, client_types=None):
+    """Carry configured legacy provider-card clients into real instances, once.
+
+    The Download Clients page used to seed a fixed card per client type whether
+    or not the user ran that client, so "SLSKD is enabled" and "I have an SLSKD
+    client" looked identical while meaning different things. The page now lists
+    only instances the user added, which makes those legacy cards the one thing
+    that must not be dropped: they are live config, still read by
+    ``load_qbit_settings()`` and friends.
+
+    So this copies each configured card into the instance model instead of
+    deleting anything. The legacy row is left exactly as it was -- the adapters'
+    fallback path keeps working untouched, and a failed migration can be retried.
+    Secrets move out of ``settings_json`` plaintext into the secret store on the
+    way across.
+    """
+    types = [str(value).lower() for value in (client_types or LEGACY_CLIENT_FIELDS)]
+    result = {"schema": CONTRACT_SCHEMA, "migrated": [], "skipped": []}
+    rows = _legacy_rows(db_path, types)
+    if not rows:
+        return result
+    with _connection(db_path) as con:
+        states = _migration_states(con, types)
+        existing_types = {
+            str(row["client_type"] or "").lower()
+            for row in con.execute("select client_type from download_client_instances where deleted_at is null")
+        }
+    for client_type in types:
+        row = rows.get(client_type)
+        if row is None:
+            continue
+        if states.get(client_type) == "completed":
+            # Already carried across. Never redo it -- the user may since have
+            # deliberately deleted or renamed the instance.
+            continue
+        if client_type in existing_types:
+            result["skipped"].append({"client_type": client_type, "reason": "instance_already_exists"})
+            _record_migration(db_path, client_type, "completed", {"reason": "instance_already_exists"})
+            continue
+        payload = _legacy_payload(client_type, row)
+        if payload is None:
+            # Nothing configured on the card. Leave it pending rather than
+            # completed: an existing install whose card is still visible can be
+            # filled in later, and this should pick it up when it is.
+            result["skipped"].append({"client_type": client_type, "reason": "not_configured"})
+            _record_migration(db_path, client_type, "pending", {"reason": "not_configured"})
+            continue
+        created = None
+        last_error = ""
+        for attempt_enabled in ([True, False] if payload["enabled"] else [False]):
+            attempt = dict(payload, enabled=attempt_enabled)
+            try:
+                created = create_instance(
+                    db_path, attempt, secret_root=secret_root,
+                    schema_resolver=None, history_writer=history_writer,
+                )
+                break
+            except ValueError as exc:
+                # A card can be enabled but incomplete by the instance model's
+                # stricter rules (qBittorrent password with no username, say).
+                # Saving it disabled keeps the config instead of losing it.
+                last_error = str(exc)
+        if created is None:
+            result["skipped"].append({"client_type": client_type, "reason": "invalid", "detail": last_error})
+            _record_migration(db_path, client_type, "failed", {"reason": "invalid", "detail": last_error})
+            continue
+        result["migrated"].append({
+            "client_type": client_type,
+            "instance_id": created["id"],
+            "enabled": created["enabled"],
+            "requested_enabled": payload["enabled"],
+        })
+        _record_migration(db_path, client_type, "completed", {
+            "instance_id": created["id"], "enabled": created["enabled"],
+        })
+    return result
 
 
 def legacy_instance_metadata(db_path, known_types=None):

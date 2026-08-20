@@ -66,8 +66,41 @@ function stageLabel(row: ManualReviewRow): string {
   return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+// A machine identifier, e.g. `qbit_torrent_completed_outside_expected_save_path`
+// or `weak_filename_unit_evidence`. Lowercase words joined by underscores and
+// nothing else -- deliberately narrow, so a sentence that merely contains an
+// underscored token ("it's stopped auto_retrying and needs a decision from
+// you.") is still treated as prose and shown.
+const REASON_CODE_RE = /^[a-z0-9]+(?:_[a-z0-9]+)+$/;
+
+// The detail line under the badge. It must never print the gate's own key.
+//
+// Reported live: a row read "Torrent finished in the wrong folder" with
+// `qbit_torrent_completed_outside_expected_save_path` printed underneath it --
+// the same fact twice, once in machine form, because this fell through to
+// `row.reason` (the gate's key) whenever nothing better was set and the badge
+// above had just translated that very string.
+//
+// The guard is general rather than a lookup entry for that one code: any
+// unmapped identifier is refused, so a reason value added later cannot leak by
+// being absent from REASON_META. Returning empty is safe because the badge
+// already carries the human label for exactly these values -- reasonBadge()
+// reads the same two fields and title-cases whatever it does not know.
+//
+// Measured against the live library before shipping: 23 Manual Review rows, 21
+// distinct reason values, of which 20 are full English sentences -- this field
+// carries prose, not enum keys. Exactly ONE row yields an identifier here, and
+// it has other prose available, so this loses information on zero rows today.
+// It is a forward-looking guard, not a fix for something widespread.
 function reasonText(row: ManualReviewRow): string {
-  return row.review_reason || row.reason || row.why_not_grabbed || row.activity_summary || "";
+  const candidates = [row.review_reason, row.reason, row.why_not_grabbed, row.activity_summary];
+  for (const value of candidates) {
+    const text = String(value || "").trim();
+    if (!text) continue;
+    if (REASON_CODE_RE.test(text.toLowerCase())) continue;
+    return text;
+  }
+  return "";
 }
 
 // Distinguishes a stuck IMPORT (file downloaded, verification/import failed)

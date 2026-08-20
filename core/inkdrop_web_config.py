@@ -57,6 +57,11 @@ MANUAL_REVIEW_RETRY_BUSY_RETRY_INTERVAL_SECONDS = 30
 MANUAL_REVIEW_RETRY_BUSY_RETRY_MAX_SECONDS = 1800
 ARCHIVE_CONVERSION_TASKS = {}
 ARCHIVE_CONVERSION_TASKS_LOCK = threading.Lock()
+# The adoption folder scan walks the same kind of library the CBZ check does and
+# takes just as long, so it runs in a background thread on the same shape of
+# registry rather than blocking one HTTP request until the browser gives up.
+LIBRARY_ADOPTION_TASKS = {}
+LIBRARY_ADOPTION_TASKS_LOCK = threading.Lock()
 SUPPORT_BUNDLE_BUILD_SLOT = threading.BoundedSemaphore(1)
 
 
@@ -560,6 +565,22 @@ try:
     INKDROP_MOBILE_JS_VERSION = hashlib.sha256(INKDROP_MOBILE_JS_FILE.read_bytes()).hexdigest()[:12]
 except OSError:
     INKDROP_MOBILE_JS_VERSION = "missing"
+# The phone's mark. inkdrop-logo-mark.png is a 1280x1280, 590KB master, and /m
+# used it for one thing: the favicon. That is half a megabyte, uncached, on
+# every cold load of a page whose whole point is being small. This is the same
+# art at 192px -- large enough to cover the apple-touch-icon slot and any
+# favicon downscale -- at 18KB.
+INKDROP_LOGO_MARK_MOBILE_FILE = Path(__file__).resolve().parents[1] / "inkdrop-logo-mark-mobile.png"
+try:
+    INKDROP_LOGO_MARK_MOBILE_VERSION = hashlib.sha256(
+        INKDROP_LOGO_MARK_MOBILE_FILE.read_bytes()
+    ).hexdigest()[:12]
+except OSError:
+    INKDROP_LOGO_MARK_MOBILE_VERSION = "missing"
+try:
+    INKDROP_LOGO_MARK_VERSION = hashlib.sha256(INKDROP_LOGO_MARK_FILE.read_bytes()).hexdigest()[:12]
+except OSError:
+    INKDROP_LOGO_MARK_VERSION = "missing"
 COVER_CACHE_DIR = CACHE_DIR / "cover-cache"
 # One table, so an approved host can never be checked without also checking the
 # directory its covers have to live under.
@@ -608,6 +629,9 @@ COMICVINE_API = "https://comicvine.gamespot.com/api"
 MANGADEX_API = "https://api.mangadex.org"
 MANGADEX_SITE_URL = "https://mangadex.org/title"
 MANGADEX_COVER_URL = "https://uploads.mangadex.org/covers"
+# MangaDex's maximum page size for /cover. One page ordered by volume is enough
+# to find book one even for a hundred-volume run.
+MANGADEX_COVER_PAGE_LIMIT = 100
 METRON_API = "https://metron.cloud/api"
 METRON_SITE_URL = "https://metron.cloud/series"
 SAB_COMIC_CATEGORIES = {"comics", "manga", "mylar", "kapowarr"}
@@ -746,6 +770,9 @@ __all__ = [
     "IMPORT_STATUS_FILE",
     "INKDROP_AUTH_BACKDROP_FILE",
     "INKDROP_LOGO_MARK_FILE",
+    "INKDROP_LOGO_MARK_MOBILE_FILE",
+    "INKDROP_LOGO_MARK_MOBILE_VERSION",
+    "INKDROP_LOGO_MARK_VERSION",
     "INKDROP_MANUAL_STATE_SYNC_ENABLED",
     "INKDROP_STATE_DB",
     "INKDROP_STATE_IMPORT_READY_STATUSES",
@@ -773,10 +800,13 @@ __all__ = [
     "LEGACY_ACQUIRE_LOG",
     "LEGACY_IMPORT_LOG",
     "LEGACY_WATCH_LOG",
+    "LIBRARY_ADOPTION_TASKS",
+    "LIBRARY_ADOPTION_TASKS_LOCK",
     "LOCK_DIR",
     "LOG_DIR",
     "MANAGED_LIBRARY_AUDIT_LAST_FILE",
     "MANGADEX_API",
+    "MANGADEX_COVER_PAGE_LIMIT",
     "MANGADEX_COVER_URL",
     "MANGADEX_DEFAULT_CONTENT_RATINGS",
     "MANGADEX_MATURE_RATING_PENALTY",

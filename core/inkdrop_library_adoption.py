@@ -162,7 +162,15 @@ def year_from_text(text):
 # ---------------------------------------------------------------------------
 
 
-def scan_adoption_root(root, media_type, *, max_files=20000, sample_limit=500):
+def scan_adoption_root(root, media_type, *, max_files=20000, sample_limit=500, progress=None):
+    """Walk `root` for readable archives.
+
+    `progress`, if given, is called as `progress(scanned, matched, current_path)`
+    while the walk runs. There is no total to divide by -- os.walk discovers the
+    tree as it goes -- so callers get a count, not a percentage. On a library
+    this takes long enough that a moving count is the difference between
+    "working" and "hung".
+    """
     root_path = Path(root)
     max_files = max(1, min(int(max_files or 20000), 100000))
     result = {"root": str(root_path), "media_type": media_type, "exists": root_path.exists(), "files": [], "truncated": False, "errors": []}
@@ -174,6 +182,7 @@ def scan_adoption_root(root, media_type, *, max_files=20000, sample_limit=500):
         return result
     import os
 
+    scanned = 0
     for current_root, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [
             name
@@ -185,6 +194,9 @@ def scan_adoption_root(root, media_type, *, max_files=20000, sample_limit=500):
                 result["truncated"] = True
                 break
             candidate = Path(current_root) / filename
+            scanned += 1
+            if progress is not None:
+                progress(scanned, len(result["files"]), str(candidate))
             extension = inkdrop_state.media_library_archive_extension(candidate)
             if not extension:
                 continue
@@ -200,6 +212,8 @@ def scan_adoption_root(root, media_type, *, max_files=20000, sample_limit=500):
             )
         if result["truncated"]:
             break
+    if progress is not None:
+        progress(scanned, len(result["files"]), None)
     return result
 
 
@@ -288,7 +302,7 @@ def classify_folder(con, folder, series_by_path, series_by_title):
 # ---------------------------------------------------------------------------
 
 
-def build_adoption_plan(db_path, root, media_type, *, search_fn=None, max_files=20000, sample_limit=200, max_metadata_lookups=25):
+def build_adoption_plan(db_path, root, media_type, *, search_fn=None, max_files=20000, sample_limit=200, max_metadata_lookups=25, scan_progress=None, folder_progress=None):
     """Read-only. Returns candidate folders with a proposed identity for a human to confirm.
 
     `search_fn`, if given, is called as `search_fn(query_title)` and must return a list of
@@ -296,9 +310,15 @@ def build_adoption_plan(db_path, root, media_type, *, search_fn=None, max_files=
     mangadex_search_manga). It is only called for folders InkDrop doesn't already
     recognize, and only up to `max_metadata_lookups` times, to bound provider API usage
     on a large first-time library scan.
+
+    `scan_progress(scanned, matched, current_path)` reports the disk walk;
+    `folder_progress(done, total, folder_name)` reports the identify pass that
+    follows it. The second pass is the slow one when metadata lookups are on --
+    it makes a provider call per unrecognized folder -- so it gets its own
+    counter rather than hiding behind a finished-looking file count.
     """
     media_type = str(media_type or "comic").strip().lower()
-    scan = scan_adoption_root(root, media_type, max_files=max_files, sample_limit=sample_limit)
+    scan = scan_adoption_root(root, media_type, max_files=max_files, sample_limit=sample_limit, progress=scan_progress)
     if not scan["exists"] or scan["errors"]:
         return {"ok": False, "root": scan["root"], "media_type": media_type, "errors": scan["errors"]}
     folders = group_files_by_folder(scan, media_type)
@@ -307,7 +327,12 @@ def build_adoption_plan(db_path, root, media_type, *, search_fn=None, max_files=
         candidates = []
         metadata_lookups_used = 0
         summary = {"folders": 0, "already_imported": 0, "existing_series_folder_candidates": 0, "new_series_candidates": 0, "loose_root_files": 0}
-        for folder in sorted(folders, key=lambda f: inkdrop_state.normalize_key(f["folder_name"])):
+        ordered_folders = sorted(folders, key=lambda f: inkdrop_state.normalize_key(f["folder_name"]))
+        folders_done = 0
+        for folder in ordered_folders:
+            folders_done += 1
+            if folder_progress is not None:
+                folder_progress(folders_done, len(ordered_folders), folder.get("folder_name"))
             if folder["reason"] == "root_file":
                 summary["loose_root_files"] += len(folder["files"])
                 continue

@@ -94,6 +94,9 @@ _add("POST", {
 }, "full_backup_merge_preview", "admin", admin=True, high_impact=True, idempotent=True)
 _add("POST", {
     "/api/library-adoption/plan",
+    "/api/library-adoption/plan/start",
+    "/api/library-adoption/plan/status",
+    "/api/library-adoption/plan/latest",
 }, "library_adoption_plan", "admin", admin=True, high_impact=True)
 _add("POST", {
     "/api/library-adoption/apply",
@@ -101,6 +104,7 @@ _add("POST", {
 _add("POST", {
     "/api/inkdrop-library/convert-archives/plan",
     "/api/inkdrop-library/convert-archives/status",
+    "/api/inkdrop-library/convert-archives/latest",
 }, "archive_conversion_plan", "admin", admin=True)
 _add("POST", {
     "/api/inkdrop-library/convert-archives/apply",
@@ -137,6 +141,12 @@ _add("POST", {
     "/api/inkdrop-state/source-memory/allow",
     "/api/inkdrop-state/source-memory/remove",
     "/api/inkdrop-state/source-memory/block",
+    # Both set a durable per-item override the acquisition passes then obey:
+    # the hand-corrected search query, and "wanted, not pursued". Same
+    # acquisition scope as the source-memory decisions above, and idempotent --
+    # setting the same query or pausing an already-paused item is a no-op.
+    "/api/inkdrop-state/reliability/search-query",
+    "/api/inkdrop-state/reliability/pursuit",
 }, "acquisition", "acquisition", idempotent=True)
 
 
@@ -202,7 +212,14 @@ _add("POST", {
 _add("POST", {
     "/api/inkdrop-diagnostics/managed-library-audit/run",
     "/api/inkdrop-diagnostics/managed_library_audit/run",
+    "/api/inkdrop-diagnostics/library-reconciliation/run",
+    "/api/inkdrop-diagnostics/library_reconciliation/run",
 }, "advanced_diagnostics_scan", "admin", admin=True, high_impact=True, idempotent=True)
+
+_add("POST", {
+    "/api/inkdrop-diagnostics/library-reconciliation/repair",
+    "/api/inkdrop-diagnostics/library_reconciliation/repair",
+}, "library_reconciliation_repair", "admin", admin=True, high_impact=True, idempotent=True)
 
 _add("DELETE", {
     "/api/auth/api-keys/revoke", "/api/inkdrop-auth/api-keys/revoke",

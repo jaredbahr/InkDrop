@@ -15,23 +15,27 @@ def require(condition, message):
 
 # Broad directory discovery is the anchor so one response can cover sibling
 # issues; the numbered issue query is second. Provider-native comics/manga
-# vocabulary is no longer front-loaded here (PASS: manga query priority,
-# 2026-08-02) -- live slskd data showed a "<title> manga"/"<title> comics"
-# qualified query consistently underperforms the plain title badly (e.g.
-# Deadman Wonderland: 1582 files/113 peers plain vs. 197 files/13 peers
-# qualified, with the qualified query's one uniquely-found peer a duplicate
-# of a match the plain query already had), so it no longer spends one of
-# the first two guaranteed query slots; exact unit variants still remain
-# available when the broad searches do not settle the row.
+# vocabulary sits behind the bare title and the wanted issue, and ahead of the
+# collected suffixes (2026-08-16). The 2026-08-02 revision demoted it out of
+# the plan on raw file counts -- Deadman Wonderland 1582 files/113 peers plain
+# vs. 197/13 qualified -- and those counts turned out to be mostly music: 67%
+# of what a bare query returns on this deployment is audio and video, because
+# Soulseek matches the full shared path and a bare title fills the 250-peer
+# response ceiling with whoever answers first. Counting book-shaped files
+# reverses it (bare "Vagabond": 1,263 files, 6 of them books; "Vagabond
+# manga": 2,240 files, 1,472 books).
+# Both comic spellings are planned, plural first, as separate queries -- terms
+# are ANDed, so a combined query would demand both tokens.
 # "<title> cbz"/"<title> cbr" are gone from the variant pool entirely
 # (2026-08-03) -- each one only matches its own archive format, so real
 # releases shared in the other format never show up, and "cbr" collides
 # with the "Constant Bit Rate" MP3 tag and pulls in unrelated music shares.
-# The singular "<title> comic" took the freed slot (same date) -- live
-# spot checks found it turns up genuine releases plural sometimes misses.
 descender = {"series": "Descender", "issue": "15", "year": "2016"}
 queries = probe.source_queries(descender)
-require(queries[:4] == ["Descender", "Descender 15", "Descender comic", "Descender complete"], queries[:8])
+require(
+    queries[:5] == ["Descender", "Descender 15", "Descender comics", "Descender comic", "Descender complete"],
+    queries[:8],
+)
 initial = probe.rotated_query_batch(queries, max_queries=2, offset=0)
 require(initial == queries[:2], initial)
 

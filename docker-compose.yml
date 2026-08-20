@@ -10,6 +10,15 @@
 # Mounting a library somewhere else without also changing Comic root or
 # Manga root under Settings -> Media Management leaves it invisible to
 # InkDrop, so it is worth keeping these as they are.
+#
+# Running SLSKD in its own container is the one case where a path has to
+# line up on both sides. InkDrop reads finished transfers from
+# /downloads/staging/slskd, so SLSKD's completed-downloads folder has to be
+# mounted where InkDrop expects to find it -- if the two containers disagree,
+# transfers finish in SLSKD and InkDrop simply never sees them. Move it with
+# INKDROP_SLSKD_DOWNLOAD_ROOT and the matching mount, together. In-progress
+# transfers sit under that folder in incomplete/; set
+# INKDROP_SLSKD_INCOMPLETE_ROOT only if you keep them on a separate disk.
 services:
   inkdrop:
     image: ghcr.io/jaredbahr/inkdrop:latest

@@ -61,6 +61,16 @@ PROTOTYPE_KEYS = {"__proto__", "prototype", "constructor"}
 INVALID_STORED_VALUE = object()
 STATE_DB_ARCHIVE_NAME = "state/inkdrop-state.sqlite3"
 AUTH_DB_ARCHIVE_NAME = "state/inkdrop-auth.sqlite3"
+# The completion/import ledger, which lives in the state directory next to the
+# other two databases but was never carried by a backup -- and, worse, was not
+# named in the manifest's `contains` block either, so nothing told an operator
+# it was missing. Most of what it holds a filesystem rescan can rebuild (at a
+# cost: a full SLSKD backlog scan is ~42 minutes, see inkdrop_container_scheduler),
+# but `artifact_bad_content_memory` and `source_failures` are *learned* -- no
+# scan reconstructs them, so a restored instance re-learns them by re-downloading
+# the same bad releases it had already ruled out. Measured 6.3 MiB against a
+# ~1.7 GB archive on the production instance, so carrying it costs nothing.
+COMPLETION_DB_ARCHIVE_NAME = "state/imported-files.sqlite3"
 CONFIG_EXPORT_ARCHIVE_NAME = "config/inkdrop-config-export.json"
 SECRET_REFS_ARCHIVE_NAME = "config/inkdrop-secret-refs.json"
 MANIFEST_ARCHIVE_NAME = "manifest.json"
@@ -923,6 +933,18 @@ def backup_sqlite_db(source_db: Path, target_db: Path):
             "error": f"{type(last_error).__name__}: {last_error}",
             "attempts": attempts,
         }
+    # Born hardened, not hardened afterwards. This copy has just been through
+    # auth sanitisation and provider-secret redaction, but redaction is not
+    # removal -- the file still carries enough to be worth 0600, and leaving
+    # it at the process umask produced a 31.7 GB backup sitting at 0644.
+    # create_backup_archive() already does this for the archive path
+    # (os.fchmod(fd, 0o600)); the raw-copy path did not.
+    try:
+        os.chmod(target_db, 0o600)
+    except OSError:
+        # Never fail a good backup over a permission call; the copy itself is
+        # the artifact worth keeping.
+        pass
     _validate_sqlite_database(target_db, label="state backup copy")
     auth_safety = inkdrop_auth.sanitize_auth_database_copy(target_db)
     if not auth_safety.get("ok"):
@@ -960,6 +982,28 @@ def create_backup_archive(
             os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1
+        # Staging is a full, uncompressed copy of every database being backed
+        # up, and it lands in the system temp directory -- not in backup_dir,
+        # which is the filesystem an operator would think to check. On the
+        # production instance that is an 11.2 GiB write into the container's
+        # /tmp. restore_backup_archive() has always preflighted its own
+        # staging with _require_free_space(); this path never did, so a
+        # too-small temp filesystem surfaced as an ENOSPC partway through
+        # rather than as a refusal before any work started.
+        #
+        # Only the staging copy is preflighted here, because it is the one
+        # number that is known exactly up front (it is a byte-for-byte copy of
+        # files already on disk). The finished archive's size is not knowable
+        # before compression, and over-estimating it is precisely what made
+        # restore demand hundreds of gigabytes to preview a legitimate backup
+        # (see the member_real_sizes comment in restore_backup_archive) -- so
+        # this deliberately does not guess at it.
+        staging_root = Path(tempfile.gettempdir())
+        staging_budget = _existing_file_size(state_db_path)
+        staging_budget += _existing_file_size(inkdrop_auth.auth_store_path(state_db_path))
+        completion_db_path = Path(state_db_path).parent / inkdrop_runtime_config.IMPORTED_FILES_DB_NAME
+        staging_budget += _existing_file_size(completion_db_path)
+        _require_free_space(staging_root, staging_budget, label="backup staging copy")
         with tempfile.TemporaryDirectory(prefix="inkdrop-backup-build-") as tmp:
             tmp_root = Path(tmp)
             temp_db = tmp_root / STATE_DB_ARCHIVE_NAME
@@ -974,6 +1018,11 @@ def create_backup_archive(
             auth_db_path = inkdrop_auth.auth_store_path(state_db_path)
             temp_auth_db = tmp_root / AUTH_DB_ARCHIVE_NAME
             auth_db_backup = backup_sqlite_db(auth_db_path, temp_auth_db)
+            # Optional: installs that have never run an import do not have one
+            # yet, and an archive without it stays restorable (the restore
+            # path treats it the same way it treats a pre-auth-split archive).
+            temp_completion_db = tmp_root / COMPLETION_DB_ARCHIVE_NAME
+            completion_db_backup = backup_sqlite_db(completion_db_path, temp_completion_db)
             config_export = redacted_config_export(env)
             secret_refs = {
             "schema_version": BACKUP_RESTORE_SCHEMA_VERSION,
@@ -988,6 +1037,7 @@ def create_backup_archive(
             "contains": {
                 "state_db": bool(db_backup.get("ok")),
                 "auth_db": bool(auth_db_backup.get("ok")),
+                "completion_db": bool(completion_db_backup.get("ok")),
                 "redacted_config_export": True,
                 "secret_reference_manifest": True,
                 "media_files": False,
@@ -999,10 +1049,12 @@ def create_backup_archive(
                 "config_dir": path_text(config_dir),
                 "state_db_path": path_text(state_db_path),
                 "auth_db_path": path_text(auth_db_path),
+                "completion_db_path": path_text(completion_db_path),
                 "backup_dir": path_text(backup_dir),
             },
             "state_db_backup": db_backup,
             "auth_db_backup": auth_db_backup,
+            "completion_db_backup": completion_db_backup,
             "credential_policy": "Authentication material in the state backup is cryptographically hashed; plaintext passwords, sessions, recovery tokens, and API keys are never exported. Provider credentials stored directly in provider settings (see state_db_backup.provider_secret_redaction) are redacted from the embedded state database copy the same way they are from the portability export.",
         }
             with zipfile.ZipFile(temp_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1013,6 +1065,8 @@ def create_backup_archive(
                     zf.write(temp_db, STATE_DB_ARCHIVE_NAME)
                 if auth_db_backup.get("ok"):
                     zf.write(temp_auth_db, AUTH_DB_ARCHIVE_NAME)
+                if completion_db_backup.get("ok"):
+                    zf.write(temp_completion_db, COMPLETION_DB_ARCHIVE_NAME)
         _verify_sensitive_archive_mode(temp_archive)
         with temp_archive.open("r+b") as handle:
             os.fsync(handle.fileno())
@@ -1046,6 +1100,78 @@ def create_backup_archive(
 # format -- create_backup_archive() names every archive this way, so listing/
 # pruning read the timestamp back out of the filename itself rather than
 # keeping a separate index that could drift from what's actually on disk.
+# A backup that dies between mkstemp() and os.replace() leaves two artifacts:
+# the partial archive (.inkdrop-backup-*.tmp, in backup_dir) and the staging
+# directory holding a full uncompressed copy of every database
+# (inkdrop-backup-build-*, in the system temp dir). create_backup_archive()
+# cleans both up on any exception, but SIGKILL is not an exception -- a
+# container recreate, an OOM kill, or a redeploy mid-backup skips the handler
+# entirely, so no amount of exception handling closes this.
+#
+# prune_backup_archives() does not help: it deliberately only ever considers
+# files matching BACKUP_ARCHIVE_NAME_RE, which is what makes it safe to point
+# at a directory that also holds hand-made pre-migration snapshots. So nothing
+# swept these, and on an 11 GiB database each abandoned staging directory is
+# an 11 GiB leak that persists for as long as its filesystem does.
+_STALE_BACKUP_WORKSPACE_MIN_AGE_SECONDS = int(
+    os.environ.get("INKDROP_BACKUP_STALE_WORKSPACE_MIN_AGE_SECONDS") or 6 * 3600
+)
+
+
+def sweep_stale_backup_workspaces(*, backup_dir=None, temp_dir=None, now=None, min_age_seconds=None):
+    """Remove abandoned backup temp files and staging directories.
+
+    Age-gated rather than unconditional: a backup of a multi-gigabyte database
+    legitimately runs for minutes, and this is called at container start while
+    the *other* container may be mid-backup against the same shared backup
+    directory. Deleting a live run's workspace would turn a slow backup into a
+    corrupt one, so anything younger than the threshold is left alone.
+    """
+    backup_dir = Path(backup_dir or inkdrop_runtime_config.backup_dir())
+    temp_dir = Path(temp_dir if temp_dir is not None else tempfile.gettempdir())
+    now = float(now if now is not None else time.time())
+    min_age = int(min_age_seconds if min_age_seconds is not None else _STALE_BACKUP_WORKSPACE_MIN_AGE_SECONDS)
+    report = {"removed_temp_archives": [], "removed_staging_dirs": [], "skipped_recent": 0, "errors": []}
+
+    def _too_young(path):
+        try:
+            return (now - path.stat().st_mtime) < min_age
+        except OSError:
+            return True
+
+    candidates = []
+    if backup_dir.is_dir():
+        # Both the create path (.inkdrop-backup-*.tmp) and the upload path
+        # (.inkdrop-backup-upload-*.zip.tmp, inkdrop_web) stage here.
+        candidates.extend(sorted(backup_dir.glob(".inkdrop-backup-*.tmp")))
+        candidates.extend(sorted(backup_dir.glob(".inkdrop-backup-upload-*.zip.tmp")))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        if _too_young(path):
+            report["skipped_recent"] += 1
+            continue
+        try:
+            path.unlink()
+            report["removed_temp_archives"].append(path_text(path))
+        except OSError as exc:
+            report["errors"].append({"path": path_text(path), "error": str(exc)})
+
+    if temp_dir.is_dir():
+        for path in sorted(temp_dir.glob("inkdrop-backup-build-*")):
+            if not path.is_dir():
+                continue
+            if _too_young(path):
+                report["skipped_recent"] += 1
+                continue
+            try:
+                shutil.rmtree(path)
+                report["removed_staging_dirs"].append(path_text(path))
+            except OSError as exc:
+                report["errors"].append({"path": path_text(path), "error": str(exc)})
+    return report
+
+
 BACKUP_ARCHIVE_NAME_RE = re.compile(r"^inkdrop-backup-(\d{8}-\d{6})-(.+)\.zip$")
 
 
@@ -1727,7 +1853,7 @@ def restore_backup_archive(
         # much free space as its real size.
         member_real_sizes = {
             name: zf.getinfo(name).file_size
-            for name in (STATE_DB_ARCHIVE_NAME, AUTH_DB_ARCHIVE_NAME, CONFIG_EXPORT_ARCHIVE_NAME, SECRET_REFS_ARCHIVE_NAME)
+            for name in (STATE_DB_ARCHIVE_NAME, AUTH_DB_ARCHIVE_NAME, COMPLETION_DB_ARCHIVE_NAME, CONFIG_EXPORT_ARCHIVE_NAME, SECRET_REFS_ARCHIVE_NAME)
             if name in archive_names
         }
 
@@ -1747,6 +1873,33 @@ def restore_backup_archive(
             aggregate_tracker=validation_tracker,
         )
         manifest = parse_strict_json_object(manifest_raw, max_bytes=_JSON_MEMBER_HARD_MAX_BYTES, label="backup manifest")
+        # Refuse an archive written by a newer InkDrop than this one. The
+        # portable-settings path has always checked its own document version
+        # (see _portable_settings_plan), but this path read the manifest's
+        # schema_version and never compared it -- so an archive from a future
+        # format was accepted and restored on the assumption that every member
+        # meant what today's code thinks it means.
+        #
+        # Only the forward direction is refused. An *older* archive is fine and
+        # is deliberately still accepted: init_schema() migrates a restored
+        # database forward on first open, which is verified by the
+        # old-application-schema case in the workspace-and-version-gate smoke.
+        # Deliberately narrow: only a version this code can read *and* compare,
+        # and which is genuinely higher, is refused. A missing or unparseable
+        # schema_version is not evidence of a future format -- a future format
+        # would carry a higher number, not a broken one -- so it falls through
+        # to the structural and SQLite integrity checks that actually defend
+        # this path. Rejecting it here instead pre-empted the decompression-bomb
+        # refusals with a misleading message, which is how
+        # inkdrop-backup-restore-decompression-bomb-smoke and
+        # inkdrop-backup-archive-resource-exhaustion-smoke caught the first cut.
+        manifest_schema_version = manifest.get("schema_version")
+        if type(manifest_schema_version) is int and manifest_schema_version > BACKUP_RESTORE_SCHEMA_VERSION:
+            raise ValueError(
+                f"backup archive was written by a newer InkDrop (backup format "
+                f"v{manifest_schema_version}; this build understands up to "
+                f"v{BACKUP_RESTORE_SCHEMA_VERSION}). Upgrade before restoring it."
+            )
         config_export_raw = _read_bounded_zip_member(
             zf,
             CONFIG_EXPORT_ARCHIVE_NAME,
@@ -1775,7 +1928,11 @@ def restore_backup_archive(
                 )
         # A dry run must prove the databases are usable, not merely that the
         # ZIP member names exist.  Extraction is isolated from restore targets.
-        preview_budget = member_real_sizes.get(STATE_DB_ARCHIVE_NAME, 0) + member_real_sizes.get(AUTH_DB_ARCHIVE_NAME, 0)
+        preview_budget = (
+            member_real_sizes.get(STATE_DB_ARCHIVE_NAME, 0)
+            + member_real_sizes.get(AUTH_DB_ARCHIVE_NAME, 0)
+            + member_real_sizes.get(COMPLETION_DB_ARCHIVE_NAME, 0)
+        )
         with tempfile.TemporaryDirectory(prefix="inkdrop-restore-preview-") as preview_dir:
             preview_root = Path(preview_dir)
             _require_free_space(preview_root, preview_budget, label="backup preview staging")
@@ -1790,6 +1947,14 @@ def restore_backup_archive(
                     preview_auth, label="backup auth database"
                 )
                 _check_validation_deadline(deadline, stage="auth database preview staging")
+            if COMPLETION_DB_ARCHIVE_NAME in archive_names:
+                preview_completion = _stage_archive_member(
+                    zf, COMPLETION_DB_ARCHIVE_NAME, preview_root, aggregate_tracker=validation_tracker
+                )
+                database_validation["completion_db"] = _validate_sqlite_database(
+                    preview_completion, label="backup completion database"
+                )
+                _check_validation_deadline(deadline, stage="completion database preview staging")
         result = {
             "ok": True,
             "dry_run": not bool(apply),
@@ -1802,6 +1967,7 @@ def restore_backup_archive(
             "would_restore": {
                 "state_db": STATE_DB_ARCHIVE_NAME in archive_names,
                 "auth_db": AUTH_DB_ARCHIVE_NAME in archive_names,
+                "completion_db": COMPLETION_DB_ARCHIVE_NAME in archive_names,
                 "config_export": CONFIG_EXPORT_ARCHIVE_NAME in archive_names,
                 "secret_refs": SECRET_REFS_ARCHIVE_NAME in archive_names,
             },
@@ -1822,7 +1988,9 @@ def restore_backup_archive(
         )
         _require_free_space(
             target_state_dir,
-            member_real_sizes.get(STATE_DB_ARCHIVE_NAME, 0) + member_real_sizes.get(AUTH_DB_ARCHIVE_NAME, 0),
+            member_real_sizes.get(STATE_DB_ARCHIVE_NAME, 0)
+            + member_real_sizes.get(AUTH_DB_ARCHIVE_NAME, 0)
+            + member_real_sizes.get(COMPLETION_DB_ARCHIVE_NAME, 0),
             label="restored state/auth databases",
         )
         _require_free_space(
@@ -1857,6 +2025,14 @@ def restore_backup_archive(
                     staged_files[AUTH_DB_ARCHIVE_NAME], label="backup auth database"
                 )
                 _check_validation_deadline(deadline, stage="auth database staging")
+            if COMPLETION_DB_ARCHIVE_NAME in archive_names:
+                staged_files[COMPLETION_DB_ARCHIVE_NAME] = _stage_archive_member(
+                    zf, COMPLETION_DB_ARCHIVE_NAME, target_state_dir, aggregate_tracker=apply_tracker
+                )
+                _validate_sqlite_database(
+                    staged_files[COMPLETION_DB_ARCHIVE_NAME], label="backup completion database"
+                )
+                _check_validation_deadline(deadline, stage="completion database staging")
             for archive_name in (CONFIG_EXPORT_ARCHIVE_NAME, SECRET_REFS_ARCHIVE_NAME):
                 staged_files[archive_name] = _stage_archive_member(
                     zf, archive_name, target_config_dir,
@@ -1924,6 +2100,18 @@ def restore_backup_archive(
             else:
                 result["auth_store"] = "absent"
             inkdrop_auth.reset_auth_store_cache()
+            if COMPLETION_DB_ARCHIVE_NAME in staged_files:
+                completion_target = target_state_dir / inkdrop_runtime_config.IMPORTED_FILES_DB_NAME
+                snapshot = _snapshot_existing_file(completion_target, backup_dir)
+                if snapshot:
+                    pre_restore_snapshots.append(path_text(snapshot))
+                os.replace(staged_files.pop(COMPLETION_DB_ARCHIVE_NAME), completion_target)
+                # Same stale-WAL hazard as the state database above: whatever
+                # -wal/-shm pair belonged to the file that used to be at this
+                # path would otherwise be replayed onto the restored one.
+                for suffix in ("-wal", "-shm"):
+                    Path(str(completion_target) + suffix).unlink(missing_ok=True)
+                result["restored_completion_db"] = path_text(completion_target)
             for archive_name, target_name in (
                 (CONFIG_EXPORT_ARCHIVE_NAME, "inkdrop-config-export.json"),
                 (SECRET_REFS_ARCHIVE_NAME, "inkdrop-secret-refs.json"),

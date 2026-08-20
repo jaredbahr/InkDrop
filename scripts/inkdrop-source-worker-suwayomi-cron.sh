@@ -3,6 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
+# What this job means its per-pass sizing to be. The environment still wins --
+# `${VAR:-default}` yields the environment's value whenever it sets one, which
+# is the right precedence for an operator override. The problem was that the
+# override was invisible: on this deployment the container environment sets
+# QUEUE_LIMIT=50 / ELIGIBLE_LIMIT=10 / MAX_RUN_SECONDS=600, so every number
+# below was dead and anyone reading this file was misled about what runs.
+# Recording the intent lets inkdrop-source-worker.sh say so in its log instead
+# of the divergence being discoverable only by measuring a live instance.
+export INKDROP_SOURCE_WORKER_JOB_INTENT="${INKDROP_SOURCE_WORKER_JOB_INTENT:-INKDROP_SOURCE_WORKER_QUEUE_LIMIT=60,INKDROP_SOURCE_WORKER_ELIGIBLE_LIMIT=60,INKDROP_SOURCE_WORKER_MAX_RUN_SECONDS=300,INKDROP_SOURCE_WORKER_COMMAND_TIMEOUT_SECONDS=360}"
+
 export INKDROP_SOURCE_WORKER_PROVIDER_IDS="${INKDROP_SOURCE_WORKER_PROVIDER_IDS:-suwayomi,mangadex,prowlarr_nyaa,prowlarr_tokyo_toshokan_manga}"
 export INKDROP_SOURCE_WORKER_EXECUTE="${INKDROP_SOURCE_WORKER_EXECUTE:-1}"
 export INKDROP_SOURCE_WORKER_WRITE="${INKDROP_SOURCE_WORKER_WRITE:-1}"

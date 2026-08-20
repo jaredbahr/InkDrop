@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from tools import inkdrop_public_repo_export
+from tools import inkdrop_docker_context_manifest, inkdrop_public_repo_export
 
 
 REQUIRED_EXPORT_FILES = {
@@ -270,6 +270,86 @@ def assert_no_private_text_markers(root):
         require(not matches, f"private marker(s) exported in {relative}: {matches}")
 
 
+# The release gate has to survive the trip into the public repo, and the two
+# repos disagree about which branch ships: qa here, main there. A condition
+# written for one reads as false on the other, and a job that skips reports a
+# green check, so the release still looks verified while nothing tested it.
+# That is how it nearly shipped -- #682 gated full_smoke_suite to
+# refs/heads/qa to keep it off pull requests, correct for this repo, and the
+# next export would have carried it to a repo where the release commit lands
+# on main.
+#
+# Checked against the exported bytes rather than the source workflow, because
+# the export is free to rewrite this file and the only thing that matters is
+# what the public repo actually receives.
+RELEASE_GATE_JOBS = ("public_release", "full_smoke_suite")
+
+# public_release is deliberately absent: its Docker-free half is the per-pull-
+# request signal and is supposed to run there. Only its container steps defer,
+# which is asserted separately below.
+JOBS_THAT_MUST_SKIP_PULL_REQUESTS = ("full_smoke_suite",)
+
+CONTAINER_STEPS_DEFERRED_ON_PULL_REQUESTS = (
+    "Build Docker image",
+    "Run strict container preflight",
+    "Verify container install support summary",
+    "Verify release-ready JSON gate",
+)
+
+
+def _evaluate_ref_condition(expression, event_name, ref):
+    """Evaluate the subset of GitHub expression syntax these gates use."""
+    if expression is None:
+        return True
+    python_expression = (
+        expression.replace("github.event_name", repr(event_name))
+        .replace("github.ref", repr(ref))
+        .replace("&&", " and ")
+        .replace("||", " or ")
+    )
+    return bool(eval(python_expression, {"__builtins__": {}}, {}))
+
+
+def assert_exported_release_gates_run_on_public_main():
+    import yaml
+
+    workflow = yaml.safe_load(
+        inkdrop_public_repo_export.public_workflow_bytes().decode("utf-8")
+    )
+    jobs = workflow.get("jobs") or {}
+    for job_name in RELEASE_GATE_JOBS:
+        job = jobs.get(job_name)
+        require(job is not None, f"exported public workflow is missing {job_name}")
+        condition = job.get("if")
+        require(
+            _evaluate_ref_condition(condition, "push", "refs/heads/main"),
+            f"exported {job_name} would skip on a public release push to main: if = {condition!r}",
+        )
+        if job_name in JOBS_THAT_MUST_SKIP_PULL_REQUESTS:
+            require(
+                not _evaluate_ref_condition(condition, "pull_request", "refs/pull/1/merge"),
+                f"exported {job_name} still runs on pull requests: if = {condition!r}",
+            )
+
+    steps = {
+        step.get("name"): step
+        for step in jobs["public_release"].get("steps") or []
+        if isinstance(step, dict) and step.get("name")
+    }
+    for step_name in CONTAINER_STEPS_DEFERRED_ON_PULL_REQUESTS:
+        step = steps.get(step_name)
+        require(step is not None, f"public_release lost its {step_name!r} step")
+        condition = step.get("if")
+        require(
+            _evaluate_ref_condition(condition, "push", "refs/heads/main"),
+            f"{step_name!r} would skip on a public release push to main: if = {condition!r}",
+        )
+        require(
+            not _evaluate_ref_condition(condition, "pull_request", "refs/pull/1/merge"),
+            f"{step_name!r} still runs on pull requests: if = {condition!r}",
+        )
+
+
 def assert_generated_manifest_matches_tree(root):
     root = Path(root)
     manifest_path = root / "PUBLIC_REPO_MANIFEST.json"
@@ -495,6 +575,41 @@ def assert_compose_mounts_match_dockerfile_defaults(root):
         )
 
 
+def assert_dockerfile_copy_sources_are_in_build_context(root):
+    """Everything the exported Dockerfile COPYs must survive .dockerignore.
+
+    The export relocates the nine cron/audit shell scripts under scripts/ and
+    rewrites the Dockerfile's COPY sources to match, but .dockerignore is a
+    default-deny allowlist and its entries were left pointing at the repo root.
+    Docker never sent scripts/ to the daemon, so `docker build` failed on the
+    first COPY of a file that was sitting right there in the tree. Checking the
+    two against each other catches any future relocation that moves a file
+    without moving its allowlist entry, not just this one.
+    """
+    included = {
+        str(path).replace("\\", "/")
+        for path in inkdrop_docker_context_manifest.included_files(Path(root))
+    }
+    text = (Path(root) / "Dockerfile").read_text(encoding="utf-8").replace("\\\n", " ")
+    sources = []
+    for line in text.splitlines():
+        if not line.startswith("COPY") or "--from=" in line:
+            continue
+        tokens = [token for token in line.split()[1:] if not token.startswith("--")]
+        sources.extend(tokens[:-1])
+    require(sources, "exported Dockerfile declares no COPY sources to check")
+    missing = sorted(
+        source
+        for source in sources
+        if not source.endswith("/") and source not in included
+    )
+    require(
+        not missing,
+        f"exported Dockerfile COPYs paths that .dockerignore excludes from the "
+        f"build context, so the image cannot build: {missing}",
+    )
+
+
 def assert_exported_compose_is_approved(root, result):
     """The public docker-compose.yml is the single-service beta file, not the dev tree's build-from-source one."""
     shipped = (Path(root) / "docker-compose.yml").read_text(encoding="utf-8")
@@ -639,9 +754,11 @@ def main():
         require(manifest.get("file_count") == len(paths) - 1, "manifest should count copied files, excluding itself")
         assert_exported_readme_is_approved(tmp, result)
         assert_exported_compose_is_approved(tmp, result)
+        assert_dockerfile_copy_sources_are_in_build_context(tmp)
         assert_generated_manifest_matches_tree(tmp)
         assert_exported_tree_self_checks(tmp)
         assert_normal_git_staging(tmp)
+        assert_exported_release_gates_run_on_public_main()
 
     print("inkdrop public repo export smoke: PASS")
 

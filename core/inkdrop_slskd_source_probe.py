@@ -32,6 +32,9 @@ except Exception:
 from core import inkdrop_runtime_config
 from core import inkdrop_internal_jobs
 from core import inkdrop_download_client_routing
+from core import inkdrop_slskd_refusal_vocabulary
+from core import inkdrop_query_variant_outcomes as query_variant_outcomes
+from core import inkdrop_source_worker_runtime
 from core import inkdrop_sources
 
 try:
@@ -48,6 +51,11 @@ try:
     from core import inkdrop_candidate_matching
 except Exception:
     inkdrop_candidate_matching = None
+
+try:
+    from core import inkdrop_source_worker_coordinator
+except Exception:
+    inkdrop_source_worker_coordinator = None
 
 try:
     from core import inkdrop_artifact_acceptance
@@ -93,7 +101,33 @@ MARK_WAITING_API_URL = os.environ.get("INKDROP_MARK_WAITING_API_URL") or (
 )
 DEFAULT_SLSKD_DOWNLOAD_ROOT = Path(os.environ.get("INKDROP_SLSKD_DOWNLOAD_ROOT") or STAGING_DIR / "slskd")
 SLSKD_DOWNLOAD_ROOT = DEFAULT_SLSKD_DOWNLOAD_ROOT
-SLSKD_INCOMPLETE_ROOT = Path(os.environ.get("INKDROP_SLSKD_INCOMPLETE_ROOT") or SLSKD_DOWNLOAD_ROOT / "incomplete")
+SLSKD_INCOMPLETE_ROOT_ENV = (os.environ.get("INKDROP_SLSKD_INCOMPLETE_ROOT") or "").strip()
+DEFAULT_SLSKD_INCOMPLETE_ROOT = Path(
+    SLSKD_INCOMPLETE_ROOT_ENV or DEFAULT_SLSKD_DOWNLOAD_ROOT / "incomplete"
+)
+SLSKD_INCOMPLETE_ROOT = DEFAULT_SLSKD_INCOMPLETE_ROOT
+
+
+def resolved_incomplete_root(configured, download_root):
+    """Resolve the incomplete path: explicit setting, then env, then derived.
+
+    ``configured`` is whatever the provider row or download-client instance
+    stored, ``download_root`` the completed-download path it pairs with.
+    Deriving straight from ``download_root`` silently discarded
+    INKDROP_SLSKD_INCOMPLETE_ROOT -- the module constant above resolved the env
+    var correctly at import, then apply_slskd_provider_settings() overwrote the
+    global with the derived path on every probe run. An operator keeping
+    in-progress transfers on a separate disk got no error and no effect.
+    Deriving stays the fallback so an unset env var keeps pairing the incomplete
+    folder with whichever download_root is actually in force.
+    """
+
+    explicit = str(configured or "").strip()
+    if explicit:
+        return explicit
+    if SLSKD_INCOMPLETE_ROOT_ENV:
+        return SLSKD_INCOMPLETE_ROOT_ENV
+    return str(Path(download_root or DEFAULT_SLSKD_DOWNLOAD_ROOT) / "incomplete")
 MANUAL_COMICS_INBOX = Path(os.environ.get("INKDROP_MANUAL_COMICS_INBOX") or MANUAL_INBOX_DIR / "comics")
 
 
@@ -243,6 +277,12 @@ DEFAULT_SLSKD_PREFERRED_EXACT_MIN_BYTES = max(
 )
 SLSKD_PREFERRED_EXACT_MIN_BYTES = DEFAULT_SLSKD_PREFERRED_EXACT_MIN_BYTES
 AUTO_INSPECT_USER_MESSAGE = "Exact issue match, but the file is smaller than expected. Sent to inspection."
+# Two different unknowns reach inspection now. Telling somebody a 60 MB book is
+# "smaller than expected" because that was the only sentence available is a
+# small lie that costs them the actual reason they are looking at this row.
+AUTO_INSPECT_ACRONYM_USER_MESSAGE = (
+    "The filename names this series only by its initials, so we are checking inside before importing."
+)
 AUTO_GRAB_MAX_BYTES = 2 * 1024 * 1024 * 1024
 AUTO_GRAB_PACK_MAX_BYTES = 5 * 1024 * 1024 * 1024
 AUTO_GRAB_MAX_ATTEMPTS_PER_REVIEW = 12
@@ -541,7 +581,7 @@ def load_slskd_provider_settings():
             "download_client_instance_id": routed["download_client_instance_id"],
             "base_url": normalized_slskd_base_url(instance.get("base_url")),
             "download_root": download_root,
-            "incomplete_root": str(runtime.get("incomplete_root") or Path(download_root) / "incomplete"),
+            "incomplete_root": resolved_incomplete_root(runtime.get("incomplete_root"), download_root),
             "max_total": int_setting(runtime, "max_total", 12, 0, 50),
             "max_per_series": int_setting(runtime, "max_per_series", 3, 1, 20),
             "wait_seconds": int_setting(runtime, "wait_seconds", 8, 2, 60),
@@ -572,7 +612,9 @@ def load_slskd_provider_settings():
         "source": config.get("source") or "fallback",
         "base_url": base_url,
         "download_root": str(settings.get("download_root") or DEFAULT_SLSKD_DOWNLOAD_ROOT),
-        "incomplete_root": str(settings.get("incomplete_root") or Path(settings.get("download_root") or DEFAULT_SLSKD_DOWNLOAD_ROOT) / "incomplete"),
+        "incomplete_root": resolved_incomplete_root(
+            settings.get("incomplete_root"), settings.get("download_root")
+        ),
         "max_total": int_setting(settings, "max_total", 12, 0, 50),
         "max_per_series": int_setting(settings, "max_per_series", 3, 1, 20),
         "wait_seconds": int_setting(settings, "wait_seconds", 8, 2, 30),
@@ -792,16 +834,26 @@ NON_ENGLISH_LANGUAGE_MARKERS = {
     "spa",
     "spanish",
 }
-NON_ENGLISH_COLLECTION_MARKERS = {
-    "bd",
-    "bds",
-    "fumetti",
-    "historieta",
-    "historietas",
-    "occidentali",
-    "quadrinho",
-    "quadrinhos",
-}
+# NON_ENGLISH_COLLECTION_MARKERS used to live here: bd, bds, fumetti,
+# historieta(s), occidentali, quadrinho(s). It is gone rather than shortened,
+# because every word in it was the same mistake.
+#
+# Those words name a *medium*, not the language of a book. "BD" is bande
+# dessinee -- it says "these are comics", exactly as a folder called Comics
+# does. "Fumetti", "historieta" and "quadrinhos" are the same word in other
+# languages, and "occidentali" means *western*: the files under it were
+# English-language Avatar comics on an Italian speaker's shelf.
+#
+# So the set gated one thing while claiming to gate another. It read the
+# language of the *shelf label* and refused the book, which meant a French
+# series the catalogue deliberately tracks was found and then thrown away:
+# ten Mortelle Adele volumes at 67-108 MB, reachable by the bare query and
+# refused at this gate for being filed under BD.
+#
+# Per tracker #296 the safety gates are wrong series, wrong unit and wrong
+# medium. Language is not among them, and the language of a folder name is not
+# even evidence about language. If language preference is wanted later it is a
+# per-series toggle under that same ruling, never a hardcoded blocklist.
 NON_ENGLISH_ARTICLES = {
     "das",
     "de",
@@ -2587,6 +2639,10 @@ def queue_source_review_item(row):
         "edition_id": row.get("edition_id") or "",
         "edition_marker": row.get("edition_marker") or "",
         "username": row.get("username") or row.get("slskd_username") or row.get("last_slskd_user") or "",
+        # Whether that username still owns a live SLSKD handoff. A staged-file
+        # scan may only credit the peer while this is false -- see
+        # staged_candidate_owner().
+        "slskd_handoff_retired": slskd_handoff_retired(row),
         "source": "series_autopilot_queue",
         "autopilot_queue": True,
         "autopilot_queue_key": row.get("key") or "",
@@ -3414,6 +3470,53 @@ def alias_mentions_issue(alias, issue):
     return number in tokens
 
 
+def alias_declares_issue(alias, issue, series_title=""):
+    """Whether an alias actually CLAIMS the wanted unit, rather than merely
+    containing its number by coincidence.
+
+    alias_mentions_issue() answers "does this text contain that number", which
+    is the right question for a coverage alias like "Batman 1-50" and the wrong
+    one for a title whose own name contains a numeral. Measured live
+    2026-08-19: five wanted rows had no unqualified query at ANY rung because
+    of this -- "5 Worlds" at issue 5, "One Piece" at issue 1, "Injustice: Gods
+    Among Us Year Five" at issue 5, "Seven To Eternity" at issue 7. Each is
+    clean at every other issue number and breaks only where the intrinsic
+    numeral collides with the wanted one, which is what makes it a collision
+    rather than a claim.
+
+    A number is a CLAIM when it is a coverage range the alias declares, or when
+    it is introduced by a unit word ("Vol 5", "Book 5"). A number already
+    present in the series' own title is INTRINSIC and claims nothing: it is
+    there for issue 1 and issue 900 alike.
+    """
+
+    if not alias_mentions_issue(alias, issue):
+        return False
+    # A declared coverage range is a real claim -- keep the existing behaviour.
+    number = token_number(str(issue or "").strip())
+    text = str(alias or "")
+    for start, end in re.findall(r"(?<!\d)(\d{1,4})\s*[-–—]\s*(\d{1,4})(?!\d)", text):
+        try:
+            if number is not None and int(start) <= number <= int(end):
+                return True
+        except ValueError:
+            pass
+    # An explicit unit marker is a real claim.
+    if title_has_numbering(text):
+        return True
+    # Otherwise: intrinsic to the name if the series title carries the same
+    # number. Compared on normalized number tokens so "5 Worlds" and its
+    # "Five Worlds" alias are recognised as the same intrinsic numeral.
+    series_tokens = {
+        token_number(token)
+        for token in re.findall(rf"(?<![a-z0-9]){NUMBER_TOKEN_PATTERN}(?![a-z0-9])", str(series_title or ""), flags=re.I)
+    }
+    series_tokens.discard(None)
+    if number is not None and number in series_tokens:
+        return False
+    return True
+
+
 def title_has_numbering(value):
     return bool(
         re.search(
@@ -3645,6 +3748,343 @@ def slskd_media_query_qualifier(item):
     return "comics"
 
 
+def query_terms(query):
+    """The whole tokens Soulseek will AND for this query."""
+    return frozenset(normalize(query).split())
+
+
+def recent_empty_query_terms(max_age_seconds=None):
+    """Term sets of recently completed searches that came back with nothing.
+
+    Read from SLSKD's own search record rather than InkDrop's ledger, because
+    the ledger counts attempts and this needs outcomes.
+
+    Bounded by the same one-hour window the code already trusts a zero for in
+    `reusable_slskd_search()`. A Soulseek zero is not proof that nothing
+    exists -- it can equally mean nobody who has it was awake -- so it is
+    worth acting on for as long as that answer is considered current, and no
+    longer.
+    """
+    window = slskd_zero_result_query_cooldown_seconds() if max_age_seconds is None else max_age_seconds
+    if window <= 0:
+        return []
+    try:
+        rows = slskd_get("/searches", timeout=5)
+    except Exception:
+        # No record is not the same as no zeros. Prune nothing.
+        return []
+    if not isinstance(rows, list):
+        return []
+    cutoff = now() - window
+    empty = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("isComplete"):
+            continue
+        if int(row.get("fileCount") or 0) > 0:
+            continue
+        started_at = _parse_slskd_started_at(row.get("startedAt"))
+        if not started_at or started_at < cutoff:
+            continue
+        terms = query_terms(row.get("searchText"))
+        if terms:
+            empty.append(terms)
+    return empty
+
+
+def query_is_futile(query, empty_term_sets):
+    """Whether AND semantics already guarantee this query returns nothing.
+
+    Soulseek requires every term to match, so adding a term can only shrink
+    the result set -- never grow it. If a search whose terms are all present
+    in this query already came back empty, this query asks for everything that
+    one asked for and more, and cannot do better than empty.
+
+    That is arithmetic, not a heuristic, and it needs no list of bad suffixes:
+    the wasteful rungs are wasteful because they pile terms onto a question
+    that was already answered with nothing. `Image Firsts ODY C` returned zero
+    at 19:18; `Image Firsts ODY-C 1 2015` returned zero at 19:32 having added
+    two more terms to it. The second search was knowably pointless before it
+    was issued.
+    """
+    terms = query_terms(query)
+    if not terms:
+        return False
+    return any(empty <= terms for empty in empty_term_sets or ())
+
+
+def prune_futile_queries(queries, empty_term_sets):
+    """Drop rungs that cannot return anything, keeping the anchor.
+
+    The anchor is never pruned even when it looks futile. It is the one query
+    that reaches a peer filing comics under no type marker at all, and a
+    single timed-out zero -- Soulseek ends most searches that way -- would
+    otherwise silence a whole series for an hour on the strength of one
+    unanswered question.
+    """
+    queries = list(queries or [])
+    if len(queries) <= 1 or not empty_term_sets:
+        return queries, []
+    kept = queries[:1]
+    dropped = []
+    for query in queries[1:]:
+        if query_is_futile(query, empty_term_sets):
+            dropped.append(query)
+        else:
+            kept.append(query)
+    return kept, dropped
+
+
+
+# Soulseek answers a search with at most this many peers. It is a protocol
+# ceiling, not a setting: nothing in slskd's exposed options carries it and
+# nothing here can raise it. What matters is not the number but how the slots
+# are filled -- by whoever answers FIRST, not by whoever is most relevant.
+# 67% of what a bare title query returns on this deployment is audio and
+# video, so on a query that fills the ceiling the comic shelves are simply
+# never heard from, and no amount of re-ranking afterwards can recover a peer
+# that was never in the reply set.
+SOULSEEK_RESPONSE_CEILING = 250
+
+# Type words that select a peer's shelf rather than naming the work. Kept
+# deliberately small: this is the set a saturated anchor may be narrowed by,
+# not a general vocabulary.
+MEDIA_MARKER_TOKENS = ("comics", "comic", "manga")
+
+
+def search_response_count(row):
+    try:
+        return int((row or {}).get("responseCount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def saturated_query_texts(max_age_seconds=None):
+    """Normalized query texts whose recent search filled Soulseek's ceiling.
+
+    Read from SLSKD's own record for the same reason recent_empty_query_terms()
+    is: the ledger counts attempts, and this needs outcomes.
+
+    A saturated answer is not a rich answer. It means the reply window filled
+    with whoever responded fastest and the search was cut short, so the peers
+    holding a niche shelf may never have been reached at all. Measured
+    2026-08-16: "Chew" filled the ceiling at 249 peers and returned 81
+    book-shaped files, while "Chew comics" reached 28 peers -- only 3 of them
+    shared with the bare query -- and returned 695. The narrowed query is not
+    a subset of the broad one, it is a mostly-disjoint reach.
+
+    Bounded by the RICH-result window, not the zero window, and the difference
+    is load-bearing. A zero is volatile -- a peer holding the file could come
+    online any minute -- so it is trusted for an hour. Saturation is not that
+    kind of fact: it says this query text is broad enough to fill the reply
+    ceiling, which is a property of the words, not of who happens to be awake.
+    "Spawn" does not stop being a common word in an hour.
+
+    Using the one-hour window here would have quietly disabled this for the
+    series that need it most. A rarely-probed series is asked once every
+    several hours, so by its next pass a one-hour saturation record has always
+    expired and the anchor would never be narrowed -- the starved series would
+    keep paying the full ceiling cost forever while busy series got the fix.
+    """
+    window = slskd_repeat_query_cooldown_seconds() if max_age_seconds is None else max_age_seconds
+    if window <= 0:
+        return set()
+    try:
+        rows = slskd_get("/searches", timeout=5)
+    except Exception:
+        # No record is not the same as no saturation. Narrow nothing.
+        return set()
+    if not isinstance(rows, list):
+        return set()
+    cutoff = now() - window
+    saturated = set()
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("isComplete"):
+            continue
+        if search_response_count(row) < SOULSEEK_RESPONSE_CEILING:
+            continue
+        started_at = _parse_slskd_started_at(row.get("startedAt"))
+        if not started_at or started_at < cutoff:
+            continue
+        text = normalize(row.get("searchText"))
+        if text:
+            saturated.add(text)
+    return saturated
+
+
+def media_qualified_rung_index(queries, anchor_terms, qualifier=""):
+    """Index of the rung that is exactly the anchor plus one shelf marker.
+
+    Exact, not "contains a marker": a rung that also adds an issue number is a
+    different question, and promoting it would narrow past the shelf.
+    """
+    preferred = [marker for marker in (normalize(qualifier),) if marker]
+    order = preferred + [marker for marker in MEDIA_MARKER_TOKENS if marker not in preferred]
+    for marker in order:
+        for index, query in enumerate(queries):
+            if index == 0:
+                continue
+            if query_terms(query) == (set(anchor_terms) | {marker}):
+                return index
+    return -1
+
+
+def narrow_saturated_anchor(queries, saturated_texts, qualifier=""):
+    """Give the anchor slot to the qualified rung when the bare anchor saturates.
+
+    source_queries() puts the bare title first and rotated_query_batch() sends
+    index 0 on every pass, so a saturating anchor spends one of every two
+    query slots re-asking a question whose reply window is already known to be
+    mostly music.
+
+    This only reorders, never drops. The bare title moves to the first
+    rotating slot, so it is still asked -- just not asked every single time.
+    It remains the one query that reaches a peer filing comics under no type
+    marker at all, which is why it keeps a place rather than being removed.
+
+    Under the ceiling this is a no-op, and deliberately so: measured on
+    Miracleman at 55 peers, the qualified form found zero peers the bare query
+    had not already reached, so narrowing there would cost reach and buy
+    nothing.
+    """
+    queries = list(queries or [])
+    if len(queries) < 2 or not saturated_texts:
+        return queries, -1
+    anchor = queries[0]
+    if normalize(anchor) not in saturated_texts:
+        return queries, -1
+    anchor_terms = query_terms(anchor)
+    if not anchor_terms:
+        return queries, -1
+    index = media_qualified_rung_index(queries, anchor_terms, qualifier)
+    if index < 1:
+        return queries, -1
+    reordered = [queries[index], anchor]
+    reordered.extend(
+        query for position, query in enumerate(queries) if position not in (0, index)
+    )
+    return reordered, index
+
+def search_text(value):
+    """A catalogue title as a Soulseek query: grammar dropped, names intact.
+
+    Soulseek ANDs whole tokens against a peer's full path, so every character
+    the catalogue carries that a filename does not is a term that can only
+    lose matches. `display_clean()` handles the separators InkDrop introduced
+    (``:`` and `` - ``) but leaves the cataloguer's own punctuation, so
+    ``Nickelodeon Avatar: The Last Airbender -- Suki, Alone`` still goes out
+    carrying a comma no peer put in a filename.
+
+    The rule is not which characters -- listing them is how you end up
+    maintaining a table of punctuation. It is what the character is *doing*,
+    and there are exactly three things it can be doing:
+
+    * **inside a word**, alphanumeric on both sides. Load-bearing: removing it
+      fuses two words into one that appears nowhere (``Takopi's`` ->
+      ``Takopis``, ``ODY-C`` -> ``ODYC``).
+    * **a word in its own right**, whitespace on both sides. Also
+      load-bearing, and easy to miss: the ``+`` in ``The Wicked + The Divine``
+      and the ``&`` in ``Love & Rockets`` are part of how those titles are
+      written and filed. One mark standing alone is being read as a word
+      ("plus", "and"); a *repeated* mark is typography rather than a word, so
+      the ``--`` in ``Airbender -- Suki, Alone`` is a dash and goes.
+    * **hanging off a word**, alphanumeric on exactly one side. This is the
+      cataloguer's grammar -- the comma in ``Suki, Alone``, the period ending
+      ``The Gods Lie.``, the brackets around ``(Omnibus)`` -- and no filename
+      token carries it.
+
+    Only the third is dropped.
+
+    Measured live against this network 2026-08-16, each pair back to back:
+
+        'Avatar The Last Airbender Suki, Alone'   3 peers    4 files
+        'Avatar The Last Airbender Suki Alone'    5 peers    6 files
+        'The Gods Lie.'                          75 peers  142 files
+        'The Gods Lie'                          142 peers  312 files
+        'Goodbye, Eri'                            5 peers    7 files
+        'Goodbye Eri'                             7 peers    9 files
+
+    Every clean form beat its punctuated form; the trailing period was worth
+    2.2x the files. Only three of the 295 tracked titles carry punctuation
+    this touches, so the reach is narrow -- but all three were series with
+    unresolved wanted rows at the time, and a hand-typed punctuation-free
+    query found one of the files the catalogue-verbatim query did not.
+
+    Query text only. Identity comparison keeps the punctuation, because there
+    the difference between two titles can be exactly the punctuation.
+    """
+    text = display_clean(value)
+    if not text:
+        return ""
+    chars = list(text)
+    kept = []
+    for index, char in enumerate(chars):
+        if char.isalnum() or char.isspace():
+            kept.append(char)
+            continue
+        previous = chars[index - 1] if index else ""
+        following = chars[index + 1] if index + 1 < len(chars) else ""
+        touching = int(previous.isalnum()) + int(following.isalnum())
+        if touching != 1:
+            kept.append(char)
+    return " ".join(
+        token
+        for token in "".join(kept).split()
+        if len(token) == 1 or any(char.isalnum() for char in token)
+    )
+
+
+def media_path_marker_queries(title, qualifier="comics"):
+    """Queries that bias Soulseek toward a peer's comic/manga shelf.
+
+    Soulseek matches whole, case-insensitive tokens against a peer's FULL
+    shared path -- not the filename -- and every term must match. Measured
+    2026-08-16 over 36 live searches: for "The Manhattan projects comics",
+    249 of 249 returned files carried "comics" in a *directory* component and
+    none in the leaf; the same query spelled "... comic" returned zero files,
+    which is only possible if the match is on whole tokens.
+
+    That makes the type word a folder selector. Without it a broad title query
+    fills Soulseek's 250-peer response ceiling with whoever answers first --
+    on this deployment 67% of what comes back is audio and video, and the
+    comic shelves are simply never heard from. "Chew" returned 249 peers and
+    81 book-shaped files; "Chew comics" returned 28 peers, only 3 of them
+    shared with the bare query, and 695 book-shaped files.
+
+    Both spellings are needed and they cannot be combined. Terms are ANDed, so
+    "<title> comic comics" demands both tokens and reaches 10% of the
+    book-shaped files the two separate queries reach together (85%). Peers
+    split by convention: "Comics\\", "##Comics\\" against "Comic Books\\",
+    "Comic Library\\".
+
+    Manga rows get "comics" as well, after their own word. The two markers are
+    not alternatives -- "COMICS\\MANGA\\Children of the Sea v01" is a real
+    shelf on this network, and 5 of the 21 files a "Children of the sea manga"
+    query returns carry both.
+
+    This never replaces the bare title. That stays at query zero, which
+    rotated_query_batch() pins as the anchor, because a fifth of the
+    book-shaped files a bare query finds sit in paths with no type marker at
+    all ("Calibre Library\\Q Hayashida\\Dorohedoro v01.cbz"). The marker
+    queries are additional reach, not a filter.
+    """
+
+    clean = display_clean(title)
+    if not clean or title_has_numbering(clean):
+        return []
+    qualifier = normalize(qualifier) or "comics"
+    if qualifier == "manga":
+        # "<t> manga" first: measured 3189 book-shaped files against 722 for
+        # "<t> comics" on Berserk, 1027 vs 93 on Dorohedoro, 1472 vs 168 on
+        # Vagabond. "comics" still earns its slot -- it was non-empty for
+        # every manga row sampled.
+        return unique_values([f"{clean} manga", f"{clean} comics"], limit=2)
+    # Plural leads for western comics: across seven titles the plural arm
+    # returned 5,190 files the singular never saw, against 334 the other way.
+    # The singular is not redundant -- those 334 are "Comic Books\" shelves --
+    # but it is the smaller half.
+    return unique_values([f"{clean} comics", f"{clean} comic"], limit=2)
+
+
 def broad_series_query_variants(title, qualifier="comics"):
     clean = display_clean(title)
     if not clean or title_has_numbering(clean):
@@ -3700,10 +4140,67 @@ def trusted_collected_singleton_query_anchor(item):
     return min(eligible, key=lambda value: (len(important_words(value)), len(normalize(value)), normalize(value)))
 
 
+def _unitless_work_issue_title(value):
+    """The shared classifier, resolved defensively.
+
+    getattr rather than a direct call: a coordinator that predates this
+    classifier must make the answer "no", not raise. These modules ship
+    together, so that is a partial-rollout guard rather than an expected path.
+    """
+
+    classifier = getattr(
+        inkdrop_source_worker_coordinator, "unitless_work_issue_title", None
+    )
+    if not callable(classifier):
+        return False
+    return bool(classifier(value))
+
+
+def item_is_unitless_work(item):
+    """Whether this wanted row is for a work that has no unit of its own.
+
+    Prefers the durable proof the coordinator computes, and falls back to the
+    same issue-title rule that proof is built from. The fallback is safe HERE
+    and would not be safe in the matcher: over-applying it on the query side
+    only means searching without a number, which is the broader question
+    anyway, while over-applying it on the matcher side loses a book silently.
+    """
+
+    item = item if isinstance(item, dict) else {}
+    if item.get("unitless_work_proof") is True:
+        return True
+    return _unitless_work_issue_title(item.get("issue_title") or item.get("issueTitle"))
+
+
 def source_queries(item):
     series = item_series_title(item)
     issue = str(item.get("issue") or "").strip()
+    unitless_work = item_is_unitless_work(item)
+    if unitless_work:
+        # A standalone graphic novel has no unit number, so every rung built
+        # from one asks for a token no correct filename can carry. Measured on
+        # the live library 2026-08-18: 66-72% of this class's ladder was such
+        # rungs, and the rotation sends two queries a pass, so they crowded out
+        # the questions that can still be answered. Clearing the issue token
+        # here empties every suffix builder below at once rather than teaching
+        # each of them the same exception.
+        issue = ""
     queries = []
+    # A hand-corrected query leads, ahead of every generated variant.
+    #
+    # SLSKD is the reason this exists as its own branch rather than riding
+    # item["query"] like the indexer sources do: nothing in this function ever
+    # reads that key, so before this an operator could correct a query, watch
+    # Prowlarr use it, and watch SLSKD keep sending the generated one. That is
+    # precisely the case the button was asked for -- catalogue titles carry
+    # formatting no filename has (a comma in "Suki, Alone", a trailing period
+    # in "The Gods Lie.", a "Nickelodeon" publisher prefix no release uses),
+    # and the medium word matters per-language ("Mortelle Adele BD" finds files
+    # where "comics" finds none). Those are file-sharing searches, so a fix
+    # that reached only the indexers would have missed the motivating example.
+    operator_query = " ".join(str(item.get("operator_query") or "").split()).strip()
+    if operator_query:
+        queries.append(operator_query)
     metadata = issue_metadata_for_item(item)
     metadata_query = metadata.get("search_query")
     variants = slskd_query_priority_titles(series, prioritized_title_variants(source_title_variants(item)))
@@ -3733,29 +4230,52 @@ def source_queries(item):
     # parsing still enforces the requested unit, while one response can expose
     # a complete sibling directory for safe multi-issue coverage.
     for title in preferred_titles[:1]:
-        if alias_mentions_issue(title, issue) or title_has_numbering(title):
+        # alias_declares_issue(), not alias_mentions_issue(): a numeral that is
+        # part of the work's own name must not cost this row its anchor. This
+        # is the ONLY slot that uses the narrower test -- every rung below
+        # still uses alias_mentions_issue(), so nothing else widens.
+        if alias_declares_issue(title, issue, series) or title_has_numbering(title):
             continue
-        # Only the bare title gets the guaranteed early slot here (this is
-        # also where slskd_query_priority_titles() puts an already-promoted
-        # alternate title, e.g. the de-prefixed form of a creator-credited
-        # series). Real slskd search history shows the media-qualified form
-        # ("<title> manga"/"<title> comics") of a title uploaders already
-        # file things under consistently underperforms the plain title
-        # badly and adds ~no unique coverage -- Monster 6622 vs 1705,
-        # Kingdom 8477 vs 1951, On a Sunbeam 1124 vs 0, Deadman Wonderland
-        # 1582 vs 197 (its one uniquely-found peer a duplicate of an
-        # already-found match), and even the exact "20th Century Boys"
-        # case that motivated the alternate-title loop below: 2,405+ files
-        # bare vs. 982 qualified, zero peers unique to the qualified form.
-        # The canonical (still-known-mismatched) title just below keeps its
-        # qualified fallback untouched -- that's a genuinely different,
-        # unverified case left alone rather than guessed at.
+        # The bare title keeps the guaranteed anchor slot (this is also where
+        # slskd_query_priority_titles() puts an already-promoted alternate
+        # title, e.g. the de-prefixed form of a creator-credited series). It
+        # is the only query that reaches a peer filing comics under no type
+        # marker at all, so it leads and is never displaced.
+        #
+        # An earlier revision read the media-qualified form as dead weight on
+        # raw file counts -- Monster 6622 vs 1705, Deadman Wonderland 1582 vs
+        # 197, "20th Century Boys" 2405 vs 982. Those counts are real and the
+        # reading of them was wrong: 67% of what a bare query returns here is
+        # audio and video, so the bigger number is mostly music. Counting only
+        # book-shaped files reverses every one of those comparisons -- bare
+        # "Vagabond" returns 1,263 files of which 6 are books, while "Vagabond
+        # manga" returns 2,240 of which 1,472 are.
+        #
+        # The peer-diff half of that evidence held up, with a boundary it did
+        # not have: the qualifier adds no new peers when the bare query stays
+        # under Soulseek's 250-peer response ceiling (Miracleman, 55 peers --
+        # zero peers unique to the qualified form, reproduced 2026-08-16), and
+        # adds a mostly-disjoint peer set when the bare query saturates it
+        # (Chew 249 peers, 25 of the qualified query's 28 peers unheard-from).
         queries.append(title)
     if canonical_title and compact_volume_suffixes and not alias_mentions_issue(canonical_title, issue) and not title_has_numbering(canonical_title):
         for suffix in compact_volume_suffixes[:3]:
             queries.append(f"{canonical_title} {suffix}")
     if canonical_title and first_suffix and not alias_mentions_issue(canonical_title, issue) and not title_has_numbering(canonical_title):
         queries.append(f"{canonical_title} {first_suffix}")
+    # Straight after the first numbered query, so a five-query pass fires both
+    # markers on its first pass instead of waiting for rotation to reach them.
+    # They displace nothing: they land ahead of the
+    # "complete"/"collection"/"volumes"/"volume" suffixes, which cost 196
+    # recorded attempts across the live probe cache and produced one
+    # auto-grab-safe result between them, against 20 from 225 qualified
+    # attempts.
+    if (
+        canonical_title
+        and not alias_mentions_issue(canonical_title, issue)
+        and not title_has_numbering(canonical_title)
+    ):
+        queries.extend(media_path_marker_queries(canonical_title, media_query_qualifier))
     # The alternate title variant gets its bare and media-qualified forms too,
     # not only the later "complete"/"collection" ones below. A metadata title
     # can be a bad Soulseek query while the shelf name is a good one: uploaders
@@ -3826,6 +4346,14 @@ def source_queries(item):
             for suffix in graphic_suffixes[:6]:
                 queries.append(f"{title} {suffix} {issue_title}")
     for issue_title in issue_titles:
+        # "GN"/"TPB"/"One-Shot" is a format marker, not a title. On a numbered
+        # series the issue title is a story name and a fine bare query; on a
+        # unitless work it is the marker that identified the class in the first
+        # place, and alone it matches most of Soulseek. Shortening the ladder
+        # is what surfaced this -- it was previously pushed past the 36-rung
+        # limit rather than being deliberately excluded.
+        if unitless_work and _unitless_work_issue_title(issue_title):
+            continue
         queries.append(issue_title)
     issue_year = str(metadata.get("date") or "")[:4] if metadata.get("date") else ""
     if not issue_year and metadata.get("year"):
@@ -3850,7 +4378,12 @@ def source_queries(item):
     queries.extend(variants)
     if series:
         queries.append(series)
-    return unique_values(queries, limit=36)
+    # Cleaned once, here, rather than at each of the twenty-odd places above
+    # that compose a query -- one of them would eventually be added without
+    # it. Doing it before unique_values() also collapses the punctuated and
+    # clean spellings of the same question into one slot instead of spending
+    # two of the thirty-six on it.
+    return unique_values([search_text(query) for query in queries], limit=36)
 
 
 def manual_search_query_variants(item, explicit_queries=None):
@@ -3886,7 +4419,17 @@ def manual_search_query_variants(item, explicit_queries=None):
     # Execute it first.  Previously SLSKD put six locally-derived anchors ahead
     # of that plan, so a 25 second provider deadline could expire before the
     # identity-preserving alias was ever attempted.
-    return unique_values([*(explicit_queries or []), *anchors, *source_queries(item)], limit=36)
+    # An operator's own typed text is left exactly as typed; the anchors are
+    # built from the same catalogue titles as the automatic plan and get the
+    # same treatment.
+    return unique_values(
+        [
+            *(explicit_queries or []),
+            *(search_text(anchor) for anchor in anchors),
+            *source_queries(item),
+        ],
+        limit=36,
+    )
 
 
 def query_signature(queries):
@@ -4658,12 +5201,27 @@ def filename_leaf(value):
     return segments[-1] if segments else str(value or "")
 
 
+SLSKD_DUPLICATE_SUFFIX_PATTERN = re.compile(r"_\d{15,}(?=\.[^.]+$|$)")
+
+
 def filename_match_values(value):
     text = str(value or "").replace("\\", "/").strip().lower()
     values = {text} if text else set()
     leaf = filename_leaf(text).lower()
     if leaf:
         values.add(leaf)
+    # When the destination name is already taken, SLSKD writes the retry
+    # alongside it as "<name>_<ticks>.<ext>" (a .NET tick stamp, 18 digits).
+    # Both files are the same artifact, but only the plain name carries the
+    # rejection record, so the suffixed copy was re-detected as a fresh
+    # candidate forever -- it is what survived the peer-ownership fix on the
+    # live Planetes row. Offer the de-suffixed form as an alias so a redownload
+    # inherits the verdict its twin already earned. The 15-digit floor keeps
+    # ordinary trailing numbers (issue/volume/year) out of this.
+    for existing in list(values):
+        stripped = SLSKD_DUPLICATE_SUFFIX_PATTERN.sub("", existing)
+        if stripped and stripped != existing:
+            values.add(stripped)
     return {value for value in values if value}
 
 
@@ -4728,10 +5286,13 @@ def durable_bad_source_candidate_match(candidate):
         return None
     candidate = candidate or {}
     provider = str(candidate.get("username") or candidate.get("provider") or candidate.get("user") or "").strip()
-    if not provider:
-        return None
     source_path = candidate_source_memory_path(candidate)
     title = candidate_source_memory_title(candidate, source_path)
+    # A peerless candidate (a staged filesystem scan) still has a file identity
+    # worth checking; requiring a peer here made the durable memory unreachable
+    # from the one caller that never has one.  find_bad_source_candidate() drops
+    # the provider filter when provider is None and still demands a title/hash
+    # plus scope match, so this narrows to the same physical artifact.
     if not (source_path or title):
         return None
     try:
@@ -4739,7 +5300,7 @@ def durable_bad_source_candidate_match(candidate):
             INKDROP_STATE_DB,
             title=title,
             source="slskd",
-            provider=provider,
+            provider=provider or None,
             protocol="soulseek",
             source_path=source_path,
         )
@@ -4870,7 +5431,6 @@ def auto_grab_context_signature():
             "explicit_english_translation_markers": sorted(EXPLICIT_ENGLISH_TRANSLATION_MARKERS),
             "english_release_markers": sorted(ENGLISH_RELEASE_MARKERS),
             "manga_publisher_phrases": sorted(MANGA_PUBLISHER_PHRASES),
-            "non_english_collection_markers": sorted(NON_ENGLISH_COLLECTION_MARKERS),
             "non_english_language_markers": sorted(NON_ENGLISH_LANGUAGE_MARKERS),
             "source_language_blocker": 2,
             "same_series_path_language_blocker": 1,
@@ -5949,6 +6509,27 @@ def issue_number(issue):
     return sorted(numbers)[0]
 
 
+def wanted_issue_number(item):
+    """Which issue the wanted item is asking for, by any spelling.
+
+    The rest of this module already reads the number as
+    ``issue_number or issue or number`` -- see the seed and detail builders.
+    Four of the matchers here read only ``issue``, and the wanted_item that
+    source_jobs_for_queue() actually hands the probe carries ``issue_number``
+    and no ``issue`` at all, so those four saw None. That is not a quiet
+    downgrade: with no wanted number to recognise, the file's own correct
+    issue number becomes an unexplained token, and
+    unexpected_series_subtitle_blocker() reports the number as evidence of a
+    different subseries -- "Gotham Central 039.cbr" refused for wanted Gotham
+    Central #39 because of the 039.
+    """
+    return issue_number(
+        (item or {}).get("issue")
+        or (item or {}).get("issue_number")
+        or (item or {}).get("number")
+    )
+
+
 def issue_match_text(filename):
     text = filename_stem(filename)
     text = re.sub(r"\(\s*\d+\s*\)\s*$", " ", text)
@@ -5974,7 +6555,7 @@ def labeled_issue_numbers(text):
 
 
 def issue_range_match(filename, item):
-    wanted = issue_number((item or {}).get("issue"))
+    wanted = wanted_issue_number(item)
     if wanted is None:
         return {"matched": False, "reason": "", "penalty": ""}
     ranges = []
@@ -6042,7 +6623,7 @@ def bare_issue_numbers(filename, item):
 
 
 def book_volume_number_match(filename, item):
-    wanted = issue_number((item or {}).get("issue"))
+    wanted = wanted_issue_number(item)
     if wanted is None:
         return {"matched": False, "reason": "", "penalty": ""}
     numbers = book_volume_numbers(filename_stem(filename))
@@ -6068,6 +6649,13 @@ def shared_volume_artifact_match(filename, item):
         "normalized_number": item.get("normalized_number") or item.get("issue") or item.get("number"),
         "volume_number": item.get("volume_number") or item.get("volume") or item.get("book_volume") or item.get("manga_volume"),
         "volume": item.get("volume") or item.get("volume_number") or item.get("book_volume") or item.get("manga_volume"),
+        # The chapter has to travel with the volume. wanted_item_is_volume_unit()
+        # reads "manga, has a volume, has no chapter" as "this is volume N", so
+        # dropping these two keys turned every chapter that knows which volume
+        # it belongs to into a request for the whole volume -- and a 91MB v01
+        # archive then scored as a match for chapter 1.
+        "chapter": item.get("chapter") or item.get("chapter_number") or item.get("chapterNumber"),
+        "chapter_number": item.get("chapter_number") or item.get("chapter") or item.get("chapterNumber"),
         "issue_title": item.get("issue_title") or item.get("issueTitle") or item.get("title"),
         "metadata_provider": item.get("metadata_provider") or item.get("source") or item.get("provider"),
         "series_source": item.get("series_source") or item.get("source") or item.get("metadata_provider"),
@@ -6085,7 +6673,7 @@ def shared_volume_artifact_match(filename, item):
 
 
 def issue_number_match(filename, item):
-    wanted = issue_number((item or {}).get("issue"))
+    wanted = wanted_issue_number(item)
     if wanted is None:
         return {"matched": False, "reason": "", "penalty": "no numeric issue token"}
 
@@ -6211,7 +6799,10 @@ def source_language_blocker(filename):
     script_marker = non_english_script_marker(filename)
     if script_marker and not explicit_english:
         return "non-English script in source path: " + script_marker
-    markers = sorted((words & NON_ENGLISH_LANGUAGE_MARKERS) | (words & NON_ENGLISH_COLLECTION_MARKERS))
+    # Language markers only. A shelf-label word like "BD" says what medium the
+    # folder holds, not what language the book is in, and refusing on it threw
+    # away valid files -- see the note where that set used to be defined.
+    markers = sorted(words & NON_ENGLISH_LANGUAGE_MARKERS)
     if not markers:
         return ""
     if explicit_english:
@@ -6450,8 +7041,11 @@ def related_subseries_tail_conflict(filename, item):
             issue_title=item.get("issue_title") or item.get("issueTitle") or item.get("title"),
             issue_number=item.get("issue_number") or item.get("issue") or item.get("number"),
             publisher=item.get("publisher") or item.get("watch_publisher") or item.get("series_publisher"),
-            # Pre-download, only the bare-word tail defense applies -- see
-            # the strict_bracket_tail docstring note at its call site.
+            # Pre-download stays out of bracket tails entirely. Reading them
+            # here would reject scene noise SLSKD's own matching is meant to
+            # tolerate; the leaf's bracket content is judged after the file
+            # arrives, by which point it is judged leniently enough that
+            # anything admitted here still imports.
             strict_bracket_tail=False,
         ) or ""
     except Exception:
@@ -6727,7 +7321,33 @@ def candidate_identity_compatibility(candidate, filename, item):
 
 
 def shared_candidate_match_details(filename, item, candidate=None):
-    """Normalize a candidate through the same authoritative identity contract."""
+    """Normalize a candidate through the same authoritative identity contract.
+
+    READ THIS BEFORE WIDENING WHAT THE MATCHER ACCEPTS.
+
+    slskd judges a file in two stages, and this is stage one. It is a hard
+    admission filter: ``item_match_details`` below runs ``series_identity_match``,
+    a word-overlap title matcher local to this module, and anything it refuses
+    is dropped by the caller before any other authority sees it. The shared
+    ``inkdrop_candidate_matching`` engine is consulted here only when the item
+    carries ``singleton_issue_proof`` or ``collected_singleton_proof``; for
+    every other row it runs later, in ``slskd_candidate_verdict``, on files
+    stage one already admitted.
+
+    The consequence is asymmetric and easy to miss. A change to
+    ``inkdrop_candidate_matching`` that makes the matcher **stricter** takes
+    effect everywhere. A change that makes it **more accepting** -- a new
+    title form, an initialism, a numbering convention, a unit marker -- does
+    nothing at all for slskd unless the same widening also lands in this
+    module's own title/unit matching. The release stays refused at stage one
+    and the new code never runs.
+
+    This is not a defect today: the acronym/folder-authority work put 33 lines
+    in ``inkdrop_candidate_matching`` and 565 here, deliberately. It is a trap
+    for the next person who fixes matching in the obvious place, sees their
+    test pass against ``candidate_compatibility``, and assumes slskd got the
+    fix too. Verify against ``shared_candidate_match_details`` as well.
+    """
 
     is_raw_page_images = bool(isinstance(candidate, dict) and candidate.get("content_type") == "raw_page_images")
     # item_match_details is patched by name in several existing tests with a
@@ -6932,6 +7552,51 @@ def filename_without_publication_date_tokens(filename):
     return text
 
 
+def release_annotation_token(text, match):
+    """True when this number counts something about the release, not units.
+
+    ``Giant Days 004 (2015) (2 covers) (digital) (Son of Ultron-Empire).cbr``
+    is one issue. The ``2`` counts the variant cover scans packaged with it.
+    The pair scan below reads two numbers separated by nothing but punctuation
+    as a range marker, and it blanks alphabetic text inside an open
+    parenthetical so a word cannot hide a boundary -- which is right for
+    ``(4-6)`` and wrong here, because it lets the cover count pair with the
+    next number across the word ``covers``. Measured against live peer results
+    on 2026-08-18: the identical release *without* ``(2 covers)`` is not a
+    pack, so this annotation alone decided it.
+
+    Being wrongly called a pack is not a small error. It sets ``pack: True``,
+    which makes Manual Search demand a membership manifest, which a single
+    file cannot produce -- so the candidate is refused
+    ``pack_membership_not_proven``. On Giant Days #4 that eliminated the
+    autopick winner and left 0 of 59 candidates accepted with the correct file
+    sitting in the list.
+
+    The vocabulary is deliberately borrowed, not re-stated:
+    ``inkdrop_candidate_matching`` already decided what a cover count and an
+    ``(of NN)`` total look like, for exactly this reason on the identity path
+    (see inkdrop-cover-count-unit-identity-smoke). This is the second copy of
+    the question, so it asks the first copy rather than growing its own
+    opinion. When that module is unavailable the answer is "not an
+    annotation", which preserves today's behaviour rather than inventing a
+    laxer one.
+
+    One-directional by construction: it only removes a token from the pack
+    scan. It cannot make something a pack that was not one, so a wrong firing
+    costs a missed pack detection, never a wrong accept.
+    """
+    if inkdrop_candidate_matching is None:
+        return False
+    body = str(text or "")
+    cover = getattr(inkdrop_candidate_matching, "COVER_COUNT_SUFFIX_RE", None)
+    if cover is not None and cover.match(body[match.end():]):
+        return True
+    of_total = getattr(inkdrop_candidate_matching, "OF_TOTAL_PREFIX_RE", None)
+    if of_total is not None and of_total.search(body[:match.start()]):
+        return True
+    return False
+
+
 def filename_has_pack_or_range(filename, item=None, validated_series_directory=False):
     raw_text = str(filename or "")
     if validated_series_directory:
@@ -7075,6 +7740,13 @@ def filename_has_pack_or_range(filename, item=None, validated_series_directory=F
                     continue
                 return True, "zero-padded dotted unit marker"
             matches = list(unit_tokens.finditer(tail))
+            # Drop release annotations only while a real unit token survives.
+            # That condition is the whole safety of the borrowed `(of NN)`
+            # rule: "Book of 5" keeps its 5 because nothing else could be the
+            # unit, while "003 of 60" drops the 60 because the 3 remains.
+            units = [match for match in matches if not release_annotation_token(tail, match)]
+            if units:
+                matches = units
             for left_match, right_match in zip(matches, matches[1:]):
                 separator = tail[left_match.end():right_match.start()]
                 comparable_separator = re.sub(
@@ -7283,7 +7955,7 @@ def unexpected_series_subtitle_blocker(filename, item):
     for alias_title in alias_titles:
         expected_words |= set(context_words(alias_title))
     issue_title = set(issue_title_words(item))
-    wanted = issue_number((item or {}).get("issue"))
+    wanted = wanted_issue_number(item)
     wanted_run_number = issue_number(
         (item or {}).get("volume_number")
         or (item or {}).get("volume")
@@ -7542,6 +8214,302 @@ def compatibility_title_without_terminal_image_imprint(filename, item):
     return sanitized, True
 
 
+# Unit/edition decoration that carries no series identity of its own. What is
+# left after stripping it is the leaf's own claim about what series it is.
+_LEAF_UNIT_DECORATION = re.compile(
+    r"(?ix)"
+    r"(?:v|vol|volume|ch|chap|chapter|c|no|issue|pt|part)\.?\s*\d+"
+    r"|\#?\d{1,4}"
+    r"|[\[\(][^\]\)]*[\]\)]"
+    r"|(?:digital|scan|scanned|complete|repack)"
+)
+
+
+_LEAF_NON_IDENTITY_WORDS = frozenset(
+    {
+        "v", "vol", "vols", "volume", "volumes",
+        "ch", "chap", "chapter", "chapters",
+        "no", "num", "issue", "issues", "pt", "part",
+        "cbz", "cbr", "cb7", "pdf", "epub", "zip", "rar", "7z",
+        "digital", "scan", "scanned", "complete", "repack", "the",
+    }
+)
+
+
+# A generated initialism proposes an identity; a short one barely proposes
+# anything. Two measurements against the live catalogue and the 5,968 real
+# candidate paths in the production probe cache, because they say different
+# things and only one of them describes this code.
+#
+# The resolver below fires only when a leaf's residue is a *single* letter run.
+# 1,874 of those paths qualify, and under that rule the corpus produced no
+# wrong resolutions at any floor: two at a floor of two ('FT' -> Fairy Tail,
+# 'ATLA' -> Avatar: The Last Airbender) and both were right. So four is not
+# justified by observed false positives here. n=2 bounds nothing.
+#
+# What four is justified by is what sits either side of that constraint. Asking
+# the broader question -- does *any* residue word resolve -- the same corpus
+# resolved 171 paths at a floor of two and essentially all were wrong: "Tokyo
+# Ghoul - re" proposed Rook: Exodus, "Ms. Marvel" proposed Money Shot,
+# "Avengers vs New Ultimates" proposed Vinland Saga, "DC's Saved by the Belle
+# Reve" proposed Deadly Class. Every one of those keys resolves to exactly one
+# series, so catalogue uniqueness caught none of them; only length did. Short
+# runs are dense in ordinary filename text, and the single-word rule is all
+# that stands between this resolver and that density.
+#
+# So the floor is margin, bought deliberately: it costs one true positive the
+# corpus contained ('FT - 09.cbr'), and it means loosening the single-word rule
+# later cannot quietly readmit those 171.
+#
+# Length alone is not sufficient either, which is why the resolver also demands
+# uniqueness: this catalogue generates 'igauyf' from both Injustice: Gods Among
+# Us Year Five and Year Four. Six letters, and still ambiguous.
+ACRONYM_MIN_LETTERS = 4
+
+# How long a resolved catalogue index may be reused before its revision is
+# rechecked. Bounded because a series added mid-run can turn a uniquely
+# resolving key into a colliding one.
+CATALOGUE_INDEX_RECHECK_SECONDS = 300
+
+_CATALOGUE_INDEX_CACHE = {"revision": None, "checked_at": 0.0, "titles": {}, "acronyms": {}}
+
+
+def _acronym_fold(value):
+    """normalize() for titles carrying accents.
+
+    normalize() maps every non-ASCII character to a space, which splits a word
+    rather than folding it: "Mortelle Adele" survives but "Mortelle Adèle"
+    tokenizes to "mortelle ad le" and generates a three-letter key from a
+    two-word title. Decomposing first keeps the word whole, so a title's key
+    does not depend on whether its accents were typed.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(value or ""))
+    return normalize("".join(ch for ch in decomposed if not unicodedata.combining(ch)))
+
+
+def generated_acronym_key(title, min_letters=None):
+    """The initialism a title generates, or "" if it generates none.
+
+    Derived on every call and never written down. That is the point: a key can
+    only ever name a series the catalogue already tracks, it disappears when
+    the series does, and there is no list to maintain or to drift out of date.
+
+    A title needs at least two words to have an initialism, and the result has
+    to be letters -- "2000 AD" yields "2a", which is a string, not an acronym.
+    """
+    floor = ACRONYM_MIN_LETTERS if min_letters is None else max(2, int(min_letters))
+    tokens = _acronym_fold(title).split()
+    if len(tokens) < 2:
+        return ""
+    key = "".join(token[0] for token in tokens)
+    return key if len(key) >= floor and key.isalpha() else ""
+
+
+def catalogue_identity_index():
+    """Normalized-title and initialism indexes over the tracked catalogue.
+
+    Returns ``(titles, acronyms)`` where ``titles`` maps a normalized title to
+    the set of catalogue titles that normalize to it, and ``acronyms`` maps a
+    generated key to the set of normalized titles that generate it. Both are
+    sets because collapsing them would hide exactly the ambiguity callers ask
+    about.
+    """
+    cache = _CATALOGUE_INDEX_CACHE
+    if inkdrop_state is None:
+        return cache["titles"], cache["acronyms"]
+    if cache["revision"] is not None and now() - float(cache["checked_at"] or 0) < CATALOGUE_INDEX_RECHECK_SECONDS:
+        return cache["titles"], cache["acronyms"]
+    try:
+        revision, titles = inkdrop_state.operational_series_catalogue(INKDROP_STATE_DB)
+    except Exception:
+        # A catalogue we could not read is not an empty catalogue. Serving an
+        # empty index would answer "unique" to every collision question and
+        # "names no tracked work" to every folder -- the two answers that open
+        # gates. Keep the last resolved index; if there has never been one, the
+        # empty default declines instead.
+        return cache["titles"], cache["acronyms"]
+    cache["checked_at"] = now()
+    if revision == cache["revision"]:
+        return cache["titles"], cache["acronyms"]
+    by_title = {}
+    for title in titles:
+        key = normalize(display_clean(title))
+        if key:
+            by_title.setdefault(key, set()).add(title)
+    by_acronym = {}
+    for key, names in by_title.items():
+        for name in names:
+            acronym = generated_acronym_key(name)
+            if acronym:
+                by_acronym.setdefault(acronym, set()).add(key)
+    cache.update({"revision": revision, "titles": by_title, "acronyms": by_acronym})
+    return by_title, by_acronym
+
+
+def folder_series_authority(candidate, item):
+    """What the nearest identity-bearing path segment proves about the series.
+
+    Only the segment closest to the file is read. Climbing past it is what
+    turns ``Comics/DC/Batman/Gotham Central`` into a Batman book: Gotham
+    Central is its own title, and an ancestor naming a tracked character is
+    shelving, not a claim about this file. The nearest segment answers or
+    nothing does.
+
+    Four outcomes:
+
+    ``exact``          it resolves to the wanted series;
+    ``contradictory``  it resolves to exactly one *other* tracked work;
+    ``insufficient``   more than one tracked work answers to it;
+    ``neutral``        it names no tracked work at all.
+
+    ``neutral`` is an answer, not a fallback. Real shelves are full of segments
+    that mean nothing to a catalogue -- a creator (``Comics/Others/John
+    Layman``), a genre (``Comics/Superheroes``), a language (``OCCIDENTALI``),
+    an uploader tag -- and the honest reading of those is that the folder
+    contributed no identity, so the candidate must find one elsewhere or stay
+    unresolved. Guessing the best-looking segment is how a folder launders a
+    file it never identified.
+    """
+    path = str((candidate or {}).get("filename") or (candidate or {}).get("path") or "").replace("\\", "/")
+    if "/" not in path:
+        return "neutral"
+    directory = path.rsplit("/", 1)[0].strip("/")
+    if not directory:
+        return "neutral"
+    cohort = series_directory_cohort_root(directory)
+    if series_directory_matches_item(cohort, item):
+        return "exact"
+    segment = normalize(display_clean(str(cohort or "").rstrip("/").rsplit("/", 1)[-1]))
+    if not segment:
+        return "neutral"
+    by_title, _acronyms = catalogue_identity_index()
+    tracked = by_title.get(segment) or set()
+    if not tracked:
+        return "neutral"
+    if len(tracked) > 1:
+        return "insufficient"
+    return "contradictory"
+
+
+def leaf_acronym_identity(leaf, item):
+    """Whether a leaf's residual text is the wanted series' own initialism.
+
+    ``target_unique`` only when the residue is a single letter run that both
+    generates from the wanted title and is generated by nothing else the
+    catalogue tracks; ``colliding`` when the run is the target's key but not
+    only the target's; ``none`` otherwise.
+
+    The question is deliberately narrow. This does not ask "which series is
+    ATLA" -- it asks "could this be the series we are already looking for",
+    which cannot invent an identity, cannot reach a series nobody wants, and
+    cannot outlive the catalogue row it came from.
+    """
+    words = leaf_identity_words(leaf)
+    if len(words) != 1:
+        return "none"
+    run = _acronym_fold(words[0])
+    if not run.isalpha() or len(run) < ACRONYM_MIN_LETTERS:
+        return "none"
+    target = generated_acronym_key(display_clean(item_series_title(item or {})))
+    if not target or run != target:
+        return "none"
+    _titles, by_acronym = catalogue_identity_index()
+    return "target_unique" if len(by_acronym.get(run) or set()) == 1 else "colliding"
+
+
+def leaf_acronym_unit_proposal(leaf):
+    """The number fused to a leading initialism, as a *proposal* about unit.
+
+    ``ATLA23_Suki Alone.cbz`` splits into ``ATLA`` and ``23``. The split is only
+    attempted at the leaf's head and only across a letter/digit boundary, so
+    ``2000 AD 003`` -- where the digits lead -- never reaches it.
+
+    What comes back is a claim the release author made by juxtaposition, not a
+    labelled unit. ``23`` here is the twenty-third book in somebody's reading
+    order as easily as it is issue 23, so the caller must corroborate it
+    against what was actually wanted rather than adopt it. Returning "" means
+    the leaf proposed nothing, which is different from proposing zero.
+    """
+    stem = str(leaf or "")
+    stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+    match = re.match(r"\s*([A-Za-z]+)(\d{1,4})(?![A-Za-z0-9])", stem)
+    return match.group(2) if match else ""
+
+
+def leaf_identity_words(leaf):
+    """The words in a leaf that are still a claim about series after stripping.
+
+    Shared by the leaf classifier and the acronym resolver so both judge the
+    same text. They must: the acronym resolver only ever runs on a leaf the
+    classifier called foreign, and it would be answering about a different
+    string than the one that was refused if the stripping diverged.
+    """
+    stem = str(leaf or "")
+    stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+    # Only what comes *before* the first unit token is a claim about series.
+    # Anything after it is a chapter or issue title -- "Ch. 001 - The Highway"
+    # is Akira chapter 1, not a series called "The Highway" -- and treating a
+    # title as a foreign-series claim refuses perfectly good chapter files.
+    first_unit = _LEAF_UNIT_DECORATION.search(stem)
+    if first_unit and first_unit.start() > 0:
+        stem = stem[: first_unit.start()]
+    elif first_unit:
+        # The leaf *begins* with a unit-shaped token, so the prefix is empty --
+        # and an empty prefix is not evidence of "no identity here". It means
+        # the stripping rule did not apply to this text, which is a different
+        # conclusion and only one of them is safe to act on.
+        #
+        # Two shapes look identical at this point and mean opposite things:
+        #   "003 (2017).cbr"    -- the leading number IS the unit
+        #   "2000 AD 003.cbr"   -- the leading number is the head of a series
+        #                          name, and 2000 AD is a real comic
+        # Reading the span up to the *next* unit token separates them: the
+        # first yields nothing, the second yields "AD". Treating both as
+        # unit-only is what let a wanted-series folder launder 2000 AD into an
+        # automatic grab.
+        #
+        # A leading unit *word* ("Ch. 001 - The Highway") is unambiguous and
+        # never reaches here -- its prefix contains the word, so start() > 0.
+        following = _LEAF_UNIT_DECORATION.search(stem, first_unit.end())
+        stem = stem[first_unit.end(): following.start()] if following else stem[first_unit.end():]
+    residue = _LEAF_UNIT_DECORATION.sub(" ", stem)
+    residue = re.sub(r"[^A-Za-z]+", " ", residue)
+    # The number-stripping above can leave the unit *word* stranded ("Vol.01"
+    # -> "Vol"), and an extension survives when the leaf has no other dot.
+    # Neither is a series name, so neither may make a leaf look foreign.
+    return [
+        word
+        for word in residue.split()
+        if len(word) > 1 and word.lower() not in _LEAF_NON_IDENTITY_WORDS
+    ]
+
+
+def leaf_identity_authority(leaf, item):
+    """Classify a candidate's leaf as 'exact', 'unit_only' or 'foreign'.
+
+    The auto-pick path lets a parent folder supply strict series context while
+    the unit parser reads the leaf. That is correct for the ordinary
+    ``Series/Vol.01 Ch.003.cbz`` layout, where the leaf genuinely carries no
+    identity -- and catastrophic for ``Series/Other Series 003.cbr``, where the
+    leaf states in plain text that it is something else and the folder
+    overrules it. Telling those apart is the whole job: strip the decoration
+    that is never a series name, and see whether the leaf still says anything.
+    """
+    matched, _reason = strict_series_match(leaf, item)
+    if matched:
+        return "exact"
+    words = leaf_identity_words(leaf)
+    if not words:
+        return "unit_only"
+    # The prefix says *something*, but saying something is not saying something
+    # foreign. "Akira01 (1988).cbr" fails a whole-leaf series match only
+    # because the number is glued to the title; its prefix is exactly the
+    # wanted series. Re-check the prefix on its own before calling it foreign,
+    # or every concatenated filename reads as a different comic.
+    prefix_match, _prefix_reason = strict_series_match(" ".join(words), item)
+    return "exact" if prefix_match else "foreign"
+
+
 def auto_grab_candidate_verdict(candidate, item):
     filename = candidate.get("filename") or candidate.get("path") or ""
     policy_filename = filename_without_exact_issue_titles(filename, item=item)
@@ -7752,12 +8720,105 @@ def auto_grab_candidate_verdict(candidate, item):
     )
     if auto_inspect_eligible:
         reasons.append("exact file and folder identity passed inspection handoff checks")
+    # A folder may vouch for a leaf that has no identity of its own; it may not
+    # overrule one that does. Without this, `Wanted Series/Foreign Series
+    # 003.cbr` auto-picked on the folder's authority while `exact_leaf_identity`
+    # -- computed a few lines above and returned in this very payload -- said
+    # the leaf was not the wanted series at all.
+    # When the series-directory handoff is active it has already resolved this
+    # candidate's identity, combining the folder's series with the leaf's unit
+    # ("Ch. 001 - The Highway.cbz" under an exact Akira folder becomes
+    # "Akira Ch. 001 - The Highway.cbz"). Judge that resolved string. Reading
+    # the raw leaf here re-asks a question the handoff already answered and
+    # then reports the answer it discarded -- the leaf "carries no series
+    # identity" only if you decline to look at the identity computed for it.
+    # Only when the handoff matched an *exact series* folder. It also fires on
+    # a neutral parent ("Complete", "Volume 01"), and there the folder never
+    # established series identity -- judging its synthesised name would
+    # manufacture the very evidence this check exists to demand.
+    authority_leaf = leaf
+    if directory_identity_filename and candidate.get("series_directory_exact_series"):
+        authority_leaf = directory_identity_filename
+    leaf_authority = leaf_identity_authority(authority_leaf, item)
+    leaf_folder_authority_ok = leaf_authority == "exact" or (
+        leaf_authority == "unit_only" and exact_folder_context
+    )
+    # `ATLA23_Suki Alone.cbz` under an exact `Avatar the last airbender` folder
+    # is refused here as a foreign series, and it is not one -- ATLA is what
+    # the wanted title itself generates, and nothing else in the catalogue
+    # generates it. That is enough to stop calling the leaf foreign. It is not
+    # enough to call the file proven, so it buys one thing only: a place in the
+    # bounded inspection path, where the bytes are fetched into quarantine and
+    # have to satisfy the ordinary content, unit and containment gates before
+    # anything is imported.
+    #
+    # Deliberately narrower than it could be. It runs only on leaves already
+    # being refused, so it can rescue but never widen; it requires the nearest
+    # folder to be the exact target, so a neutral or contradictory shelf
+    # declines; and it leaves `leaf_folder_authority_ok` alone, so the
+    # candidate stays out of `autopick_eligible` and can never be grabbed
+    # automatically on an initialism.
+    acronym_authority = "none"
+    folder_authority = folder_series_authority(candidate, item)
+    if leaf_authority == "foreign":
+        acronym_authority = leaf_acronym_identity(leaf, item)
+    # The digits fused to the initialism have to agree with what was wanted.
+    # Without this the mechanism would fetch every ATLA-prefixed book on the
+    # peer to inspect for one wanted issue, and an initialism that resolves is
+    # not a reason to transfer the wrong unit. A proposal that disagrees is
+    # worse than none: it is positive evidence of a different book.
+    wanted_unit = issue_number((item or {}).get("issue"))
+    proposed_unit = leaf_acronym_unit_proposal(leaf)
+    unit_proposal_agrees = bool(
+        (
+            proposed_unit
+            and wanted_unit is not None
+            and token_number(proposed_unit) == wanted_unit
+        )
+        # A want that is its own single unit has nothing for the digits to
+        # agree with, and demanding agreement anyway would refuse the one
+        # shape where the unit was never in question.
+        or proof_bound_identity
+    )
+    acronym_inspect_eligible = bool(
+        acronym_authority == "target_unique"
+        and folder_authority == "exact"
+        and unit_proposal_agrees
+        and not blockers
+        and not is_pack
+        and (ext in AUTO_GRAB_EXTENSIONS or archive_exact_issue_eligible)
+        and AUTO_INSPECT_HARD_MIN_BYTES <= size <= size_ceiling
+    )
+    if acronym_inspect_eligible:
+        auto_inspect_eligible = True
+        # Replaces the foreign-series reason rather than joining it: that reason
+        # is a statement about this leaf that is not true, and leaving it beside
+        # the real one would report two different findings about one file. The
+        # replacement still reads as unresolved, which is the point -- it keeps
+        # the verdict at needs_review and out of every automatic-grab path.
+        review_reasons.append(
+            "series identified only by the initialism the wanted title generates; "
+            "identity unproven until the file is inspected"
+        )
+        reasons.append(
+            "leaf initialism resolves uniquely to the wanted series and the nearest folder is an exact match"
+        )
+    elif leaf_authority == "foreign":
+        review_reasons.append(
+            f"leaf names a different series than the folder claims: {filename_leaf(filename)}"
+        )
+    elif leaf_authority == "unit_only" and not exact_folder_context:
+        review_reasons.append(
+            "leaf carries no series identity and the folder is not an exact series match"
+        )
+    review_reasons = list(dict.fromkeys(str(value) for value in review_reasons if value))
     autopick_eligible = (
         not blockers
         and not (
             proof_bound_identity
             and (unit_compatibility or {}).get("review_codes")
         )
+        and leaf_folder_authority_ok
         and (ext in AUTO_GRAB_EXTENSIONS or archive_pack_eligible or archive_exact_issue_eligible)
         and score_ok
         and size_floor <= size <= size_ceiling
@@ -7776,11 +8837,19 @@ def auto_grab_candidate_verdict(candidate, item):
         "blockers": blockers,
         "autopick_eligible": autopick_eligible,
         "auto_inspect_eligible": auto_inspect_eligible,
-        "inspection_message": AUTO_INSPECT_USER_MESSAGE if auto_inspect_eligible else "",
+        "inspection_message": (
+            AUTO_INSPECT_ACRONYM_USER_MESSAGE
+            if acronym_inspect_eligible
+            else AUTO_INSPECT_USER_MESSAGE if auto_inspect_eligible else ""
+        ),
         "preferred_size_bytes": SLSKD_PREFERRED_EXACT_MIN_BYTES,
         "inspection_hard_min_bytes": AUTO_INSPECT_HARD_MIN_BYTES,
         "exact_leaf_identity": exact_leaf_identity,
         "exact_folder_context": exact_folder_context,
+        "folder_series_authority": folder_authority,
+        "leaf_acronym_authority": acronym_authority,
+        "leaf_acronym_unit_proposal": proposed_unit,
+        "acronym_inspect_eligible": acronym_inspect_eligible,
         "extension": ext,
         "match_score": match_score,
         "direct_match_confidence": direct_match,
@@ -7945,9 +9014,14 @@ def annotate_auto_grab_verdicts(candidates, item):
 
     if winner:
         gate = winner.get("auto_grab") or {}
-        if winner_is_clear:
+        # Winning the ranking clears ranking-only reasons and nothing else. If
+        # unresolved evidence survives that, the winner stays in review no
+        # matter how far ahead it scored.
+        promoted = clear_threshold_review_reasons(dict(gate)) if winner_is_clear else None
+        winner_promotable = promoted is not None and auto_grab_promotion_allowed(promoted)
+        if winner_promotable:
+            gate = promoted
             gate["verdict"] = "auto_grab_safe"
-            gate = clear_threshold_review_reasons(gate)
             reasons = list(gate.get("reasons") or [])
             try:
                 match_score = int(gate.get("match_score") or 0)
@@ -7978,6 +9052,11 @@ def annotate_auto_grab_verdicts(candidates, item):
             if leaf_counts.get(leaf, 0) > 1:
                 reasons.append("duplicate-looking filename exists; choosing top scored source")
             gate["reasons"] = list(dict.fromkeys(reasons))
+        elif winner_is_clear:
+            # Ranking was decisive, the evidence was not. Leave the unresolved
+            # reasons exactly as they stand -- appending a ranking complaint
+            # here would misdescribe why this needs a human.
+            gate["verdict"] = "needs_review"
         else:
             gate["verdict"] = "needs_review"
             reasons = list(gate.get("review_reasons") or [])
@@ -7999,8 +9078,24 @@ def retry_candidate_has_direct_match(row):
     return direct_title_issue_evidence(reasons)
 
 
+def admitted_on_acronym_only(row):
+    """Whether this candidate's series identity rests on an initialism.
+
+    Such a candidate reached bounded inspection precisely because its identity
+    is *not* settled, and the relaxed-promotion paths below ask questions that
+    cannot settle it. Running out of attempts, or being the only near-threshold
+    match left, are facts about the search rather than about the file. Neither
+    turns an initialism into proof, so neither may carry this candidate into an
+    automatic grab: it goes to inspection or it waits.
+    """
+    gate = row.get("auto_grab") if isinstance(row, dict) and isinstance(row.get("auto_grab"), dict) else {}
+    return bool(gate.get("acronym_inspect_eligible"))
+
+
 def retry_candidate_after_failure_eligible(row):
     if not isinstance(row, dict) or row.get("manual_source_bad_candidate"):
+        return False
+    if admitted_on_acronym_only(row):
         return False
     gate = row.get("auto_grab") if isinstance(row.get("auto_grab"), dict) else {}
     if gate.get("verdict") == "blocked" or gate.get("blockers"):
@@ -8036,6 +9131,8 @@ def retry_candidate_after_failure_eligible(row):
 def near_threshold_direct_match_eligible(row):
     if not isinstance(row, dict) or row.get("manual_source_bad_candidate"):
         return False
+    if admitted_on_acronym_only(row):
+        return False
     gate = row.get("auto_grab") if isinstance(row.get("auto_grab"), dict) else {}
     if gate.get("verdict") == "blocked" or gate.get("blockers"):
         return False
@@ -8065,6 +9162,29 @@ def near_threshold_direct_match_eligible(row):
     if size < floor or size > ceiling:
         return False
     return retry_candidate_has_direct_match(row)
+
+
+def auto_grab_promotion_allowed(gate):
+    """Whether ranking may move this gate up to auto_grab_safe.
+
+    The composition is monotonic: a conflict blocks, unresolved evidence needs
+    review, and only a candidate whose required evidence is all supported is
+    eligible. Ranking -- score, gap, size, availability, source popularity,
+    folder text -- decides *who wins among* candidates at an outcome. It never
+    decides *whether anyone qualifies*, so it can reorder within an outcome and
+    can never carry a candidate across one.
+
+    Ranking-only reasons are the exception, and only because they are not
+    evidence about the candidate: "score N below threshold" and "lower-ranked
+    autopick candidate" describe its position in the list, and winning the
+    ranking is exactly what resolves them. Anything left after those are
+    removed is unresolved evidence, and a high score is not an answer to it.
+    """
+    if not isinstance(gate, dict):
+        return False
+    if gate.get("blockers"):
+        return False
+    return not (clear_threshold_review_reasons(dict(gate)).get("review_reasons") or [])
 
 
 def clear_threshold_review_reasons(gate):
@@ -8148,7 +9268,11 @@ def annotate_bad_candidate_verdicts(candidates, review_id):
         winner_gap = None if next_score is None else winner_score - next_score
         retry_relaxed = bool(had_bad_candidate and retry_candidate_after_failure_eligible(winner))
         near_threshold_direct = bool(not had_bad_candidate and near_threshold_direct_match_eligible(winner))
-        if winner and (
+        # Same contract as the primary promotion: a retry allowance, a score
+        # and a near-threshold direct match are all ranking. None of them
+        # answers unresolved evidence, so none of them may carry a candidate
+        # from review into auto_grab_safe.
+        if winner and auto_grab_promotion_allowed(winner.get("auto_grab") or {}) and (
             winner_score >= AUTO_GRAB_HIGH_SCORE
             or winner_gap is None
             or winner_gap >= AUTO_GRAB_CLEAR_WIN_DELTA
@@ -9453,6 +10577,9 @@ def fallback_manual_source_waiting_record(entry, candidate, transfer, validation
                 "is_archive_exact_issue_candidate",
                 "autopick_eligible",
                 "auto_inspect_eligible",
+                "acronym_inspect_eligible",
+                "folder_series_authority",
+                "leaf_acronym_authority",
                 "inspection_message",
                 "preferred_size_bytes",
                 "inspection_hard_min_bytes",
@@ -9469,7 +10596,16 @@ def fallback_manual_source_waiting_record(entry, candidate, transfer, validation
             "outcome": "auto_inspect",
             "candidate_identity_hash": identity_hash,
             "exact_artifact_proof_required": True,
-            "neutral_missing_evidence": ["size_below_preferred"],
+            # What inspection is being asked to settle. Two different unknowns
+            # reach this handoff now -- a file below the preferred size, and a
+            # series named only by its initialism -- and recording the wrong
+            # one would describe the transfer as answering a question nobody
+            # asked.
+            "neutral_missing_evidence": (
+                ["acronym_identity_unproven"]
+                if auto_grab.get("acronym_inspect_eligible")
+                else ["size_below_preferred"]
+            ),
             "preferred_size_bytes": int(auto_grab.get("preferred_size_bytes") or SLSKD_PREFERRED_EXACT_MIN_BYTES),
         }
         record["candidate_locator_digest"] = identity_hash
@@ -9783,6 +10919,12 @@ def ranked_retry_fallback_candidates(entry, reason):
         if (candidate.get("auto_grab") or {}).get("verdict") == "auto_grab_safe":
             continue
         if not retry_candidate_after_failure_eligible(candidate):
+            continue
+        # Same contract as the other two promotion sites. Exhausting the
+        # attempt limit is a statement about how many times we have tried,
+        # not about the candidate -- it cannot resolve evidence, so it cannot
+        # carry one out of review.
+        if not auto_grab_promotion_allowed(candidate.get("auto_grab") or {}):
             continue
         promoted = dict(candidate)
         gate = dict(promoted.get("auto_grab") or {})
@@ -10244,7 +11386,27 @@ def _run_auto_grab_with_ephemeral_candidates(args, result):
                         elif automatic_decision != "authorize_enqueue":
                             row["status"] = str(reservation.get("status") or "skipped_durable_queue_gate")
                             row["reason"] = reservation.get("reason") or "durable candidate handoff was not authorized"
-                            row["retry_eligible"] = automatic_decision in {"retryable_rollback", "invalid_binding"}
+                            # queue_has_active_candidate_task means an earlier task on THIS
+                            # SAME queue row is blocking the handoff. That earlier task can
+                            # already be dead (its staged file went missing, its transfer
+                            # vanished) for up to ~30-70 minutes before a separate periodic
+                            # sweep (inkdrop_manual_source_autoresolve, every 10 min with its
+                            # own 30-min stale grace period) catches up and retires it. Until
+                            # then this gate has no way to tell "genuinely still active" from
+                            # "already dead, just not detected yet" -- so a real, safe
+                            # candidate found during that window was previously discarded with
+                            # no retry, leaving the row to wait for its next full queue-fairness
+                            # turn (which can itself be hours to days out under a large
+                            # backlog). A short retry gives it a prompt recheck once the
+                            # blocking task is actually retired. sibling_exact_unit_active (a
+                            # DIFFERENT queue row's task) is left alone -- that owner is a
+                            # distinct row this fix has no evidence about, and retrying every
+                            # few minutes against a genuinely active sibling would just be
+                            # wasted search load.
+                            row["retry_eligible"] = (
+                                automatic_decision in {"retryable_rollback", "invalid_binding"}
+                                or reservation.get("reason") == "queue_has_active_candidate_task"
+                            )
                             row["manual_review_required"] = automatic_decision == "invalid_binding"
                             if row["retry_eligible"]:
                                 row["transient_error"] = True
@@ -10428,7 +11590,9 @@ def _run_auto_grab_with_ephemeral_candidates(args, result):
                         if row["mark_waiting"].get("review_id"):
                             row["status"] = "started_waiting"
                             if inspection_handoff:
-                                row["reason"] = AUTO_INSPECT_USER_MESSAGE
+                                row["reason"] = (
+                                    gate.get("inspection_message") or AUTO_INSPECT_USER_MESSAGE
+                                )
                             outcome["started_count"] += 1
                         else:
                             row["status"] = "waiting_record_missing"
@@ -10861,6 +12025,48 @@ def weak_staged_filename_guard(filename, item):
     return ""
 
 
+# Penalties that mean the folder is making a *contradicting* series claim,
+# rather than simply failing to make one. A dated dump folder produces neither.
+_STAGED_PARENT_CONFLICT_MARKERS = (
+    "different titled series/subseries",
+    "filename title appears to be a different series",
+    "related subseries title tail",
+)
+
+
+def staged_parent_series_conflict(path, root, item):
+    """An explicit contradiction from the staged file's parent folder, or ''.
+
+    `staged_match_details()` used to return the moment the leaf matched, so a
+    correct-looking leaf inside another series' folder was promoted and
+    imported -- `Berserk of Gluttony/Berserk Vol.01.cbz` satisfied a want for
+    Berserk volume 1, even though evaluating the whole path rejects it on a
+    related-subseries penalty. The folder was not noise; it was the more
+    specific claim, and it was never read.
+
+    Only an explicit conflict counts. Most staging roots are dated dump
+    folders that say nothing about series, and treating "does not match" as
+    "contradicts" would strand essentially every real import.
+    """
+    leaf = Path(path).name
+    # Evaluate the *relative* path, not the flattened context string. The
+    # separator is load-bearing: "Berserk of Gluttony/Berserk Vol.01.cbz"
+    # yields the accurate "related subseries title tail: gluttony", while the
+    # flattened form collapses to a vaguer repeated-title penalty that would
+    # not distinguish a contradiction from ordinary noise.
+    for text in (relative_display_path(path, root), staged_context_filename(path, root)):
+        if not text or text == leaf:
+            continue
+        details = item_match_details(text, item)
+        if details.get("matched"):
+            return ""
+        penalties = " | ".join(str(value).lower() for value in (details.get("penalties") or []))
+        for marker in _STAGED_PARENT_CONFLICT_MARKERS:
+            if marker in penalties:
+                return f"parent folder names a different series: {text}"
+    return ""
+
+
 def staged_match_details(path, root, item):
     leaf = Path(path).name
     weak_guard = weak_staged_filename_guard(leaf, item)
@@ -10874,6 +12080,18 @@ def staged_match_details(path, root, item):
         }
     leaf_details = item_match_details(leaf, item)
     if leaf_details.get("matched"):
+        # Read the parent before trusting the leaf. A folder that explicitly
+        # names a different series outranks a leaf that merely looks right --
+        # otherwise the more specific claim never gets read at all.
+        parent_conflict = staged_parent_series_conflict(path, root, item)
+        if parent_conflict:
+            penalties = list(leaf_details.get("penalties") or [])
+            penalties.append(parent_conflict)
+            leaf_details["matched"] = False
+            leaf_details["penalties"] = list(
+                dict.fromkeys(str(value) for value in penalties if value)
+            )
+            leaf_details["parent_series_conflict"] = True
         leaf_details["match_basis"] = "filename"
         leaf_details["match_text"] = leaf
         return leaf_details
@@ -10986,6 +12204,33 @@ def scan_staged_file_candidates():
     return candidates
 
 
+def slskd_handoff_retired(item):
+    """Has this row's SLSKD handoff ended, so its peer no longer owns the file?
+
+    Accepts either shape the probe sees: the reduced review item built by
+    queue_source_review_item() (which carries the precomputed flag) or a raw
+    autopilot queue row (which carries the underlying markers).
+    """
+    item = item if isinstance(item, dict) else {}
+    if item.get("slskd_handoff_retired"):
+        return True
+    if item.get("retired_download_task_at") or item.get("slskd_terminal_recovery"):
+        return True
+    return str(item.get("last_slskd_autopick_status") or "").strip().lower() == "reservation_expired"
+
+
+def staged_candidate_owner(item):
+    """The peer that can be credited with a file found by a filesystem scan.
+
+    Only the owner of a still-live handoff qualifies; see the call site in
+    detected_staged_files() for why a retired one must not be asserted.
+    """
+    item = item if isinstance(item, dict) else {}
+    if slskd_handoff_retired(item):
+        return None
+    return item.get("username") or item.get("slskd_username") or item.get("last_slskd_user")
+
+
 def detected_staged_files(item, max_files=8, review_id=None):
     out = []
     review_id = str(review_id or (item or {}).get("review_id") or "")
@@ -11002,12 +12247,16 @@ def detected_staged_files(item, max_files=8, review_id=None):
             # A staged filesystem scan has no peer identity of its own.  Bind
             # bad-candidate history to the authoritative handoff owner carried
             # by the queue/task item so an unrelated peer's filename-only
-            # failure cannot shadow this exact transfer.
-            "username": (
-                (item or {}).get("username")
-                or (item or {}).get("slskd_username")
-                or (item or {}).get("last_slskd_user")
-            ),
+            # failure cannot shadow this exact transfer -- but only while that
+            # handoff is still live.  Once the transfer is retired or
+            # terminally recovered the queue's peer is just whoever it tried
+            # last, not whoever left this file on disk, and asserting it
+            # hid the file's own rejection record from
+            # matching_bad_candidate_rows() (which drops rows whose username
+            # differs).  The file was then re-detected as fresh every pass,
+            # forever: 15 of 17 live stuck rows, e.g. Planetes staged from
+            # Senda-t7 while the queue had moved on to jkage.
+            "username": staged_candidate_owner(item),
             "provider": (item or {}).get("provider"),
         }
         if review_id:
@@ -11064,7 +12313,17 @@ def detected_staged_files(item, max_files=8, review_id=None):
 
 
 def attach_staged_detection(entry, item):
-    review_id = str((item or {}).get("review_id") or (entry or {}).get("review_id") or "")
+    # A queue row carries its waiting review under last_slskd_waiting_review_id,
+    # not review_id -- so the autopilot path resolved "" here and skipped the
+    # whole bad-candidate filter in detected_staged_files(), re-detecting an
+    # already-rejected staged file on every pass.
+    review_id = str(
+        (item or {}).get("review_id")
+        or (entry or {}).get("review_id")
+        or (item or {}).get("last_slskd_waiting_review_id")
+        or (entry or {}).get("last_slskd_waiting_review_id")
+        or ""
+    )
     detected = detected_staged_files(item, review_id=review_id)
     previous_status = str(entry.get("status") or "")
     entry["staged_scan_at"] = now()
@@ -11156,6 +12415,84 @@ def summarize_rejections(rejections, checked_file_count, response_count):
         "rejection_reasons": reason_counts,
         "rejection_samples": samples,
     }
+
+
+def durable_refusal_evidence(rejection_summary, decided_at):
+    """Turn one query's rejections into evidence the ledger can keep.
+
+    Returns ``(refusal_evidence, media_filter_summary)``. They are two values
+    rather than one because they must never be added together: the media
+    filter runs before candidate construction, so the files it drops were
+    never candidates and are not decisions about one. Merging them would put
+    ``unsupported_file_extension`` at the top of the product's refusal
+    distribution -- 92.4% of refused files, measured 2026-08-18 -- and bury the
+    8% that is an actual judgement. `refusal_evidence["reasons"]`, the list
+    every cross-provider consumer reads, is built only from the adjudication
+    map, so there is no call shape that can contaminate it.
+
+    Both halves are bounded and say so. `summarize_rejections` caps reasons at
+    eight and samples at five; when the cap bit, ``*_truncated`` is set, so a
+    partial view can never be mistaken for a complete one.
+
+    Both callers get the same shape, and it is safe for both because no field
+    in it is readable text. Two separate contracts demanded that and neither
+    could be satisfied by a filename: Manual Search stores queries as sha256
+    fingerprints so a search leaves nothing readable behind
+    (inkdrop-manual-search-slskd-smoke), and peer file inventory is memory-only
+    and never persisted at all (inkdrop-slskd-series-run-handoff-smoke). Both
+    of those broke against an earlier version of this change that kept the
+    candidate's leaf name. Candidates are identified by digest instead -- see
+    inkdrop_slskd_refusal_vocabulary.identity_fingerprint.
+    """
+    summary = rejection_summary if isinstance(rejection_summary, dict) else {}
+    counts = inkdrop_slskd_refusal_vocabulary.classify_counts(summary.get("rejection_reasons"))
+    samples = inkdrop_slskd_refusal_vocabulary.candidate_samples(summary.get("rejection_samples"))
+    adjudicated = [
+        row for row in samples
+        if row.get("refusal_class") == inkdrop_slskd_refusal_vocabulary.CLASS_ADJUDICATION
+    ]
+    rejected_file_count = int(summary.get("rejected_file_count") or 0)
+    classified_file_count = counts["adjudication_file_count"] + counts["media_filter_file_count"]
+
+    evidence = {}
+    if counts["adjudication"]:
+        ranked = sorted(counts["adjudication"].items(), key=lambda row: (-row[1], row[0]))
+        detail = {
+            "provider": "slskd",
+            "reason_counts": {code: count for code, count in ranked},
+            "refused_file_count": counts["adjudication_file_count"],
+            "candidates": adjudicated,
+            "candidate_sample_cap": inkdrop_slskd_refusal_vocabulary.SAMPLE_CAP,
+            "candidates_truncated": counts["adjudication_file_count"] > len(adjudicated),
+            "reason_counts_truncated": classified_file_count < rejected_file_count,
+        }
+        if counts["unmapped_labels"]:
+            # Named, not folded into a neighbour. An unmapped label means the
+            # probe grew a penalty shape the vocabulary has not been told
+            # about, and it has to be visible to get fixed.
+            detail["unmapped_labels"] = counts["unmapped_labels"]
+            detail["unmapped_label_count"] = counts["unmapped_label_count"]
+        evidence = inkdrop_source_worker_runtime.refusal_evidence(
+            stage=inkdrop_source_worker_runtime.REFUSAL_STAGE_CONSIDERED,
+            # slskd's own admission filter decided this, not the shared
+            # compatibility matcher. Recording that distinction is the point:
+            # a refusal made here is invisible to changes that widen
+            # inkdrop_candidate_matching.
+            authority=inkdrop_source_worker_runtime.REFUSAL_AUTHORITY_PROVIDER_ADAPTER,
+            reasons=[code for code, _count in ranked],
+            decided_at=decided_at,
+            detail=detail,
+        )
+
+    media_filter_summary = {}
+    if counts["media_filter"]:
+        media_filter_summary = {
+            "provider": "slskd",
+            "stage": "pre_candidate_media_filter",
+            "filtered_file_count": counts["media_filter_file_count"],
+            "reason_counts": counts["media_filter"],
+        }
+    return evidence, media_filter_summary
 
 
 # Mirrors inkdrop_archive_conversion.MIN_PAGE_DIRECTORY_IMAGES: below this
@@ -12311,7 +13648,19 @@ def merge_query_candidates(candidate_groups, item):
     return annotate_auto_grab_verdicts(merged, item)
 
 
-def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_queries=6, deadline=None, candidate_limit=None):
+
+# A Soulseek search is not finished when it first has something to show. Live
+# distribution over 112 completed searches on this deployment: p50 16s, p90
+# 20s, p95 23s, and a 38s maximum -- so 79% of searches are still running at
+# 8 seconds, which is what this defaulted to. The one live caller overrides it
+# to ~41s and is fine, so nothing was broken; but a default that reads almost
+# every search before it finishes is one new caller away from producing exactly
+# the empty results this module spends so much effort explaining. Set above the
+# observed maximum, below the 55s window cap in slskd_search().
+DEFAULT_SLSKD_DISCOVERY_WAIT_SECONDS = 45
+
+
+def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=DEFAULT_SLSKD_DISCOVERY_WAIT_SECONDS, max_queries=6, deadline=None, candidate_limit=None):
     """Run bounded SLSKD discovery without enqueue, cache, or action writes.
 
     This is deliberately narrower than ``probe_item`` and retains no query text
@@ -12377,7 +13726,10 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_
                 attempt_status = "partial_file_cap"
             else:
                 completed_query_count += 1
-            attempts.append({
+            manual_refusal_evidence, manual_media_filter = durable_refusal_evidence(
+                rejection_summary, now()
+            )
+            manual_attempt = {
                 "query_ordinal": len(attempts) + 1,
                 "query_fingerprint": hashlib.sha256(normalize(query).encode()).hexdigest()[:12],
                 "status": attempt_status,
@@ -12386,7 +13738,12 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=8, max_
                 "candidate_count": len(candidates),
                 "rejected_file_count": rejected,
                 "processed_file_count": processed,
-            })
+            }
+            if manual_refusal_evidence:
+                manual_attempt["refusal_evidence"] = manual_refusal_evidence
+            if manual_media_filter:
+                manual_attempt["media_filter_summary"] = manual_media_filter
+            attempts.append(manual_attempt)
             if not failure_status and remaining_file_budget <= 0 and completed_query_count < len(planned_queries):
                 failure_status = "provider_failure"
                 failure_reason = "slskd_normalization_file_cap"
@@ -12567,6 +13924,24 @@ def probe_item(
     directory_items=None,
 ):
     queries = source_queries(item)
+    # Prune before rotation, not after. Dropping a futile rung from the batch
+    # would just shrink the pass; dropping it from the list means the rotation
+    # spends the same budget on a question that can still be answered.
+    queries, futile_queries = prune_futile_queries(queries, recent_empty_query_terms())
+    # Saturation narrowing: when the bare anchor filled Soulseek's reply
+    # ceiling, the peers holding this series may never have been in the answer
+    # at all, so the shelf-qualified rung takes the anchor slot for this pass.
+    queries, narrowed_from = narrow_saturated_anchor(
+        queries, saturated_query_texts(), slskd_media_query_qualifier(item)
+    )
+    if narrowed_from >= 0:
+        log(
+            "probe_anchor_narrowed_on_saturation",
+            review_id=item.get("review_id"),
+            series=item.get("series"),
+            promoted=queries[0],
+            demoted=queries[1],
+        )
     planned_queries = rotated_query_batch(
         queries,
         max_queries=max_queries,
@@ -12655,6 +14030,12 @@ def probe_item(
             # inventory. Counts and normalized reasons are sufficient for the
             # durable cache/status diagnostic contract.
             persisted_rejection_summary.pop("rejection_samples", None)
+            # The raw samples are still never persisted, and neither is any
+            # readable form of them: peer file inventory stays memory-only, so
+            # a refused candidate goes durable as a digest of its leaf.
+            query_refusal_evidence, query_media_filter = durable_refusal_evidence(
+                rejection_summary, now()
+            )
             attempt = {
                 "query": query,
                 "elapsed_seconds": round(now() - started, 1),
@@ -12665,6 +14046,10 @@ def probe_item(
                 "series_directory_observation_count": len(query_observations),
                 **persisted_rejection_summary,
             }
+            if query_refusal_evidence:
+                attempt["refusal_evidence"] = query_refusal_evidence
+            if query_media_filter:
+                attempt["media_filter_summary"] = query_media_filter
             attempts.append(attempt)
             if cumulative_auto_counts["auto_grab_safe"]:
                 attempt["search_stop_reason"] = "safe_exact_candidate_found"
@@ -12779,6 +14164,23 @@ def probe_item(
     if best_candidates and failed_candidate_count == len(best_candidates):
         status = "failed_candidates_exhausted"
     effective_max_queries = max_queries + len(expansion_queries)
+    # Persist what this search already measured per rung. The attempts list
+    # above carries query text, elapsed, response_count and candidate_count
+    # for every variant tried; without this it is used once and dropped, which
+    # is why yield concentration has never been measurable and why futile
+    # retirement has to ask slskd's own one-hour /searches memory instead.
+    # Recording only -- nothing here changes which queries run.
+    try:
+        query_variant_outcomes.record_variant_outcomes(
+            INKDROP_STATE_DB,
+            attempts,
+            review_id=item.get("review_id"),
+            series=item.get("series"),
+            provider_id="slskd",
+        )
+    except Exception:
+        # A search must never fail because its telemetry could not be stored.
+        pass
     entry = {
         "schema_version": PROBE_SCHEMA_VERSION,
         "auto_grab_context_signature": auto_grab_context_signature(),
@@ -12792,6 +14194,10 @@ def probe_item(
         "queries": attempts,
         "attempts": attempts,
         "query_total": len(queries),
+        # Named, not silently absent. A pass that quietly stopped asking
+        # something reads identically to one that never had it to ask.
+        "futile_queries_pruned": len(futile_queries),
+        "futile_query_samples": futile_queries[:5],
         "query_offset": int(query_offset or 0) % len(queries) if queries else 0,
         "query_anchor_included": bool(include_anchor),
         "next_query_offset": next_query_offset(

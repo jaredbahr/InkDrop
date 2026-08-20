@@ -29,12 +29,21 @@
     "nzbget:api_key": "Use this instead of the username and password if your NZBGet exposes an API key.",
   };
   const SLSKD_ADVANCED = [
+    ["max_total", "Max Items Per Pass", "How many items one SLSKD probe pass may work through before handing back to the queue.", 0],
+    ["max_per_series", "Max Per Series", "Cap on items taken from a single series in one pass, so one series cannot use the whole budget.", 1],
     ["wait_seconds", "Search Wait Seconds", "How long InkDrop waits for each bounded SLSKD search to return results.", 1],
     ["max_queries", "Max Queries", "Maximum query variants InkDrop may send during one SLSKD probe.", 1],
     ["auto_grab_max", "Auto Grab Max", "Maximum safe SLSKD candidates InkDrop can start in one probe pass.", 0],
     ["probe_budget_seconds", "Probe Budget Seconds", "Maximum total time for one SLSKD probe before InkDrop returns to the queue.", 30],
     ["cooldown_hours", "Cooldown Hours", "Delay before InkDrop repeats an unsuccessful SLSKD probe for the same item.", 0],
     ["max_active_per_user", "Max Active Per User", "Per-user transfer cap so one Soulseek user cannot stall all active work.", 1],
+    ["search_history_keep", "Search History Keep", "How many recent searches to leave in SLSKD when history cleanup runs.", 0],
+    ["search_history_max_delete", "Search History Max Delete", "Ceiling on how many searches one cleanup run may remove, so a large backlog is cleared gradually.", 0],
+    ["search_history_min_age_minutes", "Search History Min Age (minutes)", "How old a search must be before cleanup may remove it, so in-flight searches are left alone.", 0],
+  ];
+  // Boolean settings that live alongside the numeric SLSKD knobs above.
+  const SLSKD_ADVANCED_FLAGS = [
+    ["delete_search_history", "Delete SLSKD search history", "Let InkDrop prune its own finished searches from SLSKD so its history does not grow without bound. Off unless you turn it on."],
   ];
   const MAX_MAPPINGS = 32;
   const stateByRoot = new WeakMap();
@@ -299,6 +308,9 @@
         const value = String(data.get(`setting:${key}`) || "").trim();
         if (value) payload.settings[key] = value; else delete payload.settings[key];
       }
+      for (const [key] of SLSKD_ADVANCED_FLAGS) {
+        if (form.elements[`setting:${key}`]) payload.settings[key] = data.get(`setting:${key}`) === "on";
+      }
     }
     const secrets = {}, clear = [];
     form.querySelectorAll("[data-secret-name]").forEach(input => {
@@ -371,7 +383,9 @@
       advanced.append(el("summary", "", "SLSKD Advanced Search Settings"));
       const grid = el("div", "download-client-advanced-grid");
       for (const [key, label, help, min] of SLSKD_ADVANCED) field(grid, label, `setting:${key}`, {type: "number", min, value: instance.settings?.[key] ?? "", help});
-      advanced.append(grid); form.append(advanced);
+      advanced.append(grid);
+      for (const [key, label, help] of SLSKD_ADVANCED_FLAGS) checkbox(advanced, label, `setting:${key}`, instance.settings?.[key] === true, help);
+      form.append(advanced);
     }
     const footer = el("div", "download-client-dialog-footer wide");
     const cancel = el("button", "", "Cancel"); cancel.type = "button"; cancel.dataset.dialogClose = "1";
@@ -485,9 +499,11 @@
   function renderCards(state) {
     state.cards.replaceChildren();
     if (!state.instances.length) {
-      // One quiet line. The old bordered box restated the section heading
-      // plus a paragraph the manager's own Add button already implies.
-      state.cards.append(el("p", "download-client-empty-line", "None configured."));
+      // This page used to open with a card per client type whether or not the
+      // user ran any of them, so an empty setup and a configured one looked the
+      // same. Saying nothing is here is the point.
+      state.cards.append(el("p", "download-client-empty-line",
+        "No download clients yet. Add the one you run — InkDrop connects to it, it isn't bundled."));
     }
     for (const instance of state.instances) {
       const card = el("article", "download-client-instance-card"); card.dataset.downloadClientInstance = instance.id; card.dataset.clientType = instance.client_type;
@@ -501,9 +517,26 @@
       const status = statusText(state.statuses.get(instance.id));
       const statusWrap = el("div", ""); statusWrap.append(el("dt", "", "Health"), el("dd", `download-client-health ${status.tone}`, status.text)); facts.append(statusWrap); card.append(facts);
       if (String(instance.client_type || "").toLowerCase() === "slskd") {
-        card.append(instance.is_active_slskd_source
-          ? el("p", "download-client-instance-note good", "Active — InkDrop is using this instance for SLSKD search and downloads. The single SLSKD card below is disabled while this is active.")
-          : el("p", "download-client-instance-note warn", "Not active yet — InkDrop is still using the single SLSKD card below. This instance takes over automatically once it's enabled with a URL and API key."));
+        // Whether there is still an SLSKD card to point at, which is not the
+        // same question as whether a legacy row exists: the row survives
+        // migration untouched, but its card is retired the moment this instance
+        // becomes active, and an empty card is retired outright. Reading the
+        // same legacy_client_cards signal hideMigratedLegacyCards() uses keeps
+        // the note and the page agreeing.
+        const slskdCardStillShowing = !instance.is_active_slskd_source
+          && (state.payload?.legacy_client_cards || []).some(row =>
+            String(row.client_type || "").toLowerCase() === "slskd" && row.configured);
+        if (instance.is_active_slskd_source) {
+          // No "card below" clause here: an active instance is exactly what
+          // retires that card, so promising it would send the user looking for
+          // something this render just removed.
+          card.append(el("p", "download-client-instance-note good",
+            "Active — InkDrop is using this instance for SLSKD search and downloads."));
+        } else {
+          card.append(el("p", "download-client-instance-note warn", slskdCardStillShowing
+            ? "Not active yet — InkDrop is still using the single SLSKD card below. This instance takes over automatically once it's enabled with a URL and API key."
+            : "Not active yet — InkDrop starts using this for SLSKD search and downloads once it's enabled with a URL and API key."));
+        }
       }
       if ((instance.path_mappings || []).length) card.append(el("p", "download-client-instance-note", `${instance.path_mappings.length} remote path mapping${instance.path_mappings.length === 1 ? "" : "s"}`));
       const actions = el("div", "download-client-instance-actions");
@@ -517,8 +550,12 @@
   }
 
   function hideMigratedLegacyCards(state) {
-    // For most client types, adding any instance means "use this instead of the
-    // legacy single card." SLSKD is different: an instance row only takes over once
+    // Legacy cards only survive on installs that had one before the page became
+    // add-first; the settings sync migrates each configured card into an
+    // instance, and this hides the card once that instance exists. Hiding is
+    // deliberately conditional on the instance being there, so a card that
+    // could not be migrated stays visible and editable rather than stranded.
+    // SLSKD is different again: an instance row only takes over once
     // it's actually ready (is_active_slskd_source, computed server-side from the same
     // check the SLSKD search worker uses) -- an enabled-looking-but-incomplete SLSKD
     // instance must NOT hide the legacy card, or neither card would show the config
@@ -526,10 +563,20 @@
     const types = new Set(state.instances
       .filter(item => String(item.client_type || "").toLowerCase() !== "slskd" || item.is_active_slskd_source)
       .map(item => String(item.client_type || "").toLowerCase()));
+    // A leftover card with no endpoint and no credential holds nothing a user
+    // could lose, and reading "Enabled" on it is what made two people think they
+    // had a client they did not have. Retire it and let the add flow be the
+    // answer. A card that does hold a connection is never touched this way --
+    // it only disappears once its config is safely on an instance.
+    const emptyCards = new Set((state.payload?.legacy_client_cards || [])
+      .filter(row => !row.configured)
+      .map(row => String(row.client_type || "").toLowerCase()));
     const group = state.root.closest(".settings-group-body") || state.root.parentElement;
     group?.querySelectorAll?.(".settings-card[data-provider-id]").forEach(card => {
-      const migrated = types.has(String(card.dataset.providerId || "").toLowerCase());
-      card.hidden = migrated; card.dataset.downloadClientLegacyFallback = migrated ? "hidden-by-instance" : "visible";
+      const providerId = String(card.dataset.providerId || "").toLowerCase();
+      const superseded = types.has(providerId) || emptyCards.has(providerId);
+      card.hidden = superseded;
+      card.dataset.downloadClientLegacyFallback = superseded ? "hidden-by-instance" : "visible";
     });
   }
 
@@ -610,7 +657,14 @@
     // toolbar (Test All Clients now covers these instances too, via the
     // InkDropDownloadClientManager hook below; the area reload re-runs
     // load(), so a separate Refresh button was the masthead's twin).
-    const copy = el("div", ""); copy.append(el("h3", "", "Additional Download Client Instances"));
+    // Not "Additional ...": adding is the only way a client gets here now, so
+    // there is no built-in set for these to be additional to.
+    const copy = el("div", "");
+    copy.append(
+      el("h3", "", "Download Clients"),
+      el("p", "download-client-manager-copy",
+        "SLSKD, SABnzbd and qBittorrent run outside InkDrop, so each one you add is a connection to a host you already have. Built-in sources like MangaDex and GetComics need no connection and are listed under Sources with a switch each."),
+    );
     const actions = el("div", "download-client-manager-actions");
     const add = el("button", "primary", "Add Download Client"); add.type = "button";
     const testAll = null;

@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from core import inkdrop_sources
 from core import inkdrop_source_providers as providers
+from core import inkdrop_source_worker_http as source_worker_http
 
 
 CONTRACT_VERSION = 1
@@ -110,20 +111,12 @@ def _normalized_hosts(values):
 
 
 def _host_allowed(url, allowed_hosts):
-    allowed = set(_normalized_hosts(allowed_hosts))
-    host = str(urlparse(str(url or "")).hostname or "").strip().lower()
-    return bool(host and (not allowed or host in allowed))
+    return source_worker_http.host_allowed(url, allowed_hosts)
 
 
 def _effective_host_cap(global_hosts, route_hosts):
-    global_cap = set(_normalized_hosts(global_hosts))
-    route_cap = set(_normalized_hosts(route_hosts))
-    if not route_cap:
-        return sorted(global_cap)
-    if not global_cap:
-        return sorted(route_cap)
-    effective = global_cap & route_cap
-    return sorted(effective) if effective else ["__inkdrop_no_allowed_host__"]
+    effective = source_worker_http.effective_host_cap_or_none(global_hosts, route_hosts)
+    return effective if effective is not None else ["__inkdrop_no_allowed_host__"]
 
 
 def _safe_response_headers(headers):

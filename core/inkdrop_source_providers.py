@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 
 from core import inkdrop_bencode
 from core import inkdrop_candidate_matching
+from core import inkdrop_title_identity
 from core import inkdrop_sources
 
 
@@ -1033,10 +1034,17 @@ def wanted_item_is_volume_unit(wanted_item=None):
     )
     if unit in VOLUME_UNIT_TYPES:
         return True
-    if media_type == "manga" and volume and not chapter:
-        return True
+    # A unit that says it is a chapter, from a source whose native unit IS the
+    # chapter, is never a volume -- not even when it also carries the volume
+    # that contains it. MangaDex and Suwayomi tag most collected chapters with
+    # their volume, so the "manga + volume + no chapter" inference below reads
+    # that containment as "this row IS volume N" the moment a caller hands over
+    # a dict that lost its chapter field. This has to be settled by what the
+    # row declares itself to be before any inference gets a turn.
     if unit == "chapter" and (chapter_native_provider or chapter_native_model):
         return False
+    if media_type == "manga" and volume and not chapter:
+        return True
     if unit == "chapter" and provider in {"comicvine", "kapowarr", "watch"} and manga_hint:
         return True
     if unit == "chapter":
@@ -2040,6 +2048,17 @@ def _series_query_aliases(wanted_item=None, *, policy=None):
             if alias and key not in seen:
                 seen.add(key)
                 aliases.append(alias)
+    # The operator alias store and the two narrow derivations, from the one
+    # shared authority. Until this line the Prowlarr predicate could not see
+    # aliases a human had saved -- slskd read them and this path did not, so
+    # adding the right alias fixed slskd and left Prowlarr still emitting
+    # mismatch before the shared matcher ever ran.
+    for record in inkdrop_title_identity.trusted_alias_records(wanted_item):
+        alias = normalized_query(record.get("title"))
+        key = alias.lower()
+        if alias and key not in seen:
+            seen.add(key)
+            aliases.append(alias)
     return aliases
 
 
@@ -2183,6 +2202,65 @@ INDEXER_PARENTHESIZED_RELEASE_GROUPS = {
     ("oda",),
     ("rillant",),
 }
+# Words that name an *edition* of the wanted work rather than another work,
+# drawn from the same vocabulary EDITION_PATTERNS uses in
+# inkdrop_candidate_matching. "Berserk Deluxe Edition Vol 01" is Berserk; what
+# to do about it is the collected-edition gate's decision, not this one's.
+INDEXER_EDITION_TOKENS = {
+    "collected",
+    "collection",
+    "compendium",
+    "complete",
+    "deluxe",
+    "edition",
+    "essential",
+    "hardcover",
+    "hc",
+    "library",
+    "omnibus",
+    "paperback",
+    "tpb",
+    "trade",
+}
+# Words that describe the *format or language* of the wanted work rather than
+# naming another work. Measured against production: without these, real packs
+# that were accepted and imported -- "BLEACH Manga Vol. 1~21", "Vagabond
+# Colored Manga V01-41", "Berserk manga batch vols. 1-35 HQ" -- read as
+# different series because a format word sat between the title and its unit.
+INDEXER_WORK_FORMAT_TOKENS = {
+    "batch",
+    "color",
+    "colored",
+    "colour",
+    "coloured",
+    "colors",
+    "colours",
+    "hd",
+    "hq",
+    "manga",
+    "manhua",
+    "manhwa",
+    "raw",
+    "raws",
+}
+# Collected editions number themselves in words as often as digits ("Saga
+# Compendium One"). Only counted directly after an edition word, so a series
+# that simply contains a number word -- "Superman One Million" -- is still
+# read as the different series it is.
+INDEXER_SPELLED_UNIT_NUMBERS = {
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+}
 INDEXER_UNIT_MARKER_TOKENS = {
     "book",
     "ch",
@@ -2196,6 +2274,22 @@ INDEXER_UNIT_MARKER_TOKENS = {
     "v",
     "vol",
     "volume",
+}
+# Plural unit words end a title segment just as squarely as the singular forms
+# above ("Berserk manga batch vols. 1-35"). They are kept separate because
+# INDEXER_UNIT_MARKER_TOKENS is *consumed* on the multi-word path, where
+# adding words would loosen a check this change does not touch; here they only
+# mark where the one-word title segment stops.
+INDEXER_UNIT_MARKER_PLURALS = {
+    "books",
+    "chapters",
+    "chs",
+    "issues",
+    "numbers",
+    "parts",
+    "tomes",
+    "volumes",
+    "vols",
 }
 INDEXER_COMPACT_UNIT_TOKEN_RE = re.compile(
     r"(?i)^(?:v|vol|volume|book|ch|chap|chapter|issue|no|number|part|pt)0*\d+(?:\.\d+)?$"
@@ -2307,18 +2401,20 @@ def _indexer_has_related_series_extension(candidate, wanted_item=None, policy=No
             leading_index += 1
             continue
         return True
-    if alias_length < 2:
-        # A one-word series name ("Batman", "Watchmen", "Die") turns up inside
-        # far too much unrelated release prose to police what follows it --
-        # real accepted packs trail things like "& Chapters 323-327 + Art
-        # Books Hiatus". The leading rule above is the half that carries its
-        # weight here: a different series built by prefixing the wanted name
-        # ("Absolute Batman" for Batman, "Before Watchmen" for Watchmen,
-        # "Who Is Miracleman" for Miracleman) is caught, and nothing that
-        # merely comes after a one-word title is second-guessed. This mirrors
-        # the SLSKD probe, which likewise only requires a one-word title to
-        # start its own title segment.
-        return False
+    # A one-word series name ("Batman", "Watchmen", "Die") turns up inside far
+    # too much unrelated release prose to police the whole tail -- real
+    # accepted packs trail things no token list will cover ("& Chapters
+    # 323-327 + Art Books Hiatus"). What can be policed is the part of the tail
+    # that is still the *title segment*: everything before the release names a
+    # unit. "Batman Beyond 001", "Venom Lethal Protector 001" and "Superman Son
+    # of Kal-El 005" put a word between the wanted name and the unit number,
+    # which is how a child series is named; "Vagabond Volume 01-37 & Chapters
+    # ..." reaches its unit marker immediately and everything after it is left
+    # alone. Multi-word aliases stay fully policed: they are specific enough
+    # that a trailing word is a real signal on its own, and their behaviour is
+    # unchanged here -- the edition tolerance below applies only to the
+    # narrower rule being added, so nothing that used to block stops blocking.
+    title_segment_only = alias_length < 2
     tail = title_tokens[alias_end:]
     index = 0
     while index < len(tail):
@@ -2328,15 +2424,29 @@ def _indexer_has_related_series_extension(candidate, wanted_item=None, policy=No
             continue
         token = tail[index]
         if token.isdigit() or INDEXER_COMPACT_UNIT_TOKEN_RE.fullmatch(token):
+            if title_segment_only:
+                return False
             index += 1
             continue
+        if title_segment_only and token in INDEXER_UNIT_MARKER_PLURALS:
+            return False
         if token in INDEXER_UNIT_MARKER_TOKENS:
+            if title_segment_only:
+                return False
             index += 1
             if index < len(tail) and re.fullmatch(r"\d+(?:\.\d+)?", tail[index]):
                 index += 1
             continue
         if token in INDEXER_RELEASE_METADATA_TOKENS or INDEXER_RELEASE_TOKEN_RE.fullmatch(token):
             index += 1
+            continue
+        if title_segment_only and token in INDEXER_WORK_FORMAT_TOKENS:
+            index += 1
+            continue
+        if title_segment_only and token in INDEXER_EDITION_TOKENS:
+            index += 1
+            if index < len(tail) and tail[index] in INDEXER_SPELLED_UNIT_NUMBERS:
+                index += 1
             continue
         return True
     return False
@@ -2483,6 +2593,12 @@ def prowlarr_candidate_from_result(result, registry_row=None, wanted_item=None):
         "request_id": str(result.get("_inkdrop_request_id") or "").strip(),
         "query_ordinal": int_value(result.get("_inkdrop_query_index"), None),
         "categoryless_fallback": bool(result.get("_inkdrop_categoryless_fallback")),
+        # The categories actually sent to Prowlarr, once rewritten to ones the
+        # selected indexers declare. Carried per-result so the gate below admits
+        # what the request asked for; without it a Nyaa release tagged 7000 is
+        # fetched and then rejected category_not_allowed, which is the same zero
+        # under a worse name. See tracker #198.
+        "resolved_allowed_categories": category_ids(result.get("_inkdrop_resolved_categories") or []),
         "categoryless_fallback_primary_request_id": str(
             result.get("_inkdrop_categoryless_fallback_primary_request_id") or ""
         ).strip(),
@@ -2495,6 +2611,27 @@ def prowlarr_candidate_from_result(result, registry_row=None, wanted_item=None):
     if aliases:
         candidate["series_query_aliases"] = aliases
     candidate["match_confidence"] = _indexer_match_confidence(candidate, wanted_item, policy=policy)
+    # Stamped here because this is where the decision is actually made. The
+    # shared matcher cannot recompute it -- importing this module would be a
+    # cycle -- and more importantly it should not: two authorities computing
+    # "is this the wanted work?" separately is the defect, not the fix.
+    candidate["outer_work_identity_match"] = indexer_outer_work_identity_matches(
+        candidate, wanted_item, policy=policy
+    )
+    candidate["title_identity_evidence"] = inkdrop_title_identity.evidence(
+        authority=inkdrop_title_identity.AUTHORITY_PROVIDER_QUERY,
+        observed_title=first_text(
+            candidate.get("original_result_title"), candidate.get("title")
+        ),
+        wanted_item=wanted_item,
+        expected_titles=aliases or None,
+        alias=inkdrop_title_identity.matched_alias(
+            first_text(candidate.get("original_result_title"), candidate.get("title")),
+            wanted_item,
+        ),
+        outer_work_match=candidate["outer_work_identity_match"],
+        match_confidence=candidate["match_confidence"],
+    )
     manifest_match = indexer_manifest_pack_match(candidate)
     if manifest_match:
         candidate["pack_contents_match"] = manifest_match
@@ -3088,7 +3225,14 @@ def indexer_candidate_verdict(candidate, registry_row=None):
     allowed_extensions = normalized_extensions(policy.get("allowed_extensions") or registry_row.get("allowed_extensions") or [])
     ext = _indexer_artifact_extension(candidate.get("extension"), candidate.get("title"), candidate.get("download_url"))
     candidate_categories = category_ids(candidate.get("category_ids") or candidate.get("categories"))
-    allowed_categories = indexer_policy_categories(policy, registry_row)
+    # Request and gate must agree on one category set or they cannot both be
+    # right. When the request was rewritten to categories the indexer actually
+    # declares, that rewritten set is the contract -- falling back to the
+    # configured policy here would reject exactly the releases we just widened
+    # the search to find.
+    allowed_categories = category_ids(candidate.get("resolved_allowed_categories") or []) or indexer_policy_categories(
+        policy, registry_row
+    )
     categoryless_fallback_category_gate = _categoryless_fallback_category_gate_allowed(candidate, policy)
     language = str(candidate.get("language") or "").strip().lower()
     policy_language_status = _indexer_language_status(language, policy, None)
@@ -6117,21 +6261,30 @@ def _query_matches_result(result, wanted_item=None, policy=None):
         )
     ).lower()
 
+    def manual_edition_target():
+        if not wanted_item.get("manual_search"):
+            return None
+        return re.match(r"(?i)^absolute\s+([^:]+):\s+.+$", normalized_query(series))
+
     def manual_semantic_conflict() -> bool:
+        # These words only disambiguate a collected edition from the monthly
+        # run that shares its storyline subtitle ("Absolute Batman: The Court
+        # of Owls" vs. a 2024 Batman monthly, an OST, or a Detective Comics
+        # printing). Off that target they are ordinary comic vocabulary: the
+        # series "Detective Comics" and "Monthly Girls' Nozaki-kun" carry a
+        # listed word in their own names, and a music manga's description
+        # mentions music. Judging every Manual Search by them returned zero
+        # results for those titles while automatic search matched them fine.
+        if not manual_edition_target():
+            return False
         return bool(
-            wanted_item.get("manual_search")
-            and (
-                re.search(r"(?i)\b(?:soundtracks?|ost|music|audio|flac|mp3)\b", haystack)
-                or re.search(r"(?i)\bdetective\s+comics\b", haystack)
-                or re.search(r"(?i)\b(?:monthly|new\s+series|ongoing\s+series)\b", haystack)
-            )
+            re.search(r"(?i)\b(?:soundtracks?|ost|music|audio|flac|mp3)\b", haystack)
+            or re.search(r"(?i)\bdetective\s+comics\b", haystack)
+            or re.search(r"(?i)\b(?:monthly|new\s+series|ongoing\s+series)\b", haystack)
         )
 
     def manual_edition_alias_allowed() -> bool:
-        if not wanted_item.get("manual_search"):
-            return True
-        target = normalized_query(series)
-        match = re.match(r"(?i)^absolute\s+([^:]+):\s+.+$", target)
+        match = manual_edition_target()
         if not match:
             return True
         if manual_semantic_conflict():
@@ -6213,10 +6366,17 @@ def _candidate_result_relevant(result, wanted_item=None, policy=None):
         edition_alias = bool(edition_match)
         franchise_tokens = _query_tokens(edition_match.group(1), ignored={"the", "an", "and", "of"}) if edition_match else []
         franchise_match = bool(franchise_tokens) and all(token in _query_tokens(haystack) for token in franchise_tokens)
+        # Scoped to the collected-edition target for the same reason as
+        # _query_matches_result(), and matching item_match_details(), which
+        # has always required its own edition match before reading these
+        # words as a conflict.
         semantic_conflict = bool(
-            re.search(r"(?i)\b(?:soundtracks?|ost|music|audio|flac|mp3)\b", haystack)
-            or re.search(r"(?i)\bdetective\s+comics\b", haystack)
-            or re.search(r"(?i)\b(?:monthly|new\s+series|ongoing\s+series)\b", haystack)
+            edition_alias
+            and (
+                re.search(r"(?i)\b(?:soundtracks?|ost|music|audio|flac|mp3)\b", haystack)
+                or re.search(r"(?i)\bdetective\s+comics\b", haystack)
+                or re.search(r"(?i)\b(?:monthly|new\s+series|ongoing\s+series)\b", haystack)
+            )
         )
         if semantic_conflict:
             return False
@@ -6607,8 +6767,16 @@ def direct_file_probe_candidates_from_payload(payload, registry_row=None, wanted
                     "direct_file_probe_source": True,
                 },
             )
-            candidate["candidate_identity"] = row.get("download_url_hash") or candidate_identity(candidate)
+            # The row's download_url_hash is a 64-character locator, not an
+            # identity, and assigning it here put this path outside the
+            # 24-hex contract every ownership gate enforces -- so a probe
+            # candidate could never prove it owned its own failed task, and a
+            # transient infrastructure failure was held for the full
+            # source-memory cooldown instead of being retried. Publish the
+            # locator as the locator and let candidate_identity() mint the
+            # identity from it, which is what every other provider does.
             candidate["download_url_hash"] = row.get("download_url_hash") or url_hash(download_url)
+            candidate["candidate_identity"] = candidate_identity(candidate)
             candidate["probe_status_code"] = status_code
             candidate["discovery_provider_id"] = provider_id
             candidate["transport_id"] = row.get("shared_file_host") or "direct_http"
@@ -8229,6 +8397,86 @@ def _suwayomi_volume_values_from_container(value):
     return values, malformed
 
 
+# An explicitly-marked volume in the release/chapter title -- "Vol. 16",
+# "Volume 16", "v16". Deliberately NOT a bare trailing number: "Chainsaw Man
+# 15" is genuinely ambiguous between volume 15 and chapter 15, and manga
+# chapter numbers are series-global, so guessing there would send chapters
+# into a volume slot. Only the marked forms are accepted, and "Chapter 411"
+# must never satisfy it.
+SUWAYOMI_TITLE_VOLUME_PATTERN = re.compile(
+    r"(?i)(?:^|[\s\-\[\(_.])(?:v|vol|volume)\.?\s*0*(\d{1,4})(?=$|[\s\-\]\)_.])"
+)
+
+# A coverage range ("v01-05", "vol. 1-3", "v01 - v05") names no single volume.
+# The volume pattern above would otherwise match only its first endpoint and
+# report a confident "volume 1" for a twenty-volume pack.
+SUWAYOMI_TITLE_VOLUME_RANGE_PATTERN = re.compile(
+    r"(?i)(?:v|vol|volume)\.?\s*0*\d{1,4}\s*(?:-|–|—|\bto\b|\.\.)\s*(?:v|vol|volume)?\.?\s*0*\d{1,4}"
+)
+
+# A title that names a chapter as well as a volume ("Vol.1 Ch.1 - Kaiman")
+# answers two different questions differently, so the caller has to say which
+# one it is asking.
+#
+#   "is this row the whole of volume 1?"   -- no. It is one chapter of it.
+#   "does this row belong in volume 1?"    -- yes, and it says so itself.
+#
+# Only the first reading may treat a co-present chapter token as
+# disqualifying. `_suwayomi_volume_chapter_rows` asks the second: it tests
+# every chapter and assembles the matches into one multi-chapter volume pack,
+# where a chapter naming its volume is precisely the membership evidence
+# wanted. The stricter question keeps its own separate test in
+# `source_title_is_single_volume_artifact`, which refuses chapter-shaped
+# titles outright, so relaxing membership does not weaken it.
+#
+# This distinction is load-bearing rather than theoretical. Read from the live
+# server on 2026-08-16, across the 99 manga behind these rejections: 1,862 of
+# 24,947 chapter names state a volume, and refusing every co-present chapter
+# token discards 1,855 of them, leaving 7. The discarded shape is the ordinary
+# MangaDex one ("Vol.1 Ch.1 - Kaiman"); the volume-only shape this pattern was
+# written to preserve does not occur in the source at all.
+SUWAYOMI_TITLE_CHAPTER_MARKER_PATTERN = re.compile(
+    r"(?i)(?:^|[\s\-\[\(_.])(?:chapter|chap|ch)\.?\s*0*\d"
+)
+
+
+def suwayomi_title_volume_number(chapter_row, *, allow_chapter_marker=False):
+    """Return a volume number stated plainly in the title, or "".
+
+    Suwayomi's GraphQL chapter type has no volume field to read -- introspected
+    2026-08-16, it carries chapterNumber, name, scanlator, sourceOrder,
+    uploadDate, url and a client-side `meta` map, and nothing else. A gate that
+    admits a chapter only on structured volume metadata is therefore asking the
+    provider for something it cannot send, and the name is the only evidence
+    there is.
+
+    `allow_chapter_marker` selects which question is being asked -- membership
+    in a volume, or standing in for the whole of one. See the note above.
+    """
+    chapter_row = chapter_row if isinstance(chapter_row, dict) else {}
+    seen = []
+    for key in ("name", "title", "chapterTitle", "chapter_title", "displayName", "filename", "file_name"):
+        text = str(chapter_row.get(key) or "").strip()
+        if not text:
+            continue
+        if SUWAYOMI_TITLE_VOLUME_RANGE_PATTERN.search(text):
+            return ""
+        if not allow_chapter_marker and SUWAYOMI_TITLE_CHAPTER_MARKER_PATTERN.search(text):
+            return ""
+        for match in SUWAYOMI_TITLE_VOLUME_PATTERN.finditer(text):
+            number = _suwayomi_number_text(match.group(1))
+            try:
+                if float(number) <= 0:
+                    continue
+            except Exception:
+                continue
+            if number not in seen:
+                seen.append(number)
+    # Two different volumes named in one title (a "v01-05" pack, say) is not
+    # evidence for any single one of them.
+    return seen[0] if len(seen) == 1 else ""
+
+
 def suwayomi_explicit_volume_evidence(chapter_row):
     """Return one conflict-free volume explicitly supplied by Suwayomi metadata."""
     chapter_row = chapter_row if isinstance(chapter_row, dict) else {}
@@ -8254,6 +8502,39 @@ def _suwayomi_explicit_volume_number(chapter_row):
     return suwayomi_explicit_volume_evidence(chapter_row).get("volume_number") or ""
 
 
+def suwayomi_chapter_volume_evidence(chapter_row, *, allow_chapter_marker=False):
+    """Resolve one chapter's volume from metadata first, then from its name.
+
+    Admission asks this question twice -- once to decide which chapters belong
+    to the wanted volume, and again while assembling them into a pack -- and
+    the two must answer identically. When they did not, membership admitted
+    rows on a title-stated volume and assembly then discarded the whole pack
+    for having no metadata, so the fallback produced no candidates at all.
+    """
+    evidence = suwayomi_explicit_volume_evidence(chapter_row)
+    volume_number = evidence.get("volume_number") or ""
+    conflict = bool(evidence.get("conflict"))
+    malformed = bool(evidence.get("malformed"))
+    title_volume = suwayomi_title_volume_number(
+        chapter_row, allow_chapter_marker=allow_chapter_marker
+    )
+    source = "metadata" if volume_number else ""
+    if volume_number and title_volume and not _number_text_matches(volume_number, title_volume):
+        # The row's own name contradicts its metadata. Either could be wrong,
+        # so neither is evidence: attaching the wrong volume to a want is a
+        # worse outcome than leaving the want open.
+        return {"volume_number": "", "conflict": True, "malformed": malformed, "source": ""}
+    if not volume_number and not conflict and not malformed and title_volume:
+        volume_number = title_volume
+        source = "title"
+    return {
+        "volume_number": volume_number,
+        "conflict": conflict,
+        "malformed": malformed,
+        "source": source,
+    }
+
+
 def suwayomi_chapter_membership(chapter_row, wanted_item=None, registry_row=None, *, volume_pack=False):
     """Return the authoritative unit-membership decision for one Suwayomi chapter."""
     chapter_row = chapter_row if isinstance(chapter_row, dict) else {}
@@ -8265,14 +8546,18 @@ def suwayomi_chapter_membership(chapter_row, wanted_item=None, registry_row=None
         wanted_volume = _wanted_volume_number(wanted_item)
         if not wanted_volume:
             return {"matches": False, "unit_type": "volume", "reason": "wanted_volume_missing"}
-        evidence = suwayomi_explicit_volume_evidence(chapter_row)
+        # Membership, not identity: a chapter that names its volume belongs in
+        # that volume's pack even though it is not the whole volume.
+        evidence = suwayomi_chapter_volume_evidence(chapter_row, allow_chapter_marker=True)
+        volume_number = evidence.get("volume_number")
+        volume_source = evidence.get("source") or "metadata"
         if evidence.get("conflict"):
             reason = "suwayomi_volume_metadata_conflict"
         elif evidence.get("malformed"):
             reason = "suwayomi_volume_metadata_invalid"
-        elif not evidence.get("volume_number"):
+        elif not volume_number:
             reason = "suwayomi_volume_metadata_missing"
-        elif not _number_text_matches(evidence.get("volume_number"), wanted_volume):
+        elif not _number_text_matches(volume_number, wanted_volume):
             reason = "suwayomi_volume_metadata_wrong"
         else:
             return {
@@ -8280,7 +8565,8 @@ def suwayomi_chapter_membership(chapter_row, wanted_item=None, registry_row=None
                 "unit_type": "volume",
                 "reason": "explicit_volume_membership",
                 "chapter_number": chapter_number,
-                "volume_number": evidence.get("volume_number"),
+                "volume_number": volume_number,
+                "volume_number_source": volume_source,
             }
         return {
             "matches": False,
@@ -8635,7 +8921,10 @@ def suwayomi_volume_page_pack_candidates_from_payload(payload, registry_row=None
     chapter_numbers = set()
     for chapter_row in matching_rows:
         chapter_row = _suwayomi_chapter_row_with_page_metadata(payload, chapter_row)
-        evidence = suwayomi_explicit_volume_evidence(chapter_row)
+        # Same rule membership used to select these rows -- see
+        # suwayomi_chapter_volume_evidence. Asking a stricter question here
+        # discards the whole pack for want of metadata the source never sends.
+        evidence = suwayomi_chapter_volume_evidence(chapter_row, allow_chapter_marker=True)
         if (
             evidence.get("conflict")
             or evidence.get("malformed")

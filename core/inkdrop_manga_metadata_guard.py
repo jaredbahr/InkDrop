@@ -75,6 +75,13 @@ BACKUP_ROOT = env_path("INKDROP_BACKUP_DIR", STATE_DIR / "backups")
 IMPORTER_PATH = env_path("INKDROP_COMPLETED_IMPORT_SCRIPT", Path(__file__).resolve().with_name("inkdrop_completed_import.py"))
 OUTSIDE_LIBRARY_ROOT = env_path("INKDROP_INTERNAL_LIBRARY_ROOT", STATE_DIR / "library-internal")
 
+# Exit codes, matching inkdrop_container_scheduler.completion_schedule: 0 is a
+# real success, 1 a real failure (counted, backed off), 78 a pass blocked on
+# operator configuration (surfaced, not retried on a failure backoff).
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_CONFIGURATION_NEEDED = 78
+
 INTERNAL_PREFIX = "_"
 MIN_REPAIR_AGE_SECONDS = int(os.environ.get("INKDROP_MANGA_METADATA_GUARD_MIN_REPAIR_AGE_SECONDS", "600") or "600")
 MAX_ARCHIVES_DEFAULT = int(os.environ.get("INKDROP_MANGA_METADATA_GUARD_MAX_ARCHIVES", "250") or "250")
@@ -513,7 +520,7 @@ def status_recent_enough(path, max_age_seconds):
         return False
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Guard InkDrop manga volume/chapter metadata and Kavita scan state")
     parser.add_argument("--repair", action="store_true", help="Apply safe repairs and move internal folders out of the Manga library root")
     parser.add_argument("--status-json", default=str(STATUS_PATH))
@@ -533,12 +540,39 @@ def main():
             "reason": "recent_status",
             "status_path": str(status_path),
             "skip_if_status_younger_seconds": int(args.skip_if_status_younger_seconds or 0),
+            "exit_code": EXIT_OK,
         }
         print(json.dumps(status, sort_keys=True))
-        return
+        return EXIT_OK
     backup_dir = BACKUP_ROOT / f"{run_id}-inkdrop-manga-guard"
     errors = []
     refresh_path_settings(errors)
+
+    # rglob() over a directory that is not there yields nothing and raises
+    # nothing, so an unmounted volume or a wrong Library Paths entry used to
+    # produce a spotless report -- state OK, zero archives scanned, no errors --
+    # for a library this guard never actually looked at. Checked after
+    # refresh_path_settings so it tests the root this run will really scan.
+    if not MANGA_ROOT.is_dir():
+        status = {
+            "updated_at": started,
+            "updated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+            "state": "CONFIG",
+            "reason": "manga_root_missing",
+            "detail": (
+                f"The configured manga library root {MANGA_ROOT} is not a directory, so nothing "
+                "could be scanned. Check the Manga path in Settings > Library Paths and that the "
+                "volume is mounted."
+            ),
+            "manga_root": str(MANGA_ROOT),
+            "archives_scanned": 0,
+            "errors": errors,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "exit_code": EXIT_CONFIGURATION_NEEDED,
+        }
+        json_dump(status_path, status)
+        print(json.dumps(status, sort_keys=True))
+        return EXIT_CONFIGURATION_NEEDED
 
     internal = move_internal_dirs(args.repair, run_id)
     max_archives = int(args.max_archives or 0)
@@ -613,9 +647,18 @@ def main():
         "errors": errors,
         "elapsed_seconds": round(time.time() - started, 3),
     }
+    # What the guard FOUND is its product, not its failure: this job is
+    # deliberately run without --repair (see the scheduler's note on why), so
+    # WATCH states and unreadable archives are permanent by design and must not
+    # report as a failing job. What the guard itself could not DO -- re-reading
+    # the library paths, triggering the Kavita scan -- is a real failure, and
+    # those are exactly the entries collected in `errors`.
+    exit_code = EXIT_FAILED if errors else EXIT_OK
+    status["exit_code"] = exit_code
     json_dump(status_path, status)
     print(json.dumps(status, sort_keys=True))
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

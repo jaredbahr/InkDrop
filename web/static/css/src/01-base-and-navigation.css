@@ -7,6 +7,7 @@
       --panel-3: #2b323a;
       --line: #343c46;
       --line-soft: #2b333c;
+      --border: var(--line);
       --text: #dce4ec;
       --muted: #9aa7b4;
       --accent: #36a9d6;

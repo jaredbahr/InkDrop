@@ -32,6 +32,7 @@ from core import inkdrop_manual_search_core
 from core import inkdrop_download_client_config
 from core import inkdrop_artifact_acceptance
 from core import inkdrop_library_identity
+from core.inkdrop_release_dates import ReleaseDate
 
 try:
     from core.inkdrop_transfer import normalize_transfer_status
@@ -657,6 +658,84 @@ def queue_retry_columns_from_raw(raw):
     return (retry_after if retry_after > 0 else None, retry_after_iso or None)
 
 
+# ---------------------------------------------------------------------------
+# Operator overrides that must outlive the rows they are displayed on.
+#
+# Both of these live in wanted_items.raw_json rather than on the queue row or in
+# wanted_items.status, and both choices were forced by something measured:
+#
+#   * queue_items.query is rewritten wholesale by the metadata-replacement
+#     upsert, so an operator's corrected query stored only there is silently
+#     discarded the next time metadata refreshes. The queue row is also
+#     superseded and recreated; the wanted row is the durable identity.
+#   * "stop searching for this" must NOT be a wanted_items.status value.
+#     Every status this codebase excludes from acquisition is also excluded
+#     from the Wanted counts, which would give us a way to improve the backlog
+#     number without acquiring anything. A count you can reduce by hiding
+#     things is the same defect as a bucket that reads green while the item has
+#     been stuck for ten days. So the row stays `wanted`, stays counted, and
+#     carries a separate visible flag.
+OPERATOR_QUERY_RAW_KEY = "operator_query"
+WANTED_PURSUIT_PAUSED_RAW_KEY = "pursuit_paused"
+
+# Keys on wanted_items.raw_json that record what the OPERATOR asked for, as
+# opposed to what a provider reported. They have to survive a provider sync.
+#
+# upsert_wanted() replaces raw_json wholesale with the incoming provider
+# payload, so before this every one of these was erased by the next ordinary
+# metadata refresh -- measured, not inferred: setting a pause and a corrected
+# query and then running one upsert_wanted() left `pursuit_paused` false and
+# `operator_query` gone. A pause that silently stops pausing is worse than no
+# pause at all, because the operator believes the capacity drain stopped.
+OPERATOR_INTENT_RAW_KEYS = (
+    "pursuit_paused",
+    "pursuit_paused_at",
+    "pursuit_paused_by",
+    "pursuit_paused_reason",
+    "operator_query",
+    "operator_query_set_at",
+    "operator_query_set_by",
+)
+
+
+def preserve_operator_intent_sql(existing, incoming):
+    """SQL that merges the operator-intent keys from `existing` onto `incoming`.
+
+    json_patch follows RFC 7396, where a null member REMOVES the key -- which
+    is exactly the behaviour wanted here: a row that never had a pause yields
+    json_extract(...) = NULL, the patch drops the key, and the incoming payload
+    is left as it was. Both sides are json_valid()-guarded because json_patch
+    returns NULL on malformed input, and silently nulling raw_json on a legacy
+    row would be a far worse bug than the one this fixes.
+    """
+    pairs = ",".join(
+        "'%s', json_extract(%s, '$.%s')" % (key, existing, key)
+        for key in OPERATOR_INTENT_RAW_KEYS
+    )
+    return (
+        f"case when json_valid({incoming}) and json_valid({existing})"
+        f" then json_patch({incoming}, json_object({pairs}))"
+        f" else {incoming} end"
+    )
+
+
+def wanted_pursuit_active_sql(alias="w"):
+    """SQL predicate for 'this item is still being pursued'.
+
+    Every acquisition entry point has to carry this, not just the one the UI
+    button happens to sit next to -- a pause that stops one of three paths
+    burns capacity while telling the operator it stopped.
+    """
+    return (
+        f"coalesce(json_extract({alias}.raw_json, '$.{WANTED_PURSUIT_PAUSED_RAW_KEY}'), 0) = 0"
+    )
+
+
+def wanted_pursuit_paused(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    return bool(raw.get(WANTED_PURSUIT_PAUSED_RAW_KEY))
+
+
 def apply_queue_retry_columns_to_raw(raw, row, prefix=""):
     out = dict(raw or {}) if isinstance(raw, dict) else {}
     keys = row.keys() if hasattr(row, "keys") else row
@@ -1118,6 +1197,50 @@ def init_schema_uncached(con):
             raw_json text
         );
         create index if not exists idx_queue_claims_expires on queue_claims(expires_at);
+        create table if not exists source_worker_runtime_samples (
+            id text primary key,
+            provider_id text not null,
+            request_count integer not null,
+            elapsed_seconds real not null,
+            seconds_per_request real not null,
+            truncated integer not null default 0,
+            created_at real not null
+        );
+        create index if not exists idx_source_worker_runtime_samples_provider
+            on source_worker_runtime_samples(provider_id, created_at desc);
+        create table if not exists source_worker_phase_samples (
+            id text primary key,
+            queue_id text,
+            provider_ids text,
+            sample_kind text not null,
+            phase text not null,
+            lane text,
+            elapsed_seconds real not null,
+            item_elapsed_seconds real not null,
+            truncated integer not null default 0,
+            created_at real not null
+        );
+        create index if not exists idx_source_worker_phase_samples_phase
+            on source_worker_phase_samples(phase, created_at desc);
+        create index if not exists idx_source_worker_phase_samples_created
+            on source_worker_phase_samples(created_at desc);
+        create table if not exists query_variant_outcomes (
+            id text primary key,
+            variant text not null,
+            query text,
+            provider_id text,
+            review_id text,
+            series text,
+            elapsed_seconds real not null default 0,
+            response_count integer not null default 0,
+            candidate_count integer not null default 0,
+            auto_grab_safe_count integer not null default 0,
+            created_at real not null
+        );
+        create index if not exists idx_query_variant_outcomes_variant
+            on query_variant_outcomes(variant, created_at desc);
+        create index if not exists idx_query_variant_outcomes_provider
+            on query_variant_outcomes(provider_id, created_at desc);
         create table if not exists review_exceptions (
             id text primary key,
             review_id text,
@@ -1392,6 +1515,30 @@ def init_schema_uncached(con):
             semantics_json text,
             derived_at real not null
         );
+        -- Long library scans (CBZ conversion check, adoption folder scan) used to
+        -- live only in a process-local dict, so a reload or a container restart
+        -- threw away a scan that can take hours on a real library. One row per
+        -- run, written as it goes, so the answer outlives the process that
+        -- produced it. `scope_key` is what was scanned (roots / folder + media
+        -- type) so a scan of one folder never shows up as the answer for another.
+        create table if not exists library_scan_runs (
+            id text primary key,
+            kind text not null,
+            scope_key text not null default '',
+            state text not null,
+            phase text,
+            started_at real,
+            updated_at real,
+            finished_at real,
+            progress_json text,
+            result_json text,
+            error text,
+            fingerprint_json text,
+            options_json text
+        );
+        create index if not exists idx_library_scan_runs_kind_started on library_scan_runs(kind, started_at desc);
+        create index if not exists idx_library_scan_runs_kind_scope_started on library_scan_runs(kind, scope_key, started_at desc);
+        create index if not exists idx_library_scan_runs_state on library_scan_runs(state, updated_at desc);
         create unique index if not exists idx_media_files_normalized_path on media_files(normalized_path);
         create index if not exists idx_media_files_series_issue on media_files(series_id, issue_id, active, last_seen_at desc);
         create index if not exists idx_media_files_import_result on media_files(import_result_id);
@@ -1972,6 +2119,18 @@ def normalize_source_attempt_payload(attempt):
         except Exception:
             pass
     out = dict(attempt)
+    # Mirror inkdrop_sources.normalize_source_attempt()'s canonical `query`
+    # promotion so the fallback path (inkdrop_sources unavailable) records the
+    # outbound search string too -- a shadowed definition that silently
+    # disagreed here would reintroduce the capture gap on exactly the installs
+    # least able to diagnose it.
+    if not str(out.get("query") or "").strip():
+        for key in ("search_query", "searchQuery", "query_variant", "_inkdrop_query_variant",
+                    "source_search_query", "search_term", "searchTerm", "term"):
+            text = str(out.get(key) or "").strip()
+            if text:
+                out["query"] = text
+                break
     source = metadata_provider_key(out.get("source") or out.get("provider_id") or out.get("download_client") or "source")
     status = str(out.get("status") or "").strip().lower()
     out.setdefault("provider_id", source)
@@ -2650,15 +2809,38 @@ def _first_text(*values):
     return ""
 
 
+def _strip_path_control_characters(text):
+    """Drop NUL and other C0/C1 control bytes from a would-be path component.
+
+    A NUL survives every cosmetic rewrite below and then fails deep in the
+    filesystem call ("embedded null byte") instead of at the boundary, so it is
+    removed here rather than left for the caller to trip over.
+    """
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+
+
+def _is_dot_only_component(text):
+    """True for ".", "..", "..." -- never a usable directory name.
+
+    The `strip(" .-")` below already collapses these today, but only as a side
+    effect of trimming trailing dots off titles like "Vol. 1.". This states the
+    traversal rule outright so it survives a change to that strip.
+    """
+    return bool(text) and set(text) == {"."}
+
+
 def sanitize_path_component(value):
     value = str(value or "").strip().replace("\\", "/").strip()
     if not value:
         return ""
+    value = _strip_path_control_characters(value)
     value = re.sub(r"[\\/:*?\"<>|]", "-", value)
     value = re.sub(r"\s+", " ", value).strip()
     value = value.replace("/", "-").replace("\\", "-")
     value = re.sub(r"-{2,}", "-", value)
     value = value.strip(" .-")
+    if _is_dot_only_component(value):
+        return "Unknown"
     return value or "Unknown"
 
 
@@ -2914,6 +3096,81 @@ def media_management_roots_from_connection(con):
 
 def path_under_any_root(path, roots):
     return any(_path_has_prefix(path, root) for root in roots or [])
+
+
+def media_root_is_mounted(root):
+    """Whether a media root looks like a live mount rather than an absent one.
+
+    A retraction sweep asks "is this file still on disk?" one path at a time.
+    When the library volume is not mounted -- during a restart, a drivepool
+    hiccup, the container coming up before its bind mounts -- every one of
+    those answers is False, and a sweep with no notion of "the whole root is
+    gone" reads that as every file having been deleted at once.
+
+    That is not hypothetical. On 2026-08-11 06:12:03 a sweep retracted 22
+    verified Akira proofs whose folders were, and still are, present on disk;
+    those units have re-searched roughly 1,100 times a day ever since. Across
+    all `stale_folder_proof_retracted` tasks carrying a real path, 107 of 329
+    (33%) still exist on disk.
+
+    An unmounted bind mount can surface either as a missing path or as an empty
+    directory, so neither check alone is enough: require the root to exist, be
+    a directory, and be non-empty. A genuinely empty library root has nothing
+    to retract anyway, so refusing to sweep it costs nothing.
+    """
+
+    root = str(root or "").strip()
+    if not root:
+        return False
+    try:
+        path = Path(root)
+        if not path.is_dir():
+            return False
+        with os.scandir(path) as entries:
+            return any(True for _ in entries)
+    except OSError:
+        return False
+
+
+def mounted_media_roots(roots):
+    return [root for root in roots or [] if media_root_is_mounted(root)]
+
+
+def record_media_root_unavailable_skip(con, roots, now):
+    """Say out loud that a sweep declined to run, so a skip is never silent.
+
+    Without this the safe behaviour and a genuinely idle pass look identical
+    in the history, and "we retracted nothing" would be indistinguishable from
+    "there was nothing to retract".
+    """
+
+    roots = [str(root or "").strip() for root in roots or [] if str(root or "").strip()]
+    if not roots or not table_exists(con, "history_events"):
+        return
+    now = safe_float(now, time.time()) or time.time()
+    listed = ", ".join(roots)
+    con.execute(
+        """
+        insert or ignore into history_events(
+            id, entity_type, entity_id, series_id, issue_id, event_type,
+            source, message, outcome, display_phase, created_at, raw_json
+        ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            stable_id("media_root_unavailable_proof_sweep_skipped", listed, int(now // 3600)),
+            "media_root",
+            listed,
+            None,
+            None,
+            "media_root_unavailable_proof_sweep_skipped",
+            "inkdrop_state",
+            f"Skipped the missing-folder proof sweep: {listed} is not mounted right now.",
+            "problem",
+            "system",
+            now,
+            json_dumps({"roots": roots, "observed_at": now, "observed_at_iso": utc_stamp(now)}),
+        ),
+    )
 
 
 def path_exists_quietly(path):
@@ -5288,7 +5545,18 @@ def upsert_issue(con, series_id, issue, now):
     if not issue_provider:
         issue_provider = "comicvine" if metadata_id and not str(metadata_id).startswith("kapowarr-") else "kapowarr"
     normalized_number = normalize_issue_number(number)
-    release_date = (
+    # One boundary for the ten spellings a provider uses for "a date". These
+    # are not interchangeable -- a store date is when a book reached shops, a
+    # cover date is printed on it and runs about two months later, and
+    # `publishAt` is the instant a chapter became readable. The chain this
+    # replaced took `date` first, the vaguest key of the ten, and preferred
+    # `cover_date` over nothing else; `from_payload` reads them in order of how
+    # specific they are and remembers which one won.
+    release_date_record = ReleaseDate.from_payload(issue)
+    # An unparseable value ("Fall 2019") still gets stored verbatim rather than
+    # dropped -- the calendar already reports those as unreadable, and losing
+    # them here would turn a visible gap into a silent one.
+    release_date = release_date_record.iso() or str(
         issue.get("date")
         or issue.get("release_date")
         or issue.get("releaseDate")
@@ -5299,7 +5567,14 @@ def upsert_issue(con, series_id, issue, now):
         or issue.get("publishAt")
         or issue.get("publishedAt")
         or issue.get("readableAt")
-    )
+        or ""
+    ).strip()
+    # Keep the provenance next to the value. Today it is unrecoverable: 6,656
+    # of 6,666 rows on prod carry `date: None` in raw_json, so nothing can tell
+    # whether a stored date was an on-sale date or a cover date.
+    issue_raw = dict(issue)
+    if release_date_record.known:
+        issue_raw["release_date_record"] = release_date_record.to_dict()
     con.execute(
         """
         insert into issues(
@@ -5335,7 +5610,7 @@ def upsert_issue(con, series_id, issue, now):
             1 if issue.get("monitored", True) else 0,
             issue.get("firstSeen") or now,
             now,
-            json_dumps(issue),
+            json_dumps(issue_raw),
         ),
     )
     if issue_provider in {"comicvine", "mangadex"} and normalized_number and release_date:
@@ -5513,7 +5788,7 @@ def upsert_wanted(con, series_id, issue_id, reason, status, raw, now):
             updated_at=excluded.updated_at,
             raw_json=case
                 when wanted_items.status='superseded_duplicate' and excluded.status='wanted' then wanted_items.raw_json
-                else excluded.raw_json
+                else """ + preserve_operator_intent_sql("wanted_items.raw_json", "excluded.raw_json") + """
             end
         """,
         (wid, series_id, issue_id, reason, status, raw.get("created_at") or raw.get("firstSeen") or now, now, json_dumps(raw)),
@@ -11044,6 +11319,45 @@ def _claim_queue_item_con(con, queue_id, owner_id, operation, now, expires_at, r
     return dict(row) if row and str(row["owner_id"] or "") == owner_id else None
 
 
+def _release_reservation_queue_claim(con, queue_id, now, *, reservation_id=""):
+    """Release a dead reservation's queue claim without taking anyone else's.
+
+    `queue_claims` is the durable exclusion between workers, and every other
+    helper here fences on ownership: `_claim_queue_item_con` refuses to
+    overwrite a live claim held by someone else, `release_queue_claim` and
+    `heartbeat_queue_claim` scope to `owner_id`, and
+    `cleanup_expired_queue_claims` only reaps rows past their expiry.
+
+    The two SLSKD reservation-expiry paths deleted by `queue_id` alone. That
+    is a real window rather than a theoretical one: a reservation's
+    `ttl_seconds` defaults to 900s while the claim it takes alongside defaults
+    to a 120s lease, so for thirteen minutes the reservation outlives its own
+    claim -- long enough for the lease to lapse, another worker to acquire the
+    queue item legitimately, and the expiring reservation to then delete that
+    worker's live claim out from under it.
+
+    So a claim is only released when it carries this reservation's own id, or
+    when it has already expired and belongs to nobody. Ownership alone is
+    deliberately not enough: the same worker can hold a live claim for an
+    unrelated operation on the same queue item, and a dead reservation has no
+    business reaping that either.
+    """
+    queue_id = str(queue_id or "").strip()
+    if not queue_id:
+        return 0
+    row = con.execute("select * from queue_claims where queue_id=?", (queue_id,)).fetchone()
+    if not row:
+        return 0
+    claim = dict(row)
+    if safe_float(claim.get("expires_at"), 0) > now:
+        claim_raw = json_loads(claim.get("raw_json") or "{}", {})
+        claim_raw = claim_raw if isinstance(claim_raw, dict) else {}
+        same_reservation = bool(reservation_id) and str(claim_raw.get("reservation_id") or "") == str(reservation_id)
+        if not same_reservation:
+            return 0
+    return int(con.execute("delete from queue_claims where queue_id=?", (queue_id,)).rowcount or 0)
+
+
 def _project_slskd_reservation_queue(
     con, queue, task, status, now, retry_at=None, reason="", authoritative_sibling=None,
 ):
@@ -11194,7 +11508,10 @@ def reserve_slskd_candidate(
                     task.update({"status": "slot_request_expired", "state": "failed", "raw_json": json_dumps(raw)})
                     retry_at = requested_at + retry_seconds
                     _project_slskd_reservation_queue(con, queue, task, "slot_request_expired", requested_at, retry_at=retry_at, reason=failure)
-                    con.execute("delete from queue_claims where queue_id=?", (queue_id,))
+                    _release_reservation_queue_claim(
+                        con, queue_id, requested_at,
+                        reservation_id=str(raw.get("reservation_id") or ""),
+                    )
                     update_sync_meta(con, requested_at, "slskd_candidate_reservation_expired")
                     con.commit()
                     return {"ok": True, "created": False, "expired": True, "reason": "slot_request_expired", "queue_id": queue_id, "download_task_id": task.get("id"), "reservation_id": raw.get("reservation_id"), "slot_request_id": raw.get("reservation_id"), "slot_request_retry_at": retry_at, "status": "slot_request_expired", "state": "failed"}
@@ -11233,6 +11550,79 @@ def reserve_slskd_candidate(
             return {"ok": True, "created": True, "reason": "candidate_reserved", "queue_id": queue_id, "source_attempt_id": source_id, "download_task_id": task["id"], "reservation_id": reservation_id, "slot_request_id": reservation_id, "slot_request_created_at": requested_at, "slot_request_retry_at": retry_at, "slot_request_deadline": deadline, "status": "waiting_for_slot", "state": "queued", "claim_owner_id": claim_owner_id if claim else None}
 
     return with_db_lock_retry(_record, attempts=4, initial_delay=1.0)
+
+
+SLSKD_COMPLETED_RECOVERY_MAX_ATTEMPTS = int(
+    os.environ.get("INKDROP_SLSKD_COMPLETED_RECOVERY_MAX_ATTEMPTS", 3)
+)
+# A finished transfer that still has not produced an importable staged file
+# this long after it completed is not going to. Past this age the transfer is
+# evidence of history, not of pending work, and re-recovering it only rebuilds
+# the same dead claim.
+SLSKD_COMPLETED_RECOVERY_MAX_AGE_SECONDS = float(
+    os.environ.get("INKDROP_SLSKD_COMPLETED_RECOVERY_MAX_AGE_SECONDS", 12 * 3600)
+)
+
+
+def slskd_completed_recovery_ledger(queue, transfer_id):
+    """Per-(queue row, slskd transfer) record of how often recovery has run."""
+    raw = json_loads((queue or {}).get("raw_json") or "{}", {})
+    raw = raw if isinstance(raw, dict) else {}
+    ledger = raw.get("completed_transfer_recovery") or {}
+    ledger = ledger if isinstance(ledger, dict) else {}
+    entry = ledger.get(str(transfer_id or "").strip()) or {}
+    entry = entry if isinstance(entry, dict) else {}
+    return {
+        "attempts": int(safe_float(entry.get("attempts"), 0) or 0),
+        "first_at": safe_float(entry.get("first_at"), None),
+        "last_at": safe_float(entry.get("last_at"), None),
+    }
+
+
+def slskd_completed_recovery_exhausted(recovery, task, now):
+    """Why this completed transfer should stop being re-recovered, or ''.
+
+    Two independent bounds. The attempt counter catches the fast oscillation.
+    The completion-age bound retires a transfer that finished long ago and has
+    had its chance -- it is what stops a row from burning all three attempts on
+    a file that has been unimportable for a fortnight.
+
+    The age bound deliberately waits for one recorded attempt first. Otherwise
+    it would also refuse the legitimate case of discovering a genuinely old
+    completed transfer for the first time (after downtime, or a backfill),
+    which is exactly the case recovery exists to serve. One attempt is enough
+    to tell those apart: a real import succeeds on it and never comes back
+    here, while an unimportable one returns with its ledger already written.
+    """
+    attempts = int(recovery.get("attempts") or 0)
+    if attempts >= SLSKD_COMPLETED_RECOVERY_MAX_ATTEMPTS:
+        return "attempts"
+    completed_at = safe_float((task or {}).get("completed_at"), None)
+    first_at = safe_float(recovery.get("first_at"), None)
+    anchor = min(v for v in (completed_at, first_at) if v) if (completed_at or first_at) else None
+    if (
+        attempts >= 1
+        and anchor
+        and (safe_float(now, 0) or 0) - anchor > SLSKD_COMPLETED_RECOVERY_MAX_AGE_SECONDS
+    ):
+        return "stale_completion"
+    return ""
+
+
+def slskd_record_completed_recovery_attempt(queue_raw, transfer_id, observed_at):
+    """Bump the recovery ledger on a queue row's raw payload, in place."""
+    key = str(transfer_id or "").strip()
+    if not key:
+        return
+    ledger = queue_raw.get("completed_transfer_recovery")
+    ledger = dict(ledger) if isinstance(ledger, dict) else {}
+    entry = ledger.get(key)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    entry["attempts"] = int(safe_float(entry.get("attempts"), 0) or 0) + 1
+    entry.setdefault("first_at", observed_at)
+    entry["last_at"] = observed_at
+    ledger[key] = entry
+    queue_raw["completed_transfer_recovery"] = ledger
 
 
 def recover_completed_slskd_candidate_task(
@@ -11424,6 +11814,30 @@ def recover_completed_slskd_candidate_task(
                 "download_task_id": task_id,
                 "external_id": transfer_id,
             }
+        # Recovery is bounded per (queue, transfer). The guard above only holds
+        # while the task is *still* sitting at import_ready; the moment the
+        # retry ladder moves it to 'failed' it stops matching and this function
+        # happily re-recovers the same physical transfer. slskd keeps reporting
+        # a finished transfer as finished forever, so with no bound that is an
+        # infinite loop: recover -> queue 'importing' -> import can't find a
+        # staged file -> task fails -> cleanup_expired_import_claims() releases
+        # the claim after its lease -> next probe pass recovers it again.
+        # Measured live 2026-08-15: 52 queue rows had been round-tripping that
+        # way for up to 14 days, 4186 recovery events between them (1235 in one
+        # day), and 53 of 55 recovered tasks carried no absolute path at all --
+        # only a bare filename. Those were never going to import; the loop just
+        # kept them looking busy while burning 21.6% of all slskd attempts.
+        recovery = slskd_completed_recovery_ledger(queue, transfer_id)
+        exhausted = slskd_completed_recovery_exhausted(recovery, task, observed_at)
+        if exhausted:
+            return {
+                "ok": False,
+                "reason": "completed_transfer_recovery_exhausted",
+                "download_task_id": task_id,
+                "external_id": transfer_id,
+                "recovery_attempts": recovery["attempts"],
+                "exhausted_by": exhausted,
+            }
 
         transfer_snapshot = {
             key: transfer.get(key)
@@ -11485,6 +11899,10 @@ def recover_completed_slskd_candidate_task(
             "updated_at": observed_at,
             "updated_at_iso": utc_stamp(observed_at),
         })
+        # Ledger lives on the queue row, not the task: the retry ladder spawns a
+        # fresh download_task per cycle (3-21 per stuck row observed live), so a
+        # task-scoped counter resets itself and bounds nothing.
+        slskd_record_completed_recovery_attempt(queue_raw, transfer_id, observed_at)
         for key in ("retry_after", "retry_after_iso"):
             queue_raw.pop(key, None)
         con.execute(
@@ -11997,9 +12415,9 @@ def _reconcile_slskd_candidate_reservations_con(con, now=None, retry_seconds=3 *
             )
         task.update({"status": status, "state": "failed", "raw_json": json_dumps(raw)})
         _project_slskd_reservation_queue(con, queue, task, status, now, retry_at=now + retry_seconds, reason=reason)
-        con.execute(
-            "delete from queue_claims where queue_id=? and operation='slskd_auto_grab_handoff'",
-            (task.get("queue_id"),),
+        _release_reservation_queue_claim(
+            con, task.get("queue_id"), now,
+            reservation_id=str(raw.get("reservation_id") or ""),
         )
         changed += 1
     legacy_rows = con.execute(
@@ -16010,6 +16428,40 @@ def bad_source_candidate_range_key(text):
     return ""
 
 
+def bad_source_candidate_validity_token(db_path, candidate_id):
+    """What one blocklist row currently says, or None if it is no longer there.
+
+    A primary-key probe -- the cheapest question this table can be asked, and
+    the only one a memoized refusal actually needs answered. Callers compare the
+    token they cached against this one: a delete (which is how an unblock lands)
+    returns None, and a changed reason or a fresh sighting returns a different
+    tuple. Either retires the memo.
+
+    Returning `last_seen_at` rather than a bare "still there" is deliberate --
+    the cooldown deadline is derived from it, so a caller can re-check its own
+    expiry against the live row instead of trusting a deadline it cached.
+    """
+    candidate_id = str(candidate_id or "").strip()
+    if not candidate_id:
+        return None
+    try:
+        path = Path(db_path)
+        if not path.exists():
+            return None
+        with connect_read(path, timeout_seconds=1.5, busy_timeout_ms=1500) as con:
+            if not table_exists(con, "bad_source_candidates"):
+                return None
+            row = con.execute(
+                "select reason, last_seen_at from bad_source_candidates where id=? limit 1",
+                (candidate_id,),
+            ).fetchone()
+    except (sqlite3.Error, OSError):
+        return None
+    if not row:
+        return None
+    return (str(row["reason"] or ""), float(row["last_seen_at"] or 0))
+
+
 def find_bad_source_candidate(
     db_path,
     *,
@@ -17173,7 +17625,40 @@ def source_identity_path_text(value):
     parts = [part for part in text.replace("\\", "/").split("/") if part not in ("", ".")]
     if not parts:
         return ""
-    return "/".join(parts[-2:])
+    scoped = parts[-2:]
+    if len(scoped) == 2 and _parent_folder_is_unrelated_staging(scoped[0], scoped[1]):
+        scoped = scoped[-1:]
+    return "/".join(scoped)
+
+
+def _path_component_identity_tokens(text):
+    """Word-ish tokens from one path component, for judging relatedness."""
+    return {token for token in re.findall(r"[a-z0-9]+", str(text or "").lower()) if len(token) >= 3}
+
+
+def _parent_folder_is_unrelated_staging(folder, filename):
+    """True when the folder holding a file claims a unit but is not its release folder.
+
+    `source_identity_path_text()` keeps the immediate parent because a scene
+    release folder carries real volume/issue evidence. When a download client
+    stages a file straight into its own working directory there is no release
+    folder at all, and that rule promotes the working directory into the role:
+    /downloads/c3_tmp/Series (2023).cbz reads "c3" as chapter 3 and quarantines
+    a correct TPB, which is the same defect one level down from the ancestors
+    already dropped above.
+
+    A real release folder names the thing it contains, so it shares tokens with
+    the file. A staging directory shares none. Only a folder that both makes a
+    unit claim of its own and has no token in common with the file is dropped;
+    an inert folder is kept either way, because keeping it changes nothing.
+    """
+    if not folder or not filename:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(folder).lower())
+    if not SINGLE_PART_SOURCE_PATTERN.search(normalized):
+        return False
+    stem = str(filename).rsplit(".", 1)[0] if "." in str(filename) else str(filename)
+    return not (_path_component_identity_tokens(folder) & _path_component_identity_tokens(stem))
 
 
 def collection_guard_text(*values):
@@ -17570,7 +18055,18 @@ def collection_target_single_part_block_reason(
         # after it would never be reached. The archive itself proved this is
         # the wanted volume; see collection_guard_source_volume_archive_evidence().
         return ""
-    if SINGLE_PART_SOURCE_PATTERN.search(collection_guard_normalized_text(source_text)):
+    # Scanned over source identity only -- never record["query"] or
+    # record["matched_series"], which are copied off the WANTED TARGET rather
+    # than off the artifact (collection_guard_record_from_import_result() fills
+    # both from the queue row). A chapter-managed manga item's auto-generated
+    # query embeds its own containing volume, e.g. "Deadman Wonderland Chapter 1
+    # Volume 1"; scanning that text made the target match "chapter 1" and block
+    # itself, whatever the downloaded file actually was. Because this scan
+    # returns on the first hit, it also pre-empted both manga volume proofs
+    # below, so the chapter->volume proof added for exactly this case never ran
+    # against a real production record. collection_guard_record_from_download_task()
+    # already blanks these two fields for the same reason.
+    if SINGLE_PART_SOURCE_PATTERN.search(collection_guard_normalized_text(source_identity_text)):
         return "single_part_file_does_not_satisfy_collection_target"
     issue_tokens = collection_guard_target_issue_tokens(queue, raw)
     media_type = str(queue.get("media_type") or raw.get("media_type") or "").strip().lower()
@@ -17600,6 +18096,72 @@ def collection_target_single_part_block_reason(
     if source_identity_text and COLLECTION_TARGET_PATTERN.search(source_identity_text):
         return ""
     return ""
+
+
+def collection_guard_record_from_candidate(candidate):
+    """The same guard record, built from a candidate instead of an import row.
+
+    The import-time guard and the candidacy check must reach their verdict from
+    one implementation, or acceptance goes on promising something completion
+    will refuse. This only changes where the source text comes from: at
+    candidacy there is no staged file, so the release name and its directory
+    stand in for `matched_local_path`.
+
+    Deliberately no archive evidence. The escapes that clear this guard on real
+    files (collection_guard_source_mixed_marker_volume_proof and friends) read
+    an archive that does not exist yet, so candidacy sees strictly less than
+    import does. That asymmetry is the reason this returns a *review* signal to
+    its caller rather than a block on anything it cannot prove -- see
+    inkdrop_candidate_matching.collection_target_conflicts_with_candidate().
+    """
+    candidate = dict(candidate or {})
+    return {
+        "matched_local_path": first_nonempty(
+            candidate.get("source_path"),
+            candidate.get("path"),
+            candidate.get("remote_filename"),
+            candidate.get("filename"),
+        ),
+        "title": first_nonempty(
+            candidate.get("original_result_title"),
+            candidate.get("title"),
+            candidate.get("filename"),
+            candidate.get("remote_filename"),
+        ),
+        "reason": "",
+        "query": candidate.get("query") or "",
+        "matched_series": candidate.get("series") or candidate.get("matched_series") or "",
+    }
+
+
+def collection_guard_queue_context(wanted_item):
+    """Target-side context for the guard, from a wanted row rather than the DB.
+
+    import_result_strict_completion_valid() assembles this from a series/issues
+    join; the matcher already holds the same fields on the wanted item, so this
+    is the same shape reached by a cheaper route -- no query, no filesystem.
+    """
+    wanted = dict(wanted_item or {})
+    series = first_nonempty(wanted.get("series"), wanted.get("title"))
+    issue_title = first_nonempty(wanted.get("issue_title"), wanted.get("issueTitle"))
+    context = {
+        "series": series,
+        "issue_title": issue_title,
+        "issue_number": wanted.get("issue_number"),
+        "media_type": wanted.get("media_type") or wanted.get("mediaType") or "",
+        "raw_json": json_dumps({
+            "series": series,
+            "issue_title": issue_title,
+            "media_type": wanted.get("media_type") or wanted.get("mediaType") or "",
+        }),
+    }
+    context["query"] = " ".join(
+        value for value in (
+            str(context.get("series") or "").strip(),
+            str(context.get("issue_title") or context.get("issue_number") or "").strip(),
+        ) if value
+    )
+    return context
 
 
 def collection_guard_record_from_import_result(import_row, queue=None):
@@ -20344,6 +20906,146 @@ def cleanup_expired_import_claims(con, now):
             ),
         )
     return released
+
+
+def retire_retry_exhausted_queue_items(con, now):
+    """Give the acquisition loop a terminal state instead of running forever.
+
+    Before this there was no global ceiling anywhere: an item could ask
+    providers indefinitely, and the only thing that ever stopped one was
+    succeeding. Live 2026-08-15 the worst schedulable row had made 2,483 real
+    provider attempts and was still going. Anything past the ceiling has
+    demonstrated the sources cannot satisfy it, so it stops consuming capacity
+    and says so, loudly, instead of quietly recycling forever.
+
+    Deliberately keyed on real attempts, not on source_attempts row count --
+    the ledger runs 5.3x higher at the median, so a ceiling read off it would
+    retire healthy items that had merely accumulated bookkeeping.
+
+    'downloading' counts too, but only for rows with no confirmed live
+    transfer -- the ones the queue renders as Source Wait. That state had no
+    ceiling anywhere: queued/searching retire here, importing/import_ready
+    get released by cleanup_expired_import_claims(), and a row claiming to
+    download with nothing behind it fell between them and ran forever. A
+    2026-08-16 field bundle had seven sitting there for nearly two days.
+
+    Real attempts are the right discriminator here rather than elapsed time.
+    A transfer genuinely parked in a peer's queue -- which SLSKD does for 48h
+    at a stretch -- makes no new provider requests while it waits, so it never
+    approaches the ceiling however long it sits. Only a row the ladder is
+    actively re-asking for accrues attempts, and that is exactly the row that
+    needs somewhere to stop. A time bound could not tell those two apart.
+    """
+    if not con or RETRY_CEILING_REAL_ATTEMPTS <= 0:
+        return 0
+
+    def stalled_download_sql(queue_alias):
+        """'downloading' with neither a live transfer nor a file to import.
+
+        The staged-file exclusion matters as much as the transfer one. A row
+        holding a downloaded artifact waiting to import has already been sent
+        the file -- retiring it as "no source ever started sending" would be
+        both untrue and destructive, because it would strand a file that is
+        sitting on disk ready to go. Those rows belong to the import path and
+        to cleanup_expired_import_claims(), not here.
+        """
+        return f"""
+        lower(coalesce({queue_alias}.state, '')) = 'downloading'
+        and not exists (
+            select 1 from download_tasks dt
+            where dt.queue_id = {queue_alias}.id
+              and {download_task_non_problem_clause("dt")}
+              and (
+                {download_task_transferring_clause("dt", queue_alias)}
+                or dt.state in ('import_ready', 'importing')
+                or lower(coalesce(dt.lifecycle_phase, '')) in ('staged_or_importing', 'verifying')
+                or lower(coalesce(dt.status, '')) in (
+                    'staged_file_ready', 'preview_importable', 'ready_import',
+                    'import_busy', 'verification_pending', 'imported_not_resolved'
+                )
+              )
+        )
+    """
+
+    stalled_download_clause = stalled_download_sql("q")
+    rows = con.execute(
+        f"""
+        select q.id, q.wanted_id, q.series_id, q.issue_id, q.state, q.raw_json,
+               {real_attempt_count_sql("sa", "queue_id", "q.id")} as real_attempts
+        from queue_items q
+        where q.active = 1
+          and (
+            lower(coalesce(q.state, '')) in ('queued', 'searching')
+            or ({stalled_download_clause})
+          )
+        """
+    ).fetchall()
+    retired = 0
+    for row in rows:
+        attempts = int(row["real_attempts"] or 0)
+        if attempts < RETRY_CEILING_REAL_ATTEMPTS:
+            continue
+        raw = json_loads(row["raw_json"] or "{}", {})
+        raw = raw if isinstance(raw, dict) else {}
+        raw.update({
+            "retry_ceiling_reached_at": now,
+            "retry_ceiling_reached_at_iso": utc_stamp(now),
+            "retry_ceiling_real_attempts": attempts,
+            "retry_ceiling_previous_state": row["state"],
+        })
+        if str(row["state"] or "").strip().lower() == "downloading":
+            message = (
+                f"Stopped after {compact_count(attempts)} real attempts. The download was "
+                "handed off this many times and no source ever started sending, so this "
+                "needs a decision from you."
+            )
+        else:
+            message = (
+                f"Stopped after {compact_count(attempts)} real attempts across every enabled source. "
+                "Nothing matched, so this needs a decision from you."
+            )
+        # The guard re-checks the same condition the select used, so a row that
+        # started transferring for real between the two statements keeps its
+        # download instead of being retired out from under it.
+        con.execute(
+            f"""
+            update queue_items
+            set state='needs_you', outcome='action_needed', display_phase='manual_review',
+                last_event=?, retry_after=null, retry_after_iso=null,
+                updated_at=?, raw_json=?
+            where id=? and active=1
+              and (
+                lower(coalesce(state,'')) in ('queued','searching')
+                or ({stalled_download_sql("queue_items")})
+              )
+            """,
+            (message, now, json_dumps(raw), row["id"]),
+        )
+        changed = int(con.execute("select changes()").fetchone()[0] or 0)
+        if not changed:
+            continue
+        retired += changed
+        if row["wanted_id"]:
+            con.execute(
+                "update wanted_items set status='blocked', updated_at=? where id=?",
+                (now, row["wanted_id"]),
+            )
+        con.execute(
+            """
+            insert or ignore into history_events(
+                id, entity_type, entity_id, series_id, issue_id, event_type,
+                source, message, outcome, display_phase, created_at, raw_json
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                stable_id("retry_ceiling_reached", row["id"], now),
+                "queue_item", row["id"], row["series_id"], row["issue_id"],
+                "retry_ceiling_reached", "inkdrop_state", message,
+                "action_needed", "manual_review", now,
+                json_dumps({"real_attempts": attempts, "ceiling": RETRY_CEILING_REAL_ATTEMPTS}),
+            ),
+        )
+    return retired
 
 
 def cleanup_non_active_searching_queue_rows(con, now):
@@ -24271,6 +24973,7 @@ def media_management_settings_context(db_path):
         "frontend_sync_after_import": media_management_bool_setting(db_path, "frontend_sync_after_import", True),
         "library_visibility_provider_order": app_setting_value(db_path, "media_management.library_visibility_provider_order", ["komga", "kavita"]) or ["komga", "kavita"],
         "manga_companion_folder_convergence": media_management_bool_setting(db_path, "manga_companion_folder_convergence", True),
+        "cover_injection_enabled": media_management_bool_setting(db_path, "cover_injection_enabled", False),
     }
 
 
@@ -24292,6 +24995,9 @@ MEDIA_MANAGEMENT_SETTING_DEFAULTS = {
     "frontend_sync_after_import": True,
     "library_visibility_provider_order": ["komga", "kavita"],
     "manga_companion_folder_convergence": True,
+    "cover_injection_enabled": False,
+    "unit_preference": "both",
+    "collected_edition_policy": "review",
 }
 
 
@@ -24308,10 +25014,13 @@ MEDIA_MANAGEMENT_SETTING_HELP = {
     "delete_empty_folders": "When a move or removal leaves a folder holding nothing, remove the folder too. The library root itself is never touched.",
     "unmonitor_deleted_issues": "If an issue's file disappears from the library, stop monitoring that issue instead of hunting for a replacement. Turn this on if deleting a file is how you say \"I don't want this one.\"",
     "folder_completion_policy": "Choose whether managed-folder proof is sufficient or frontend visibility is also required.",
+    "unit_preference": "Which unit you want a series in. Issues, volumes, chapters, or both. This is never a reason to refuse a download -- InkDrop still takes whatever fills a gap, and applies your preference later by replacing what it already has. Changing it does not revisit anything already in your library.",
+    "collected_edition_policy": "What to do with an omnibus, trade paperback or other collected edition that holds an issue you want. \"Review\" shows it to you, \"Admit\" lets it grab automatically, \"Refuse\" hides it. Collected editions were silently refused before this setting existed.",
     "library_visibility_required": "Require a configured library frontend to see the file before final verification.",
     "library_visibility_checks_enabled": "Collect optional frontend visibility evidence after folder completion.",
     "frontend_sync_after_import": "Ask enabled library frontends to rescan after a managed import.",
     "library_visibility_provider_order": "Preferred library frontend order for visibility checks and sync requests.",
+    "cover_injection_enabled": "Write the series' cover art into the first page of its lowest-numbered book, so Kavita and Komga show it as the series cover. Both readers build a series' cover from the first page of book one and ignore the cover InkDrop stores, which is why a volume that opens on a title page or a scanlator's banner shows that instead -- verified against real Kavita and Komga instances. With this on, a newly imported book that becomes the series' new lowest volume gets the cover moved to it automatically, and a corrected cover is rewritten into the archive. This edits the archive files in your library: the cover is added as a new first page (nothing is replaced), the original is kept in the quarantine folder so it can be restored, and any file whose chapter/volume classification would change is skipped rather than rewritten. Off by default. Leave it off and use the manual sweep on the Library page if you would rather review each run before it touches anything.",
     "manga_companion_folder_convergence": "When a MangaDex companion tracks new chapters ahead of a volume-based series, place them in the same folder as the canonical series instead of a separate one. Both Kavita and Komga group by physical folder, not by matching metadata across folders -- verified live against a real Kavita instance on 2026-07-28, a companion in its own folder always displays as a second, incomplete series tile, and whichever folder gets scanned most recently silently drops the other's chapters from the reader's index. Turn this off only if you deliberately want companion chapters kept in a separate folder for some other reason.",
 }
 
@@ -24370,6 +25079,7 @@ def media_management_sanitize_component(value, *, replace_illegal=True, colon_re
     text = str(value or "").strip().replace("\\", "/").strip()
     if not text:
         return ""
+    text = _strip_path_control_characters(text)
     colon_mode = str(colon_replacement or "smart").strip().lower()
     if colon_mode == "delete":
         text = text.replace(":", "")
@@ -24383,6 +25093,8 @@ def media_management_sanitize_component(value, *, replace_illegal=True, colon_re
     text = text.replace("/", replacement or "-").replace("\\", replacement or "-")
     text = re.sub(r"-{2,}", "-", text)
     text = text.strip(" .-")
+    if _is_dot_only_component(text):
+        return "Unknown"
     return text or "Unknown"
 
 
@@ -24616,6 +25328,108 @@ def persist_reader_binding(db_path, work_id, reader_series_id, reader_library_id
         return {"ok": True, "reader_series_id": proposed[0], "reader_library_id": proposed[1], "source": source}
 
 
+def _linked_manga_companion_canonical_id(con, work_id):
+    """Return the canonical series a linked MangaDex companion belongs to.
+
+    Only the mangadex side of a `status='linked'` row is a companion; the
+    comicvine side is the canonical series and must never be redirected.
+    """
+    work_id = str(work_id or "").strip()
+    if not work_id or not table_exists(con, "manga_companion_links"):
+        return ""
+    row = con.execute(
+        "select comicvine_series_id from manga_companion_links "
+        "where mangadex_series_id=? and lower(coalesce(status,''))='linked' limit 1",
+        (work_id,),
+    ).fetchone()
+    canonical = str(row["comicvine_series_id"] or "").strip() if row else ""
+    return canonical if canonical and canonical != work_id else ""
+
+
+def _canonical_series_folder_target(con, canonical_series_id):
+    """The folder a canonical series' imports actually land in, if it has one.
+
+    Prefers the durable `canonical_library_identities` lock, then the live
+    `series.library_path` leaf -- a companion linked before the canonical ever
+    imported anything has neither, and must not be redirected onto a guess.
+    """
+    canonical_series_id = str(canonical_series_id or "").strip()
+    if not canonical_series_id:
+        return ""
+    if table_exists(con, "canonical_library_identities"):
+        row = con.execute(
+            "select series_folder from canonical_library_identities where work_id=? limit 1",
+            (canonical_series_id,),
+        ).fetchone()
+        folder = str(row["series_folder"] or "").strip() if row else ""
+        if folder:
+            return folder
+    row = con.execute(
+        "select library_path from series where id=? limit 1", (canonical_series_id,)
+    ).fetchone()
+    library_path = str(row["library_path"] or "").strip().replace("\\", "/").rstrip("/") if row else ""
+    return library_path.rsplit("/", 1)[-1] if library_path else ""
+
+
+def _companion_folder_identity_redirect(con, work_id, series_folder):
+    """Resolve a companion's proposed folder to its canonical series' folder.
+
+    A MangaDex companion carries the original-serialization year while the
+    canonical ComicVine row carries the localized edition's year, so
+    `{Series Title} ({Year})` renders two different folders for one work. Both
+    rows then lock their own folder here, Kavita/Komga index each folder as its
+    own series, and the library splits in the reader -- which is exactly what
+    `_sync_companion_folder_to_canonical` converges at link time and what this
+    call path used to silently undo on the next import.
+    """
+    canonical_series_id = _linked_manga_companion_canonical_id(con, work_id)
+    if not canonical_series_id:
+        return str(series_folder or "").strip(), ""
+    canonical_folder = _canonical_series_folder_target(con, canonical_series_id)
+    series_folder = str(series_folder or "").strip()
+    if not canonical_folder:
+        return series_folder, ""
+    pinned = con.execute(
+        "select library_path_source from series where id=? limit 1", (work_id,)
+    ).fetchone()
+    if pinned and str(pinned["library_path_source"] or "").strip().lower() == "user":
+        # `_sync_companion_folder_to_canonical` refuses to move a user-pinned
+        # companion, so reporting the canonical folder here would hand callers a
+        # folder this function did not and will not converge onto. The import
+        # destination decision acts on exactly this value, so an unhonoured
+        # redirect would write the file into the folder the pin exists to avoid.
+        return series_folder, ""
+    return canonical_folder, canonical_series_id
+
+
+def _reconverge_linked_manga_companions(con, db_path, canonical_series_id, now):
+    """Pull every linked companion onto the canonical series' folder.
+
+    `_sync_companion_folder_to_canonical` only fires once, when the companion
+    job completes. A canonical series whose folder is locked or corrected later
+    would otherwise strand its companions on the folder they were converged to
+    at link time, re-splitting the work across two reader entries.
+    """
+    canonical_series_id = str(canonical_series_id or "").strip()
+    if not canonical_series_id or not table_exists(con, "manga_companion_links"):
+        return 0
+    if not media_management_bool_setting(db_path, "manga_companion_folder_convergence", True):
+        return 0
+    rows = con.execute(
+        "select mangadex_series_id from manga_companion_links "
+        "where comicvine_series_id=? and lower(coalesce(status,''))='linked'",
+        (canonical_series_id,),
+    ).fetchall()
+    converged = 0
+    for row in rows:
+        companion_id = str(row["mangadex_series_id"] or "").strip()
+        if not companion_id or companion_id == canonical_series_id:
+            continue
+        if _sync_companion_folder_to_canonical(con, db_path, canonical_series_id, companion_id, now):
+            converged += 1
+    return converged
+
+
 def _sync_series_library_path_to_canonical_folder(con, work_id, series_folder, now):
     """Repoint series.library_path at the durable canonical folder once confirmed.
 
@@ -24819,6 +25633,27 @@ def persist_series_folder_identity(db_path, work_id, series_folder, *, library_t
     now = float(now or time.time())
     with connect(db_path) as con:
         con.execute("begin immediate")
+        canonical_folder, companion_canonical_id = _companion_folder_identity_redirect(
+            con, work_id, series_folder
+        )
+        if companion_canonical_id and media_management_bool_setting(
+            db_path, "manga_companion_folder_convergence", True
+        ):
+            # The canonical series owns this folder's identity; a companion that
+            # minted its own would take a second unique-index slot and re-split
+            # the reader's view of one work. Follow the canonical instead.
+            converged = _sync_companion_folder_to_canonical(
+                con, db_path, companion_canonical_id, work_id, now
+            )
+            con.commit()
+            return {
+                "ok": True,
+                "reason": "companion_follows_canonical_folder",
+                "library_type": str(library_type or "unknown"),
+                "series_folder": canonical_folder,
+                "canonical_series_id": companion_canonical_id,
+                "folder_converged": converged,
+            }
         con.execute(
             """
             create table if not exists canonical_library_identities(
@@ -24898,6 +25733,7 @@ def persist_series_folder_identity(db_path, work_id, series_folder, *, library_t
                 )
                 return {"ok": False, "reason": reason, "library_type": persisted_library, "series_folder": persisted}
             _sync_series_library_path_to_canonical_folder(con, work_id, persisted, now)
+            _reconverge_linked_manga_companions(con, db_path, work_id, now)
             return {"ok": True, "reason": "persisted_folder_identity", "library_type": persisted_library, "series_folder": persisted}
         # First lock for this work_id: canonical_library_identities has nothing to
         # compare against yet, so on its own this would just adopt whatever folder
@@ -24974,6 +25810,7 @@ def persist_series_folder_identity(db_path, work_id, series_folder, *, library_t
         raw["canonical_library_identity_v1"] = current
         con.execute("update series set raw_json=?,updated_at=max(coalesce(updated_at,0),?) where id=?", (json_dumps(raw), now, work_id))
         _sync_series_library_path_to_canonical_folder(con, work_id, current["series_folder"], now)
+        _reconverge_linked_manga_companions(con, db_path, work_id, now)
         return {"ok": True, "reason": "persisted_folder_identity", "series_folder": current["series_folder"]}
 
 
@@ -26939,8 +27776,21 @@ def reconcile_monitored_metadata_only_wanted(con, now, *, limit=250, series_id=N
         left join wanted_items w on w.issue_id = i.id
         left join queue_items q on q.issue_id = i.id and q.active = 1
         left join import_results ir on ir.issue_id = i.id and ir.verified = 1
+        -- auto_grab is deliberately NOT a condition here. It answers "may
+        -- InkDrop acquire this without asking", which is an automation
+        -- preference; it was being read as "should this unit be enumerated at
+        -- all", which is a different question. A monitored series with
+        -- auto-grab off still needs its missing units listed -- the operator
+        -- picks them by hand, which is impossible if they were never recorded.
+        --
+        -- This was the second half of the Hunter x Hunter disappearance. The
+        -- companion refresh dropped 411/415/416/417 for a MangaDex delivery
+        -- limitation, and this reconciler -- the net that exists to catch
+        -- exactly that -- skipped them because the companion carries
+        -- auto_grab=0. Both faults were needed; either alone would have been
+        -- survivable. Measured 2026-08-17: all four passed every other
+        -- condition here, and 12 monitored series carry auto_grab=0.
         where coalesce(s.monitored, 0) = 1
-          and coalesce(s.auto_grab, 0) = 1
           and coalesce(i.monitored, 1) = 1
           and w.id is null
           and q.id is null
@@ -27296,6 +28146,14 @@ def merge_wanted_items_group(con, series_id, canonical_issue_id, wanted_rows, no
     # Reproduced at roughly 1 run in 14 of the concurrent-subprocess fixture,
     # in merge_wanted_items_group rather than in the issues cleanup the
     # earlier fix targeted.
+    # The payload written here is a dedupe audit trail, and row_summary above
+    # deliberately drops each merged row's own raw_json from it -- the trail
+    # exists to record status/reason/priority, not to carry payloads forward.
+    # That is right for provider metadata and wrong for operator intent: a
+    # paused item whose issue lands in a duplicate group would come out of this
+    # statement unpaused, because the keys live in the payload being replaced.
+    # Same reason upsert_wanted() patches instead of assigning, so it gets the
+    # same treatment rather than a second rule.
     cur = con.execute(
         """
         insert into wanted_items(id, series_id, issue_id, reason, status, priority, created_at, updated_at, raw_json)
@@ -27308,7 +28166,7 @@ def merge_wanted_items_group(con, series_id, canonical_issue_id, wanted_rows, no
           status=excluded.status,
           priority=max(priority, excluded.priority),
           updated_at=excluded.updated_at,
-          raw_json=excluded.raw_json
+          raw_json=""" + preserve_operator_intent_sql("wanted_items.raw_json", "excluded.raw_json") + """
         """,
         (
             canonical_wanted_id,
@@ -33479,6 +34337,23 @@ def cleanup_missing_folder_verified_import_proofs(
     managed_roots = media_management_roots_from_connection(con)
     if not managed_roots:
         return {"import_results": 0, "queue_items": 0, "download_tasks": 0, "media_files": 0}
+    # Only sweep roots that are actually mounted. A root that is missing or
+    # empty cannot tell the difference between "these files were deleted" and
+    # "this volume is not here right now", and this sweep's answer to that
+    # question is destructive -- see media_root_is_mounted().
+    unmounted_roots = [root for root in managed_roots if not media_root_is_mounted(root)]
+    if unmounted_roots:
+        managed_roots = [root for root in managed_roots if root not in set(unmounted_roots)]
+        if not dry_run:
+            record_media_root_unavailable_skip(con, unmounted_roots, now)
+    if not managed_roots:
+        return {
+            "import_results": 0,
+            "queue_items": 0,
+            "download_tasks": 0,
+            "media_files": 0,
+            "skipped_unmounted_roots": list(unmounted_roots),
+        }
     try:
         limit = max(1, min(int(limit or 5000), 5000))
     except Exception:
@@ -33544,7 +34419,11 @@ def cleanup_missing_folder_verified_import_proofs(
         try:
             dest_exists = Path(dest_path).exists()
         except OSError:
-            dest_exists = False
+            # "I could not read this path" is not "this file was deleted". A
+            # flaky mount raises here, and treating that as absence retracts a
+            # proof the disk never disputed. Skip the row and let a later pass
+            # decide once the answer is trustworthy.
+            continue
         if dest_exists:
             continue
         relocated_path = None
@@ -34981,6 +35860,19 @@ def _restore_manga_companion_discovery_locked(
         "series_removed_guard_at_iso",
         "series_removed_guard_message",
         "series_removed_guard_source",
+        # A duplicate merge parks the companion under its own marker set
+        # rather than either shape above (see apply_series_duplicate_merge).
+        # Clearing these matters as much as clearing monitored=0: left behind,
+        # the row keeps claiming to be "merged into comicvine:NNN" everywhere
+        # raw_json is projected, describing a fold-up that has just been
+        # reversed, and _series_row_parked_or_removed() would still read it as
+        # merged. Nothing forensic is lost -- this function's own history
+        # event carries the entire prior raw_json as
+        # pre_restore_series_snapshot, so the merge stays auditable.
+        "merged_into_series_id",
+        "merged_at",
+        "merged_at_iso",
+        "pre_merge_series_snapshot",
     ):
         new_raw.pop(key, None)
     new_raw.update(
@@ -35175,6 +36067,141 @@ def reconcile_discovery_only_companion_staleness(db_path, *, now=None, limit=25)
     if healed:
         clear_state_view_summary_cache()
     return {"ok": True, "checked": checked, "healed": healed, "alerted": alerted}
+
+
+def reconcile_merge_parked_companion_discovery(db_path, *, now=None, limit=25):
+    """Periodic self-heal for MangaDex companions folded into their own
+    canonical series by a duplicate merge.
+
+    apply_series_duplicate_merge() now refuses this shape outright
+    (`manga_companion_paired_series_merge`), but the refusal only protects
+    pairings from here on. Four monitored manga on production were already
+    merged away before that blocker existed -- Fool Night, One-Punch Man,
+    Soul Eater and Vinland Saga, all parked within five seconds of each other
+    in one sweep -- and nothing else in the codebase can see them: the link
+    still reads status='linked'/last_refresh_status='ok', so only joining it
+    to the companion series' monitored flag reveals the break, and
+    reconcile_discovery_only_companion_staleness() cannot help because these
+    links carry discovery_mode=None (they were established normally by
+    link_manga_companion(), never restored, so nothing ever set the flag).
+
+    The gate is deliberately narrower than "a merged companion": it fires
+    only when the companion was merged into *the very series it companions*.
+    That case carries its own proof of being wrong, independent of any
+    judgement about the two titles -- a live manga_companion_links row is a
+    standing assertion that these two rows are a deliberate pair, so a merge
+    declaring them the same series contradicts a decision the system already
+    made and is re-attaching a link that existed and was verified, not
+    guessing at a new one. A companion merged into some *other* series is a
+    real identity call a human made about two genuinely different rows, and
+    is left alone.
+
+    Reuses _restore_manga_companion_discovery_locked() rather than writing
+    the series row here, so a companion revived by this pass is
+    indistinguishable from one revived by any other guarded path -- same
+    monitored/monitor_new restore, same discovery_only transition, same
+    history event, same refusal to reactivate a genuine user removal (which
+    is why the two `user_removed` zombies on production, Dorohedoro and
+    Vagabond, are correctly out of scope: a user really did remove those).
+    """
+    now = float(now or time.time())
+    checked = []
+    healed = []
+    skipped = []
+    with connect(Path(db_path)) as con:
+        init_schema(con)
+        rows = con.execute(
+            """
+            select l.id as link_id, l.comicvine_series_id, l.mangadex_series_id,
+                   c.title as canonical_title, m.raw_json as companion_raw_json
+            from manga_companion_links l
+            join series c on c.id = l.comicvine_series_id
+            join series m on m.id = l.mangadex_series_id
+            where l.status='linked' and m.monitored=0 and c.monitored=1
+            order by m.updated_at
+            limit ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        for row in rows:
+            raw = json_loads(row["companion_raw_json"] or "{}", {})
+            if not isinstance(raw, dict):
+                raw = {}
+            if str(raw.get("automation_parked_reason") or "") != "series_merged":
+                continue
+            checked.append(row["mangadex_series_id"])
+            if str(raw.get("merged_into_series_id") or "") != str(row["comicvine_series_id"]):
+                # Merged into something other than its own canonical partner:
+                # a real identity decision about two different rows. Not ours
+                # to reverse.
+                skipped.append(
+                    {
+                        "mangadex_series_id": row["mangadex_series_id"],
+                        "reason": "merged_into_other_series",
+                        "merged_into_series_id": raw.get("merged_into_series_id"),
+                    }
+                )
+                continue
+            snapshot = raw.get("pre_merge_series_snapshot")
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            if not snapshot.get("monitored"):
+                # Without a pre-merge snapshot showing the companion was live,
+                # there is nothing to restore it *to* -- the merge may have
+                # folded up a row that was already dark for some other reason,
+                # and turning discovery on would be a new decision rather than
+                # the reversal of a demonstrated regression.
+                skipped.append(
+                    {
+                        "mangadex_series_id": row["mangadex_series_id"],
+                        "reason": "no_live_pre_merge_snapshot",
+                    }
+                )
+                continue
+            outcome = _restore_manga_companion_discovery_locked(
+                con,
+                row["mangadex_series_id"],
+                source="inkdrop_state.reconcile_merge_parked_companion_discovery",
+                reason=(
+                    "Periodic self-heal: a duplicate merge folded this MangaDex companion into "
+                    f"{row['comicvine_series_id']}, the very series it companions, silently ending "
+                    "live chapter discovery while manga_companion_links still authorized it"
+                ),
+                now=now,
+            )
+            if outcome.get("ok"):
+                healed.append(row["mangadex_series_id"])
+            else:
+                skipped.append(
+                    {
+                        "mangadex_series_id": row["mangadex_series_id"],
+                        "reason": str(outcome.get("reason") or "restore_failed"),
+                    }
+                )
+                continue
+            _record_search_history(
+                con,
+                event_type="manga_companion_merge_park_healed",
+                entity_type="series",
+                entity_id=row["mangadex_series_id"],
+                series_id=row["mangadex_series_id"],
+                message=(
+                    f"Restored MangaDex discovery for {row['canonical_title']} -- its companion "
+                    f"({row['mangadex_series_id']}) had been merged into the same series it "
+                    "companions, which ends discovery without changing the companion link"
+                ),
+                raw={
+                    "link_id": row["link_id"],
+                    "comicvine_series_id": row["comicvine_series_id"],
+                    "merged_at_iso": raw.get("merged_at_iso"),
+                    "pre_merge_series_snapshot": snapshot,
+                    "heal_outcome": outcome,
+                },
+                source="inkdrop_state.reconcile_merge_parked_companion_discovery",
+                now=now,
+            )
+    if healed:
+        clear_state_view_summary_cache()
+    return {"ok": True, "checked": checked, "healed": healed, "skipped": skipped}
 
 
 def heal_zombie_manga_companion_links(con, now=None):
@@ -36755,6 +37782,8 @@ def sync_import_results(state_dir, db_path=None):
             con.commit()
             expired_import_claims_released = cleanup_expired_import_claims(con, now)
             con.commit()
+            retry_exhausted_retired = retire_retry_exhausted_queue_items(con, now)
+            con.commit()
             stale_slskd_wrong_title_bad_candidates = sync_stale_slskd_wrong_title_bad_candidates(con, now)
             con.commit()
             download_task_history_count = backfill_download_task_history(con)
@@ -36846,6 +37875,43 @@ def sync_import_results(state_dir, db_path=None):
     return with_db_lock_retry(_sync, attempts=4, initial_delay=1.0)
 
 
+def record_provider_enabled_change(con, provider_id, display_name, before, after, source, now):
+    """Write down that a provider was switched on or off, and by which path.
+
+    `update_provider_config()` -- the Settings save an operator performs -- has
+    always recorded a `provider_update` event. `upsert_provider_config()`, the
+    settings-resync path, recorded nothing at all, so a resync applying a
+    code-level `enabled` default could turn a source off and leave no trace
+    that it had ever been on. The only evidence was the absence of traffic.
+
+    A distinct event type rather than `provider_update`, because the two are
+    different claims: one is "an operator saved this", the other is "a resync
+    changed this without being asked to". Reading them as the same thing is how
+    an unattended change acquires an author.
+    """
+    before = 1 if before else 0
+    after = 1 if after else 0
+    if before == after:
+        return ""
+    verb = "enabled" if after else "disabled"
+    return record_settings_history(
+        con,
+        "provider_enabled_changed",
+        "provider",
+        provider_id,
+        source or "runtime",
+        f"{display_name or provider_id} was {verb} by a settings resync",
+        {
+            "provider_id": provider_id,
+            "enabled_before": bool(before),
+            "enabled_after": bool(after),
+            "changed_by": source or "runtime",
+            "path": "upsert_provider_config",
+        },
+        now,
+    )
+
+
 def upsert_provider_config(con, provider, now):
     provider = dict(provider or {})
     provider_id = str(provider.get("id") or "").strip()
@@ -36908,6 +37974,15 @@ def upsert_provider_config(con, provider, now):
                 provider_id,
             ),
         )
+        record_provider_enabled_change(
+            con,
+            provider_id,
+            provider.get("display_name") or provider_id,
+            existing_enabled,
+            new_enabled,
+            source,
+            now,
+        )
         return True
     con.execute(
         """
@@ -36953,6 +38028,19 @@ def upsert_provider_config(con, provider, now):
             now,
         ),
     )
+    if existing is not None:
+        # `on conflict do update set enabled=excluded.enabled` overwrites an
+        # existing row just as surely as the UPDATE above. A first insert is
+        # not a change and records nothing.
+        record_provider_enabled_change(
+            con,
+            provider_id,
+            provider.get("display_name") or provider_id,
+            existing["enabled"],
+            1 if provider.get("enabled", True) else 0,
+            source,
+            now,
+        )
     return True
 
 
@@ -37139,6 +38227,10 @@ def sync_settings(db_path, providers=None, settings=None):
         scrubbed_indexer_ids = scrub_leaked_prowlarr_catalog_indexer_ids(con)
         update_sync_meta(con, now, "settings")
         con.commit()
+    # Outside the connection above on purpose: create_instance() takes its own
+    # `begin immediate`, so running it while this transaction is open would have
+    # the settings sync deadlock against itself.
+    legacy_client_migration = migrate_legacy_download_clients(db_path)
     clear_settings_caches()
     return {
         "ok": True,
@@ -37147,10 +38239,28 @@ def sync_settings(db_path, providers=None, settings=None):
             "providers": provider_count,
             "settings": setting_count,
             "scrubbed_prowlarr_catalog_indexer_ids": scrubbed_indexer_ids,
+            "legacy_download_clients": legacy_client_migration,
         },
         "synced_at": now,
         "synced_at_iso": utc_stamp(now),
     }
+
+
+def migrate_legacy_download_clients(db_path, **kwargs):
+    """Carry configured legacy download-client provider cards into instances.
+
+    Best-effort by design: a settings load must still render if one card cannot
+    be materialized. Failures are recorded per client type by the store itself,
+    so the next sync retries them rather than losing them silently.
+    """
+    try:
+        return inkdrop_download_client_config.materialize_legacy_instances(
+            db_path,
+            history_writer=record_settings_history,
+            **kwargs,
+        )
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def create_download_client_instance(db_path, payload, **kwargs):
@@ -37995,376 +39105,14 @@ def settings_snapshot(db_path):
         return snapshot
 
 
-AUTH_PASSWORD_ALGORITHM = "pbkdf2_sha256"
-AUTH_PASSWORD_ITERATIONS = 260000
-AUTH_SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
-API_KEY_PREFIX = "ik"
-
-
-def _token_digest(token):
-    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
-
-
-def _new_public_token(prefix):
-    return f"{prefix}_{secrets.token_urlsafe(32)}"
-
-
-def auth_password_hash(password, *, salt=None, iterations=AUTH_PASSWORD_ITERATIONS):
-    password = str(password or "")
-    if len(password) < 8:
-        raise ValueError("password must be at least 8 characters")
-    salt_bytes = bytes.fromhex(salt) if salt else secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt_bytes,
-        int(iterations or AUTH_PASSWORD_ITERATIONS),
-    )
-    return f"{AUTH_PASSWORD_ALGORITHM}${int(iterations or AUTH_PASSWORD_ITERATIONS)}${salt_bytes.hex()}${digest.hex()}"
-
-
-def auth_verify_password(password, stored_hash):
-    parts = str(stored_hash or "").split("$")
-    if len(parts) != 4 or parts[0] != AUTH_PASSWORD_ALGORITHM:
-        return False
-    try:
-        expected = auth_password_hash(password, salt=parts[2], iterations=int(parts[1]))
-    except Exception:
-        return False
-    return hmac.compare_digest(expected, str(stored_hash or ""))
-
-
-def api_key_fingerprint(token):
-    digest = _token_digest(token)
-    return f"{digest[:6]}:{digest[-6:]}"
-
-
-def _auth_setting_bool(con, key, default):
-    row = con.execute("select value_json from app_settings where key=?", (key,)).fetchone()
-    if not row:
-        return bool(default)
-    value = json_loads(row["value_json"], default)
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() not in {"0", "false", "no", "off", "disabled"}
-
-
-def auth_status(db_path, environ=None):
-    env = dict(os.environ if environ is None else environ)
-    auth_required_default = str(env.get("INKDROP_AUTH_REQUIRED") or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
-    db_path = Path(db_path)
-    def default_status():
-        return {
-            "ok": True,
-            "db_path": str(db_path),
-            "required": bool(auth_required_default),
-            "built_in_auth": {
-                "available": True,
-                "enabled": True,
-                "configured": False,
-                "user_count": 0,
-                "bootstrap_required": True,
-            },
-            "external_auth": {
-                "compatible": True,
-                "enabled": str(env.get("INKDROP_EXTERNAL_AUTH_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"},
-                "header": str(env.get("INKDROP_EXTERNAL_AUTH_HEADER") or "X-Forwarded-User"),
-            },
-            "api_keys": {"available": True, "enabled": True, "configured": False, "active_count": 0, "revoked_count": 0},
-            "secret_policy": "Secrets and API keys are write-only; public payloads expose only presence, prefix, and fingerprint.",
-        }
-    if not db_path.exists():
-        return default_status()
-    with connect(db_path) as con:
-        try:
-            built_in_enabled = _auth_setting_bool(con, "auth.built_in_enabled", True)
-            api_keys_enabled = _auth_setting_bool(con, "auth.api_keys_enabled", True)
-            auth_required = _auth_setting_bool(con, "auth.required", auth_required_default)
-            external_enabled = _auth_setting_bool(
-                con,
-                "auth.external_auth_enabled",
-                str(env.get("INKDROP_EXTERNAL_AUTH_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"},
-            )
-            user_count = int(con.execute("select count(*) from auth_users where enabled=1").fetchone()[0] or 0)
-            session_count = int(
-                con.execute(
-                    "select count(*) from auth_sessions where revoked_at is null and (expires_at is null or expires_at > ?)",
-                    (time.time(),),
-                ).fetchone()[0]
-                or 0
-            )
-            active_key_count = int(con.execute("select count(*) from api_keys where enabled=1 and revoked_at is null").fetchone()[0] or 0)
-            revoked_key_count = int(con.execute("select count(*) from api_keys where revoked_at is not null or enabled=0").fetchone()[0] or 0)
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
-                return default_status()
-            raise
-    return {
-        "ok": True,
-        "db_path": str(db_path),
-        "required": bool(auth_required),
-        "built_in_auth": {
-            "available": True,
-            "enabled": bool(built_in_enabled),
-            "configured": user_count > 0,
-            "user_count": user_count,
-            "active_session_count": session_count,
-            "bootstrap_required": bool(built_in_enabled and user_count == 0),
-            "login_supported": True,
-        },
-        "external_auth": {
-            "compatible": True,
-            "enabled": bool(external_enabled),
-            "header": str(env.get("INKDROP_EXTERNAL_AUTH_HEADER") or "X-Forwarded-User"),
-            "next_action": "Keep enabled behind a trusted reverse proxy." if external_enabled else "Optional for reverse-proxy SSO installs.",
-        },
-        "api_keys": {
-            "available": True,
-            "enabled": bool(api_keys_enabled),
-            "configured": active_key_count > 0,
-            "active_count": active_key_count,
-            "revoked_count": revoked_key_count,
-            "create_supported": True,
-            "raw_key_visible_once": True,
-        },
-        "secret_policy": "Secrets and API keys are write-only; public payloads expose only presence, prefix, and fingerprint.",
-    }
-
-
-def bootstrap_auth_user(db_path, username, password, *, role="admin"):
-    username = str(username or "").strip()
-    if not username:
-        raise ValueError("username is required")
-    password_hash = auth_password_hash(password)
-    now = time.time()
-    with connect(db_path) as con:
-        init_schema(con)
-        existing = int(con.execute("select count(*) from auth_users").fetchone()[0] or 0)
-        if existing:
-            raise ValueError("built-in auth already has a user; create additional users from the authenticated settings flow")
-        user_id = stable_id("auth_user", username.lower(), now)
-        con.execute(
-            """
-            insert into auth_users(id, username, password_hash, role, enabled, created_at, updated_at, raw_json)
-            values(?,?,?,?,?,?,?,?)
-            """,
-            (
-                user_id,
-                username,
-                password_hash,
-                str(role or "admin"),
-                1,
-                now,
-                now,
-                json_dumps({"source": "bootstrap"}),
-            ),
-        )
-        record_settings_history(
-            con,
-            "auth_user_bootstrap",
-            "auth_user",
-            user_id,
-            username,
-            f"Built-in auth user {username} created",
-            {"username": username, "role": str(role or "admin")},
-            now,
-        )
-        con.commit()
-    clear_settings_caches()
-    return {"ok": True, "user": {"id": user_id, "username": username, "role": str(role or "admin"), "enabled": True}}
-
-
-def login_auth_user(db_path, username, password, *, user_agent=None, remote_addr=None, ttl_seconds=AUTH_SESSION_TTL_SECONDS):
-    username = str(username or "").strip()
-    now = time.time()
-    with connect(db_path) as con:
-        init_schema(con)
-        row = con.execute(
-            "select id, username, password_hash, role, enabled from auth_users where lower(username)=lower(?)",
-            (username,),
-        ).fetchone()
-        if not row or not row["enabled"] or not auth_verify_password(password, row["password_hash"]):
-            raise ValueError("invalid username or password")
-        token = _new_public_token("is")
-        session_id = stable_id("auth_session", row["id"], token, now)
-        expires_at = now + max(60, int(ttl_seconds or AUTH_SESSION_TTL_SECONDS))
-        con.execute(
-            """
-            insert into auth_sessions(id, user_id, token_hash, created_at, expires_at, user_agent, remote_addr, raw_json)
-            values(?,?,?,?,?,?,?,?)
-            """,
-            (
-                session_id,
-                row["id"],
-                _token_digest(token),
-                now,
-                expires_at,
-                str(user_agent or "")[:256],
-                str(remote_addr or "")[:128],
-                json_dumps({"source": "login"}),
-            ),
-        )
-        con.execute("update auth_users set last_login_at=?, updated_at=? where id=?", (now, now, row["id"]))
-        con.commit()
-    return {
-        "ok": True,
-        "session": {
-            "id": session_id,
-            "token": token,
-            "expires_at": expires_at,
-            "expires_at_iso": utc_stamp(expires_at),
-        },
-        "user": {"id": row["id"], "username": row["username"], "role": row["role"], "enabled": True},
-    }
-
-
-def create_api_key(db_path, name, *, role="admin"):
-    name = str(name or "").strip()
-    if not name:
-        raise ValueError("api key name is required")
-    token = _new_public_token(API_KEY_PREFIX)
-    digest = _token_digest(token)
-    fingerprint = api_key_fingerprint(token)
-    prefix = token[:10]
-    now = time.time()
-    key_id = stable_id("api_key", name.lower(), fingerprint, now)
-    with connect(db_path) as con:
-        init_schema(con)
-        con.execute(
-            """
-            insert into api_keys(id, name, key_hash, fingerprint, prefix, role, enabled, created_at, updated_at, raw_json)
-            values(?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                key_id,
-                name,
-                digest,
-                fingerprint,
-                prefix,
-                str(role or "admin"),
-                1,
-                now,
-                now,
-                json_dumps({"source": "user", "raw_key_visible_once": True}),
-            ),
-        )
-        record_settings_history(
-            con,
-            "api_key_create",
-            "api_key",
-            key_id,
-            name,
-            f"API key {name} created",
-            {"id": key_id, "name": name, "fingerprint": fingerprint, "prefix": prefix, "role": str(role or "admin")},
-            now,
-        )
-        con.commit()
-    return {
-        "ok": True,
-        "api_key": {
-            "id": key_id,
-            "name": name,
-            "key": token,
-            "prefix": prefix,
-            "fingerprint": fingerprint,
-            "role": str(role or "admin"),
-            "enabled": True,
-            "created_at": now,
-            "created_at_iso": utc_stamp(now),
-            "raw_key_visible_once": True,
-        },
-    }
-
-
-def list_api_keys(db_path):
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return []
-    with connect(db_path) as con:
-        init_schema(con)
-        rows = con.execute(
-            """
-            select id, name, fingerprint, prefix, role, enabled, created_at, updated_at, last_used_at, revoked_at
-            from api_keys
-            order by created_at desc
-            """
-        ).fetchall()
-    out = []
-    for row in rows:
-        out.append(
-            {
-                "id": row["id"],
-                "name": row["name"],
-                "fingerprint": row["fingerprint"],
-                "prefix": row["prefix"],
-                "preview": f"{row['prefix']}..." if row["prefix"] else "",
-                "role": row["role"],
-                "enabled": bool(row["enabled"]) and row["revoked_at"] is None,
-                "created_at": row["created_at"],
-                "created_at_iso": utc_stamp(row["created_at"]) if row["created_at"] else None,
-                "updated_at": row["updated_at"],
-                "last_used_at": row["last_used_at"],
-                "revoked_at": row["revoked_at"],
-            }
-        )
-    return out
-
-
-def verify_api_key(db_path, token, *, mark_used=False):
-    digest = _token_digest(token)
-    if not token:
-        return None
-    now = time.time()
-    with connect(db_path) as con:
-        init_schema(con)
-        row = con.execute(
-            "select id, name, fingerprint, prefix, role, enabled from api_keys where key_hash=? and enabled=1 and revoked_at is null",
-            (digest,),
-        ).fetchone()
-        if not row:
-            return None
-        if mark_used:
-            con.execute("update api_keys set last_used_at=?, updated_at=? where id=?", (now, now, row["id"]))
-            con.commit()
-        return {
-            "id": row["id"],
-            "name": row["name"],
-            "fingerprint": row["fingerprint"],
-            "prefix": row["prefix"],
-            "role": row["role"],
-            "enabled": True,
-        }
-
-
-def revoke_api_key(db_path, key_id):
-    key_id = str(key_id or "").strip()
-    if not key_id:
-        raise ValueError("api key id is required")
-    now = time.time()
-    with connect(db_path) as con:
-        init_schema(con)
-        cur = con.execute(
-            "update api_keys set enabled=0, revoked_at=?, updated_at=? where id=? and revoked_at is null",
-            (now, now, key_id),
-        )
-        if cur.rowcount:
-            record_settings_history(
-                con,
-                "api_key_revoke",
-                "api_key",
-                key_id,
-                key_id,
-                f"API key {key_id} revoked",
-                {"id": key_id},
-                now,
-            )
-        con.commit()
-    return {"ok": True, "revoked": int(cur.rowcount or 0), "api_keys": list_api_keys(db_path)}
-
-
-# Auth-security v12 compatibility surface. The original prototype exported these
-# helpers from inkdrop_state; keep those names stable while the hardened
-# implementation lives in the focused security module.
+# Auth-security v12 compatibility surface. Callers still reach auth through
+# these inkdrop_state names; every one of them delegates to inkdrop_auth, which
+# owns the only password-hashing, session, and API-key implementation. The
+# prototype implementations that used to sit above this comment were deleted --
+# a later definition of each name shadowed them, so they had been unreachable
+# since the typed-settings change, and a second PBKDF2/API-key path in this file
+# was one careless reorder away from becoming the live one again. Do not add a
+# local implementation here; extend inkdrop_auth instead.
 def auth_password_hash(password, *, salt=None, iterations=inkdrop_auth.PASSWORD_ITERATIONS):
     return inkdrop_auth.password_hash(password, salt=salt, iterations=iterations)
 
@@ -39678,13 +40426,6 @@ def app_setting(db_path, key):
     return with_db_lock_retry(_read, attempts=4, initial_delay=0.5)
 
 
-def _app_setting_value_from_connection(con, key, default):
-    row = con.execute("select value_json from app_settings where key=?", (key,)).fetchone()
-    if not row:
-        return default
-    return json_loads(row["value_json"], default)
-
-
 def slskd_active_stall_policy(con):
     """Return the single effective active zero-progress SLSKD stall policy."""
     enabled = boolish(_app_setting_value_from_connection(con, "automation.queue_watchdog_enabled", True), True)
@@ -40513,8 +41254,88 @@ def classify_duplicate_series_group(items):
     }
 
 
-def annotate_duplicate_series_rows(rows):
+def linked_manga_companion_pair_keys(con):
+    """Series-id pairs that a companion link deliberately holds apart.
+
+    A ComicVine row and its MangaDex counterpart share a title on purpose --
+    that is what the companion link *is*: one work, two catalogs, kept as
+    separate rows so each provider keeps its own volume/chapter numbering.
+    Duplicate-title grouping sees only the normalized title, so it cannot
+    tell a deliberate companion pair from an accidental double registration
+    and has to be told. Returns unordered {a, b} keys so callers do not have
+    to know which side ComicVine was on.
+    """
+    pairs = set()
+    try:
+        rows = con.execute(
+            "select comicvine_series_id, mangadex_series_id from manga_companion_links where status='linked'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Only a not-yet-created table is tolerated. A closed or misused
+        # connection must NOT be swallowed: this set is a safety exclusion, and
+        # an empty one silently re-offers deliberate companion pairs as merge
+        # candidates -- failing open on exactly the case it exists to prevent.
+        return pairs
+    for row in rows:
+        left = str(row["comicvine_series_id"] or "")
+        right = str(row["mangadex_series_id"] or "")
+        if left and right and left != right:
+            pairs.add(frozenset((left, right)))
+    return pairs
+
+
+def classify_duplicate_series_relationship(group_rows, companion_pairs=None):
+    """Say what a same-title group actually is, before anything offers to merge it.
+
+    Sharing a normalized title is the weakest possible evidence of being the
+    same work, so this answers the prior question: is there positive evidence
+    these rows are deliberately distinct? Only a group with no such evidence
+    ("unresolved") is worth comparing at all -- and even then the comparison
+    has to be read, not trusted, because issue *numbers* restart at 1 for
+    every volume of every series.
+    """
+    group_rows = [item for item in (group_rows or []) if isinstance(item, dict)]
+    ids = [str(item.get("series_id") or item.get("id") or "") for item in group_rows]
+    ids = {series_id for series_id in ids if series_id}
+    covered = set()
+    for left in ids:
+        for right in ids:
+            if left != right and frozenset((left, right)) in (companion_pairs or set()):
+                covered.update((left, right))
+    if ids and covered == ids:
+        return {
+            "duplicate_series_relationship": "linked_companion",
+            "duplicate_series_relationship_label": "Linked companion catalogs",
+            "duplicate_series_relationship_note": (
+                "A linked ComicVine/MangaDex companion pair -- one work catalogued twice on "
+                "purpose, so each provider keeps its own numbering. Not a duplicate."
+            ),
+        }
+    years = duplicate_series_distinct_values(group_rows, "year")
+    if len(years) > 1:
+        return {
+            "duplicate_series_relationship": "distinct_runs",
+            "duplicate_series_relationship_label": "Distinct runs",
+            "duplicate_series_relationship_note": (
+                "These rows carry different publication years ("
+                + ", ".join(str(year) for year in years)
+                + "), so they are separate runs that happen to share a title."
+            ),
+        }
+    return {
+        "duplicate_series_relationship": "unresolved",
+        "duplicate_series_relationship_label": "Unresolved title collision",
+        "duplicate_series_relationship_note": (
+            "Nothing on record shows whether these are one work or two. Compare their issue "
+            "titles and release dates before treating them as duplicates."
+        ),
+    }
+
+
+def annotate_duplicate_series_rows(rows, con=None, companion_pairs=None):
     rows = list(rows or [])
+    if companion_pairs is None:
+        companion_pairs = linked_manga_companion_pair_keys(con) if con is not None else set()
     groups = {}
     for row in rows:
         key = duplicate_series_title_key(row.get("title"))
@@ -40525,6 +41346,7 @@ def annotate_duplicate_series_rows(rows):
         if len(group_rows) < 2:
             continue
         classification = classify_duplicate_series_group(group_rows)
+        relationship = classify_duplicate_series_relationship(group_rows, companion_pairs)
         group_ids = [str(item.get("series_id") or item.get("id") or "") for item in group_rows if item.get("series_id") or item.get("id")]
         group_titles = [str(item.get("title") or "") for item in group_rows if item.get("title")]
         active_work = sum(
@@ -40544,6 +41366,12 @@ def annotate_duplicate_series_rows(rows):
             item["duplicate_series_row_work"] = row_work
             item["duplicate_series_conflict"] = active_work > 0
             item.update(classification)
+            item.update(relationship)
+            # Only an unresolved collision is worth comparing. A linked
+            # companion pair and a multi-year run split are both *known* to be
+            # separate works, so offering to reconcile them would be inviting
+            # the operator to destroy a deliberate distinction.
+            item["duplicate_series_comparable"] = relationship["duplicate_series_relationship"] == "unresolved"
             if classification["duplicate_series_group_class"] == "adapter_shadow_candidate" and row_work <= 0 and row_ownership == "adapter":
                 row_recommendation = "candidate_supersede_after_review"
             elif classification["duplicate_series_group_class"] == "active_identity_conflict":
@@ -40723,27 +41551,59 @@ def series_merge_candidate_detail(db_path, series_id_a, series_id_b):
                 "active_queue_items": metrics["active_queue_count"],
             }
 
-        numbers_a = {
-            row["normalized_number"]
+        def issues_by_number(series_id):
+            found = {}
             for row in con.execute(
-                "select normalized_number from issues where series_id=? and coalesce(normalized_number,'')<>''",
-                (series_id_a,),
-            )
-        }
-        numbers_b = {
-            row["normalized_number"]
-            for row in con.execute(
-                "select normalized_number from issues where series_id=? and coalesce(normalized_number,'')<>''",
-                (series_id_b,),
-            )
-        }
+                "select normalized_number, title, release_date from issues "
+                "where series_id=? and coalesce(normalized_number,'')<>''",
+                (series_id,),
+            ):
+                found.setdefault(
+                    row["normalized_number"],
+                    {"title": row["title"] or "", "release_date": row["release_date"] or ""},
+                )
+            return found
+
+        issues_a = issues_by_number(series_id_a)
+        issues_b = issues_by_number(series_id_b)
+        numbers_a = set(issues_a)
+        numbers_b = set(issues_b)
         shared = sorted(numbers_a & numbers_b)
+
+        # Issue-number overlap is NOT evidence of the same work: every volume of
+        # every series restarts at #1, so two unrelated runs "share" #1-#6 by
+        # construction. The titles and release dates behind those numbers are
+        # what actually distinguishes them, so they travel with the overlap and
+        # a caller cannot read the count without them.
+        shared_evidence = []
+        matching_titles = 0
+        for number in shared[:24]:
+            left = issues_a.get(number) or {}
+            right = issues_b.get(number) or {}
+            left_title = str(left.get("title") or "")
+            right_title = str(right.get("title") or "")
+            same_title = bool(left_title) and normalize_key(left_title) == normalize_key(right_title)
+            if same_title:
+                matching_titles += 1
+            shared_evidence.append(
+                {
+                    "issue_number": number,
+                    "a_title": left_title,
+                    "a_release_date": str(left.get("release_date") or ""),
+                    "b_title": right_title,
+                    "b_release_date": str(right.get("release_date") or ""),
+                    "titles_match": same_title,
+                }
+            )
         only_a = sorted(numbers_a - numbers_b)
         only_b = sorted(numbers_b - numbers_a)
 
         item_a = build_item(series_id_a, row_a)
         item_b = build_item(series_id_b, row_b)
         classification = classify_duplicate_series_group([item_a, item_b])
+        relationship = classify_duplicate_series_relationship(
+            [item_a, item_b], linked_manga_companion_pair_keys(con)
+        )
 
         work_a = duplicate_series_item_work(item_a)
         work_b = duplicate_series_item_work(item_b)
@@ -40761,10 +41621,21 @@ def series_merge_candidate_detail(db_path, series_id_a, series_id_b):
 
     return {
         "ok": True,
+        # This endpoint compares. It does not merge, and nothing downstream of
+        # it can: apply is disabled server-side pending the reference-coverage
+        # work, so any caller that presents this as a merge preview is lying.
+        "comparison_only": True,
+        "merge_available": False,
+        "merge_unavailable_reason": (
+            "Merging is unavailable: a merge would silently strand collected-edition links, "
+            "companion links and source/language policy on the retired row. Comparison is read-only."
+        ),
         "series_a": item_a,
         "series_b": item_b,
         "shared_issue_numbers": shared[:50],
         "shared_issue_count": len(shared),
+        "shared_issue_evidence": shared_evidence,
+        "shared_issue_title_match_count": matching_titles,
         "only_in_a": only_a[:50],
         "only_in_a_count": len(only_a),
         "only_in_b": only_b[:50],
@@ -40772,6 +41643,7 @@ def series_merge_candidate_detail(db_path, series_id_a, series_id_b):
         "suggested_target_series_id": suggested_target_id,
         "suggested_target_reason": suggested_reason,
         **classification,
+        **relationship,
     }
 
 
@@ -40925,6 +41797,89 @@ def apply_series_duplicate_merge(
             ).fetchone()
             if leased:
                 blockers.append("manga_companion_job_lease_active")
+
+        # A MangaDex companion is not a duplicate of the series it companions
+        # -- InkDrop deliberately keeps both rows, because the MangaDex row is
+        # the only live chapter-discovery path for a manga whose ComicVine
+        # cataloguing lags real releases. It looks exactly like a duplicate in
+        # the series list, though (same title, wildly different numbering),
+        # which is precisely the confusion that made three separate sessions
+        # hand-write parking onto companion rows in July 2026 before there was
+        # a merge tool at all.
+        #
+        # Now that there is one, the same mistake is one click away and leaves
+        # no trace a coverage audit can see: the merge parks the shadow
+        # monitored=0, which drops it out of due_mangadex_companion_links()
+        # (that query requires the companion series monitored=1), while
+        # manga_companion_links.status keeps reading 'linked' -- the identical
+        # invisible-death shape heal_zombie_manga_companion_links() exists to
+        # undo. Measured live on production 2026-08-15: four monitored manga
+        # (Fool Night, One-Punch Man, Soul Eater, Vinland Saga) lost MangaDex
+        # discovery exactly this way, each with a pre_merge_series_snapshot
+        # proving it was monitored=1 immediately before, and each still dark.
+        #
+        # PR #518's guards do not reach this: park_series_automation() is
+        # never called here (the merge writes the series row directly), and
+        # its discovery_only check would have missed these anyway -- all four
+        # links carry discovery_mode=None, having been established normally
+        # rather than restored by _restore_manga_companion_discovery_locked().
+        #
+        # Which side is being folded away decides whether discovery survives,
+        # so this cannot be a blanket "shadow has a companion link" refusal:
+        #
+        #   - shadow is the MangaDex side  -> that row is the discovery
+        #     mechanism, and the merge parks it monitored=0. Discovery ends.
+        #     Refuse while the canonical it serves is still monitored.
+        #   - shadow is the ComicVine side, target is its own companion ->
+        #     the pairing is being folded into itself from the other
+        #     direction. Refuse while the companion is still monitored.
+        #   - shadow is the ComicVine side, target is some other series ->
+        #     legitimate, and deliberately still allowed. The loop below
+        #     retargets the link onto the surviving canonical and never
+        #     touches the MangaDex row, so discovery continues uninterrupted.
+        #     tests/inkdrop-series-duplicate-merge-tool-smoke.py's collision
+        #     fixture is exactly this case and must keep passing.
+        #
+        # Only a link currently authorizing discovery counts either way -- an
+        # already-dead pairing is not made worse by folding it up, so status
+        # must be 'linked' and the surviving counterpart still monitored.
+        if shadow and target:
+            for link_row in con.execute(
+                """
+                select l.id, l.comicvine_series_id, l.mangadex_series_id,
+                       canonical.monitored as canonical_monitored,
+                       companion.monitored as companion_monitored
+                from manga_companion_links l
+                join series canonical on canonical.id = l.comicvine_series_id
+                join series companion on companion.id = l.mangadex_series_id
+                where l.status='linked'
+                  and (l.comicvine_series_id=? or l.mangadex_series_id=?)
+                """,
+                (shadow_series_id, shadow_series_id),
+            ).fetchall():
+                companion_side = str(link_row["mangadex_series_id"]) == shadow_series_id
+                paired = target_series_id in (
+                    str(link_row["comicvine_series_id"]),
+                    str(link_row["mangadex_series_id"]),
+                )
+                if companion_side and link_row["canonical_monitored"]:
+                    # Distinguish the two shapes in the blocker code, because
+                    # they mean different things to whoever reads the preview.
+                    # The paired case is never legitimate under any override:
+                    # "these two are the same series" is the premise of the
+                    # pairing, not a reason to fold it up. Folding a linked
+                    # companion into some unrelated third series is a real
+                    # judgement a human could still defend, so name it
+                    # separately.
+                    blockers.append(
+                        "manga_companion_paired_series_merge"
+                        if paired
+                        else "manga_companion_live_discovery_shadow"
+                    )
+                    break
+                if paired and not companion_side and link_row["companion_monitored"]:
+                    blockers.append("manga_companion_paired_series_merge")
+                    break
 
         # When both series carry an explicit series_source_profile_overrides
         # row, the merge below keeps the target's and deletes the shadow's.
@@ -45619,6 +46574,10 @@ def state_sections_from_summary(summary, db_path=None, fast=False):
     wanted_in_progress = int(wanted.get("in_progress") or 0)
     wanted_blocked = int(wanted.get("blocked") or 0)
     wanted_satisfied = int(wanted.get("satisfied") or 0)
+    # Parked, not counted in the tile's headline number (see
+    # state_view_total_count's "wanted" case) -- surfaced here instead so it
+    # stays visible and findable rather than silently absent from the tile.
+    wanted_awaiting_release = int(wanted.get("awaiting_release") or 0)
     queue_working_count = searching_count + downloading_count + importing_count
     queue_exception_count = sum(int(active_queue.get(state) or 0) for state in ("needs_you", "blocked", "failed"))
     review_parked_count = int(review.get("provider_wait") or 0)
@@ -45660,6 +46619,9 @@ def state_sections_from_summary(summary, db_path=None, fast=False):
     elif wanted_waiting:
         wanted_state = "wanted"
         wanted_action = "Waiting for source workers to search"
+    elif wanted_awaiting_release:
+        wanted_state = "awaiting_release"
+        wanted_action = "Review items parked awaiting release"
     else:
         wanted_state = "satisfied"
         wanted_action = "Wanted list is satisfied"
@@ -45683,6 +46645,7 @@ def state_sections_from_summary(summary, db_path=None, fast=False):
         reason_bits.append(f"{policy_blocked_count or language_blocked_count} rule blocked")
     retry_detail = "; ".join(retry_bits + reason_bits) or f"{queued_count} retry backlog"
     provider_health_detail = f"; {provider_health_problem_count} provider health" if provider_health_problem_count else ""
+    awaiting_release_detail = f"; {wanted_awaiting_release} awaiting release" if wanted_awaiting_release else ""
     queue_detail_bits = [
         f"{queue_working_count} working",
         f"{download_task_active_count} transfers" if download_task_active_count else "",
@@ -45786,7 +46749,7 @@ def state_sections_from_summary(summary, db_path=None, fast=False):
             "key": "wanted",
             "label": "Wanted",
             "count": wanted_section_count,
-            "detail": f"{wanted_waiting} wanted; {wanted_in_progress} in progress; {source_coverage_count} source coverage{provider_health_detail}",
+            "detail": f"{wanted_waiting} wanted; {wanted_in_progress} in progress; {source_coverage_count} source coverage{provider_health_detail}{awaiting_release_detail}",
             "state": wanted_state,
             "next_action": wanted_action,
             "default_filter": "provider_wait" if wanted_provider_wait and not (wanted_in_progress or wanted_waiting) else "active",
@@ -45897,7 +46860,17 @@ def state_view_total_count(summary, key, db_path=None):
     if key in {"issues", "issue", "volumes"}:
         return int(summary.get("issues") or 0)
     if key == "wanted":
-        return sum(int(wanted.get(state) or 0) for state in ("blocked", "in_progress", "wanted", "grabbed"))
+        # Same "actively being pursued" set WANTED_FILTERS["active"] uses --
+        # kept as one authority instead of a second hardcoded copy of the
+        # same four statuses drifting out of sync with it. Deliberately
+        # excludes awaiting_release: that status means the automation gave
+        # up searching for now, so folding it into this headline count would
+        # read as more work in flight than there actually is. It still has
+        # to be visible and countable somewhere -- see the "awaiting release"
+        # subtotal state_sections_from_summary adds to this same tile's
+        # detail text, and WANTED_FILTERS["all"] / RELIABILITY_DEFAULT_STATUSES
+        # below, which do count it.
+        return sum(int(wanted.get(state) or 0) for state in WANTED_FILTERS["active"][1])
     if key == "queue":
         return sum(int(display_active_queue.get(state) or 0) for state in ("downloading", "importing", "searching", "needs_you", "failed", "blocked", "source_wait"))
     if key == "manual_review":
@@ -45931,7 +46904,12 @@ WANTED_FILTERS = {
     "recovering": ("Recovering", ("blocked", "in_progress", "wanted", "grabbed")),
     "provider_wait": ("Source Wait", ("blocked", "in_progress", "wanted", "grabbed")),
     "satisfied": ("Satisfied", ("satisfied",)),
-    "all": ("All", ("blocked", "in_progress", "wanted", "grabbed", "satisfied")),
+    # A real, reachable wanted_items.status (see sweep_wanted_awaiting_release)
+    # that had no filter of its own -- it fell out of every count silently
+    # instead of being wrong. "All" must mean all, and this gives it a
+    # findable, individually-countable home the same way "satisfied" has one.
+    "awaiting_release": ("Awaiting Release", ("awaiting_release",)),
+    "all": ("All", ("blocked", "in_progress", "wanted", "grabbed", "satisfied", "awaiting_release")),
 }
 
 
@@ -48674,6 +49652,7 @@ def completion_gate_for_row(row):
     wanted_status = str(row.get("wanted_status") or row.get("status") or "").strip().lower()
     ownership = str(row.get("ownership") or series_ownership(row.get("series_source"), row.get("metadata_provider"), row.get("kapowarr_id"))).strip().lower()
     import_status = str(latest_import.get("status") or "").strip().lower()
+    import_tone = str(latest_import.get("tone") or "").strip().lower()
     task_state = str(download_task.get("state") or "").strip().lower()
     task_status = str(download_task.get("status") or "").strip().lower()
     evidence = []
@@ -48784,6 +49763,17 @@ def completion_gate_for_row(row):
             ),
         )
     if queue_state == "verified":
+        if import_tone == "bad":
+            return gate(
+                "verification_contested",
+                latest_import.get("operator_phase_label") or "Import Problem",
+                source_of_truth="import_result",
+                confidence="high",
+                terminal=False,
+                complete=False,
+                needs_verification=True,
+                next_step=latest_import.get("next_action") or "Import failed; retry or review.",
+            )
         source = "kapowarr_adapter" if ownership == "adapter" else "inkdrop_queue"
         return gate(
             "inkdrop_verified",
@@ -48796,6 +49786,17 @@ def completion_gate_for_row(row):
             next_step="No user action needed.",
         )
     if wanted_status == "satisfied":
+        if import_tone == "bad":
+            return gate(
+                "verification_contested",
+                latest_import.get("operator_phase_label") or "Import Problem",
+                source_of_truth="import_result",
+                confidence="high",
+                terminal=False,
+                complete=False,
+                needs_verification=True,
+                next_step=latest_import.get("next_action") or "Import failed; retry or review.",
+            )
         source = "kapowarr_adapter" if ownership == "adapter" else "inkdrop_queue"
         return gate(
             "satisfied",
@@ -55262,7 +56263,26 @@ def manual_review_row_matches_filter(row, manual_review_filter):
     return True
 
 
-def manual_review_ignored_ids():
+# Every list in manual-review-actions.json that records a decision a human
+# already made on a Manual Review row. None of these decisions has a natural
+# terminal state on queue_items or review_exceptions at the moment it lands --
+# that is precisely why they are recorded in this file -- so this file is the
+# only thing that knows the row is done:
+#   ignored        ignore_manual_review()
+#   approved       approve_manual_review(), approve_manual_review_local_file(),
+#                  mark_manual_source_import_resolved()
+#   pack_approved  approve_pack_review()
+#   pack_finished  the pack reconciler, once a pack review reaches a terminal
+#                  status
+#   bad            mark_bad_match()
+# The legacy JSONL read path (inkdrop_web.load_manual_review() plus
+# pack_is_handled()) has always honoured all five. This one honoured only
+# "ignored", so Ignore cleared a row instantly while every other decision left
+# it on screen -- see manual_review_canonical_snapshot().
+MANUAL_REVIEW_RESOLVED_ACTION_KEYS = ("ignored", "approved", "pack_approved", "pack_finished", "bad")
+
+
+def manual_review_resolved_ids():
     # Deferred import: inkdrop_web_config imports inkdrop_state at module load,
     # so importing it back at this module's top level would be circular.
     try:
@@ -55270,8 +56290,14 @@ def manual_review_ignored_ids():
         data = json_loads(MANUAL_REVIEW_ACTIONS_FILE.read_text(encoding="utf-8"), {}) if MANUAL_REVIEW_ACTIONS_FILE.exists() else {}
     except Exception:
         return set()
-    ignored = data.get("ignored") if isinstance(data, dict) else None
-    return {str(value) for value in ignored} if isinstance(ignored, list) else set()
+    if not isinstance(data, dict):
+        return set()
+    resolved = set()
+    for key in MANUAL_REVIEW_RESOLVED_ACTION_KEYS:
+        recorded = data.get(key)
+        if isinstance(recorded, list):
+            resolved.update(str(value) for value in recorded if str(value or ""))
+    return resolved
 
 
 def manual_review_canonical_snapshot(db_path, limit=5000):
@@ -55287,14 +56313,18 @@ def manual_review_canonical_snapshot(db_path, limit=5000):
         limit,
         states=MANUAL_REVIEW_FILTERS["all"][1],
     )
-    # ignore_manual_review() records a review_id here (manual-review-actions.json)
-    # instead of mutating queue/review_exceptions state directly, since Ignore
-    # has no natural terminal state on either source table. Without this filter
-    # an ignored row just keeps reappearing every time this snapshot rebuilds.
-    ignored_ids = manual_review_ignored_ids()
-    if ignored_ids:
-        queue_candidates = [row for row in queue_candidates if str(row.get("review_id") or "") not in ignored_ids]
-        review_candidates = [row for row in review_candidates if str(row.get("review_id") or "") not in ignored_ids]
+    # The action handlers record a decided review_id in manual-review-actions.json
+    # instead of mutating queue/review_exceptions state directly, because none of
+    # these decisions has a natural terminal state on either source table at the
+    # moment it lands. Without this filter a decided row just keeps reappearing
+    # every time this snapshot rebuilds -- which is what "Use this candidate"
+    # looked like from the operator's side: the import ran, the decision was
+    # recorded, and the row (and the badge count) came straight back, because
+    # only "ignored" was ever consulted here.
+    resolved_ids = manual_review_resolved_ids()
+    if resolved_ids:
+        queue_candidates = [row for row in queue_candidates if str(row.get("review_id") or "") not in resolved_ids]
+        review_candidates = [row for row in review_candidates if str(row.get("review_id") or "") not in resolved_ids]
     decisions = [
         row for row in [*queue_candidates, *review_candidates]
         if bool(row.get("manual_review_actionable"))
@@ -58169,6 +59199,11 @@ def request_series_search(db_path, series_id, source_order=None, recovery_steps=
             left join issues i on i.id = w.issue_id
             where w.series_id=?
               and coalesce(w.status, 'wanted') not in ('satisfied', 'ignored', 'suppressed', 'superseded_duplicate')
+              -- A series-wide search must not quietly resume the items the
+              -- operator paused individually. request_wanted_search() is
+              -- deliberately NOT gated: pause stops automatic pursuit, and
+              -- asking for one specific item by hand is not automatic.
+              and """ + wanted_pursuit_active_sql("w") + """
             order by coalesce(i.normalized_number, i.issue_number, w.id)
             """,
             (series_id,),
@@ -58247,6 +59282,36 @@ def series_removed_sql(alias="s"):
         f"(coalesce(json_extract({alias}.raw_json, '$.removed_by_user'), 0) in (1, '1', 'true') "
         f"or lower(coalesce(json_extract({alias}.raw_json, '$.automation_parked_reason'), '')) in ({reasons}))"
     )
+
+
+def operational_series_catalogue(db_path):
+    """Every series title the catalogue still tracks, plus a revision token.
+
+    Callers that derive an index from these titles -- resolving a path segment
+    to a work, generating initialisms -- must be able to tell when the answer
+    they cached went stale. A series added today can turn yesterday's uniquely
+    resolving key into a collision, and a resolver that keeps answering
+    "unique" from a warm cache would be confidently wrong for as long as the
+    process lives. The token changes whenever a row is added, removed, retitled
+    or parked, so a cache keyed on it rebuilds instead of drifting.
+
+    Returns ``(revision, titles)``. ``revision`` is opaque; compare it, do not
+    parse it.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return "", []
+    titles = []
+    with connect_read(path) as con:
+        for (title,) in con.execute(
+            f"select s.title from series s where not {series_removed_sql('s')}"
+        ):
+            text = str(title or "").strip()
+            if text:
+                titles.append(text)
+    titles.sort()
+    digest = hashlib.sha256("\n".join(titles).encode("utf-8", "replace")).hexdigest()
+    return f"{len(titles)}:{digest[:16]}", titles
 
 
 def series_discovery_only_sql(alias="s"):
@@ -58613,7 +59678,17 @@ def update_series_display_metadata(db_path, series_id, metadata, *, source="comi
     }
 
 
-def update_series_image_metadata(db_path, series_id, image, *, source="comicvine", metadata=None):
+def update_series_image_metadata(db_path, series_id, image, *, source="comicvine", metadata=None, replace=False):
+    """Store a provider cover on a series.
+
+    ``replace`` exists for the case where the series already has a cover but the
+    stored one is the wrong picture, not a missing one. Fill-only was right while
+    the only caller was backfilling series that had no art at all; it is why a
+    MangaDex series that latched onto the last volume's cover could never be
+    corrected by any number of refreshes. Callers that mean "swap the art" pass
+    ``replace=True`` and get an ``already_current`` no-op when nothing changes.
+    """
+
     db_path = Path(db_path)
     series_id = str(series_id or "").strip()
     image = image if isinstance(image, dict) else str(image or "").strip()
@@ -58640,7 +59715,8 @@ def update_series_image_metadata(db_path, series_id, image, *, source="comicvine
             return {"ok": False, "updated": False, "reason": "series_not_found", "series_id": series_id}
         raw = json_loads(row["raw_json"] or "{}", {})
         raw = raw if isinstance(raw, dict) else {}
-        if series_image_from_raw(raw):
+        current_image = series_image_from_raw(raw)
+        if current_image and not replace:
             return {
                 "ok": True,
                 "updated": False,
@@ -58651,7 +59727,33 @@ def update_series_image_metadata(db_path, series_id, image, *, source="comicvine
         image_payload = {"image": image}
         if metadata:
             image_payload["metadata"] = metadata
-        raw = merge_series_image_metadata(raw, image_payload)
+        if current_image:
+            resolved = series_image_from_raw(image_payload)
+            if not resolved:
+                return {"ok": False, "updated": False, "reason": "image_not_usable", "series_id": series_id, "title": row["title"]}
+            if resolved == current_image:
+                return {
+                    "ok": True,
+                    "updated": False,
+                    "reason": "already_current",
+                    "series_id": series_id,
+                    "title": row["title"],
+                    "image": current_image,
+                }
+            # series_image_from_raw reads the top-level "image" key of raw before
+            # any nested provider blob, so writing there is what actually changes
+            # the picture. merge_ helpers cannot: they all bail the moment the
+            # target already has art.
+            raw["image"] = image
+            raw["cover_metadata_replaced"] = {
+                "source": str(source or "comicvine"),
+                "previous_image": current_image,
+                "image": image,
+                "replaced_at": now,
+                "replaced_at_iso": utc_stamp(now),
+            }
+        else:
+            raw = merge_series_image_metadata(raw, image_payload)
         if not series_image_from_raw(raw):
             return {"ok": False, "updated": False, "reason": "image_not_usable", "series_id": series_id, "title": row["title"]}
         raw["cover_metadata_repair"] = {
@@ -59131,7 +60233,7 @@ def series_rows(db_path, limit=80, series_filter=None):
                 )
             apply_ownership_evidence(row_out, raw)
             out.append(row_out)
-        out = annotate_duplicate_series_rows(out)
+        out = annotate_duplicate_series_rows(out, con=con)
         if series_filter == "duplicate_titles":
             out = [row for row in out if int(row.get("duplicate_series_group_count") or 0) > 1]
             out.sort(
@@ -59217,6 +60319,9 @@ def series_compact_card_rows(db_path, limit=80, series_filter=None):
     with connect_read(db_path) as con:
         availability_by_series = series_issue_availability_rollup(con, row_series_ids)
         reader_visibility_by_series = series_reader_visibility_rollup(con, row_series_ids)
+        # Read while the connection is still open -- annotation happens after
+        # this block exits, where `con` is bound but closed.
+        companion_pairs = linked_manga_companion_pair_keys(con)
     out = []
     for row in rows:
         raw = json_loads(row["raw_json"] or "{}", {})
@@ -59278,7 +60383,7 @@ def series_compact_card_rows(db_path, limit=80, series_filter=None):
             )
         apply_ownership_evidence(row_out, raw)
         out.append(row_out)
-    out = annotate_duplicate_series_rows(out)
+    out = annotate_duplicate_series_rows(out, companion_pairs=companion_pairs)
     if series_filter == "duplicate_titles":
         out = [row for row in out if int(row.get("duplicate_series_group_count") or 0) > 1]
         out.sort(
@@ -61046,7 +62151,7 @@ def plan_bucket_pages(bucket_counts, offset, limit):
     return plan
 
 
-WANTED_STATUS_BUCKET_ORDER = ("blocked", "in_progress", "wanted", "grabbed", "satisfied")
+WANTED_STATUS_BUCKET_ORDER = ("blocked", "in_progress", "wanted", "grabbed", "satisfied", "awaiting_release")
 
 
 def _wanted_rows_sql(where_sql, order_by_sql):
@@ -61134,7 +62239,23 @@ def _wanted_rows_sql(where_sql, order_by_sql):
         from wanted_items w
         left join series s on s.id = w.series_id
         left join issues i on i.id = w.issue_id
-        left join queue_items q on q.wanted_id = w.id
+        left join queue_items q on q.id = (
+            -- A handful of wanted_items carry more than one queue_items row
+            -- (a superseded_duplicate left behind alongside its replacement,
+            -- both with the same wanted_id) -- a plain q.wanted_id = w.id
+            -- join fans those out, so a page of `limit` wanted rows can
+            -- return duplicates of the same wanted item and push a real,
+            -- distinct one off the page. Same tie-break as
+            -- _reliability_source_rows_sql's fix for the identical fanout:
+            -- picking active=1 first (else most-recently-updated) collapses
+            -- it to one row without ever excluding a legitimately
+            -- single-row item.
+            select q2.id
+            from queue_items q2
+            where q2.wanted_id = w.id
+            order by q2.active desc, q2.updated_at desc, q2.id desc
+            limit 1
+        )
         left join source_attempts la on la.id = (
             select sa.id
             from source_attempts sa
@@ -61184,6 +62305,7 @@ WANTED_ROWS_DEFAULT_ORDER_BY = """
                 when 'wanted' then 2
                 when 'grabbed' then 3
                 when 'satisfied' then 5
+                when 'awaiting_release' then 6
                 else 4
               end,
               coalesce(q.updated_at, w.updated_at, w.created_at, 0) desc,
@@ -61280,7 +62402,16 @@ def _wanted_compact_rows_sql(where_sql, order_by_sql):
         from wanted_items w
         left join series s on s.id = w.series_id
         left join issues i on i.id = w.issue_id
-        left join queue_items q on q.wanted_id = w.id
+        left join queue_items q on q.id = (
+            -- Same wanted_id-carries->1-queue-row fanout as _wanted_rows_sql
+            -- above -- see that comment. Same tie-break as
+            -- _reliability_source_rows_sql.
+            select q2.id
+            from queue_items q2
+            where q2.wanted_id = w.id
+            order by q2.active desc, q2.updated_at desc, q2.id desc
+            limit 1
+        )
         left join source_attempts la on la.id = (
             select sa.id
             from source_attempts sa
@@ -61356,31 +62487,584 @@ RELIABILITY_STAGE_LABELS = {
 # inkdrop_wanted_backlog_throughput_audit_20260811 memory / PR #502) and are
 # meant to stay mutually exclusive and sum to the item universe, which the
 # generic cause taxonomy does not guarantee.
-RELIABILITY_BUCKET_ORDER = (
-    "manual_review_needed",
-    "import_recheck_loop",
-    "known_bad_blocked",
-    "budget_starved",
-    "actively_processing",
-    "no_source_found_yet",
-    "other",
+# source_attempts is a lifecycle ledger, not a search log. It records import
+# verifications, activity heartbeats, retry scheduling and deliberate
+# known-bad skips alongside real provider requests, so counting its rows
+# answers "how many things happened to this item", not "how many times did we
+# try". Measured live 2026-08-15: 80.4% of all 901,087 rows are bookkeeping
+# ('verified' alone is 45%), and the displayed count runs 5.3x the real one at
+# the median. That is where "2210 attempts" came from -- Yona of the Dawn #11
+# had 2214 ledger rows and 8 real attempts, 1023 of the rest being
+# known_bad_candidate_skipped, i.e. records of us correctly REFUSING to try it.
+NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES = frozenset({
+    # pure bookkeeping / heartbeats
+    "activity", "observed", "queued", "searching", "available", "busy",
+    "resolved", "ready_to_import", "coalesced_retry_duplicate",
+    # import-side lifecycle, not an acquisition attempt
+    "verified", "importing", "staged_file_ready", "staged_or_importing",
+    # scheduling records -- a decision to try later is not a try
+    "retry_scheduled", "retry_cooling_down", "retry_pending",
+    "source_runtime_budget_skipped",
+    # the block WORKING: we deliberately did not attempt this candidate
+    "known_bad_candidate_skipped",
+    # in-flight transfer progress for an attempt already counted at grab time
+    "downloading", "transfer_in_progress", "sent", "download_started",
+    "started_waiting", "waiting_for_slot", "provider_wait",
+    # supersession / cleanup markers
+    "superseded_duplicate", "superseded_duplicate_owner",
+    "provider_wait_superseded", "stale_staged_signal_cleared",
+    "stale_failed_transfer_cleared", "reservation_expired",
+})
+
+
+# Sources that represent an actual request to an acquisition provider. The
+# retry ceiling counts these and nothing else.
+#
+# This is an allowlist on purpose. The previous rule was a status *denylist*,
+# so anything not explicitly denied counted as a provider attempt -- and the
+# ledger is dominated by rows that are not requests at all. Measured live
+# 2026-08-16: `importer` 381,313 rows, `queue` 53,741, `source_ladder` 30,346,
+# `download_client` 25,374, `autopilot` 11,614, `kavita` 7,746. Two shapes did
+# most of the damage on their own: kavita/verified_import_ignored_different_issue
+# (2,407 rows) and download_client/wrong_series_or_subseries (2,368), neither of
+# which is InkDrop asking a provider for anything.
+#
+# An allowlist also fails in the safe direction. An unrecognised new provider
+# under-counts, so the ceiling does not fire and live work keeps running; a
+# denylist over-counts, and over-counting here terminalizes a queue row and
+# blocks its Wanted entry. Add new providers here deliberately.
+PROVIDER_ATTEMPT_SOURCES = frozenset({
+    "slskd", "prowlarr", "rss", "mangadex", "suwayomi", "comicscodes",
+    "getcomics", "internet_archive", "metron", "kapowarr", "buzzheavier",
+})
+
+# Prowlarr indexers are recorded per-indexer (prowlarr_nyaa,
+# prowlarr_dognzb_comics, ...), so match the family by prefix as well.
+PROVIDER_ATTEMPT_SOURCE_PREFIXES = ("prowlarr_",)
+
+
+def source_is_provider_attempt(source):
+    """True when this source_attempts row is a request to a provider."""
+    value = str(source or "").strip().lower()
+    if not value:
+        return False
+    if value in PROVIDER_ATTEMPT_SOURCES:
+        return True
+    return any(value.startswith(prefix) for prefix in PROVIDER_ATTEMPT_SOURCE_PREFIXES)
+
+
+def _provider_attempt_source_sql(alias):
+    """SQL predicate matching PROVIDER_ATTEMPT_SOURCES, kept in one place."""
+    names = ",".join("'%s'" % value.replace("'", "''") for value in sorted(PROVIDER_ATTEMPT_SOURCES))
+    prefixes = " or ".join(
+        "lower(coalesce({a}.source, '')) like '{p}%%'".format(a=alias, p=prefix.replace("'", "''"))
+        for prefix in PROVIDER_ATTEMPT_SOURCE_PREFIXES
+    )
+    return f"(lower(coalesce({alias}.source, '')) in ({names}) or {prefixes})"
+
+
+def source_attempt_is_real_attempt(row):
+    """True when this source_attempts row represents an actual try.
+
+    An attempt means we asked a provider for something or acted on a
+    candidate. Everything in NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES is the
+    ledger recording something else that happened to the item.
+    """
+    row = row if isinstance(row, dict) else {}
+    # Provenance first: a row that is not a provider request cannot be a
+    # provider attempt, whatever its status says.
+    if not source_is_provider_attempt(row.get("source")):
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    if not status:
+        return False
+    if status in NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES:
+        return False
+    failure = str(row.get("failure_reason") or "").strip().lower()
+    if "did not start before the worker runtime budget" in failure:
+        return False
+    if failure.startswith(("autopilot runtime budget reached", "runtime budget has")):
+        return False
+    return True
+
+
+def real_attempt_predicate_sql(alias):
+    """The three conditions that make a source_attempts row a real attempt.
+
+    Extracted so every consumer answers the question the same way. It was split
+    before: real_attempt_count_sql() below (which drives the retry ceiling)
+    filtered on provenance, status and the budget-skip reason, while
+    attach_real_attempt_counts() -- the number the Reliability page PRINTS --
+    hand-rolled the same idea and omitted the provenance clause. On a row with
+    one Prowlarr search and three internal lifecycle rows the ceiling counted 1
+    and the page displayed 4, so the card contradicted the mechanism that
+    decides when the item is retired.
+
+    This is the single authority. Every caller below composes it rather than
+    restating it -- the scheduler's ageing, the retry ceiling's count and the
+    Reliability page's display all have to mean the same thing by construction,
+    not by three people remembering to keep three copies in step.
+    """
+    statuses = ",".join("'%s'" % value.replace("'", "''") for value in sorted(NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES))
+    return (
+        f"{_provider_attempt_source_sql(alias)}"
+        f" and lower(coalesce({alias}.status, '')) not in ({statuses})"
+        f" and lower(coalesce({alias}.failure_reason, ''))"
+        f" not like '%did not start before the worker runtime budget%'"
+    )
+
+
+def real_attempt_count_sql(alias, join_column, join_value, *, stop_at=None):
+    """SQL scalar subquery counting only genuine provider attempts.
+
+    stop_at bounds the count: the subquery stops reading once it has seen that
+    many rows, and the result saturates there. Callers that only need to know
+    "at least N" should pass it -- the worst live row carries 2,483 real
+    attempts and counting all of them, for every row, on every scheduler pass,
+    is most of the query's cost for none of its answer.
+
+    The filter comes from real_attempt_predicate_sql() rather than being spelled
+    out again here. An earlier revision of this extraction restated the three
+    conditions inline and dropped the provenance clause, which put 149 provider
+    requests and 4,775 ledger rows through the same count and returned 4,924 --
+    the exact figure the ceiling is supposed to exclude ledger rows from.
+    Composing the predicate makes that particular mistake unavailable.
+    """
+    predicate = f"""
+          where {alias}.{join_column} = {join_value}
+            and {real_attempt_predicate_sql(alias)}"""
+    if stop_at is None:
+        return f"""
+        (select count(*) from source_attempts {alias}{predicate})
+    """
+    return f"""
+        (select count(*) from (
+            select 1 from source_attempts {alias}{predicate}
+            limit {int(stop_at)}))
+    """
+
+
+def last_real_attempt_at_sql(alias, join_column, join_value):
+    """SQL scalar subquery for when a genuine attempt last happened.
+
+    Shares its filter with real_attempt_count_sql() on purpose: the scheduler
+    ages rows on the same definition of "an attempt" that the retry ceiling
+    retires them on, so the two can never disagree about what a row has done.
+    """
+    statuses = ",".join("'%s'" % value.replace("'", "''") for value in sorted(NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES))
+    return f"""
+        (select max(coalesce({alias}.completed_at, {alias}.started_at, 0))
+           from source_attempts {alias}
+          where {alias}.{join_column} = {join_value}
+            and {real_attempt_predicate_sql(alias)})
+    """
+
+
+# A queue row that has genuinely asked providers this many times and still has
+# nothing is not going to get there by asking again. Chosen from the live
+# distribution 2026-08-15 (median 12, p90 52, p95 69, p99 147): 150 retires
+# ~1% of the backlog -- unambiguously pathological, well clear of normal.
+RETRY_CEILING_REAL_ATTEMPTS = int(
+    os.environ.get("INKDROP_RETRY_CEILING_REAL_ATTEMPTS", 150)
 )
 
+# Display order is band order: everything that needs a decision, then
+# everything that is merely waiting, then everything healthy. The page makes
+# the "is this normal?" judgment so the operator does not have to read twelve
+# counts and work it out.
+RELIABILITY_BUCKET_ORDER = (
+    # Needs attention
+    "manual_review_needed",
+    "stuck_import",
+    "known_bad_blocked",
+    "active_unconfirmed",
+    # Waiting
+    "budget_starved",
+    "candidate_awaiting_pick",
+    "candidate_unconfirmed",
+    "candidates_rejected",
+    "search_never_completed",
+    "searched_nothing_found",
+    "not_searched_yet",
+    # Healthy / housekeeping
+    "actively_processing",
+    "superseded_duplicate",
+    "other",
+    # Paused
+    "not_pursued",
+)
+
+# `import_recheck_loop` is deliberately absent. Membership required catching a
+# row in queue_state='searching' with a specific sentence in last_event at the
+# instant the page loaded, so it measured "caught in the act", not "is
+# looping": counts flickered 20 -> 1 between two reads on 2026-08-15 and
+# measured exactly 0 live on 2026-08-17 while six rows carrying that very
+# sentence sat in `other`. The genuine runaway case already has an owner --
+# retire_retry_exhausted_queue_items() moves anything past
+# RETRY_CEILING_REAL_ATTEMPTS to needs_you, which lands it in
+# manual_review_needed -- so re-deriving a loop bucket here would double-label
+# rows the engine has already retired. Kept out of the aliases too: a saved
+# filter for it should show nothing rather than silently mean something else.
 RELIABILITY_BUCKET_LABELS = {
-    "manual_review_needed": "Needs manual review",
-    "import_recheck_loop": "Import recheck loop",
-    "known_bad_blocked": "Known-bad blocked",
-    "budget_starved": "Budget-starved",
-    "actively_processing": "Actively processing",
-    "no_source_found_yet": "No source found yet",
-    "other": "Other",
+    "manual_review_needed": "Needs your decision",
+    "stuck_import": "Stuck importing",
+    "known_bad_blocked": "Blocked on a bad release",
+    "budget_starved": "Waiting for a search slot",
+    "candidate_awaiting_pick": "Found a match, hasn't taken it",
+    "candidate_unconfirmed": "Possible match, nothing usable saved",
+    "candidates_rejected": "Everything found was rejected",
+    "search_never_completed": "Searches keep not finishing",
+    "searched_nothing_found": "Searched — nothing found",
+    "not_searched_yet": "Never searched",
+    "active_unconfirmed": "State says in progress — ownership unconfirmed",
+    "actively_processing": "Working right now",
+    "superseded_duplicate": "Superseded leftovers",
+    "other": "Unsorted",
+    "not_pursued": "Paused by you",
 }
 
-RELIABILITY_DEFAULT_STATUSES = ("blocked", "in_progress", "wanted", "grabbed")
+# A fourth band rather than filing paused items under one of the other three.
+# They are not waiting (nothing is coming), not healthy (you still want the
+# book), and not asking for a decision (you already made it). Forcing them into
+# an existing band would have been the same compression that produced the
+# 2,041-row catch-all this rework exists to undo.
+RELIABILITY_BAND_ORDER = ("needs_attention", "waiting", "healthy", "paused")
+
+RELIABILITY_BAND_LABELS = {
+    "needs_attention": "Needs attention",
+    "waiting": "Waiting",
+    "healthy": "Healthy",
+    "paused": "Not being pursued",
+}
+
+RELIABILITY_BUCKET_BANDS = {
+    "manual_review_needed": "needs_attention",
+    "stuck_import": "needs_attention",
+    "known_bad_blocked": "needs_attention",
+    "budget_starved": "waiting",
+    "candidate_awaiting_pick": "waiting",
+    "candidate_unconfirmed": "waiting",
+    "candidates_rejected": "waiting",
+    "search_never_completed": "waiting",
+    "searched_nothing_found": "waiting",
+    "not_searched_yet": "waiting",
+    "active_unconfirmed": "needs_attention",
+    "actively_processing": "healthy",
+    "superseded_duplicate": "healthy",
+    "other": "healthy",
+    "not_pursued": "paused",
+}
+
+# One paragraph per bucket: what it means, whether it is expected, and what to
+# do about it. Rendered under the rollup when a bucket is selected and as the
+# header of the filtered list -- the cards themselves stay count + label.
+RELIABILITY_BUCKET_EXPLAINERS = {
+    "manual_review_needed": (
+        "InkDrop hit something it won't decide on its own — a match it isn't sure about, a failed "
+        "import, a file that needs a human eye. These don't move until you act."
+    ),
+    "stuck_import": (
+        "The download finished — sometimes weeks ago — but the file never made it into your "
+        "library. Usually the file InkDrop was told about never actually landed on disk, and the "
+        "import kept picking the same ghost back up. These retire themselves after a few tries now; "
+        "anything still sitting here needs a different copy, not another retry."
+    ),
+    "known_bad_blocked": (
+        "InkDrop found a copy, tried it, and rejected it — wrong series, broken file, or a download "
+        "that never actually produced anything. It remembers the rejection so it won't grab the same "
+        "copy twice, and keeps looking for a different one. Open a row to see exactly what was "
+        "rejected and why. If it got one wrong, allow the release and it will try again."
+    ),
+    "budget_starved": (
+        "Every search pass has a time budget, and these items' turn didn't come up before it ran out. "
+        "Nothing is wrong with the items — they're in line. If one has been waiting for days, "
+        "“Search now” jumps the queue."
+    ),
+    "candidate_awaiting_pick": (
+        "A search found a usable match and InkDrop hasn't taken it yet — normally it picks on its "
+        "next pass. If something sits here longer than a day, the automatic pick isn't happening; open "
+        "the row and take it yourself."
+    ),
+    "candidate_unconfirmed": (
+        "A search reported a possible match — a count, a phrase, or an older attempt — but nothing "
+        "InkDrop can currently point to as a specific saved candidate. There is nothing here to open or "
+        "take yet; Search again is the only useful action until a real candidate is retained."
+    ),
+    "candidates_rejected": (
+        "Searches did find copies — InkDrop turned every one of them down. Wrong series, wrong "
+        "volume, a bundle that didn't contain this issue, a name that didn't convincingly match. Open a "
+        "row to see each rejected copy and the exact check it failed. If one of them is actually the "
+        "right file, allow it and InkDrop will take it."
+    ),
+    "search_never_completed": (
+        "The most recent real search for these either timed out or errored out — or the provider "
+        "reported itself unavailable, which isn't the same claim: that only means the source said no, "
+        "not that a request definitely went out and failed. Either way, that's different from "
+        "“nothing exists”: InkDrop genuinely doesn't know yet. If one source keeps landing items "
+        "here, the problem is the source, not the items."
+    ),
+    "searched_nothing_found": (
+        "Sources searched and genuinely came back empty. For out-of-print and obscure back-catalog "
+        "that's expected — InkDrop keeps checking on a slower cycle. If you can find a copy by "
+        "hand, the search query is probably off; open the row to see the exact queries used."
+    ),
+    "not_searched_yet": (
+        "No real search has ever run for these — new items, or items the passes haven't reached. A "
+        "few days here is normal after adding a big series; weeks here means the line isn't moving."
+    ),
+    "active_unconfirmed": (
+        "The queue says this is searching, downloading, importing, or waiting on a source — but "
+        "InkDrop found no live claim, no unexpired lease, and no fresh task evidence proving anything "
+        "is currently working it. Sometimes that is just lag right after real work finishes; sometimes "
+        "the state was never cleaned up after ownership disappeared. If it stays here, treat it as "
+        "stalled, not as progress."
+    ),
+    "actively_processing": (
+        "Mid-flight: searching, downloading, or importing, with recent movement. Nothing to do."
+    ),
+    "superseded_duplicate": (
+        "Bookkeeping rows that were replaced by a newer attempt at the same item. Harmless, but they "
+        "clutter the counts. Clearing them is safe — the live row stays."
+    ),
+    "other": (
+        "Rows the classifier can't place yet. If this number grows, the classifier is missing a case "
+        "— tell InkDrop's developer, which is to say: this count is watched."
+    ),
+    "not_pursued": (
+        "You told InkDrop to stop looking for these. Nothing searches for them and they use no "
+        "capacity, but they are still on your Wanted list and still counted here — stopping the "
+        "search doesn't pretend you stopped wanting the book. Resume any of them whenever you like."
+    ),
+}
+
+# How long a queue row may sit in importing/import_ready before it stops
+# counting as progress and starts counting as a stall. Comfortably above the
+# import claim lease (2h) so a claim that is merely mid-flight or waiting on
+# one lease cycle never trips it.
+STUCK_IMPORT_ATTENTION_SECONDS = float(
+    os.environ.get("INKDROP_STUCK_IMPORT_ATTENTION_SECONDS", 6 * 3600)
+)
+
+# `no_source_found_yet` was a residual: reliability_bucket_for_item() returned
+# it for any queued row once the five signals above missed, without ever
+# consulting source_attempts. Measured against production 2026-08-15 it held
+# 2,118 items across 186 series and hid at least five unrelated failures --
+# 59.3% of them had a real candidate in hand and rejected it, while the reason
+# string claimed search had not run. It had NOT run for exactly zero of them.
+# Kept as an alias so saved filters and older links still resolve.
+RELIABILITY_BUCKET_ALIASES = {"no_source_found_yet": "searched_nothing_found"}
+
+# Failure reasons that mean "a candidate existed and we refused it". Sourced
+# from the live vocabulary, not invented: these are the reasons actually
+# written against the affected items, in descending live volume.
+_RELIABILITY_REJECTED_REASONS = {
+    "candidate_title_mismatch",
+    "wrong_issue_number",
+    "suwayomi_volume_metadata_missing",
+    "suwayomi_volume_metadata_invalid",
+    "suwayomi_volume_metadata_conflict",
+    "suwayomi_volume_metadata_wrong",
+    "suwayomi_volume_unit_mismatch",
+    "trusted_issue_missing_source_number",
+    "wrong_unit_type",
+    "related_series_identity",
+    "coverage_not_unit_number",
+    "wrong_volume_number",
+    "ambiguous_unit_identity",
+    "missing_required_unit_number",
+    "collected_edition_disallowed",
+    "seeders_below_minimum",
+    "category_not_allowed",
+    "indexer_payload_title_mismatch",
+    "print_run_not_confirmed",
+    "candidate_year_mismatch",
+}
+# `known_bad_candidate_skipped` / `known_bad_source_candidate` are deliberately
+# NOT here. A blocklist hit is the blocklist working correctly -- a refusal we
+# already decided on -- not "we found a usable release and threw it away", and
+# counting it as the latter is what made a correct refusal read as a retry
+# loop. It has its own bucket (`known_bad_blocked`) earlier in the priority
+# order. Measured live: this affects 12 of 1,170 items in the rejected bucket,
+# so it is a labelling correction rather than a change to the headline.
+_RELIABILITY_REJECTED_STATUSES = {"blocked", "review"}
+
+# "We asked and the provider genuinely had nothing."
+_RELIABILITY_ZERO_RESULT_STATUSES = {"searched_no_candidates", "no_candidate_retry"}
+_RELIABILITY_ZERO_RESULT_REASONS = {"no_candidates", "no_exact_result", "no_safe_source", "manga_no_safe_result"}
+_RELIABILITY_ZERO_RESULT_NEEDLES = (
+    "no candidates found",
+    "no safe automatic candidate",
+    "no actionable candidate",
+    # "stale empty SLSKD result queued for bounded automatic reprobe" -- the
+    # search did complete and did come back empty; the row is queued for a
+    # re-probe because that empty answer has aged out, not because anything
+    # failed. 91 items live.
+    "stale empty",
+)
+
+# "We never got an answer at all" -- timeouts, health backoff, transport
+# failures. Never evidence about whether the release exists.
+#
+# provider_wait/busy/retry_scheduled/retry_pending are deliberately absent:
+# they are internal wait/retry bookkeeping, not a real provider request (see
+# NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES) -- real_attempt_predicate_sql() already
+# keeps rows carrying those statuses out of `lra`/the residual evidence scan,
+# so a status_text this function receives can no longer legitimately be one
+# of them. Listing them here again would just be a second copy of that same
+# exclusion, quietly restating a judgement instead of composing the one
+# authority that already makes it.
+_RELIABILITY_INCOMPLETE_STATUSES = {"timeout", "error"}
+_RELIABILITY_INCOMPLETE_NEEDLES = (
+    # "never finished" is how an abandoned search reads now: the autopilot
+    # stopped calling those rows "<provider> source timed out" once measurement
+    # showed the markers had sat a median of 43 minutes against a 12s request
+    # timeout, so they were never a provider going silent. The evidence class is
+    # unchanged -- an unfinished search is still no answer -- but the words it
+    # arrives in are not, and this tuple matches on words. Without this needle
+    # those rows fall to "other", which is the residual this page exists to
+    # shrink. See normalize_stale_source_started_attempts().
+    "never finished",
+    "timed out", "did not report a result before", "budget ended before",
+    "http_request_failed", "backoff", "errored", "waiting on provider",
+)
+# provider_unavailable is a REAL attempt under real_attempt_predicate_sql (the
+# status is not in NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES), but the status alone
+# does not prove the outbound request itself started -- an indexer/provider
+# reporting itself unavailable is a different claim from "we asked and it
+# timed out". Kept as its own evidence class rather than folded into
+# "never_completed" so the two populations (affirmative timeout/error vs.
+# unproven-start) stay countable and describable separately, per the
+# Prompt117 audit: 94 affirmative vs. 22 provider_unavailable, live 2026-08-18.
+_RELIABILITY_UNAVAILABLE_STATUSES = {"provider_unavailable"}
+
+# A usable candidate was found and no decision was ever taken -- neither a
+# rejection nor an absence. 255 items / 71 series live. "not confident enough
+# to auto-pick" belongs here rather than under rejection: candidates existed
+# and scored, we simply declined to choose one automatically.
+_RELIABILITY_AWAITING_PICK_NEEDLES = (
+    "candidates available for autopick",
+    "not confident enough",
+    "safe alternate available",
+)
+
+# Deliberately derived from the canonical sets rather than restated. The
+# hand-written list this replaced omitted buzzheavier, internet_archive,
+# kapowarr and metron -- four real providers -- so an item whose only searches
+# ran against one of them read as `has_provider_attempt = false` and was
+# reported to the operator as "Never searched" on a page whose entire purpose
+# is to stop saying things like that.
+_RELIABILITY_PROVIDER_SOURCE_PREFIXES = tuple(
+    sorted(set(PROVIDER_ATTEMPT_SOURCES) | set(PROVIDER_ATTEMPT_SOURCE_PREFIXES))
+)
+
+
+def reliability_attempt_is_provider_search(source):
+    """True for real provider searches, false for internal lifecycle rows.
+
+    source_attempts records importer/queue/source_ladder/kavita/autopilot rows
+    in the same table -- counting those as searches is the trap documented in
+    the inkdrop_source_attempts_semantics memory.
+    """
+    text = str(source or "").strip().lower()
+    return any(text.startswith(prefix) for prefix in _RELIABILITY_PROVIDER_SOURCE_PREFIXES)
+
+
+def _reliability_sql_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _reliability_provider_sql(alias):
+    # One definition of "this row is a provider search", shared with the retry
+    # ceiling and with source_attempt_is_real_attempt().
+    return _provider_attempt_source_sql(alias)
+
+
+def _reliability_evidence_sql(alias, statuses=(), reasons=(), needles=()):
+    """Build the SQL mirror of reliability_attempt_evidence_class().
+
+    Generated from the same Python constants rather than hand-written so the
+    aggregate counts and the per-attempt classifier cannot drift apart.
+    """
+    clauses = []
+    if statuses:
+        values = ",".join(_reliability_sql_quote(value) for value in sorted(statuses))
+        clauses.append(f"lower(coalesce({alias}.status,'')) in ({values})")
+    if reasons:
+        values = ",".join(_reliability_sql_quote(value) for value in sorted(reasons))
+        clauses.append(f"lower(coalesce({alias}.failure_reason,'')) in ({values})")
+    for needle in needles:
+        clauses.append(
+            f"lower(coalesce({alias}.failure_reason,'')) like {_reliability_sql_quote('%' + needle + '%')}"
+        )
+    return "(" + " or ".join(clauses) + ")" if clauses else "0"
+
+
+def _reliability_evidence_exists_sql(label, alias, **kwargs):
+    """EXISTS, deliberately, not COUNT.
+
+    source_attempts is ~900k rows with roughly 85 attempts per wanted item and
+    only idx_source_attempts_wanted_recent to work with. Because these
+    predicates read source/status/failure_reason they cannot be answered from
+    that index alone, so every extra correlated subquery pays for another
+    round of row fetches. Measured against production 2026-08-15 over 2,307
+    rows: the page's existing query is 0.17s; five correlated COUNTs took
+    6.79s, five EXISTS took 2.66s, and a grouped LEFT JOIN was worse still at
+    3.36s. EXISTS short-circuits on the first matching row, and only the two
+    predicates that genuinely need history are kept -- see
+    reliability_search_outcome_bucket() for why the other three are answered
+    from the item's current state instead.
+    """
+    return (
+        f"(select exists(select 1 from source_attempts {alias} where {alias}.wanted_id = w.id "
+        f"and {_reliability_provider_sql(alias)} and {_reliability_evidence_sql(alias, **kwargs)})) as {label}"
+    )
+
+
+def reliability_attempt_evidence_class(status, failure_reason, last_event=""):
+    """Classify one provider attempt into what it actually proves."""
+    status_text = str(status or "").strip().lower()
+    reason_text = str(failure_reason or "").strip().lower()
+    event_text = str(last_event or "").strip().lower()
+    combined = f"{reason_text} {event_text}"
+    if any(needle in combined for needle in _RELIABILITY_AWAITING_PICK_NEEDLES):
+        return "awaiting_pick"
+    if reason_text in _RELIABILITY_REJECTED_REASONS or status_text in _RELIABILITY_REJECTED_STATUSES:
+        return "rejected"
+    if (
+        status_text in _RELIABILITY_ZERO_RESULT_STATUSES
+        or reason_text in _RELIABILITY_ZERO_RESULT_REASONS
+        or any(needle in reason_text for needle in _RELIABILITY_ZERO_RESULT_NEEDLES)
+    ):
+        return "zero_results"
+    if (
+        status_text in _RELIABILITY_INCOMPLETE_STATUSES
+        or any(needle in reason_text for needle in _RELIABILITY_INCOMPLETE_NEEDLES)
+    ):
+        return "never_completed"
+    if status_text in _RELIABILITY_UNAVAILABLE_STATUSES:
+        return "provider_unavailable"
+    # The newest attempt is frequently a bare "activity" lifecycle row that
+    # carries no status or reason of its own -- 228 items live. The queue's
+    # own last_event still describes what happened and costs nothing extra to
+    # read, so fall back to it rather than returning "no idea".
+    if event_text:
+        if any(needle in event_text for needle in _RELIABILITY_ZERO_RESULT_NEEDLES):
+            return "zero_results"
+        if any(needle in event_text for needle in _RELIABILITY_INCOMPLETE_NEEDLES):
+            return "never_completed"
+        if "candidate marked bad" in event_text or "known-bad" in event_text:
+            return "rejected"
+    return ""
+
+# awaiting_release included on purpose: it is the strongest possible outcome
+# of "no candidates found anywhere" (see sweep_wanted_awaiting_release), so
+# it belongs on this page more than almost anything else here, not less.
+# reliability_bucket_for_item()/reliability_search_outcome_bucket() already
+# classify these rows correctly off queue_items/source_attempts evidence --
+# they were only ever missing because this tuple gated them out upstream.
+RELIABILITY_DEFAULT_STATUSES = ("blocked", "in_progress", "wanted", "grabbed", "awaiting_release")
 
 _RELIABILITY_KNOWN_BAD_STATUSES = {"known_bad_source_candidate", "known_bad_candidate_skipped"}
-
-_RELIABILITY_RECHECK_MESSAGE_NEEDLE = "a recheck could not confirm this import"
 
 # Three real message shapes observed live (verified against production
 # 2026-08-11/12, not guessed): runtime_budget_skip_reason()'s detailed
@@ -61472,20 +63156,39 @@ def _reliability_budget_signal(last_event, last_attempt_status=None, last_attemp
     return any(needle in combined for needle in _RELIABILITY_BUDGET_NEEDLES)
 
 
-def _reliability_recheck_signal(queue_state, last_event):
-    return (
-        str(queue_state or "").strip().lower() == "searching"
-        and _RELIABILITY_RECHECK_MESSAGE_NEEDLE in str(last_event or "").strip().lower()
-    )
+def _reliability_stuck_import_seconds(row, now):
+    """How long this row has been claiming to import, or 0."""
+    if str(row.get("queue_state") or "").strip().lower() not in {"importing", "import_ready"}:
+        return 0.0
+    completed_at = safe_float(row.get("first_transfer_completed_at"), None)
+    if not completed_at:
+        return 0.0
+    return max((safe_float(now, 0) or 0) - completed_at, 0.0)
 
 
-def reliability_bucket_for_item(row):
+def reliability_bucket_for_item(row, now=None):
     queue_state = str(row.get("queue_state") or "").strip().lower()
     last_event = row.get("last_event") or ""
+    # Checked before everything else, including manual review: the operator has
+    # already made the decision this page would otherwise be asking them for,
+    # so a paused item must not sit in "needs attention" demanding it again.
+    if row.get("wanted_pursuit_paused"):
+        return "not_pursued"
     if queue_state in {"needs_you", "failed", "blocked"}:
         return "manual_review_needed"
-    if _reliability_recheck_signal(queue_state, last_event):
-        return "import_recheck_loop"
+    # Checked before actively_processing on purpose: 'importing' otherwise
+    # falls straight through to "actively processing" and stays there, which
+    # is how 52 rows sat in that bucket for up to 14 days without ever
+    # surfacing anywhere an operator would look.
+    if _reliability_stuck_import_seconds(row, now if now is not None else time.time()) > STUCK_IMPORT_ATTENTION_SECONDS:
+        return "stuck_import"
+    # Named rather than left in the residual. These are queue rows that were
+    # replaced by a fresher row for the same wanted item and say so in
+    # last_event ("Duplicate queue row superseded by <id>"); 5 live 2026-08-17.
+    # They are harmless but they inflate every count they land in, and the old
+    # catch-all made them indistinguishable from a genuine classifier miss.
+    if queue_state == "superseded_duplicate":
+        return "superseded_duplicate"
     if queue_state in {"queued", "searching", ""} and _reliability_known_bad_signal(
         row.get("last_attempt_status"), row.get("last_attempt_failure_reason")
     ):
@@ -61500,14 +63203,319 @@ def reliability_bucket_for_item(row):
     if queue_state in {"searching", "downloading", "importing", "source_wait"}:
         return "actively_processing"
     if queue_state in {"queued", ""}:
-        return "no_source_found_yet"
+        return reliability_search_outcome_bucket(row)
     return "other"
 
 
+def current_pickable_candidate_reference(row):
+    """Prompt122: the bounded proof seam behind `candidate_awaiting_pick`.
+
+    282 wanted|in_progress identities carried this bucket live 2026-08-18 on
+    evidence alone: three prose needles ("candidates available for
+    autopick", "not confident enough", "safe alternate available") matched
+    somewhere in the latest real attempt's reason, queue prose, or a
+    historical attempt -- no candidate ID, title, locator, hash, or safe
+    verdict required. Only 54/282 had a real candidate identity or
+    download-url hash retained on the SAME attempt that triggered the
+    bucket; the other 228 were pure prose/count narrative.
+
+    This does not (and cannot yet) prove a row is actually pickable end to
+    end -- there is no general UI action or automated consumer that replays
+    a persisted generic source attempt into a grab today (SLSKD's own
+    autopick reads its separate mutable probe cache, not this column, see
+    has_cached_safe_slskd_candidate()). Queue counters and prose are
+    diagnostics only and must never be read as proof a candidate exists or
+    can be picked -- that is the whole defect this seam exists to close.
+    What this DOES prove, cheaply and durably (candidate_identity/
+    download_url_hash are already-joined columns on `lra`, no extra query),
+    is the narrower, honest claim: the row's own triggering evidence
+    retained a genuine candidate reference rather than only a phrase or a
+    count. Everything else demotes to candidate_unconfirmed.
+    """
+    row = row if isinstance(row, dict) else {}
+    identity = str(row.get("last_real_attempt_candidate_identity") or "").strip()
+    url_hash = str(row.get("last_real_attempt_download_url_hash") or "").strip()
+    if not identity and not url_hash:
+        return None
+    return {
+        "candidate_identity": identity or None,
+        "download_url_hash": url_hash or None,
+        "source": row.get("last_real_attempt_source") or None,
+    }
+
+
+def reliability_search_outcome_bucket(row):
+    """Split a queued item by what its searches actually produced.
+
+    Replaces the old `no_source_found_yet` residual. Priority is deliberate
+    and matches the production measurement: a rejection is the most
+    actionable thing we can say (we had the file), an incomplete search is
+    never evidence of absence, and only a completed search that returned
+    nothing earns "nothing found".
+    """
+    row = row if isinstance(row, dict) else {}
+
+    def flag(key):
+        return bool(row.get(key))
+
+    # "Column absent" and "column present and false" mean opposite things:
+    # absent means the caller built the row without evidence columns, false
+    # means we genuinely never ran a provider search. Collapsing them
+    # reported every never-searched item as "other".
+    if "has_provider_attempt" in row:
+        if not flag("has_provider_attempt"):
+            return "not_searched_yet"
+    elif not row.get("attempt_count"):
+        return "not_searched_yet"
+
+    last_event = row.get("last_event") or ""
+    # Deliberately the latest REAL attempt (last_real_attempt_*), not
+    # last_attempt_status/last_attempt_failure_reason -- those come from the
+    # single newest source_attempts row of ANY kind, which is frequently
+    # internal wait/retry bookkeeping (queued, retry_scheduled, activity)
+    # written well after the last genuine search. Judging the bucket off that
+    # row is exactly the Prompt117 classifier bug: a real zero-result search
+    # from days ago, sitting behind a fresh retry_scheduled row, displayed as
+    # "still timing out" even though a decisive answer already exists.
+    # last_event (the queue's own prose) is untouched -- it is queue-level
+    # state, not a source_attempts row, and stays a legitimate fallback.
+    last_class = reliability_attempt_evidence_class(
+        row.get("last_real_attempt_status"),
+        row.get("last_real_attempt_failure_reason"),
+        last_event,
+    )
+    # The item's CURRENT state leads, and only ONE historical predicate is
+    # consulted. That is a deliberate cost decision, not an oversight: each
+    # historical predicate is a correlated subquery over a ~900k-row table
+    # (see _reliability_evidence_exists_sql), and the other three added
+    # ~2s to the page for no classification benefit -- "did a search time
+    # out" and "did a search come back empty" are already answered correctly
+    # by the latest attempt, because those states recur every pass.
+    #
+    # A past rejection is different. It is durable evidence that a matching
+    # release genuinely existed for this item, it does NOT recur once the
+    # ladder moves on, and it is the single most actionable thing the page can
+    # report -- so it survives even when the newest attempt is a timeout.
+    if last_class == "awaiting_pick":
+        if current_pickable_candidate_reference(row):
+            return "candidate_awaiting_pick"
+        return "candidate_unconfirmed"
+    if last_class == "rejected" or flag("has_rejected_attempt"):
+        return "candidates_rejected"
+    # provider_unavailable shares the bucket with never_completed -- both are
+    # "no decisive answer yet" from the operator's point of view -- but stays
+    # a distinct evidence class (see _RELIABILITY_UNAVAILABLE_STATUSES) so the
+    # two populations remain separately countable rather than collapsed.
+    if last_class in ("never_completed", "provider_unavailable"):
+        return "search_never_completed"
+    if last_class == "zero_results":
+        return "searched_nothing_found"
+    return "other"
+
+
+# Evidence class -> bucket, used by both the current-state classifier above and
+# the residual backfill below so the two can never disagree about what a piece
+# of evidence means.
+_RELIABILITY_EVIDENCE_BUCKETS = {
+    "awaiting_pick": "candidate_awaiting_pick",
+    "rejected": "candidates_rejected",
+    "never_completed": "search_never_completed",
+    "provider_unavailable": "search_never_completed",
+    "zero_results": "searched_nothing_found",
+}
+_RELIABILITY_EVIDENCE_PRECEDENCE = ("awaiting_pick", "rejected", "never_completed", "provider_unavailable", "zero_results")
+
+
+def attach_residual_evidence_buckets(db_path, items, now=None):
+    """Give the `other` residual one bounded look at its own search history.
+
+    reliability_search_outcome_bucket() reads the item's CURRENT state, which
+    is right and nearly free -- but the newest source_attempts row for a queued
+    item is frequently a bare `activity` lifecycle row carrying no status and
+    no failure reason, so the item falls through to `other` while its actual
+    searches sit one row further back. Measured live 2026-08-17: `other` held
+    186 rows, and 134 of the 177 queued ones had a classifiable provider
+    attempt in history -- 89 nothing but timeouts, 21 awaiting a pick.
+
+    This is NOT the fifth correlated EXISTS the design ruled out on cost. Those
+    ran against every row in the universe; this runs once, over only the rows
+    that failed to classify, and it reads their attempts directly instead of
+    asking a yes/no question per predicate. Measured at 0.26s for 177 residual
+    rows against the 11.5GB production database -- see the perf note on
+    _reliability_evidence_exists_sql() for why the whole-universe shape is not
+    an option.
+
+    Rows are marked `bucket_evidence_scope='history'` so the reason line can
+    say the evidence is older than the row's latest activity rather than
+    implying it just happened.
+    """
+    items = [item for item in (items or []) if item]
+    residual = [
+        item for item in items
+        if item.get("bucket") == "other"
+        and str(item.get("queue_state") or "").strip().lower() in {"queued", ""}
+        and str(item.get("wanted_id") or "").strip()
+    ]
+    if not residual:
+        return items
+    by_id = {str(item["wanted_id"]): item for item in residual}
+    keys = list(by_id)
+    best = {}
+    with connect_read(Path(db_path)) as con:
+        # Chunked because the residual is unbounded by construction: it is
+        # whatever the classifier could not place, so a future regression that
+        # widens it would otherwise hit SQLite's bound-variable ceiling and
+        # take the whole page down. 177 rows live today.
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in con.execute(
+                f"""
+                select sa.wanted_id, sa.status, sa.failure_reason,
+                       sa.candidate_identity, sa.download_url_hash,
+                       coalesce(sa.completed_at, sa.started_at, 0) as at
+                  from source_attempts sa
+                 where sa.wanted_id in ({placeholders})
+                   and {real_attempt_predicate_sql('sa')}
+                """,
+                tuple(chunk),
+            ):
+                klass = reliability_attempt_evidence_class(row["status"], row["failure_reason"])
+                if klass not in _RELIABILITY_EVIDENCE_BUCKETS:
+                    continue
+                key = str(row["wanted_id"])
+                rank = _RELIABILITY_EVIDENCE_PRECEDENCE.index(klass)
+                current = best.get(key)
+                # Strongest evidence wins; ties go to the most recent attempt so
+                # the timestamp we show belongs to the attempt we named.
+                if current is None or rank < current[0] or (rank == current[0] and (row["at"] or 0) > current[1]):
+                    best[key] = (rank, float(row["at"] or 0), klass, row["candidate_identity"], row["download_url_hash"])
+    now = time.time() if now is None else now
+    for key, (_, at, klass, candidate_identity, download_url_hash) in best.items():
+        item = by_id[key]
+        bucket = _RELIABILITY_EVIDENCE_BUCKETS[klass]
+        # Same proof seam as the current-state path: a historical awaiting_pick
+        # attempt earns the bucket only if IT retained a real candidate
+        # reference, never on the phrase alone.
+        if klass == "awaiting_pick" and not current_pickable_candidate_reference(
+            {"last_real_attempt_candidate_identity": candidate_identity, "last_real_attempt_download_url_hash": download_url_hash}
+        ):
+            bucket = "candidate_unconfirmed"
+        item["bucket"] = bucket
+        item["bucket_label"] = RELIABILITY_BUCKET_LABELS.get(item["bucket"], item["bucket"])
+        item["bucket_evidence_scope"] = "history"
+        item["bucket_evidence_at"] = at or None
+        item["reason"] = reliability_item_reason(item["bucket"], item, now)
+    return items
+
+
+def demote_unconfirmed_active_rows(db_path, items, now=None):
+    """Prompt121: "actively_processing" must mean a live claim, an unexpired
+    lease, or a mapped owner proved current work -- not merely that
+    queue_state is one of searching/downloading/importing/source_wait.
+    Measured live 2026-08-18: 39-40 wanted|in_progress identities carried that
+    label with zero queue_claims, zero unexpired leases, and zero mapped
+    worker/process owners -- the label meant only that a queue projection
+    contained one of four strings.
+
+    Runs as a corrective pass after the initial classification, exactly like
+    attach_residual_evidence_buckets() above, rather than folding the check
+    into reliability_bucket_for_item() itself: the second proof (a fresh
+    handoff task) lives in inkdrop_source_worker_scheduler's tables/module,
+    reached through a batched per-queue_id lookup, not a correlated subquery
+    this function's SQL can absorb. The first proof (has_live_claim) is
+    already on every row from _reliability_source_rows_sql(), so only rows
+    without a live claim need the second, more expensive check at all.
+
+    Downloading/source_wait rows are deliberately NOT offered a "Search now"
+    retry when demoted (see CAN_SEARCH_NOW in ReliabilityView.tsx) -- the
+    audit that found this explicitly warned against blind requeue while a
+    real external client transfer might still be in flight despite carrying
+    no claim or recognized task evidence. Searching/importing rows carry no
+    such risk: retrying them cannot duplicate a download that was never
+    dispatched.
+    """
+    items = [item for item in (items or []) if item]
+    now = time.time() if now is None else now
+    candidates = [
+        item for item in items
+        if item.get("bucket") == "actively_processing" and not item.get("has_live_claim")
+    ]
+    if not candidates:
+        return items
+    from core import inkdrop_source_worker_scheduler as scheduler
+
+    queue_ids = [str(item.get("queue_id") or "").strip() for item in candidates]
+    queue_ids = [qid for qid in queue_ids if qid]
+    if not queue_ids:
+        return items
+    with connect_read(Path(db_path)) as con:
+        handoffs_by_queue = scheduler.active_handoff_tasks_by_queue_id(con, queue_ids, now=now)
+    for item in candidates:
+        queue_id = str(item.get("queue_id") or "").strip()
+        fresh = bool(handoffs_by_queue.get(queue_id))
+        item["has_fresh_handoff_task"] = fresh
+        if fresh:
+            continue
+        item["bucket"] = "active_unconfirmed"
+        item["bucket_label"] = RELIABILITY_BUCKET_LABELS.get(item["bucket"], item["bucket"])
+        item["bucket_evidence_scope"] = "current"
+        item["reason"] = reliability_item_reason(item["bucket"], item, now)
+    return items
+
+
 def reliability_item_reason(bucket, row, now):
+    text = _reliability_item_reason_text(bucket, row, now)
+    # A bucket reached through attach_residual_evidence_buckets() is standing on
+    # an older attempt than the row's newest activity. Saying so is the whole
+    # difference between reporting evidence and implying it just happened.
+    if str(row.get("bucket_evidence_scope") or "") == "history":
+        stamp = row.get("bucket_evidence_at")
+        try:
+            stamp = float(stamp or 0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        when = relative_time_label(now - stamp) if stamp else ""
+        tail = f" The latest activity here reported nothing; this is from the last search that did, {when}." if when \
+            else " The latest activity here reported nothing; this is from the last search that did."
+        return f"{text}{tail}"
+    return text
+
+
+def _reliability_prose(text):
+    """last_event, but only when it is a sentence rather than a machine code.
+
+    queue_items.last_event is mostly written as prose, but a handful of writers
+    put a bare failure code in it -- live 2026-08-17 the whole reason line for
+    155 `searched_nothing_found` rows was the single word "no_candidates".
+    Printing that as the explanation is the same failure as printing the bucket
+    name: it restates a code instead of saying what happened. Codes fall
+    through here so the bucket's own written sentence gets used instead.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if " " not in text and ("_" in text or text.islower()):
+        return ""
+    return text
+
+
+def _reliability_item_reason_text(bucket, row, now):
+    # Resolve the alias here rather than at every call site. `no_source_found_yet`
+    # still arrives from saved filters, older links and stored rows written
+    # before the residual was split, and without this it matched no branch at
+    # all and fell through to a bare "Queued." -- which is exactly the
+    # uninformative answer the split existed to remove.
+    bucket = RELIABILITY_BUCKET_ALIASES.get(bucket, bucket)
     queue_state = row.get("queue_state")
-    last_event = str(row.get("last_event") or "").strip()
-    attempt_count = int(row.get("attempt_count") or 0)
+    last_event = _reliability_prose(row.get("last_event"))
+    # A row that reached its bucket through the history backfill got there
+    # precisely BECAUSE its newest activity reported nothing, so that activity
+    # is the one sentence that must not lead. Live sample before this guard:
+    # "A recheck could not confirm this import. Searching again." under the
+    # heading "Searches keep not finishing".
+    if str(row.get("bucket_evidence_scope") or "") == "history":
+        last_event = ""
 
     def ago_from(ts):
         try:
@@ -61519,49 +63527,170 @@ def reliability_item_reason(bucket, row, now):
         return relative_time_label(now - ts)
 
     if bucket == "known_bad_blocked":
+        # "last retried" was wrong and alarming: these rows are the blocklist
+        # working -- the ledger entry records a candidate being turned away,
+        # not tried. 24,350 of them in one week across 84 rows, one candidate
+        # re-offered and re-refused 4.6 times an hour. The waste is real but
+        # it is re-evaluation, not re-downloading, and the copy should say so.
         ago = ago_from(row.get("last_attempt_completed_at") or row.get("last_attempt_started_at"))
-        suffix = f", last retried {ago}" if ago else ""
-        return f"Blocked: known-bad candidate{suffix}."
+        suffix = f" A source offered it again {ago}." if ago else ""
+        return (
+            "InkDrop tried this release before and rejected it, so it keeps skipping it and "
+            f"looking elsewhere.{suffix}"
+        )
     if bucket == "budget_starved":
+        # "Budget-starved" is engine vocabulary and is not used in copy any
+        # more; and the old "InkDrop will retry next pass" was measurably
+        # false -- live 2026-08-17 the median gap since a real search was 6.5
+        # days and the 90th percentile 20.5. Say what is true instead: it is
+        # in line, and Search now jumps it.
         detail_text = last_event or str(row.get("last_attempt_failure_reason") or "").strip()
         match = _RELIABILITY_BUDGET_DETAIL_RE.search(detail_text)
         if match:
             source = match.group("source").strip().rstrip(".")
             remaining = match.group("remaining").strip()
             minimum = match.group("minimum").strip().rstrip(".")
-            return f"Budget-starved: {source} didn't get a search slot this cycle ({remaining} left, needed {minimum})."
+            return f"{source}'s turn didn't come up before the search pass ran out of time ({remaining} left, needed {minimum})."
         if "did not start before the worker runtime budget" in detail_text.lower():
-            return f"Budget-starved: {detail_text.rstrip('.')}."
-        return "Budget-starved: the runtime budget ran out this cycle before this item's next source could run; InkDrop will retry next pass."
-    if bucket == "import_recheck_loop":
-        ago = ago_from(row.get("queue_updated_at"))
-        suffix = f" (searching again since {ago})" if ago else " Searching again."
-        return f"Recheck could not confirm this import.{suffix}"
+            return f"{detail_text.rstrip('.')}."
+        return "This item's turn didn't come up before the search pass ran out of time. It's in line; Search now jumps the queue."
+    if bucket == "stuck_import":
+        stalled = _reliability_stuck_import_seconds(row, now)
+        # relative_time_label() already ends in "ago" -- the old copy appended
+        # a second one and shipped "The download finished 10d ago ago."
+        ago = relative_time_label(stalled) if stalled else ""
+        detail = f" The download finished {ago}." if ago else ""
+        return f"The download finished but the file never made it into your library.{detail}"
+    if bucket == "not_pursued":
+        ago = ago_from(row.get("wanted_pursuit_paused_at"))
+        when = f" You stopped {ago}." if ago else ""
+        why = str(row.get("wanted_pursuit_paused_reason") or "").strip()
+        because = f" Your note: {why.rstrip('.')}." if why else ""
+        return f"Nothing is searching for this.{when}{because} It stays on your Wanted list."
+    if bucket == "superseded_duplicate":
+        return last_event or "Replaced by a newer queue row for the same item. Safe to clear."
     if bucket == "manual_review_needed":
         return last_event or "Needs manual review."
+    if bucket == "active_unconfirmed":
+        return (
+            f"Queue state says '{queue_state}', but no live claim, lease, or fresh task evidence "
+            "confirms anything is currently working it. Check again before treating this as progress."
+        )
     if bucket == "actively_processing":
         return last_event or f"In progress ({queue_state})."
-    if bucket == "no_source_found_yet":
-        # Prefer the real recorded event over a synthesized claim -- last_event
-        # sometimes says candidates *are* available and autopick is pending,
-        # which "no safe candidate matched" would misstate.
+    if bucket == "candidates_rejected":
+        # Only quote the last failure_reason when it IS a rejection. The most
+        # recent attempt is frequently a timeout on an item whose rejections
+        # are older, and printing "Last rejection: SLSKD probe exceeded 165s"
+        # names the wrong mechanism entirely.
+        reason_code = ""
+        if reliability_attempt_evidence_class(
+            row.get("last_attempt_status"), row.get("last_attempt_failure_reason")
+        ) == "rejected":
+            reason_code = str(row.get("last_attempt_failure_reason") or "").strip()
+        # The code turned into a sentence. "Last rejection:
+        # coverage_not_unit_number" told the operator nothing they could act
+        # on; unmapped codes still print raw rather than getting invented prose.
+        sentence = reliability_reason_sentence(reason_code)
+        detail = f" The last one was turned down because {sentence}." if sentence else ""
+        return f"A search did find a copy of this, and InkDrop turned it down.{detail}"
+    if bucket == "candidate_awaiting_pick":
+        return last_event or "A usable candidate was found but nothing has picked it yet."
+    if bucket == "candidate_unconfirmed":
+        return (
+            "A search reported a possible match, but no usable match is currently saved for this item — "
+            "only a count or a phrase, not a specific candidate InkDrop can point to. Search again is the "
+            "only action that can move this forward right now."
+        )
+    if bucket == "search_never_completed":
+        # provider_unavailable checked ahead of last_event on purpose: this is
+        # the "don't collapse into the affirmative failures" distinction --
+        # if last_event happened to win here it could paper right back over
+        # the one thing this bucket now goes out of its way to keep separate.
+        if str(row.get("last_real_attempt_status") or "").strip().lower() == "provider_unavailable":
+            provider = source_display_label(row.get("last_real_attempt_source"))
+            return (
+                f"{provider} reported itself unavailable on the most recent real attempt. "
+                "That's the source saying no, not confirmation that a request went out and "
+                "failed -- treat it as unresolved, not as a proven failure."
+            )
+        # Deliberately NOT phrased as an availability claim -- a timeout or a
+        # health backoff says nothing about whether the release exists.
+        return last_event or "Searches for this item keep timing out or being cut short, so we still have no answer either way."
+    if bucket == "searched_nothing_found":
         if last_event:
             return last_event
-        if attempt_count:
-            return f"Queued -- no source has converted to a grab yet, after {compact_count(attempt_count)} attempt{'s' if attempt_count != 1 else ''}."
-        return "No source found yet -- search hasn't run for this item yet."
+        # Never print `attempt_count`: it is a raw source_attempts row count,
+        # and that table is a lifecycle ledger -- measured live, 57.8% of its
+        # 901,000 rows are not provider rows at all. Low #6 carries 2,316 raw
+        # rows against **seven** real provider attempts, so printing it would
+        # be off by a factor of 330 and read as a retry storm that never
+        # happened. `real_attempt_count` is that number with the bookkeeping
+        # removed, so it is the one number here that is safe to quote. It is
+        # None until attach_real_attempt_counts() fills it for the rendered
+        # page; until then the sentence simply carries no count.
+        real_attempts = int(row.get("real_attempt_count") or 0)
+        if real_attempts:
+            return (
+                f"Searched {compact_count(real_attempts)} "
+                f"time{'s' if real_attempts != 1 else ''}; no source returned a match yet."
+            )
+        return "Searched; no source returned a match yet."
+    if bucket == "not_searched_yet":
+        # Precisely what the column measures: no *provider* search. Some of
+        # these items do carry download-client history from an earlier grab
+        # that went stale, so the event still gets shown -- but it goes AFTER
+        # the fact that no search has run, never instead of it. Leading with it
+        # shipped "A recheck could not confirm this import" under the heading
+        # "Never searched", which reads as a contradiction because it is one.
+        detail = f" Its last activity was: {last_event.rstrip('.')}." if last_event else ""
+        return f"No source has searched for this item yet.{detail}"
     return last_event or "Queued."
 
 
-def _reliability_source_rows_sql(where_sql):
+def _reliability_source_rows_sql(where_sql, now):
+    # Provenance alone ("this row's source is a provider") is not "a real
+    # attempt happened" -- a provider-sourced row can still be pure
+    # bookkeeping (queued/activity/retry_scheduled/...). Using
+    # real_attempt_predicate_sql() here, instead of _reliability_provider_sql()
+    # alone, is what makes has_provider_attempt answer the question its name
+    # asks. Measured live 2026-08-18 against the "incomplete provider run"
+    # bucket: 50/302 rows had zero rows passing this predicate at all.
+    has_provider_attempt = (
+        "(select exists(select 1 from source_attempts sap where sap.wanted_id = w.id "
+        f"and {real_attempt_predicate_sql('sap')})) as has_provider_attempt"
+    )
+    has_rejected_attempt = _reliability_evidence_exists_sql(
+        "has_rejected_attempt", "sar",
+        statuses=_RELIABILITY_REJECTED_STATUSES, reasons=_RELIABILITY_REJECTED_REASONS,
+    )
+    # The canonical claim-liveness check -- same table, same "expires_at > now"
+    # test already used elsewhere (e.g. the download-task retry guard) to
+    # decide whether a queue row is currently held by a worker. `now` is a
+    # trusted float this module computed, not user input, so it is safe to
+    # inline as a SQL numeric literal rather than threading it through the
+    # positional-parameter list every other clause here uses.
+    has_live_claim = (
+        f"(select exists(select 1 from queue_claims qc where qc.queue_id = q.id "
+        f"and qc.expires_at > {float(now)!r})) as has_live_claim"
+    )
     return f"""
         select w.id as wanted_id, w.series_id, w.issue_id, w.status as wanted_status,
                w.created_at as wanted_created_at, w.updated_at as wanted_updated_at,
+               -- Read from raw_json, not from status, on purpose: pausing a
+               -- search must not remove the item from any count it was in.
+               json_extract(w.raw_json, '$.pursuit_paused') as wanted_pursuit_paused,
+               json_extract(w.raw_json, '$.pursuit_paused_at') as wanted_pursuit_paused_at,
+               json_extract(w.raw_json, '$.pursuit_paused_reason') as wanted_pursuit_paused_reason,
+               json_extract(w.raw_json, '$.operator_query') as operator_query,
                s.title as series, s.media_type,
                i.issue_number, i.title as issue_title,
                q.id as queue_id, q.state as queue_state, q.current_source, q.last_event,
                q.active as queue_active, q.updated_at as queue_updated_at,
                (select count(*) from source_attempts sa2 where sa2.wanted_id = w.id) as attempt_count,
+               {has_provider_attempt},
+               {has_rejected_attempt},
+               {has_live_claim},
                la.id as last_attempt_id,
                la.status as last_attempt_status,
                la.failure_reason as last_attempt_failure_reason,
@@ -61569,7 +63698,48 @@ def _reliability_source_rows_sql(where_sql):
                la.display_phase as last_attempt_display_phase,
                la.source as last_attempt_source,
                la.completed_at as last_attempt_completed_at,
-               la.started_at as last_attempt_started_at
+               la.started_at as last_attempt_started_at,
+               -- The latest REAL provider attempt, separately from `la` above
+               -- (the latest ledger row of ANY kind). reliability_bucket_for_item()
+               -- must judge "did a provider run finish" off a row a provider
+               -- actually ran, never off whichever bookkeeping entry (queued,
+               -- retry_scheduled, activity) happened to be written most
+               -- recently -- that was the classifier bug: a genuine zero-result
+               -- search from three days ago, sitting behind a fresh
+               -- retry_scheduled row, displayed as "still timing out." `la`
+               -- itself is left untouched: reliability_stage_for_item() still
+               -- needs the true latest row (including sent/downloading) to
+               -- detect in-flight transfers, which real_attempt_predicate_sql()
+               -- deliberately excludes.
+               lra.status as last_real_attempt_status,
+               lra.failure_reason as last_real_attempt_failure_reason,
+               lra.source as last_real_attempt_source,
+               lra.completed_at as last_real_attempt_completed_at,
+               lra.started_at as last_real_attempt_started_at,
+               -- Prompt122: candidate_awaiting_pick's own proof seam. Reads
+               -- off the SAME row (lra) that produced the awaiting_pick
+               -- classification, not `la` above (a different, possibly
+               -- newer bookkeeping row) -- current_pickable_candidate_reference()
+               -- must judge the triggering attempt's own retained identity,
+               -- never a different attempt's.
+               lra.candidate_identity as last_real_attempt_candidate_identity,
+               lra.download_url_hash as last_real_attempt_download_url_hash,
+               -- What "Block this release" needs a target for. Without these
+               -- the button gated on `last_attempt_id` alone and therefore
+               -- rendered on effectively every row, including rows whose last
+               -- attempt was a budget skip -- offering to block a release that
+               -- was never fetched, let alone offered.
+               la.candidate_identity as last_attempt_candidate_identity,
+               la.download_url_hash as last_attempt_download_url_hash,
+               -- When this row's earliest transfer actually finished. The
+               -- stall detector cannot use q.updated_at: the recovery loop
+               -- this bucket exists to catch rewrites the queue row every few
+               -- minutes, so a row stuck for two weeks still reads as "just
+               -- touched". completed_at is written once per transfer and does
+               -- not move, which is exactly what makes it usable here.
+               (select min(dt2.completed_at) from download_tasks dt2
+                 where dt2.queue_id = q.id and dt2.completed_at is not null
+               ) as first_transfer_completed_at
         from wanted_items w
         left join series s on s.id = w.series_id
         left join issues i on i.id = w.issue_id
@@ -61592,6 +63762,14 @@ def _reliability_source_rows_sql(where_sql):
             select sa.id
             from source_attempts sa
             where sa.wanted_id = w.id
+            order by coalesce(sa.completed_at, sa.started_at, 0) desc, sa.id desc
+            limit 1
+        )
+        left join source_attempts lra on lra.id = (
+            select sa.id
+            from source_attempts sa
+            where sa.wanted_id = w.id
+              and {real_attempt_predicate_sql('sa')}
             order by coalesce(sa.completed_at, sa.started_at, 0) desc, sa.id desc
             limit 1
         )
@@ -61621,7 +63799,7 @@ def reliability_view_rows(db_path, statuses=None, now=None):
         clauses.append("w.status in ({})".format(",".join("?" for _ in status_values)))
         params.extend(status_values)
     where = f"where {' and '.join(clauses)}" if clauses else ""
-    select_sql = _reliability_source_rows_sql(where)
+    select_sql = _reliability_source_rows_sql(where, now)
     with connect_read(db_path) as con:
         rows = con.execute(select_sql, params).fetchall()
     out = []
@@ -61633,6 +63811,10 @@ def reliability_view_rows(db_path, statuses=None, now=None):
             "wanted_status": row["wanted_status"],
             "wanted_created_at": row["wanted_created_at"],
             "wanted_updated_at": row["wanted_updated_at"],
+            "wanted_pursuit_paused": bool(row["wanted_pursuit_paused"]),
+            "wanted_pursuit_paused_at": row["wanted_pursuit_paused_at"],
+            "wanted_pursuit_paused_reason": row["wanted_pursuit_paused_reason"],
+            "operator_query": row["operator_query"],
             "series": row["series"],
             "media_type": row["media_type"],
             "issue_number": row["issue_number"],
@@ -61642,8 +63824,47 @@ def reliability_view_rows(db_path, statuses=None, now=None):
             "current_source": row["current_source"],
             "last_event": row["last_event"],
             "queue_active": bool(row["queue_active"]) if row["queue_active"] is not None else False,
-            "queue_updated_at": row["queue_updated_at"],
+            # queue_updated_at is deliberately NOT carried into the payload.
+            # The retry machinery touches it every pass, so every one of the 49
+            # rows stuck up to 47 days read "updated just now" on the card --
+            # the single most misleading thing this page printed. It is still
+            # selected because the queue-row join tie-breaks on it; it just
+            # never leaves this function.
             "attempt_count": int(row["attempt_count"] or 0),
+            # The two historical predicates _reliability_source_rows_sql()
+            # already paid for. They must be carried through explicitly:
+            # reliability_search_outcome_bucket() reads them with `in` and
+            # `.get()`, so a missing key does not raise -- it silently takes
+            # the other branch. Leaving them out cost the page its two biggest
+            # buckets. `has_provider_attempt` in particular must stay
+            # *present*, because "absent" and "present and false" mean
+            # opposite things there: absent falls back to the raw ledger
+            # count, which is ~91% bookkeeping and therefore non-zero for
+            # nearly every row.
+            "has_provider_attempt": bool(row["has_provider_attempt"]),
+            "has_rejected_attempt": bool(row["has_rejected_attempt"]),
+            # Prompt121: an unexpired queue_claims row for this queue_id --
+            # one of the two proofs reliability_bucket_for_item() now requires
+            # before it will call a searching/downloading/importing/source_wait
+            # row "actively_processing". The other is a fresh handoff task,
+            # attached below via attach_active_ownership_proof() (needs its own
+            # connection into a different module's tables, so it can't be a
+            # correlated subquery here the way this one is).
+            "has_live_claim": bool(row["has_live_claim"]),
+            # The second proof, filled by demote_unconfirmed_active_rows()
+            # below -- a per-queue_id batched lookup against download_tasks in
+            # a different module, so it cannot be a correlated subquery here.
+            # Only ever computed for rows the initial pass called
+            # actively_processing with no live claim; stays False otherwise.
+            "has_fresh_handoff_task": False,
+            # Both are surfaced: real_attempt_count is what an operator should
+            # read and sort on, ledger_row_count stays available so the gap
+            # between them (5.3x at the median) is inspectable rather than
+            # silently corrected away. Filled in per page by
+            # attach_real_attempt_counts() -- computing it for every row here
+            # costs 0.9s against the live database for a page that shows 80.
+            "real_attempt_count": None,
+            "ledger_row_count": int(row["attempt_count"] or 0),
             "last_attempt_id": row["last_attempt_id"],
             "last_attempt_status": row["last_attempt_status"],
             "last_attempt_failure_reason": row["last_attempt_failure_reason"],
@@ -61652,15 +63873,47 @@ def reliability_view_rows(db_path, statuses=None, now=None):
             "last_attempt_source": row["last_attempt_source"],
             "last_attempt_completed_at": row["last_attempt_completed_at"],
             "last_attempt_started_at": row["last_attempt_started_at"],
+            "last_attempt_candidate_identity": row["last_attempt_candidate_identity"],
+            "last_attempt_download_url_hash": row["last_attempt_download_url_hash"],
+            "first_transfer_completed_at": row["first_transfer_completed_at"],
+            # The latest REAL attempt's own status/reason -- see the comment on
+            # `lra` in _reliability_source_rows_sql(). reliability_search_outcome_bucket()
+            # must classify off these, not off last_attempt_status/last_attempt_failure_reason,
+            # or a bookkeeping row (retry_scheduled, activity, queued) can
+            # outrank a real, decisive search outcome that happened earlier.
+            "last_real_attempt_status": row["last_real_attempt_status"],
+            "last_real_attempt_failure_reason": row["last_real_attempt_failure_reason"],
+            "last_real_attempt_source": row["last_real_attempt_source"],
+            "last_real_attempt_completed_at": row["last_real_attempt_completed_at"],
+            "last_real_attempt_started_at": row["last_real_attempt_started_at"],
+            "last_real_attempt_candidate_identity": row["last_real_attempt_candidate_identity"],
+            "last_real_attempt_download_url_hash": row["last_real_attempt_download_url_hash"],
+            # When a real provider last searched. `la` above is the newest
+            # source_attempts row of ANY kind and that table is ~91% lifecycle
+            # bookkeeping, so it answers "when was this row last touched", not
+            # "when was it last searched" -- and q.updated_at is worse still.
+            # Filled by attach_last_provider_attempt(): as a correlated
+            # subquery in this SELECT it measured +1.15s on the list query
+            # (0.95s -> 2.13s against production 2026-08-17), and every other
+            # whole-population shape priced the same 1.2-1.4s. It is therefore
+            # paid for the rendered page only, and separately (off the critical
+            # path) for the health signals.
+            "last_provider_attempt_at": None,
         }
         item["stage"] = reliability_stage_for_item(
             item["queue_state"], item["last_attempt_status"], item["last_attempt_lifecycle_phase"]
         )
         item["stage_label"] = RELIABILITY_STAGE_LABELS.get(item["stage"], item["stage"])
-        item["bucket"] = reliability_bucket_for_item(item)
+        item["bucket"] = reliability_bucket_for_item(item, now)
         item["bucket_label"] = RELIABILITY_BUCKET_LABELS.get(item["bucket"], item["bucket"])
+        item["bucket_band"] = RELIABILITY_BUCKET_BANDS.get(item["bucket"], "healthy")
+        item["bucket_evidence_scope"] = "current"
         item["reason"] = reliability_item_reason(item["bucket"], item, now)
         out.append(item)
+    attach_residual_evidence_buckets(db_path, out, now=now)
+    demote_unconfirmed_active_rows(db_path, out, now=now)
+    for item in out:
+        item["bucket_band"] = RELIABILITY_BUCKET_BANDS.get(item["bucket"], "healthy")
     return out
 
 
@@ -61669,13 +63922,214 @@ def reliability_rollup(items):
     for item in items:
         bucket = item.get("bucket") or "other"
         counts[bucket] = counts.get(bucket, 0) + 1
+    band_counts = {key: 0 for key in RELIABILITY_BAND_ORDER}
+    for key, count in counts.items():
+        band_counts[RELIABILITY_BUCKET_BANDS.get(key, "healthy")] += count
     return {
         "total": len(items),
         "buckets": [
-            {"key": key, "label": RELIABILITY_BUCKET_LABELS.get(key, key), "count": counts.get(key, 0)}
+            {
+                "key": key,
+                "label": RELIABILITY_BUCKET_LABELS.get(key, key),
+                "count": counts.get(key, 0),
+                "band": RELIABILITY_BUCKET_BANDS.get(key, "healthy"),
+                "explainer": RELIABILITY_BUCKET_EXPLAINERS.get(key, ""),
+            }
             for key in RELIABILITY_BUCKET_ORDER
         ],
+        "bands": [
+            {"key": key, "label": RELIABILITY_BAND_LABELS[key], "count": band_counts.get(key, 0)}
+            for key in RELIABILITY_BAND_ORDER
+        ],
         "by_bucket": counts,
+    }
+
+
+# Each health signal renders quiet until it crosses its threshold, then amber.
+# The literals live here, in one place, rather than being scattered through the
+# view: never-searched is only interesting once items have sat there for a
+# while, any stuck row at all is interesting, and a search-slot wait past a
+# week means the line is not moving rather than merely busy.
+RELIABILITY_SIGNAL_STUCK_ALERT = 1
+RELIABILITY_SIGNAL_NEVER_SEARCHED_ALERT = 1
+RELIABILITY_SIGNAL_WAIT_ALERT_DAYS = 7.0
+
+
+def _reliability_percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def reliability_health_signals(items, now):
+    """The four numbers that turn a wall of counts into a judgment.
+
+    Computed from the rows already in hand -- no extra queries. Every age here
+    comes from wanted_items.created_at, download_tasks.completed_at, or the
+    last real provider attempt. None of them comes from queue_items.updated_at,
+    which is what made the old page report a 47-day stall as fresh.
+    """
+    items = [item for item in (items or []) if item]
+    now = float(now or time.time())
+
+    def days_since(stamp):
+        try:
+            stamp = float(stamp or 0)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, (now - stamp) / 86400.0) if stamp else None
+
+    never_searched = [item for item in items if not item.get("has_provider_attempt")]
+    stuck = [item for item in items if item.get("bucket") == "stuck_import"]
+    stuck_ages = [d for d in (days_since(item.get("first_transfer_completed_at")) for item in stuck) if d is not None]
+    wanted_ages = [d for d in (days_since(item.get("wanted_created_at")) for item in items) if d is not None]
+    search_gaps = [
+        d for d in (days_since(item.get("last_provider_attempt_at")) for item in items) if d is not None
+    ]
+    waiting = [item for item in items if item.get("bucket") == "budget_starved"]
+    wait_gaps = [
+        d for d in (days_since(item.get("last_provider_attempt_at")) for item in waiting) if d is not None
+    ]
+
+    def signal(key, label, value, detail, alert):
+        return {"key": key, "label": label, "value": value, "detail": detail, "tone": "warn" if alert else "neutral"}
+
+    oldest_wanted = max(wanted_ages) if wanted_ages else None
+    median_gap = _reliability_percentile(search_gaps, 0.5)
+    p90_gap = _reliability_percentile(search_gaps, 0.9)
+    worst_wait = max(wait_gaps) if wait_gaps else None
+    median_wait = _reliability_percentile(wait_gaps, 0.5)
+
+    return [
+        # A count, never a share: the never-searched percentage is unreconciled
+        # across three independent measurements and does not ship until it is.
+        signal(
+            "never_searched", "Never searched", len(never_searched),
+            f"oldest item in the backlog is {oldest_wanted:.0f} days old" if oldest_wanted else "",
+            len(never_searched) >= RELIABILITY_SIGNAL_NEVER_SEARCHED_ALERT,
+        ),
+        signal(
+            "stuck", "Stuck importing", len(stuck),
+            f"oldest finished downloading {max(stuck_ages):.0f} days ago" if stuck_ages else "",
+            len(stuck) >= RELIABILITY_SIGNAL_STUCK_ALERT,
+        ),
+        signal(
+            "search_freshness", "Typical wait since a real search",
+            f"{median_gap:.1f}d" if median_gap is not None else "—",
+            f"9 in 10 within {p90_gap:.0f}d" if p90_gap is not None else "",
+            bool(median_gap is not None and median_gap > RELIABILITY_SIGNAL_WAIT_ALERT_DAYS),
+        ),
+        signal(
+            "slot_wait", "Longest wait for a search slot",
+            f"{worst_wait:.0f}d" if worst_wait is not None else "—",
+            f"half of them past {median_wait:.1f}d" if median_wait is not None else "nothing is waiting on a slot",
+            bool(worst_wait is not None and worst_wait > RELIABILITY_SIGNAL_WAIT_ALERT_DAYS),
+        ),
+    ]
+
+
+def attach_real_attempt_counts(db_path, items, now=None):
+    """Fill real_attempt_count for one page of rows, and re-word their reason.
+
+    Scoped to the rendered page on purpose. The same count as a correlated
+    subquery over the whole result set measured 0.112s -> 0.921s against the
+    live database (a grouped CTE was worse still at 2.2s) because no index
+    covers wanted_id together with status. For the ~80 rows actually shown,
+    an IN-list lookup rides idx_source_attempts_wanted_recent and disappears.
+    """
+    items = [item for item in (items or []) if item]
+    wanted_ids = [str(item.get("wanted_id") or "").strip() for item in items]
+    wanted_ids = [value for value in wanted_ids if value]
+    if not wanted_ids:
+        return items
+    placeholders = ",".join("?" for _ in wanted_ids)
+    counts = {}
+    with connect_read(Path(db_path)) as con:
+        # real_attempt_predicate_sql(), not a hand-rolled copy of it: this is
+        # the number the card prints, and it has to be the same number the
+        # retry ceiling acts on.
+        for row in con.execute(
+            f"""
+            select sa.wanted_id, count(*) as n from source_attempts sa
+             where sa.wanted_id in ({placeholders})
+               and {real_attempt_predicate_sql('sa')}
+             group by sa.wanted_id
+            """,
+            tuple(wanted_ids),
+        ):
+            counts[str(row["wanted_id"])] = int(row["n"] or 0)
+    now = time.time() if now is None else now
+    for item in items:
+        item["real_attempt_count"] = int(counts.get(str(item.get("wanted_id") or ""), 0))
+        # Recomputed now that the honest number is available -- the reason
+        # text quotes an attempt count and would otherwise quote zero.
+        item["reason"] = reliability_item_reason(item.get("bucket"), item, now)
+    return items
+
+
+def attach_last_provider_attempt(db_path, items):
+    """Fill last_provider_attempt_at for a set of rows.
+
+    Priced three ways against production 2026-08-17, all within noise of each
+    other (1.23-1.47s for the full 2,318-row universe): a correlated subquery in
+    the list SELECT, one grouped query joined to wanted_items, and this chunked
+    IN-list. There is no cheap version -- the provider filter reads
+    source_attempts.source, which no index covers alongside wanted_id. So the
+    cost is paid where it buys something: ~80 rows for the rendered page
+    (milliseconds), and the whole population only for the health signals, which
+    load separately and never block the list.
+    """
+    items = [item for item in (items or []) if item]
+    by_id = {}
+    for item in items:
+        key = str(item.get("wanted_id") or "").strip()
+        if key:
+            by_id.setdefault(key, []).append(item)
+    if not by_id:
+        return items
+    keys = list(by_id)
+    with connect_read(Path(db_path)) as con:
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in con.execute(
+                f"""
+                select sa.wanted_id,
+                       max(coalesce(sa.completed_at, sa.started_at, 0)) as last_at
+                  from source_attempts sa
+                 where sa.wanted_id in ({placeholders})
+                   and {real_attempt_predicate_sql('sa')}
+                 group by sa.wanted_id
+                """,
+                tuple(chunk),
+            ):
+                stamp = safe_float(row["last_at"], 0.0)
+                for item in by_id.get(str(row["wanted_id"]), ()):
+                    item["last_provider_attempt_at"] = stamp or None
+    return items
+
+
+def reliability_health_signals_view(db_path, statuses=None, now=None):
+    """The aggregate strip, computed over the whole population.
+
+    Its own endpoint rather than part of the list payload: the freshness
+    numbers need a real provider timestamp for every row, which costs ~1.2s
+    however it is fetched, and making the list wait for it would have doubled
+    the page's time to first content. The strip fills in a beat later instead.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return {"ok": False, "reason": "state_db_missing"}
+    now = time.time() if now is None else float(now)
+    items = reliability_view_rows(path, statuses=statuses, now=now)
+    attach_last_provider_attempt(path, items)
+    return {
+        "ok": True,
+        "generated_at": now,
+        "total": len(items),
+        "signals": reliability_health_signals(items, now),
     }
 
 
@@ -61689,6 +64143,7 @@ def reliability_state_view(db_path, limit=80, offset=0, statuses=None, bucket_fi
     except (TypeError, ValueError):
         offset = 0
     bucket_filter = str(bucket_filter or "").strip().lower()
+    bucket_filter = RELIABILITY_BUCKET_ALIASES.get(bucket_filter, bucket_filter)
     if bucket_filter not in RELIABILITY_BUCKET_ORDER:
         bucket_filter = ""
     now = time.time()
@@ -61696,7 +64151,11 @@ def reliability_state_view(db_path, limit=80, offset=0, statuses=None, bucket_fi
     rollup = reliability_rollup(items)
     filtered = [item for item in items if not bucket_filter or item.get("bucket") == bucket_filter]
     total_count = len(filtered)
-    page = filtered[offset:offset + limit]
+    page = attach_real_attempt_counts(path, filtered[offset:offset + limit], now=now)
+    # Only the rendered page pays for the honest freshness stamp -- see
+    # attach_last_provider_attempt() for the measurement that put it here
+    # rather than in the list SELECT.
+    attach_last_provider_attempt(path, page)
     return {
         "ok": True,
         "view": "reliability",
@@ -61704,8 +64163,12 @@ def reliability_state_view(db_path, limit=80, offset=0, statuses=None, bucket_fi
             "ok": True,
             "db_path": str(path),
             "generated_at": now,
+            # `signals` is deliberately absent: it needs a provider timestamp
+            # for all ~2,300 rows and is served by
+            # /api/inkdrop-state/reliability/signals instead.
             **rollup,
         },
+        "bucket_explainer": RELIABILITY_BUCKET_EXPLAINERS.get(bucket_filter, ""),
         "count": len(page),
         "loaded_count": len(page),
         "total_count": total_count,
@@ -61718,6 +64181,388 @@ def reliability_state_view(db_path, limit=80, offset=0, statuses=None, bucket_fi
         "focused": False,
         "bucket_filter": bucket_filter,
         "stages": [{"key": key, "label": RELIABILITY_STAGE_LABELS[key]} for key in RELIABILITY_STAGE_ORDER],
+    }
+
+
+# bad_source_candidates.reason -> a sentence. Only the values that are
+# actually written live are mapped; anything unmapped shows the raw reason
+# rather than a made-up sentence, the same fail-open convention the Manual
+# Review decision panel uses. Inventing prose for an unknown code is how a
+# panel starts confidently describing a mechanism that does not exist.
+RELIABILITY_KNOWN_BAD_REASON_SENTENCES = {
+    "stale_no_local_file": "the client said it finished, but no file ever appeared on disk",
+    "slskd_transfer_missing_staged_file": "the client said it finished, but no file ever appeared on disk",
+    "transfer_missing_stale": "the client said it finished, but no file ever appeared on disk",
+    "transfer_stale_unknown": "the transfer went quiet and never produced a file",
+    "candidate_failed": "the download failed",
+    "failed_download": "the download failed",
+    "wrong_series_or_subseries": "it turned out to be a different series or a spin-off",
+    "download_client_stale_orphan": "the download client lost track of it",
+    "import_verification_failed": "the finished file didn't pass verification",
+    "zero_or_empty_header": "the archive was empty or unreadable",
+    "pack_no_matching_missing_file": "it was a bundle that didn't actually contain this issue",
+    "staged_file_low_confidence": "the file's name didn't convincingly match this issue",
+    "staged_file_mismatch": "the file's name didn't convincingly match this issue",
+    "slskd_transfer_stalled": "the transfer stalled and never finished",
+}
+
+# The rejection codes a provider attempt can carry, in the same register.
+RELIABILITY_REJECTION_SENTENCES = {
+    "candidate_title_mismatch": "the title didn't convincingly match this series",
+    "wrong_issue_number": "it was a different issue number",
+    "wrong_volume_number": "it was a different volume",
+    "wrong_unit_type": "it was a chapter where a volume was wanted, or the other way round",
+    "related_series_identity": "it belonged to a related series, not this one",
+    "coverage_not_unit_number": "the numbering it covered wasn't this unit",
+    "ambiguous_unit_identity": "it wasn't clear which unit it actually was",
+    "missing_required_unit_number": "it carried no issue or volume number at all",
+    "trusted_issue_missing_source_number": "the source gave no number to check against",
+    "collected_edition_disallowed": "it was a collected edition and those are turned off",
+    "seeders_below_minimum": "too few seeders to be worth trying",
+    "category_not_allowed": "the indexer filed it under a category that's turned off",
+    "indexer_payload_title_mismatch": "the indexer's own title didn't match what it returned",
+    "print_run_not_confirmed": "the print run couldn't be confirmed",
+    "candidate_year_mismatch": "the year didn't match this series",
+    "suwayomi_volume_metadata_missing": "Suwayomi didn't say which volume it was",
+    "suwayomi_volume_metadata_invalid": "Suwayomi's volume number didn't parse",
+    "suwayomi_volume_metadata_conflict": "Suwayomi gave two different volume numbers",
+    "suwayomi_volume_metadata_wrong": "Suwayomi's volume number was for a different volume",
+    "suwayomi_volume_unit_mismatch": "Suwayomi listed chapters where a volume was wanted",
+}
+
+RELIABILITY_EVIDENCE_OUTCOMES = {
+    "rejected": "Found a copy and turned it down",
+    "awaiting_pick": "Found a usable copy, no pick taken",
+    "zero_results": "Searched, came back empty",
+    "never_completed": "Never finished",
+    "provider_unavailable": "Provider reported unavailable (request start unconfirmed)",
+}
+
+
+def reliability_reason_sentence(reason):
+    """A sentence for a rejection/known-bad code, or the raw code."""
+    key = str(reason or "").strip().lower()
+    if not key:
+        return ""
+    return (
+        RELIABILITY_KNOWN_BAD_REASON_SENTENCES.get(key)
+        or RELIABILITY_REJECTION_SENTENCES.get(key)
+        or str(reason).strip()
+    )
+
+
+RELIABILITY_EVIDENCE_ATTEMPT_LIMIT = 40
+
+
+def _reliability_wanted_and_queue(con, wanted_id):
+    return con.execute(
+        """
+        select w.id as wanted_id, w.raw_json as wanted_raw_json, w.status as wanted_status,
+               q.id as queue_id, q.query as queue_query, q.raw_json as queue_raw_json
+          from wanted_items w
+          left join queue_items q on q.id = (
+                select q2.id from queue_items q2 where q2.wanted_id = w.id
+                 order by q2.active desc, q2.updated_at desc, q2.id desc limit 1)
+         where w.id = ?
+        """,
+        (wanted_id,),
+    ).fetchone()
+
+
+def set_operator_search_query(db_path, wanted_id, query, *, set_by="inkdrop_user", now=None):
+    """Store a hand-corrected search query, durably.
+
+    Written to wanted_items.raw_json because queue_items.query does not
+    survive: the metadata-replacement upsert rewrites that column outright, and
+    the queue row itself is superseded and recreated. It is still mirrored onto
+    the queue row so the current pass picks it up without waiting for a
+    refresh, but the wanted row is what the readers now prefer.
+
+    Passing an empty query clears the override and hands the item back to the
+    generated one.
+    """
+    wanted_id = str(wanted_id or "").strip()
+    if not wanted_id:
+        return {"ok": False, "reason": "wanted_id_required"}
+    query = " ".join(str(query or "").split()).strip()
+    if len(query) > 400:
+        return {"ok": False, "reason": "query_too_long"}
+    path = Path(db_path)
+    if not path.exists():
+        return {"ok": False, "reason": "state_db_missing"}
+    now = time.time() if now is None else float(now)
+    with connect(path) as con:
+        row = _reliability_wanted_and_queue(con, wanted_id)
+        if not row:
+            return {"ok": False, "reason": "wanted_item_not_found"}
+        wanted_raw = json_loads(row["wanted_raw_json"] or "{}", {})
+        wanted_raw = wanted_raw if isinstance(wanted_raw, dict) else {}
+        previous = str(wanted_raw.get(OPERATOR_QUERY_RAW_KEY) or "").strip()
+        if query:
+            wanted_raw[OPERATOR_QUERY_RAW_KEY] = query
+            wanted_raw["operator_query_set_at"] = now
+            wanted_raw["operator_query_set_by"] = str(set_by or "inkdrop_user")
+        else:
+            for key in (OPERATOR_QUERY_RAW_KEY, "operator_query_set_at", "operator_query_set_by"):
+                wanted_raw.pop(key, None)
+        con.execute(
+            "update wanted_items set raw_json=?, updated_at=? where id=?",
+            (json_dumps(wanted_raw), now, wanted_id),
+        )
+        if row["queue_id"]:
+            # queue_items.query is deliberately left alone. Mirroring the
+            # override onto it overwrote the generated query, so the panel's
+            # "InkDrop would otherwise send ..." line echoed the operator's own
+            # string back at them and there was no way to see what the override
+            # had replaced. The wanted row is authoritative and the autopilot
+            # reads it first, so the mirror bought nothing and cost the
+            # comparison. Only the queue's raw_json carries a marker, for
+            # anything diagnosing a pass after the fact.
+            queue_raw = json_loads(row["queue_raw_json"] or "{}", {})
+            queue_raw = queue_raw if isinstance(queue_raw, dict) else {}
+            if query:
+                queue_raw[OPERATOR_QUERY_RAW_KEY] = query
+            else:
+                queue_raw.pop(OPERATOR_QUERY_RAW_KEY, None)
+            con.execute(
+                "update queue_items set raw_json=?, updated_at=? where id=?",
+                (json_dumps(queue_raw), now, row["queue_id"]),
+            )
+        con.execute(
+            """
+            insert or ignore into history_events(
+                id, entity_type, entity_id, event_type, source, message, created_at, raw_json
+            ) values(?,?,?,?,?,?,?,?)
+            """,
+            (
+                stable_id("operator_search_query", wanted_id, now),
+                "wanted_item", wanted_id, "operator_search_query", "inkdrop_web",
+                (f"Search query set to \"{query}\"." if query
+                 else "Search query handed back to the generated one."),
+                now,
+                json_dumps({"query": query, "previous": previous, "set_by": str(set_by or "")}),
+            ),
+        )
+        con.commit()
+    return {"ok": True, "wanted_id": wanted_id, "query": query, "previous": previous}
+
+
+def set_wanted_pursuit(db_path, wanted_id, paused, *, set_by="inkdrop_user", reason="", now=None):
+    """Stop or resume searching for one item, WITHOUT hiding it.
+
+    Deliberately does not touch wanted_items.status. Every status the
+    acquisition gates exclude is also excluded from the Wanted counts, so
+    routing this through status would let the backlog number be improved by
+    pressing a button instead of by acquiring anything. The row stays `wanted`
+    and stays counted; what changes is that the three acquisition entry points
+    skip it and the page shows it in its own state.
+    """
+    wanted_id = str(wanted_id or "").strip()
+    if not wanted_id:
+        return {"ok": False, "reason": "wanted_id_required"}
+    path = Path(db_path)
+    if not path.exists():
+        return {"ok": False, "reason": "state_db_missing"}
+    paused = bool(paused)
+    now = time.time() if now is None else float(now)
+    with connect(path) as con:
+        row = _reliability_wanted_and_queue(con, wanted_id)
+        if not row:
+            return {"ok": False, "reason": "wanted_item_not_found"}
+        raw = json_loads(row["wanted_raw_json"] or "{}", {})
+        raw = raw if isinstance(raw, dict) else {}
+        was_paused = wanted_pursuit_paused(raw)
+        if paused:
+            raw[WANTED_PURSUIT_PAUSED_RAW_KEY] = True
+            raw["pursuit_paused_at"] = now
+            raw["pursuit_paused_by"] = str(set_by or "inkdrop_user")
+            if str(reason or "").strip():
+                raw["pursuit_paused_reason"] = str(reason).strip()[:400]
+        else:
+            for key in ("pursuit_paused_at", "pursuit_paused_by", "pursuit_paused_reason"):
+                raw.pop(key, None)
+            raw.pop(WANTED_PURSUIT_PAUSED_RAW_KEY, None)
+        con.execute(
+            "update wanted_items set raw_json=?, updated_at=? where id=?",
+            (json_dumps(raw), now, wanted_id),
+        )
+        con.execute(
+            """
+            insert or ignore into history_events(
+                id, entity_type, entity_id, event_type, source, message, created_at, raw_json
+            ) values(?,?,?,?,?,?,?,?)
+            """,
+            (
+                stable_id("wanted_pursuit", wanted_id, now),
+                "wanted_item", wanted_id,
+                "wanted_pursuit_paused" if paused else "wanted_pursuit_resumed",
+                "inkdrop_web",
+                ("Stopped searching for this. It stays on your Wanted list."
+                 if paused else "Searching for this again."),
+                now,
+                json_dumps({"paused": paused, "was_paused": was_paused, "set_by": str(set_by or "")}),
+            ),
+        )
+        con.commit()
+    return {"ok": True, "wanted_id": wanted_id, "paused": paused, "was_paused": was_paused}
+
+
+def reliability_item_evidence(db_path, wanted_id, now=None):
+    """Read-only per-item evidence for the expandable row panel.
+
+    Every query here is keyed on a single wanted_id and rides
+    idx_source_attempts_wanted_recent, which is the whole reason this is a
+    separate endpoint: the same joins run across the entire universe take 3.2s,
+    while per item they are milliseconds. Nothing in here writes.
+    """
+    wanted_id = str(wanted_id or "").strip()
+    path = Path(db_path)
+    if not wanted_id:
+        return {"ok": False, "reason": "wanted_id_required"}
+    if not path.exists():
+        return {"ok": False, "reason": "state_db_missing"}
+    now = time.time() if now is None else float(now)
+    with connect_read(path) as con:
+        head = con.execute(
+            """
+            select w.id as wanted_id, w.reason as wanted_reason, w.status as wanted_status,
+                   w.created_at as wanted_created_at, w.raw_json as wanted_raw_json,
+                   s.title as series, i.issue_number, i.raw_json as issue_raw_json,
+                   q.id as queue_id, q.state as queue_state, q.query as queue_query,
+                   q.last_event, q.raw_json as queue_raw_json
+              from wanted_items w
+              left join series s on s.id = w.series_id
+              left join issues i on i.id = w.issue_id
+              left join queue_items q on q.id = (
+                    select q2.id from queue_items q2 where q2.wanted_id = w.id
+                     order by q2.active desc, q2.updated_at desc, q2.id desc limit 1)
+             where w.id = ?
+            """,
+            (wanted_id,),
+        ).fetchone()
+        if not head:
+            return {"ok": False, "reason": "wanted_item_not_found"}
+        queue_raw = json_loads(head["queue_raw_json"] or "{}", {})
+        queue_raw = queue_raw if isinstance(queue_raw, dict) else {}
+        wanted_raw = json_loads(head["wanted_raw_json"] or "{}", {})
+        wanted_raw = wanted_raw if isinstance(wanted_raw, dict) else {}
+        issue_raw = json_loads(head["issue_raw_json"] or "{}", {})
+        issue_raw = issue_raw if isinstance(issue_raw, dict) else {}
+        retry_after, retry_after_iso = queue_retry_columns_from_raw(queue_raw)
+        attempt_rows = con.execute(
+            f"""
+            select sa.id, sa.source, sa.provider, sa.status, sa.failure_reason, sa.title,
+                   sa.username, sa.started_at, sa.completed_at, sa.raw_json,
+                   sa.candidate_identity, sa.download_url_hash
+              from source_attempts sa
+             where sa.wanted_id = ?
+               and {_reliability_provider_sql('sa')}
+             order by coalesce(sa.completed_at, sa.started_at, 0) desc, sa.id desc
+             limit ?
+            """,
+            (wanted_id, RELIABILITY_EVIDENCE_ATTEMPT_LIMIT + 1),
+        ).fetchall()
+        titles = [str(head["series"] or "").strip()]
+        known_bad = []
+        if titles[0]:
+            known_bad = con.execute(
+                """
+                select id, source, provider, title, reason, failure_count,
+                       first_seen_at, last_seen_at
+                  from bad_source_candidates
+                 where series = ?
+                 order by last_seen_at desc
+                 limit 25
+                """,
+                (titles[0],),
+            ).fetchall()
+
+    truncated = len(attempt_rows) > RELIABILITY_EVIDENCE_ATTEMPT_LIMIT
+    attempts = []
+    for row in attempt_rows[:RELIABILITY_EVIDENCE_ATTEMPT_LIMIT]:
+        raw = json_loads(row["raw_json"] or "{}", {})
+        raw = raw if isinstance(raw, dict) else {}
+        klass = reliability_attempt_evidence_class(row["status"], row["failure_reason"])
+        at = safe_float(row["completed_at"], 0.0) or safe_float(row["started_at"], 0.0)
+        attempts.append({
+            "id": row["id"],
+            "source": row["source"],
+            "provider": row["provider"],
+            "status": row["status"],
+            "title": row["title"],
+            "at": at or None,
+            # The attempt's OWN completion time. Never queue_items.updated_at:
+            # that is rewritten by bookkeeping and would date every one of
+            # these rows to a few minutes ago.
+            "at_label": relative_time_label(now - at) if at else "",
+            "outcome": RELIABILITY_EVIDENCE_OUTCOMES.get(klass, ""),
+            "outcome_key": klass,
+            "failure_reason": row["failure_reason"],
+            "failure_sentence": reliability_reason_sentence(row["failure_reason"]),
+            "query": str(raw.get("query") or "").strip() or None,
+            "candidate_count": raw.get("candidate_count"),
+            "safe_candidate_count": raw.get("safe_candidate_count"),
+            "rejected_candidate_count": raw.get("rejected_candidate_count"),
+            "candidate_identity": row["candidate_identity"],
+            "download_url_hash": row["download_url_hash"],
+        })
+
+    rejected_releases = []
+    for row in known_bad:
+        first_seen = safe_float(row["first_seen_at"], 0.0)
+        last_seen = safe_float(row["last_seen_at"], 0.0)
+        rejected_releases.append({
+            "id": row["id"],
+            "title": row["title"],
+            "source": row["source"],
+            "provider": row["provider"],
+            "reason": row["reason"],
+            "reason_sentence": reliability_reason_sentence(row["reason"]),
+            "failure_count": int(row["failure_count"] or 0),
+            "first_seen_at": first_seen or None,
+            "last_seen_at": last_seen or None,
+            "last_seen_label": relative_time_label(now - last_seen) if last_seen else "",
+        })
+
+    # The query InkDrop will actually send next, resolved by the SAME precedence
+    # the autopilot uses when it builds the item -- not a reconstruction from
+    # series and issue. That string being invisible is a large part of why the
+    # catalogue-formatting failures (a comma in "Suki, Alone", a trailing period
+    # in "The Gods Lie.", a publisher prefix no release carries) went unnoticed
+    # for so long: nothing anywhere showed the operator what was being asked.
+    operator_query = " ".join(str(wanted_raw.get(OPERATOR_QUERY_RAW_KEY) or "").split()).strip()
+    generated_query = (
+        str(head["queue_query"] or "").strip()
+        or str(issue_raw.get("searchQuery") or "").strip()
+        or str(queue_raw.get("query") or "").strip()
+        or " ".join(
+            value for value in (str(head["series"] or "").strip(), str(head["issue_number"] or "").strip())
+            if value
+        )
+    )
+    return {
+        "ok": True,
+        "wanted_id": wanted_id,
+        "series": head["series"],
+        "issue_number": head["issue_number"],
+        "queue_id": head["queue_id"],
+        "queue_state": head["queue_state"],
+        "search_query": operator_query or generated_query or None,
+        "search_query_source": "operator" if operator_query else "generated",
+        "generated_search_query": generated_query or None,
+        "operator_search_query": operator_query or None,
+        "pursuit_paused": wanted_pursuit_paused(wanted_raw),
+        "pursuit_paused_at": wanted_raw.get("pursuit_paused_at"),
+        "pursuit_paused_reason": wanted_raw.get("pursuit_paused_reason"),
+        "wanted_reason": head["wanted_reason"],
+        "wanted_created_at": head["wanted_created_at"],
+        "retry_after": retry_after,
+        "retry_after_iso": retry_after_iso,
+        "attempts": attempts,
+        "attempts_truncated": truncated,
+        "attempt_limit": RELIABILITY_EVIDENCE_ATTEMPT_LIMIT,
+        "rejected_releases": rejected_releases,
+        "generated_at": now,
     }
 
 
@@ -67305,11 +70150,22 @@ SERIES_COMPACT_ROW_KEYS = {
     "reader_visibility_latest_at",
     "reader_visibility_latest_at_iso",
     "linked_entities",
+    # The duplicate-group identity keys have to travel with the count, not
+    # behind it: the Series row gates its duplicate action on the count but the
+    # action itself needs the ids to find the other side, and the Manual Review
+    # duplicate-workload map groups on the title key. Drop either and the
+    # action still renders on a compact row while what it opens finds nothing.
+    "duplicate_title_key",
     "duplicate_series_group_count",
+    "duplicate_series_group_ids",
     "duplicate_series_group_label",
     "duplicate_series_group_class",
     "duplicate_series_active_work",
     "duplicate_series_group_next_action",
+    "duplicate_series_relationship",
+    "duplicate_series_relationship_label",
+    "duplicate_series_relationship_note",
+    "duplicate_series_comparable",
     "series_display_collapsed_count",
     "series_display_collapsed_ids",
     "series_display_collapsed_titles",
@@ -69350,7 +72206,13 @@ def discovered_series_root_folder_candidates(series_row, scan_limit=1000, manage
     series_year = str(series_row.get("series_year") or series_row.get("year") or "").strip()
     if root is None or not title_key:
         return []
-    cache_key = ("managed_root_series_folders", str(root), title_key, series_year)
+    # What the series' own year means depends on what the series is, so the
+    # media type is part of the comparison, not decoration.
+    series_date = ReleaseDate.from_series_year(series_year, media_type=series_row.get("media_type"))
+    cache_key = (
+        "managed_root_series_folders", str(root), title_key, series_year,
+        series_date.semantic,
+    )
     if cache_key in managed_folder_cache:
         return list(managed_folder_cache[cache_key])
     try:
@@ -69371,13 +72233,28 @@ def discovered_series_root_folder_candidates(series_row, scan_limit=1000, manage
             child_key, child_year = managed_series_folder_name_identity(child.name)
             if child_key != title_key:
                 continue
-            # A series that carries a year accepts only folders marked with
-            # that exact year. An unqualified same-title folder may belong to
-            # a different edition, so it cannot satisfy a dated identity --
-            # files it holds are recovered through their own media records
-            # instead of through folder discovery.
-            if series_year and child_year != series_year:
-                continue
+            # The two years only mean something to each other when they are
+            # measuring the same kind of thing.
+            #
+            # For a comic they are: `series.year` is the run's start year and
+            # the folder is named after that same release. So the original rule
+            # stands unchanged -- a dated series takes only a folder marked
+            # with that year, and files under an unqualified folder are
+            # recovered through their own media records instead.
+            #
+            # For manga they are not. `series.year` is the original Japanese
+            # serialization year while the folder carries the English edition
+            # year, so "Vinland Saga" (2005) lives in "Vinland Saga (2013)".
+            # Comparing those as bare integers read as "different series" and
+            # took those folders out of every presence check, which left
+            # autopilot re-downloading books already on the shelf.
+            #
+            # The ranking below still prefers an exactly-matching year when one
+            # exists, and a tie still returns nothing rather than guessing.
+            folder_date = ReleaseDate.from_folder_year(child_year)
+            if series_date.known and series_date.same_kind_as(folder_date):
+                if not folder_date.known or series_date.differs_from(folder_date):
+                    continue
             resolved = _series_library_canonical_path(child)
             if resolved is None or not _series_library_path_under(resolved, root):
                 continue

@@ -1111,21 +1111,52 @@
       padding: 18px;
       background: rgba(0, 0, 0, .72);
     }
+    /* The dialog is a column whose BODY scrolls -- the head and the action
+       footer are never part of the scrolled content. It used to be a plain
+       `display: grid; overflow: auto` box, which made the whole stack
+       (including the footer) the scroll content: once the content exceeded
+       `100vh - 36px` the action row rendered past the dialog's own clip
+       boundary. The clipped part is not hit-testable, so a tap on a visible
+       action button landed on the `.series-remove-modal` backdrop behind it
+       -- and the backdrop's click handler CLOSES the dialog. The decision
+       looked like it did nothing. Buttons below the fold were unreachable
+       outright. Only the >=1100px docked Manual Review panel had this fixed
+       (it sets the same flex/scroll-body rules on its own dialog); every
+       narrow viewport still fell back to this shared rule, which is why it
+       read as a phone-only bug. Applies to every dialog on this markup
+       (Manual Review decision, confirm, text prompt, remove/move series),
+       because the trap is the shared box, not one panel. */
     .series-remove-dialog {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       width: min(620px, calc(100vw - 24px));
       max-height: calc(100vh - 36px);
-      overflow: auto;
+      overflow: hidden;
       border: 1px solid rgba(255, 125, 125, .42);
       border-radius: 4px;
       background: #22272e;
       box-shadow: 0 18px 42px rgba(0, 0, 0, .45);
+    }
+    /* Head, footer and the prev/next nav keep their natural height; only the
+       body absorbs the leftover space and scrolls. `min-height: 0` is what
+       lets a flex item shrink below its content size -- without it the body
+       refuses to shrink and pushes the footer back out of the box. */
+    .series-remove-dialog > * {
+      flex: 0 0 auto;
+    }
+    .series-remove-dialog > .series-remove-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
     }
     .series-remove-dialog.warn {
       border-color: rgba(247, 201, 111, .48);
     }
     .series-remove-dialog.good {
       border-color: rgba(120, 217, 155, .38);
+    }
+    .series-remove-dialog.info {
+      border-color: rgba(114, 210, 255, .38);
     }
     .series-remove-head,
     .series-remove-foot {
@@ -1183,6 +1214,13 @@
     .series-remove-alert.good {
       border-color: rgba(120, 217, 155, .34);
       background: rgba(10, 43, 37, .24);
+    }
+    /* The base alert is red because this dialog was built for destructive
+       confirmations. A read-only view borrows the same shell and must not
+       inherit the danger framing. */
+    .series-remove-alert.info {
+      border-color: rgba(114, 210, 255, .32);
+      background: rgba(12, 34, 48, .24);
     }
     .manual-review-decision-dialog {
       width: min(860px, calc(100vw - 24px));
@@ -1292,6 +1330,30 @@
       font-size: 13px;
       line-height: 1.4;
     }
+    /* Pinned between the scrolling body and the action row, so a failed
+       decision is reported where the person is already looking -- the toast
+       is behind this overlay on narrow viewports. */
+    .manual-review-decision-status[hidden] {
+      display: none;
+    }
+    .manual-review-decision-status {
+      padding: 10px 16px;
+      border-top: 1px solid rgba(255, 255, 255, .14);
+      background: rgba(74, 24, 24, .3);
+      color: var(--bad);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .manual-review-decision-status.warn {
+      background: rgba(58, 41, 13, .3);
+      color: var(--warn);
+    }
+    .manual-review-decision-status.good {
+      background: rgba(18, 48, 30, .3);
+      color: var(--good);
+    }
     .manual-review-decision-actions {
       flex-wrap: wrap;
       align-items: stretch;
@@ -1354,6 +1416,7 @@
     }
     .series-remove-alert.warn strong { color: var(--warn); }
     .series-remove-alert.good strong { color: var(--good); }
+    .series-remove-alert.info strong { color: var(--text); }
     .series-remove-alert span,
     .series-remove-copy {
       color: var(--muted);
@@ -1461,6 +1524,10 @@
     .series-remove-confirm.warn {
       color: var(--warn);
       border-color: rgba(247, 201, 111, .48);
+    }
+    .series-remove-confirm.info {
+      color: var(--text);
+      border-color: rgba(114, 210, 255, .38);
     }
     .series-remove-confirm.good {
       color: var(--good);

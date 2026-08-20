@@ -848,13 +848,16 @@ def main():
         # A provider that was never template-shaped in the first place
         # (no source_template key at all) must not gain this key either --
         # the fix is a no-op for the overwhelming majority of providers.
-        qbittorrent_after = inkdrop_state.provider_config(db_path, "qbittorrent")
+        # Was qBittorrent until download clients stopped being seeded onto
+        # installs that don't run them; ComicVine is the same shape of fixture
+        # (a runtime provider that was never template-shaped) and is still here.
+        comicvine_after = inkdrop_state.provider_config(db_path, "comicvine")
         assert_true(
-            "source_template" not in qbittorrent_after["settings"],
-            "fixture sanity: qBittorrent was never template-shaped",
+            "source_template" not in comicvine_after["settings"],
+            "fixture sanity: ComicVine was never template-shaped",
         )
         assert_true(
-            "source_template_instance" not in qbittorrent_after["settings"],
+            "source_template_instance" not in comicvine_after["settings"],
             "a provider with no source_template flag never gains an instance flag either",
         )
 

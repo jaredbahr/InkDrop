@@ -94,11 +94,35 @@
   background: var(--panel-2);
 }
 
+/* A switched-off connection used to differ from a working one by a single
+   small chip, which meant a disabled Discord and an enabled Pushover read as
+   the same card at a glance. Recessing the card and quieting its heading give
+   the state something to land on before you get to the chip; the muted trigger
+   pills the JS switches to do the rest.
+
+   Two things this deliberately does not do. It does not dim the card with
+   opacity -- that would drag Configure/Test/Delete down with it and make
+   working buttons look dead, when a disabled connection is still fully
+   editable and testable. And it stays solid-bordered: dashed already means
+   "empty slot" on the Add Connection tile below, and a disabled connector is
+   configured, not absent. */
+.notifications-channel-card.is-disabled {
+  background: var(--panel);
+}
+
+.notifications-channel-card.is-disabled h3 {
+  color: var(--muted);
+}
+
 .notifications-channel-card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.notifications-channel-off-note {
+  margin: 0;
 }
 
 .notifications-channel-card-head h3 {
@@ -223,6 +247,31 @@
 .library-adoption-panel > button,
 .archive-conversion-panel > button {
   justify-self: start;
+}
+
+/* Check and Convert are two steps of one job, so they sit on one row. Stacked,
+   with a progress bar rendering below them, it read as three unrelated
+   controls and it was never obvious which one was live. */
+.archive-conversion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+/* When a stored result was taken. Muted while it is merely old; warm once the
+   library has moved under it, because that is when acting on it is a mistake. */
+.scan-run-age {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.scan-run-age.stale {
+  padding: 8px 10px;
+  border: 1px solid rgba(230, 162, 62, .4);
+  border-radius: 4px;
+  background: rgba(230, 162, 62, .1);
+  color: #e6a23e;
 }
 
 .library-adoption-form {
@@ -739,6 +788,44 @@
 .download-client-delete-warning p {
   margin: 4px 0 0;
   color: var(--muted);
+}
+
+/* A legacy client card whose config now lives on a real instance must stay
+   gone. hideMigratedLegacyCards() sets the `hidden` property, but
+   applyInkdropSettingsSearch() clears `hidden` on every .settings-card whenever
+   the search box is empty -- which is most of the time -- so the superseded card
+   came straight back and the page showed the same client twice. The data
+   attribute is the durable signal: only the manager writes it, and no filter
+   pass touches it. */
+.settings-card[data-download-client-legacy-fallback="hidden-by-instance"] {
+  display: none !important;
+}
+
+/* Labelled break between the clients a user connects InkDrop to and the
+   sources already built into it. Spans the settings grid so the two groups
+   read as two groups rather than one long list of cards. */
+.settings-subsection-divider {
+  grid-column: 1 / -1;
+  min-width: 0;
+  margin: 6px 0 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line, #2a2f3a);
+}
+
+.settings-subsection-divider h3 {
+  margin: 0;
+}
+
+.settings-subsection-divider p {
+  margin: 4px 0 0;
+  max-width: 68ch;
+  color: var(--muted);
+}
+
+/* Keeps the clients-vs-built-in-sources explainer to a readable measure
+   instead of stretching across a wide settings column. */
+.download-client-manager-copy {
+  max-width: 68ch;
 }
 
 .download-client-manager-actions,
@@ -1621,3 +1708,45 @@ button.missing-recovery-metric:focus-visible {
 .provider-test-button[data-test-state="ok"]::before { content: "\2713"; }
 .provider-test-button[data-test-state="err"]::before { content: "\2715"; }
 @keyframes provider-test-spin { to { transform: rotate(360deg); } }
+
+/* Delivery history is the one .series-remove-dialog that holds an
+   arbitrarily long list. The base dialog puts overflow:auto on itself, which
+   is right for a short confirm box but scrolls the title and the close button
+   out of reach here once "Load more" has been used a few times -- leaving
+   Escape or a backdrop click as the only way out. Give this one a fixed frame
+   and scroll the body instead, with the column labels pinned so a row 200
+   deep still says which column is which. */
+.notifications-history-list-modal .series-remove-dialog {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* Neutral, not the base dialog's destructive red -- nothing here deletes
+     anything. */
+  border-color: rgba(255, 255, 255, .16);
+}
+
+.notifications-history-list-modal .series-remove-head {
+  flex: 0 0 auto;
+}
+
+.notifications-history-list-modal .series-remove-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  align-content: start;
+  /* No top padding: a sticky header pins to the scrollport's padding edge,
+     so any padding here becomes a transparent strip that scrolled rows show
+     through above the pinned column labels. The table's own cell padding
+     already gives the first row its breathing room. */
+  padding-top: 0;
+}
+
+.notifications-history-list-modal .notifications-history-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  /* Opaque, matching .series-remove-dialog's background -- a translucent
+     header would show the rows sliding underneath it. */
+  background: #22272e;
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, .14);
+}

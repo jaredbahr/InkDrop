@@ -6,39 +6,23 @@ from __future__ import annotations
 import threading
 import time
 
+from core.inkdrop_records import (
+    CLIENT_DISPLAY_NAMES,
+    TRANSFER_STATES_ACTIVE,
+    TRANSFER_STATES_COMPLETE,
+    TRANSFER_STATES_QUEUED,
+    coerce_client_id,
+)
 from core.inkdrop_transfer import normalize_transfer_status
 
 
-CLIENT_NAMES = {
-    "qbittorrent": "qBittorrent",
-    "sabnzbd": "SABnzbd",
-    "slskd": "SLSKD",
-    "transmission": "Transmission",
-    "deluge": "Deluge",
-    "nzbget": "NZBGet",
-    "utorrent": "uTorrent",
-    "rtorrent": "rTorrent",
-}
+# Kept as module-level names because callers import them from here; the values
+# live in inkdrop_records so a newly supported client is named once.
+CLIENT_NAMES = CLIENT_DISPLAY_NAMES
 
 
 def canonical_client_id(value):
-    key = str(value or "").strip().lower().replace("-", "").replace("_", "")
-    return {
-        "qbit": "qbittorrent",
-        "qb": "qbittorrent",
-        "qbittorrent": "qbittorrent",
-        "sab": "sabnzbd",
-        "sabnzbd": "sabnzbd",
-        "soulseek": "slskd",
-        "slskd": "slskd",
-        "transmission": "transmission",
-        "deluge": "deluge",
-        "nzbget": "nzbget",
-        "utorrent": "utorrent",
-        "utorrentweb": "utorrent",
-        "rtorrent": "rtorrent",
-        "rtorrentxmlrpc": "rtorrent",
-    }.get(key, str(value or "").strip().lower())
+    return coerce_client_id(value)
 
 
 def _integer(value):
@@ -76,9 +60,9 @@ def client_status_contract(client_id, *, health=None, snapshots=None, effective=
         item["download_client_instance_id"] = snapshot.get("download_client_instance_id")
         normalized.append(item)
     states = [item.get("transfer_state") for item in normalized]
-    active_states = {"downloading", "stalled"}
-    queued_states = {"queued", "paused"}
-    complete_states = {"completed", "seeding"}
+    active_states = TRANSFER_STATES_ACTIVE
+    queued_states = TRANSFER_STATES_QUEUED
+    complete_states = TRANSFER_STATES_COMPLETE
     rates = [item.get("download_rate_bytes_per_second") for item in normalized if item.get("download_rate_bytes_per_second") is not None]
     upload_rates = [item.get("upload_rate_bytes_per_second") for item in normalized if item.get("upload_rate_bytes_per_second") is not None]
     remaining = []

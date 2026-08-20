@@ -1800,6 +1800,104 @@ def stale_staged_match_memory_revalidation_smoke():
                 "same-peer failure was bypassed",
             )
 
+        # Peer scoping is only meaningful while the handoff is live. Once the
+        # transfer is retired, "current-peer" is just whoever the queue tried
+        # last -- not whoever left this file on disk -- so asserting it would
+        # hide the file's own rejection record and the file would be
+        # re-detected as fresh every pass, forever. Live instance: 15 of 17
+        # permanently-stuck queue rows, e.g. Planetes staged from Senda-t7
+        # after the queue had moved on to jkage; that row logged 777 no-op
+        # "known_bad_candidate_skipped" attempts and blocked every source
+        # search for the issue for six days.
+        for retirement_marker in (
+            {"retired_download_task_at": 1786473483.4},
+            {"slskd_terminal_recovery": True},
+            {"last_slskd_autopick_status": "reservation_expired"},
+        ):
+            retired_item = {**item, **retirement_marker}
+            require(
+                probe.staged_candidate_owner(retired_item) is None,
+                f"retired handoff still claimed the staged file: {retirement_marker}",
+            )
+            with (
+                mock.patch.object(probe, "scan_staged_file_candidates", return_value=[candidate]),
+                mock.patch.object(
+                    probe,
+                    "manual_source_bad_candidate_rows",
+                    return_value=[current_peer_stale_match, different_peer_failure],
+                ),
+                mock.patch.object(probe, "durable_bad_source_candidate_match", return_value=None),
+            ):
+                require(
+                    not probe.detected_staged_files(retired_item, review_id=item["review_id"]),
+                    f"retired handoff let a rejected staged file back through: {retirement_marker}",
+                )
+
+        # The reduced review item the probe actually builds must carry that
+        # liveness signal; without it the retired case above cannot be seen.
+        require(
+            probe.queue_source_review_item({
+                "series": "Fairy Tail", "issue": "26", "last_slskd_user": "current-peer",
+                "slskd_terminal_recovery": True,
+            }).get("slskd_handoff_retired") is True,
+            "queue_source_review_item dropped the SLSKD handoff liveness signal",
+        )
+
+        # A queue row names its waiting review last_slskd_waiting_review_id, not
+        # review_id; resolving only the latter skipped the bad-candidate filter
+        # entirely on the autopilot path.
+        queue_shaped = {k: v for k, v in item.items() if k != "review_id"}
+        queue_shaped["last_slskd_waiting_review_id"] = item["review_id"]
+        queue_shaped["slskd_terminal_recovery"] = True
+        with (
+            mock.patch.object(probe, "scan_staged_file_candidates", return_value=[candidate]),
+            mock.patch.object(
+                probe,
+                "manual_source_bad_candidate_rows",
+                return_value=[current_peer_stale_match, different_peer_failure],
+            ),
+            mock.patch.object(probe, "durable_bad_source_candidate_match", return_value=None),
+        ):
+            entry = probe.attach_staged_detection({}, queue_shaped)
+        require(
+            int(entry.get("detected_count") or 0) == 0,
+            f"waiting review id was not resolved, so the rejected file stayed staged: {entry}",
+        )
+
+        # SLSKD writes a redownload next to a name already on disk as
+        # "<name>_<ticks>.<ext>". Only the plain name carries the rejection
+        # record, so on the live instance the suffixed twin was the one file
+        # that survived every other fix here and kept both Planetes rows
+        # staged. The two names must resolve to one artifact.
+        dup_leaf = "Fairy Tail v26 (2013) (Digital)_639219590629183717.cbz"
+        require(
+            probe.filename_match_values(dup_leaf) & probe.filename_match_values(staged.name),
+            f"a redownloaded duplicate did not match its own earlier copy: {dup_leaf}",
+        )
+        for untouched in ("Batman 019.cbz", "Akira 1988.cbz", staged.name):
+            require(
+                probe.filename_match_values(untouched) == {untouched.lower()},
+                f"ordinary trailing digits were stripped as a duplicate suffix: {untouched}",
+            )
+        dup_path = staged.parent / dup_leaf
+        dup_path.write_bytes(b"redownloaded twin")
+        dup_candidate = {**candidate, "path": dup_path, "filename": dup_leaf}
+        with (
+            mock.patch.object(probe, "scan_staged_file_candidates", return_value=[dup_candidate]),
+            mock.patch.object(
+                probe,
+                "manual_source_bad_candidate_rows",
+                return_value=[current_peer_stale_match, different_peer_failure],
+            ),
+            mock.patch.object(probe, "durable_bad_source_candidate_match", return_value=None),
+        ):
+            require(
+                not probe.detected_staged_files(
+                    {**item, "slskd_terminal_recovery": True}, review_id=item["review_id"]
+                ),
+                "a redownloaded duplicate of a rejected file was detected as fresh",
+            )
+
 
 def insert_task(db_path, task_id, external_id, title, started_at, progress=None):
     with inkdrop_state.connect(db_path) as con:

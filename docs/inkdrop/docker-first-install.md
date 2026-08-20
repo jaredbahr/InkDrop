@@ -679,8 +679,8 @@ runs on -- run these two commands inside the InkDrop container to create a
 short-lived one-time token and reset the password:
 
 ```bash
-docker compose exec inkdrop python -B inkdrop_auth_cli.py recovery-token
-docker compose exec inkdrop python -B inkdrop_auth_cli.py reset-password
+docker compose exec inkdrop python -B core/inkdrop_auth_cli.py recovery-token
+docker compose exec inkdrop python -B core/inkdrop_auth_cli.py reset-password
 ```
 
 Recovery tokens expire and can be used only once. Password recovery revokes

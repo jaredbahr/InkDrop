@@ -22,6 +22,8 @@ from pathlib import Path
 
 import yaml
 
+from core import inkdrop_bounded_read
+
 
 DEFAULT_BASE_URL = "http://127.0.0.1:5030/api/v0"
 STATE_DB_NAME = "inkdrop-state.sqlite3"
@@ -62,7 +64,34 @@ def state_db_path() -> Path:
     return Path(os.environ.get("INKDROP_STATE_DIR") or "/state") / STATE_DB_NAME
 
 
+def active_instance_settings(client_type: str) -> dict:
+    """Settings from the download-client instance InkDrop actually routes to.
+
+    An SLSKD instance supersedes the legacy provider card for search and
+    downloads, so it has to supersede it for search-history cleanup too --
+    otherwise the knob a user edits on the instance and the knob this reads are
+    two different knobs.
+    """
+    if client_type != "slskd":
+        return {}
+    db_path = state_db_path()
+    if not db_path.exists():
+        return {}
+    try:
+        from core import inkdrop_download_client_routing
+
+        routed = inkdrop_download_client_routing.slskd_source_instance(db_path)
+    except (ImportError, sqlite3.Error, OSError, ValueError):
+        return {}
+    instance = (routed or {}).get("instance") or {}
+    settings = instance.get("settings")
+    return dict(settings) if isinstance(settings, dict) else {}
+
+
 def load_provider_settings(provider_id: str) -> dict:
+    instance_settings = active_instance_settings(provider_id)
+    if instance_settings:
+        return instance_settings
     db_path = state_db_path()
     if not db_path.exists():
         return {}
@@ -138,7 +167,13 @@ def api_request(base_url: str, api_key: str, path: str, *, method: str = "GET", 
         method=method,
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read()
+        # Search history is the surface this module exists to keep bounded, so
+        # the read that fetches it should not be the one unbounded step.
+        body = inkdrop_bounded_read.bounded_read_bytes(
+            response,
+            inkdrop_bounded_read.LOCAL_CLIENT_JSON_MAX_BYTES,
+            label="slskd search history",
+        )
         if not body:
             return None
         return json.loads(body.decode("utf-8"))

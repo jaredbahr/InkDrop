@@ -79,6 +79,39 @@ DEFAULT_RETRY_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BACKOFF_SECONDS = 300
 DEFAULT_HISTORY_RETENTION_DAYS = 30
 
+# `notification_deliveries` is two things at once, and pruning has to respect
+# both. It is the user-visible delivery history, and it is the live ledger the
+# dispatch pipeline reads back: reserve_new_delivery() probes it for a prior
+# 'sent'/'sending'/'queued' row on the same occurrence_key inside
+# dedup_window_seconds, and the rate limiter counts 'sent'/'sending' rows
+# inside the last hour. Deleting a row inside either horizon does not shrink
+# history -- it silently re-arms a duplicate the dedup window was supposed to
+# suppress, or lets a send slip past the per-hour ceiling. So every delete
+# below is gated on RATE_LIMIT_WINDOW_SECONDS/dedup_window first.
+RATE_LIMIT_WINDOW_SECONDS = 3600
+
+# The two retention tiers. Measured on the live 42,461-row install over 11.4
+# days: 88.9% of rows are 'deduped' -- 19 suppression records for every
+# notification actually sent (37,566 deduped vs 1,984 sent on import_verified
+# alone), and 20,016 rows landed on the busiest single day. Suppression rows
+# are never read back by dedup or the rate limiter, which is why they can go
+# early; 'sent'/'failed' are the user's actual delivery record and keep the
+# full history_retention_days. Pruning suppression rows at 2 days reclaims
+# 92.8% of that table while losing none of the 2,975-row delivery record.
+HISTORY_RECORD_STATUSES = ("sent", "failed")
+HISTORY_ACTIVE_STATUSES = ("queued", "sending")
+DEFAULT_SUPPRESSION_RETENTION_SECONDS = 2 * 86400
+
+# A backstop against pathological growth, not a display limit. Sized from the
+# same measurements: after tiered pruning the steady state is ~8k rows (30
+# days of the ~270 sent/day record) plus at most ~40k of a 2-day suppression
+# window at the observed peak rate, so 50k is the worst realistic case and
+# never binds in normal operation. It is gated on the pipeline horizon too --
+# correctness outranks the ceiling, so a install that genuinely holds more
+# than this inside its dedup window keeps the rows and reports the overage
+# rather than breaking dedup to honour a number.
+NOTIFICATION_HISTORY_MAX_ROWS = 50000
+
 SCHEMA_SQL = """
 create table if not exists notification_connectors (
     id text primary key,
@@ -857,16 +890,128 @@ def list_deliveries(db_path, *, limit=100, before=None, event_type=None, channel
         return [_delivery_row(row) for row in rows]
 
 
-def prune_history(db_path, *, retention_days=None):
-    settings = get_settings(db_path) if retention_days is None else None
-    days = retention_days if retention_days is not None else settings["history_retention_days"]
-    cutoff = time.time() - (max(1, int(days)) * 86400)
+def history_windows(settings, *, retention_days=None):
+    """The three horizons pruning has to respect, in seconds.
+
+    `protect` is the one that is not negotiable: reserve_new_delivery() reads
+    'sent'/'sending'/'queued' rows back inside dedup_window_seconds to decide
+    whether an occurrence is a duplicate, and counts 'sent'/'sending' rows
+    inside the last hour against rate_limit_max_per_hour. Nothing newer than
+    that may be deleted for any reason, or the pipeline starts re-firing
+    duplicates and overshooting the hourly ceiling with no error anywhere.
+
+    `record` is history_retention_days -- what the user asked to keep. It
+    governs 'sent'/'failed', their actual delivery record.
+
+    `suppression` governs everything else ('deduped'/'filtered'/'disabled'/
+    'skipped'): rows that record a *non*-send. Those are the bulk of the table
+    and nothing reads them back, so they go early -- but never before the
+    dedup window they explain, and never after the retention the user set.
+    """
+    days = settings["history_retention_days"] if retention_days is None else retention_days
+    record = max(1, int(days)) * 86400
+    dedup = max(0, int(settings.get("dedup_window_seconds") or 0))
+    protect = max(dedup, RATE_LIMIT_WINDOW_SECONDS)
+    suppression = min(record, max(DEFAULT_SUPPRESSION_RETENTION_SECONDS, dedup))
+    return {"record": record, "suppression": suppression, "protect": protect}
+
+
+def prune_history(db_path, *, retention_days=None, now=None, cap=NOTIFICATION_HISTORY_MAX_ROWS):
+    now = time.time() if now is None else float(now)
     with _connection(db_path) as con:
-        cur = con.execute(
-            "delete from notification_deliveries where created_at < ? and status not in ('queued','sending')",
-            (cutoff,),
+        settings = _settings_row(
+            con.execute(
+                "select * from notification_settings where id=?", (GLOBAL_SETTINGS_ID,)
+            ).fetchone()
         )
-        return {"deleted": cur.rowcount if cur.rowcount is not None else 0}
+        windows = history_windows(settings, retention_days=retention_days)
+        protect_after = now - windows["protect"]
+        active = ",".join(f"'{status}'" for status in HISTORY_ACTIVE_STATUSES)
+        record = ",".join(f"'{status}'" for status in HISTORY_RECORD_STATUSES)
+        # One statement, one guard. `prunable` is the whole safety story: not
+        # in the active pipeline, and older than the horizon the dispatch
+        # pipeline can still read back (delivered_at as well as created_at --
+        # a row created before the horizon can have been delivered inside it,
+        # and dedup/rate-limit both key off coalesce(delivered_at, created_at)).
+        prunable = f"""status not in ({active})
+                       and created_at < :protect
+                       and coalesce(delivered_at, created_at) < :protect"""
+        # The second half of the safety story, and the one the ceiling below
+        # used to skip: has this row outlived the window its own status is
+        # kept for? 'sent'/'failed' answer to history_retention_days -- the
+        # number the operator set and the Settings page promises -- and
+        # everything else to the shorter suppression window.
+        retention_expired = f"""(
+                           (status in ({record}) and created_at < :record_cutoff)
+                           or (status not in ({record}) and created_at < :suppression_cutoff)
+                       )"""
+        horizons = {
+            "protect": protect_after,
+            "record_cutoff": now - windows["record"],
+            "suppression_cutoff": now - windows["suppression"],
+        }
+        cur = con.execute(
+            f"""delete from notification_deliveries
+                 where {prunable}
+                   and {retention_expired}""",
+            horizons,
+        )
+        deleted = cur.rowcount if cur.rowcount is not None else 0
+
+        # Ceiling backstop, and it answers to BOTH guards -- this is the half
+        # that was missing. It used to delete on `prunable` alone, so a table
+        # over `cap` shed 'sent' rows the operator's retention still covered:
+        # 50 three-day-old sends under a 30-day setting went, with nothing
+        # said anywhere. That is the same "silently overriding the operator's
+        # retention" failure this module already refuses to allow on write
+        # paths, arriving through the ceiling instead.
+        #
+        # Retention wins. The ceiling may only take rows retention has already
+        # released, which means that with the unbounded retention pass above it
+        # can find nothing left to take and reports 0. That is deliberate, not
+        # dead code: the ceiling stays a correct expression of the policy
+        # rather than a second, contradictory one, so bounding the retention
+        # pass later (a LIMIT for transaction size, say) cannot quietly turn
+        # the ceiling back into a retention override.
+        #
+        # An install genuinely over `cap` therefore keeps an over-cap table and
+        # says so, the same way it already does for rows the dispatch pipeline
+        # still needs. See docs/inkdrop/ -- the count is reported and nothing
+        # currently acts on it.
+        cap = max(1, int(cap))
+        over_cap = con.execute(
+            f"""select count(*) as n from notification_deliveries
+                 where status not in ({active})
+                   and id in (
+                       select id from notification_deliveries
+                       where status not in ({active})
+                       order by created_at desc limit -1 offset ?
+                   )""",
+            (cap,),
+        ).fetchone()
+        over_cap = int(over_cap["n"] if over_cap else 0)
+        capped = 0
+        if over_cap:
+            cur = con.execute(
+                f"""delete from notification_deliveries
+                     where {prunable}
+                       and {retention_expired}
+                       and id in (
+                           select id from notification_deliveries
+                           where status not in ({active})
+                           order by created_at desc limit -1 offset :cap
+                       )""",
+                {**horizons, "cap": cap},
+            )
+            capped = cur.rowcount if cur.rowcount is not None else 0
+        return {
+            "deleted": deleted + capped,
+            "pruned_by_retention": deleted,
+            "pruned_by_cap": capped,
+            # Over the ceiling and kept anyway: either the dispatch pipeline
+            # still reads it back, or the operator's retention still covers it.
+            "over_cap_retained": max(0, over_cap - capped),
+        }
 
 
 # --------------------------------------------------------------------------

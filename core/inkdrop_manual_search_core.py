@@ -704,6 +704,15 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     _ensure_column(con, "manual_search_runs", "claimed_by", "text")
     _ensure_column(con, "manual_search_runs", "lease_expires_at", "real")
     _ensure_column(con, "manual_search_runs", "reclaim_count", "integer not null default 0")
+    # The durable half of request idempotency. Partial unique index so rows
+    # from before this column (and any run started without a client request
+    # id) stay unconstrained -- SQLite treats every NULL as distinct in a
+    # normal unique index, but being explicit says the intent out loud.
+    _ensure_column(con, "manual_search_runs", "request_key", "text")
+    con.execute(
+        "create unique index if not exists idx_manual_runs_request_key "
+        "on manual_search_runs(request_key) where request_key is not null"
+    )
     _ensure_column(con, "manual_search_grab_results", "forced_rejected", "integer not null default 0")
     _ensure_column(con, "manual_search_grab_results", "handoff_binding", "text not null default ''")
     seed_source_profiles(con)
@@ -1079,6 +1088,35 @@ def resolve_search_targets(
     }
 
 
+def request_idempotency_key(requested_by: str, request_id: str, request: dict[str, Any]) -> str:
+    """Stable key for one logical Manual Search request.
+
+    Scoped three ways, and each one matters:
+
+    * the principal, so two operators cannot collide on a guessable id, and so
+      one cannot replay another's run by quoting it;
+    * the client's request id, so a retry after a lost response lands on the
+      same key;
+    * the normalized request itself, so the same id carrying a *different*
+      search (different providers, a different unit) is a different logical
+      request and gets its own run rather than silently replaying the old
+      answer at it.
+
+    Sorted-key JSON so dict ordering cannot change the digest.
+    """
+    material = json.dumps(
+        {
+            "requested_by": str(requested_by or "anonymous"),
+            "request_id": str(request_id or ""),
+            "request": request,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 def create_search_run(
     db_path: str | Path,
     *,
@@ -1093,6 +1131,7 @@ def create_search_run(
     include_rejected: bool = True,
     pack_allowed: bool | None = None,
     timeout_seconds: int | None = None,
+    request_id: str = "",
     now: Any = None,
 ) -> dict[str, Any]:
     ts = _now(now)
@@ -1144,8 +1183,57 @@ def create_search_run(
         series_id,
         now=ts,
     )
+    # The normalized request, resolved. Built before the rate-limit check on
+    # purpose: a retry of a request we already ran must cost nothing, and
+    # charging the limiter before recognising the replay would let a client
+    # whose response got lost rate-limit itself out of its own answer.
+    request = {
+        "series_id": series_id,
+        "edition_id": edition_id,
+        "issue_id": issue_id,
+        "unit_id": unit_id,
+        "provider_selection": providers,
+        "source_profile_id": profile.get("id"),
+        "force_refresh": bool(force_refresh),
+        "include_rejected": bool(include_rejected),
+        "pack_allowed": allow_pack,
+    }
+    request_key = (
+        request_idempotency_key(requested_by, request_id, request)
+        if _text(request_id)
+        else None
+    )
+
+    def _replay(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "run_id": row["id"],
+            "state": row["state"],
+            "providers": _json(row["provider_selection_json"], []),
+            "deadline_at": row["deadline_at"],
+            "source_profile": profile,
+            # So a caller can tell "your search is running" from "I started a
+            # second one", and so the tests can prove no second fanout.
+            "idempotent_replay": True,
+        }
+
     with _db(db_path) as con:
         ensure_schema(con)
+        if request_key:
+            existing = con.execute(
+                "select * from manual_search_runs where request_key=? and (expires_at is null or expires_at>?)",
+                (request_key, ts),
+            ).fetchone()
+            if existing:
+                return _replay(existing)
+            # Past its retention a run stops owning its key. The row itself is
+            # left alone -- history and diagnostics still want it -- but it
+            # releases the key so the unique index does not hand a caller back
+            # a run that has aged out, which is the opposite of replaying.
+            con.execute(
+                "update manual_search_runs set request_key=null where request_key=? and expires_at<=?",
+                (request_key, ts),
+            )
         recent = con.execute(
             "select count(*) as count from manual_search_runs where requested_by=? and created_at>=?",
             (requested_by or "anonymous", ts - DEFAULT_RATE_LIMIT_WINDOW_SECONDS),
@@ -1154,27 +1242,29 @@ def create_search_run(
             return {"ok": False, "reason": "manual_search_rate_limited", "retry_after_seconds": DEFAULT_RATE_LIMIT_WINDOW_SECONDS}
         context = _search_context(con, series_id, issue_id, singleton_context=singleton_context)
         run_id = f"manual-search:{uuid.uuid4()}"
-        request = {
-            "series_id": series_id,
-            "edition_id": edition_id,
-            "issue_id": issue_id,
-            "unit_id": unit_id,
-            "provider_selection": providers,
-            "source_profile_id": profile.get("id"),
-            "force_refresh": bool(force_refresh),
-            "include_rejected": bool(include_rejected),
-            "pack_allowed": allow_pack,
-        }
-        con.execute(
-            """
+        try:
+            con.execute(
+                """
             insert into manual_search_runs(id,series_id,edition_id,issue_id,unit_id,requested_by,state,source_profile_id,
-              provider_selection_json,request_json,context_json,include_rejected,pack_allowed,force_refresh,deadline_at,expires_at,created_at,updated_at)
-            values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              provider_selection_json,request_json,context_json,include_rejected,pack_allowed,force_refresh,deadline_at,expires_at,created_at,updated_at,request_key)
+            values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (run_id, series_id, edition_id, issue_id or None, unit_id or None,
-             requested_by or "anonymous", "queued", profile.get("id"), _dump(providers), _dump(request), _dump(context),
-             int(include_rejected), int(allow_pack), int(force_refresh), ts + timeout, ts + DEFAULT_RUN_RETENTION_SECONDS, ts, ts),
-        )
+                (run_id, series_id, edition_id, issue_id or None, unit_id or None,
+                 requested_by or "anonymous", "queued", profile.get("id"), _dump(providers), _dump(request), _dump(context),
+                 int(include_rejected), int(allow_pack), int(force_refresh), ts + timeout, ts + DEFAULT_RUN_RETENTION_SECONDS, ts, ts,
+                 request_key),
+            )
+        except sqlite3.IntegrityError:
+            # Two identical requests raced and the other one won the unique
+            # index. That is the concurrency case working, not an error: read
+            # back the winner and answer with it, so both callers get the same
+            # run and only one provider fanout ever happens.
+            existing = con.execute(
+                "select * from manual_search_runs where request_key=?", (request_key,)
+            ).fetchone()
+            if existing:
+                return _replay(existing)
+            raise
         _record_history(
             con,
             event_type="manual_search_started",

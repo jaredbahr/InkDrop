@@ -240,19 +240,45 @@
    the same as every other status surface in the app; nothing here introduces a
    new palette. */
 
+/* --inkdrop-island-fill-height is the real distance from the top of the rows
+   box to the bottom of the window, measured live by the React bridge
+   (web/frontend/src/viewportFill.ts) and published on the mount container.
+
+   It replaces a flat `calc(100vh - 220px)`: the chrome above the rows box
+   measures ~104px, not 220px, so the pane used to overshoot the fold by ~150px,
+   the document grew a second scrollbar behind the pane's own, and whichever row
+   straddled the fold was left sliced through its cover art. The literal below
+   is only the one frame before the first measurement lands.
+
+   Any island that wants a self-scrolling pane should size off this variable
+   rather than doing its own viewport arithmetic. */
 .inkdrop-series-poster-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  /* One row, allowed to shrink: the grid pane and the alphabet rail both live
+     inside the pane's height instead of the taller of the two setting it.
+     The rail is 26 buttons tall and used to win, which is what pushed the
+     container past the fold and left dead space under the clipped row. */
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
+  height: var(--inkdrop-island-fill-height, calc(100vh - 220px));
+  min-height: 320px;
 }
 
 /* Virtuoso scroller: own real height (useWindowScroll collapses to ~1 row
    in this app's auto-height layout). !important beats its inline style. */
-.inkdrop-series-grid-scroller,
+.inkdrop-series-grid-scroller {
+  min-width: 0;
+  height: 100% !important;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* The table view has no rail beside it, so it is its own fill-height pane. */
 .inkdrop-series-virtual-scroller {
   min-width: 0;
-  height: calc(100vh - 220px) !important;
+  height: var(--inkdrop-island-fill-height, calc(100vh - 220px)) !important;
   min-height: 320px;
   overflow-y: auto;
 }
@@ -384,15 +410,25 @@
 /* Kept exposed down the right-hand edge of the grid rather than tucked into a
    menu: 378 series with no fast jump is a long scroll. */
 .inkdrop-series-alpha-rail {
-  position: sticky;
-  top: 8px;
   display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 1px;
   justify-items: center;
+  /* Sits inside the pane's height now, so a 26-letter rail can never be what
+     decides how tall the pane is. If it ever does outgrow the pane (a very
+     short window), it scrolls itself rather than pushing the grid off-screen. */
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .inkdrop-series-alpha-rail button {
   min-width: 20px;
+  /* `height`, not just `min-height`: the global `input, select, button` rule
+     sets a hard height: 38px, which min-height alone does not override. That
+     made every rail button 38px instead of 17px and the whole rail 1013px --
+     the height that was displacing the grid. */
+  height: auto;
   min-height: 17px;
   padding: 0 3px;
   border: 0;
@@ -483,7 +519,11 @@
    than disappearing -- the jump is the point of it. */
 @media (max-width: 760px) {
   .inkdrop-series-poster-layout {
+    /* Grid pane takes the room the strip leaves, so both stay on screen --
+       before this the strip was laid out under a pane that already reached
+       the bottom of the window, i.e. always past the fold. */
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
   }
 
   .inkdrop-series-grid {
@@ -492,11 +532,13 @@
   }
 
   .inkdrop-series-alpha-rail {
-    position: static;
     grid-auto-flow: column;
+    grid-auto-columns: max-content;
+    align-content: center;
     justify-content: start;
     gap: 2px;
     overflow-x: auto;
+    overflow-y: hidden;
     padding-bottom: 4px;
   }
 
@@ -518,6 +560,12 @@
   font-weight: var(--weight-semibold, 700);
   letter-spacing: .08em;
   text-transform: uppercase;
+  background: var(--panel-2);
+}
+.history-row {
+  cursor: pointer;
+}
+.history-row:hover {
   background: var(--panel-2);
 }
 .history-col-time {
@@ -741,9 +789,8 @@
   }
   /* History card specifics: the day header row is a section divider, not a
      card; the expanded detail row reads as part of its parent card. The
-     chevron is the only disclosure control (rows themselves aren't
-     clickable, desktop or mobile), so it must stay visible and tappable
-     here -- keep it right-aligned as its own line rather than hiding it. */
+     whole card is clickable (see .history-row above), but the chevron stays
+     as a visible tap target of its own rather than hiding it. */
   .history-day-row {
     margin: 0 0 8px;
     padding: 0 2px 4px;

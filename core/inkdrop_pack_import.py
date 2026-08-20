@@ -21,6 +21,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from core import inkdrop_bounded_read
 from core import inkdrop_runtime_config
 from core import inkdrop_library_frontends
 from core import inkdrop_artifact_acceptance
@@ -664,19 +665,12 @@ def append_manual_review(reason, payload, db_path=None):
     try:
         from core import inkdrop_notifications
         # Callers should pass db_path explicitly (every real call site now does),
-        # but this fallback is what actually prevents a silent no-delivery repeat
-        # of the bug this replaced -- notify_manual_review() no-ops on db_path=None
-        # with no error, so an eventual new call site that forgets db_path would
+        # but fallback_db_path is what actually prevents a silent no-delivery
+        # repeat of the bug this replaced -- dispatch no-ops on db_path=None with
+        # no error, so an eventual new call site that forgets db_path would
         # otherwise fail exactly as silently as every existing one did.
-        inkdrop_notifications.notify_manual_review(
-            db_path if db_path is not None else INKDROP_STATE_DB,
-            reason=reason,
-            series=payload.get("series") or payload.get("matched_series"),
-            source=payload.get("source"),
-            detail=payload.get("detail"),
-            note=payload.get("note"),
-            series_id=payload.get("series_id") or payload.get("native_series_id"),
-            issue_id=payload.get("issue_id"),
+        inkdrop_notifications.notify_manual_review_from_payload(
+            db_path, reason, payload, fallback_db_path=INKDROP_STATE_DB
         )
     except Exception:
         pass
@@ -2219,7 +2213,12 @@ def sab_history_slots(settings, nzo_ids=None, limit=200, timeout=8):
     url = f"{host}/api?{urllib.parse.urlencode(params)}"
     try:
         with urllib.request.urlopen(url, timeout=max(1, min(float(timeout or 8), 30))) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            payload = inkdrop_bounded_read.bounded_read_json(
+                response,
+                inkdrop_bounded_read.LOCAL_CLIENT_JSON_MAX_BYTES,
+                label="SAB history",
+                default={},
+            )
     except Exception as exc:
         log({"event": "pack_sab_history_lookup_failed", "error": f"{type(exc).__name__}: {exc}"})
         return []
@@ -3122,11 +3121,20 @@ def comicinfo_xml(series, number, title=None, year=None, unit_type="volume"):
         value = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         return f"  <{name}>{value}</{name}>\n"
     unit_type = str(unit_type or "volume").strip().lower()
-    display_number = int(float(number))
+    numeric = float(number)
+    display_number = int(numeric)
     if unit_type == "chapter":
-        number_nodes = f"{node('Number', f'{display_number:03d}')}"
+        # A split chapter has to keep its fraction. int(float("56.2")) is 56,
+        # which labelled Deadman Wonderland chapter 56.2 as chapter 56 -- a
+        # silent collision with the real chapter 56 in the reader, not a crash,
+        # so nothing ever surfaced it.
+        whole, dot, frac = str(number).strip().partition(".")
+        frac = frac.rstrip("0") if dot else ""
+        padded = f"{display_number:03d}" + (f".{frac}" if frac else "")
+        chapter_display = str(display_number) + (f".{frac}" if frac else "")
+        number_nodes = f"{node('Number', padded)}"
         format_name = "Manga Chapter"
-        default_title = f"Chapter {display_number}"
+        default_title = f"Chapter {chapter_display}"
     else:
         number_nodes = f"{node('Volume', display_number)}"
         format_name = "Manga"

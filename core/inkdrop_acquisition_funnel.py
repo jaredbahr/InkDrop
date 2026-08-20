@@ -10,9 +10,11 @@ if str(_ROOT) not in _sys.path:
 
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -512,6 +514,54 @@ def _mixed_recovery_cohort(units, target=50):
     return selected, shortfalls
 
 
+# How often SQLite calls the progress handler, in virtual-machine steps. Small
+# enough that a deadline is honoured promptly, large enough that the callback
+# is not itself a measurable cost on a multi-second scan.
+SQL_PROGRESS_HANDLER_STEPS = 25_000
+
+# Ceiling on the read transaction's lifetime. This bounds the checkpoint
+# horizon the Missing Recovery dashboard can hold: the SQL phase is documented
+# at 8-37 seconds observed, so the default leaves real headroom above the
+# measured worst case while still refusing to hold a snapshot indefinitely.
+# Raising it is a deliberate operator choice, not something the code drifts
+# into.
+DEFAULT_MISSING_BACKLOG_SQL_DEADLINE_SECONDS = 90.0
+
+
+def missing_backlog_sql_deadline_seconds():
+    try:
+        value = float(
+            os.environ.get("INKDROP_MISSING_BACKLOG_SQL_DEADLINE_SECONDS")
+            or DEFAULT_MISSING_BACKLOG_SQL_DEADLINE_SECONDS
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_MISSING_BACKLOG_SQL_DEADLINE_SECONDS
+    # A deadline of zero would abort before the first statement and a negative
+    # one is meaningless; clamp rather than let a typo disable the dashboard.
+    return max(1.0, min(value, 3600.0))
+
+
+def _emit_missing_backlog_sql_timing(elapsed_seconds, row_count, outcome, *, deadline=None):
+    """Emit what the transaction cost. Absent before: a three-hour log search
+    for this phase's duration found no timing event at all, so an 8-37 second
+    snapshot hold was invisible to anyone not reading the source."""
+    parts = [
+        "missing_backlog_accounting_sql",
+        "outcome=%s" % outcome,
+        "elapsed_seconds=%.3f" % float(elapsed_seconds or 0.0),
+        # Unknown rather than 0 when the transaction was cut short: nothing has
+        # counted the rows yet at that point, and reporting 0 would read as "it
+        # found nothing" instead of "it did not finish".
+        "rows=%s" % ("unknown" if row_count is None else int(row_count)),
+    ]
+    if deadline is not None:
+        parts.append("deadline_seconds=%.1f" % float(deadline))
+    try:
+        print(" ".join(parts), flush=True)
+    except Exception:
+        pass
+
+
 def build_missing_backlog_accounting(
     db_path, cohort_size=200, recovery_cohort_size=50, now=None, token_salt="private-audit"
 ):
@@ -528,13 +578,48 @@ def build_missing_backlog_accounting(
     started = time.perf_counter()
     snapshot_stat = path.stat()
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=5.0) as con:
+    sql_deadline_seconds = missing_backlog_sql_deadline_seconds()
+    sql_started = time.monotonic()
+    # contextlib.closing() is the difference between "the transaction ended" and
+    # "the handle is gone". `with sqlite3.connect(...) as con` only ends the
+    # transaction; the connection object survives to function return, so the
+    # read snapshot's owner outlived the SQL phase by the whole CPU
+    # classification below. Closing explicitly makes the checkpoint horizon this
+    # function holds end when its SQL does, on the exception path too.
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as con, con:
         con.row_factory = sqlite3.Row
         con.create_function(
             "inkdrop_concrete_safe_candidate", 8, _concrete_safe_candidate_count
         )
         con.execute("pragma query_only=1")
         con.execute("pragma busy_timeout=3000")
+
+        # The cancellation path this transaction did not have. Single-flight
+        # bounds how MANY of these run, never how long one runs, so a stalled
+        # dashboard thread could hold the checkpoint horizon for the lifetime
+        # of its web thread purely by contract -- documented at 8-37 seconds
+        # observed, with no upper bound in the code. SQLite calls this handler
+        # every N virtual-machine steps and aborts the running statement when
+        # it returns non-zero, which is the only way to interrupt a long read
+        # from inside its own thread.
+        # Deliberately not wrapped in try/except here: the interrupt is raised
+        # as sqlite3.OperationalError and left to propagate. The caller
+        # (spawn_missing_recovery_status_refresh) already catches, caches a
+        # failure payload and keeps serving the previous snapshot flagged
+        # stale, which is the honest outcome. Returning a half-materialized
+        # accounting would be worse than saying the refresh did not finish.
+        def _abort_when_past_deadline(_state={"logged": False}):
+            elapsed = time.monotonic() - sql_started
+            if elapsed > sql_deadline_seconds:
+                if not _state["logged"]:
+                    _state["logged"] = True
+                    _emit_missing_backlog_sql_timing(
+                        elapsed, None, "deadline_exceeded",
+                        deadline=sql_deadline_seconds)
+                return 1
+            return 0
+
+        con.set_progress_handler(_abort_when_past_deadline, SQL_PROGRESS_HANDLER_STEPS)
         con.execute("begin")
         canonicalization = dict(
             con.execute(
@@ -853,6 +938,12 @@ def build_missing_backlog_accounting(
                    where accepted=1 and acquisition_capability='automatic'"""
             ).fetchone()
         )
+    # The SQL phase is over and the connection is closed by contextlib.closing();
+    # everything below is CPU-only classification and holds no read snapshot.
+    _emit_missing_backlog_sql_timing(
+        time.monotonic() - sql_started, len(units), "completed",
+        deadline=sql_deadline_seconds)
+
     for unit in units:
         queue = queues.get(unit["wanted_id"])
         if unit["unit_type"] == "unknown" and queue and queue["queue_unit_type"]:

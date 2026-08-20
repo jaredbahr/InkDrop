@@ -8,6 +8,11 @@ import json
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.inkdrop_text_output import write_text_lf
 
 SCHEMA_VERSION = 1
 DEFAULT_SERVICE_NAME = "inkdrop"
@@ -199,7 +204,9 @@ def write_overlay_if_requested(args, report):
         return report
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text((report.get("proposed_service_block") or "") + "\n", encoding="utf-8")
+    # A Compose overlay is fed straight back to `docker compose -f`; keep it
+    # LF so a plan written on Windows is byte-identical to one written on Linux.
+    write_text_lf(output_path, (report.get("proposed_service_block") or "") + "\n")
     report["output_written"] = True
     report["output_path"] = str(output_path)
     report["next_step"] = (

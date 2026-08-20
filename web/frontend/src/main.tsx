@@ -9,6 +9,7 @@ import { ManualReview } from "./sections/ManualReview";
 import { Series } from "./sections/Series";
 import { SeriesDetail } from "./sections/SeriesDetail";
 import { ReliabilityView } from "./sections/ReliabilityView";
+import { releaseViewportFill, trackViewportFill } from "./viewportFill";
 
 // Bridge between the existing vanilla-JS shell (inkdrop_web.py's inline
 // renderInkdropSection) and React. The shell owns navigation, the section
@@ -55,11 +56,16 @@ function mount(sectionKey: string, container: Element, payload: SectionPayload):
     root = createRoot(container);
     roots.set(container, root);
   }
+  // Publish how much room this container actually has before the bottom of the
+  // window. Sections with a self-scrolling pane size off it; the rest ignore
+  // it. See viewportFill.ts for why it is measured rather than assumed.
+  trackViewportFill(container);
   root.render(<Component payload={payload} />);
   return true;
 }
 
 function unmount(container: Element): void {
+  releaseViewportFill(container);
   const root = roots.get(container);
   if (!root) return;
   root.unmount();

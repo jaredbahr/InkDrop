@@ -49,6 +49,23 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.12",
+      slug: "v0-1-12",
+      released_at: "2026-08-19",
+      title: "Screens that were telling you things that weren't true",
+      summary: "Mostly corrections. A few screens were confidently telling you things that weren't true — what got searched, what was actually downloading, what a backup brings back. They've stopped. If books have been stuck in Wanted or Queue for weeks, this one's worth taking.",
+      highlights: [
+        "Wanted now tells you why something hasn't arrived, instead of a catch-all \"no source found yet\"",
+        "Five search bugs fixed — wrong issue numbers, wrong years, dropped volume markers",
+        "Downloads no longer stick on \"Importing\" forever",
+        "\"Actively processing\" now means something is actually happening",
+        "Mobile home shows your series, instead of a download-client list that was counting wrong",
+        "\"Compare & Merge\" is now just Compare — it won't merge anything on its own",
+        "New report showing where your library and your database disagree",
+        "Restoring a backup doesn't bring back your passwords — you'll re-enter those"
+      ]
+    }),
+    publicRelease({
       version: "v0.1.11",
       slug: "v0-1-11",
       released_at: "2026-08-14",
@@ -194,20 +211,6 @@
         "Searches for licensed creator-credit titles (like \"Naoki Urasawa's Monster\") now try the title people actually share files under, instead of spending the whole budget on one nobody uses.",
         "A volume/print-run marker like \"v1 #19\" no longer gets treated as a mismatch when it's exactly the issue you wanted — that was silently blocking real grabs.",
         "The System page no longer hangs on a silent \"Loading...\" if a request stalls; you'll see what failed instead."
-      ]
-    }),
-    publicRelease({
-      version: "v0.1.02",
-      slug: "v0-1-02",
-      released_at: "2026-08-01",
-      title: "Searches that found nothing now work",
-      summary: "Several separate faults could each stop a series from ever getting a search result. If something has sat in Wanted with no explanation, this build is worth trying.",
-      highlights: [
-        "Searches run properly again, and reuse a recent result instead of asking twice for the same thing.",
-        "Volumes and chapters match correctly, and ordinary comic filenames are no longer rejected.",
-        "A failed archive read could be remembered as having no metadata for two weeks, and the wrong issue imported afterwards.",
-        "A CBR import could crash after copying the file and mark a good file as bad.",
-        "qBittorrent supports API keys. MangaDex mature content is ranked, not hidden."
       ]
     })
   ]);

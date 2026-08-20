@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
+from core import inkdrop_bounded_read
 from core import inkdrop_runtime_config
 from core import inkdrop_internal_jobs
 from core import inkdrop_artifact_acceptance
@@ -1728,8 +1729,17 @@ def targeted_waiting_detected_files(probe, item, record):
     return rows[:8]
 
 
+TRANSFER_STAGED_LOOKUP_STATUSES = {"transfer_succeeded", "transfer_evidence_expired"}
+
+
 def transfer_local_path_candidates(probe, record, transfer):
-    if not isinstance(transfer, dict) or transfer.get("status") != "transfer_succeeded":
+    # Expired evidence belongs here too. The caller promises a completed
+    # transfer "one real look on disk first" before retiring it, and that look
+    # is this function -- with only transfer_succeeded accepted, the look was
+    # dead code for exactly the status it was written to protect, and an
+    # expired transfer whose file was still staged never got the chance to
+    # import.
+    if not isinstance(transfer, dict) or transfer.get("status") not in TRANSFER_STAGED_LOOKUP_STATUSES:
         return []
     root = Path(getattr(probe, "SLSKD_DOWNLOAD_ROOT", SLSKD_DOWNLOAD_ROOT))
     filename_value = transfer.get("filename") or record.get("filename")
@@ -2202,6 +2212,14 @@ def mark_manual_source_candidate_bad(review_id, record, detected, reason, transf
         ),
         "ts": now(),
         "ts_iso": utc_stamp(),
+        # How long this candidate has been bad, and how often it has been
+        # re-confirmed, are what repeat_bad_candidate_park_reason() needs to
+        # decide a file is never going to import and should surface for a
+        # human instead. `ts` alone cannot answer that: the merge below
+        # refreshes it on every re-mark, so it tracks the last rejection, not
+        # the first. first_seen_at is written once and carried forward.
+        "first_seen_at": now(),
+        "failure_count": 1,
     }
     for key in CONTEXT_FIELDS:
         value = (record or {}).get(key)
@@ -2216,6 +2234,26 @@ def mark_manual_source_candidate_bad(review_id, record, detected, reason, transf
             continue
         merged = dict(row)
         merged.update({key: value for key, value in entry.items() if value not in (None, "")})
+        try:
+            previous_first_seen = float(row.get("first_seen_at") or 0)
+        except (TypeError, ValueError):
+            previous_first_seen = 0
+        if previous_first_seen <= 0:
+            # Pre-existing rows predate first_seen_at. Their `ts` is the last
+            # rejection we know of, which is the oldest evidence available --
+            # anchoring there keeps real history instead of restarting the
+            # clock at zero the first time this code touches an old row.
+            try:
+                previous_first_seen = float(row.get("ts") or 0)
+            except (TypeError, ValueError):
+                previous_first_seen = 0
+        if previous_first_seen >= PLAUSIBLE_EPOCH_FLOOR_SECONDS:
+            merged["first_seen_at"] = previous_first_seen
+        try:
+            previous_failures = int(row.get("failure_count") or 0)
+        except (TypeError, ValueError):
+            previous_failures = 0
+        merged["failure_count"] = max(1, previous_failures) + 1
         rows[index] = merged
         updated_existing = True
         break
@@ -2763,7 +2801,157 @@ def recovery_failure_reason(row):
     return ""
 
 
-def waiting_candidate_known_bad(probe, review_id, detected):
+IDENTITY_VERDICT_REDERIVE_EXCLUDED_REASONS = frozenset({
+    # The transient set already has its own TTL retry
+    # (transient_bad_candidate_retry_ready). These are about the transfer, not
+    # about what the file IS, so re-deriving identity says nothing about them.
+    "resolver_error",
+    "slskd_transfer_failed",
+    "slskd_transfer_missing_staged_file",
+    "slskd_transfer_stalled",
+})
+
+
+CONTENT_DIGEST_RE = re.compile(r"^(?:sha256|sha1|md5|blake2b|blake2s):[0-9a-f]{16,}$", re.I)
+
+
+def looks_like_a_content_digest(value):
+    """A `path` that is really a hash, not a path.
+
+    Production emits `path` as a content digest on staged slskd rows -- the
+    live example is `sha256:b798f48c...` beside a perfectly good `filename`.
+    Handing that to the matcher as identity text asks it to find a volume
+    number in a hash, which it correctly cannot, so the candidate reads as
+    incompatible and its stale refusal is honoured forever.
+    """
+    return bool(CONTENT_DIGEST_RE.match(str(value or "").strip()))
+
+
+def candidate_identity_text_for_rederive(detected, record):
+    """The text to judge this candidate by, never a digest.
+
+    Two halves, and both are needed. The name fields come FIRST because they
+    are the ones that actually carry identity -- reading `path` first is what
+    fed the matcher a hash and left 23 of 73 skipping groups unfixed while 50
+    cleared, a split entirely explained by whether `path` happened to hold real
+    text. And `path` is still rejected when it is plainly a digest, because
+    reordering alone leaves the hash reachable the moment the name fields are
+    empty: the same bug, waiting.
+    """
+    detected = detected or {}
+    record = record or {}
+    for value in (
+        detected.get("filename"),
+        record.get("candidate_filename"),
+        detected.get("remote_filename"),
+        detected.get("title"),
+        detected.get("path"),
+        detected.get("source_path"),
+    ):
+        text = str(value or "").strip()
+        if text and not looks_like_a_content_digest(text):
+            return text
+    return ""
+
+
+def stored_identity_verdict_is_stale(probe, record, detected, known_bad):
+    """Would today's matcher still refuse the file this verdict refused?
+
+    The objection to re-deriving an identity verdict is that a file's identity
+    does not change, so its verdict should not expire. That is true and beside
+    the point: the verdict is not stale because the FILE changed, it is stale
+    because OUR CONTRACT changed. Measured live 2026-08-19 -- a stored refusal
+    reading "missing issue/part, volume, or issue-title evidence" about
+    `Yona of the Dawn v11 (2018) (Digital) (1r0n) (f).cbz`, which today's
+    matcher parses as volume_number=11 and calls `compatible` with positive
+    `exact_volume_number`. It had been re-skipped 1,283 times over 13.8 days.
+
+    Every matcher fix invalidates some stored identity verdicts, and nothing
+    re-derived them -- which is why this class only becomes visible after the
+    matcher improves.
+
+    Answers "should we still skip", never "should we accept". A stale verdict
+    returns the candidate to the ordinary acceptance path, gates intact.
+    """
+    if not isinstance(known_bad, dict):
+        return False
+    reason = str(known_bad.get("reason") or "").strip()
+    if reason in IDENTITY_VERDICT_REDERIVE_EXCLUDED_REASONS:
+        return False
+    queue_id = str((record or {}).get("queue_key") or "").strip()
+    if not queue_id:
+        return False
+    checker = getattr(probe, "candidate_identity_compatibility", None)
+    if not callable(checker):
+        return False
+    try:
+        from core import inkdrop_source_worker_coordinator
+    except Exception:
+        return False
+    try:
+        with inkdrop_state.connect_read(INKDROP_STATE_DB) as con:
+            con.row_factory = sqlite3.Row
+            queue_row = con.execute(
+                """
+                select q.*, s.title as series, s.media_type as media_type,
+                       i.title as issue_title, i.issue_number as issue_number,
+                       i.release_date as issue_release_date,
+                       i.metadata_provider as issue_metadata_provider,
+                       s.metadata_provider as metadata_provider
+                from queue_items q
+                left join series s on s.id=q.series_id
+                left join issues i on i.id=q.issue_id
+                where q.id=? limit 1
+                """,
+                (queue_id,),
+            ).fetchone()
+            if not queue_row:
+                return False
+            wanted = inkdrop_source_worker_coordinator.wanted_item_from_queue(dict(queue_row), con=con)
+    except Exception:
+        return False
+    if not wanted:
+        return False
+    filename = candidate_identity_text_for_rederive(detected, record)
+    if not filename:
+        return False
+    try:
+        verdict, _identity = checker(detected or {}, filename, wanted)
+    except Exception:
+        return False
+    if not isinstance(verdict, dict):
+        return False
+    # Only a clean pass reopens it. A review verdict is not "we were wrong to
+    # refuse this", and treating it as one would walk a file back into the
+    # acceptance path on weaker evidence than the refusal it replaces.
+    return (
+        str(verdict.get("status") or "") == "compatible"
+        and not (verdict.get("rejection_codes") or [])
+        and not (verdict.get("review_codes") or [])
+    )
+
+
+def waiting_known_bad_disposition(probe, review_id, chosen, record, transfer):
+    """Is this staged candidate still known-bad, and is its evidence expired?
+
+    Extracted from run() so the decision is reachable by a test. While it lived
+    inline, dropping `record` from the call changed no observable behaviour and
+    no mutation could bite -- the seam was guarded by a required argument but
+    not covered by anything. Returns (known_bad_or_None, evidence_expired).
+    """
+    known_bad = waiting_candidate_known_bad(probe, review_id, chosen, record)
+    if not known_bad:
+        return None, False
+    expired = bool(transfer and transfer.get("status") == "transfer_evidence_expired")
+    return known_bad, expired
+
+
+def waiting_candidate_known_bad(probe, review_id, detected, record):
+    # `record` is required, not defaulted. It carries the queue_key the
+    # re-derivation needs, and a default of None would let a caller drop it
+    # silently: the re-derivation would never run and nothing would fail.
+    # Confirmed by mutation -- removing it from the call site produced no test
+    # failure at all, so the signature is what makes that omission loud.
     """Has this exact staged file already been marked bad for this review?
 
     A rejected candidate is recorded via mark_manual_source_candidate_bad, but
@@ -2779,9 +2967,15 @@ def waiting_candidate_known_bad(probe, review_id, detected):
     if not callable(bad_match):
         return None
     try:
-        return bad_match(review_id, detected)
+        known_bad = bad_match(review_id, detected)
     except Exception:
         return None
+    if known_bad and stored_identity_verdict_is_stale(probe, record, detected, known_bad):
+        # Do not skip. The candidate goes back to the ordinary acceptance path
+        # and is judged by today's contract with every gate still in front of
+        # it -- this never marks anything satisfied.
+        return None
+    return known_bad
 
 
 REPEAT_BAD_CANDIDATE_PARK_FAILURE_THRESHOLD = 12
@@ -2793,10 +2987,16 @@ def repeat_bad_candidate_park_reason(known_bad):
     enough that re-detecting and re-skipping it every pass, forever, stops
     being useful and should instead surface for a human decision?
 
-    `known_bad` is durable bad-source-candidate memory (failure_count/
-    first_seen_at persist across passes in bad_source_candidates), not the
-    short-lived in-process runtime cache, so these numbers reflect real
-    history, not one pass's noise.
+    `known_bad` is durable bad-candidate memory, not the short-lived
+    in-process runtime cache, so these numbers reflect real history rather
+    than one pass's noise. Two shapes reach here and they name their history
+    differently: rows from the `bad_source_candidates` table carry
+    failure_count/first_seen_at, while the per-review rows written by
+    mark_manual_source_candidate_bad() carry `ts`/`ts_iso`. Reading only the
+    table's field names left every per-review row scoring 0 failures and age
+    0, so this returned None for them unconditionally and the file was
+    re-detected and re-skipped every pass forever with nothing surfaced --
+    confirmed live on 20 rows stuck up to 226h, none of which ever parked.
     """
     if not isinstance(known_bad, dict):
         return None
@@ -2804,10 +3004,22 @@ def repeat_bad_candidate_park_reason(known_bad):
         failure_count = int(known_bad.get("failure_count") or 0)
     except (TypeError, ValueError):
         failure_count = 0
-    try:
-        first_seen_at = float(known_bad.get("first_seen_at") or 0)
-    except (TypeError, ValueError):
-        first_seen_at = 0
+    first_seen_at = 0
+    for key in ("first_seen_at", "ts"):
+        try:
+            value = float(known_bad.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        # A stored timestamp below the plausible epoch floor is not a date --
+        # it is a row whose timestamp was never really written. Treating it as
+        # one would park every such candidate instantly on fake age.
+        if value >= PLAUSIBLE_EPOCH_FLOOR_SECONDS:
+            first_seen_at = value
+            break
+    if first_seen_at <= 0:
+        parsed = parse_slskd_time(known_bad.get("ts_iso"))
+        if parsed and parsed >= PLAUSIBLE_EPOCH_FLOOR_SECONDS:
+            first_seen_at = float(parsed)
     if failure_count <= 0 and first_seen_at <= 0:
         return None
     if failure_count >= REPEAT_BAD_CANDIDATE_PARK_FAILURE_THRESHOLD:
@@ -3344,7 +3556,13 @@ def slskd_get_json(path):
         raise RuntimeError("slskd API key not found")
     request = urllib.request.Request(require_slskd_base_url() + path, headers={"X-API-Key": key})
     with urllib.request.urlopen(request, timeout=20) as response:
-        body = response.read().decode("utf-8")
+        body = inkdrop_bounded_read.bounded_read_text(
+            response,
+            inkdrop_bounded_read.LOCAL_CLIENT_JSON_MAX_BYTES,
+            label="slskd API",
+            encoding="utf-8",
+            errors="strict",
+        )
     return json.loads(body) if body else None
 
 
@@ -3359,7 +3577,13 @@ def slskd_request_json(method, path, payload=None, timeout=20):
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(require_slskd_base_url() + path, data=data, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8")
+        body = inkdrop_bounded_read.bounded_read_text(
+            response,
+            inkdrop_bounded_read.LOCAL_CLIENT_JSON_MAX_BYTES,
+            label="slskd API",
+            encoding="utf-8",
+            errors="strict",
+        )
     return json.loads(body) if body else {}
 
 
@@ -3632,6 +3856,54 @@ def waiting_status_row(review_id, record, reason, *, source="waiting", status=No
         for key, value in row.items()
         if value not in (None, "", [], {})
     }
+
+
+def expired_transfer_evidence_reason(transfer, detail):
+    """Say what expired and what the staged file on disk turned out to be.
+
+    The leading clause is load-bearing: classify_candidate_failure() reads this
+    text, not the status, and keys the expiry off "no longer has any record of
+    this transfer". Reword that and the failure classifies as something else,
+    the candidate stops counting as bad, and the retirement below never runs.
+    """
+    age_hours = int((transfer or {}).get("recorded_snapshot_age_seconds") or 0) // 3600
+    return (
+        f"SLSKD no longer has any record of this transfer and {detail} "
+        f"(last seen {age_hours}h ago)"
+    )
+
+
+def expired_transfer_evidence_skip(args, result, review_id, record, source, transfer, detail):
+    """Retire a candidate whose recorded completion is too old to replay.
+
+    Every caller reaches this having already established that the pass will not
+    import from this transfer -- either nothing on disk belongs to it, or the
+    file it did leave staged is the wrong artifact.
+
+    Reporting the expiry here rather than whatever rejected the staged file is
+    the whole point: retire_expired_transfer_evidence_download_tasks() closes
+    the download_task out only for status='transfer_evidence_expired'. Any
+    other terminal status leaves the row selectable, so the next pass rebuilds
+    the same dead candidate from it -- which is how these rows survived for
+    weeks, re-deriving the same rejection thousands of times.
+    """
+    reason = expired_transfer_evidence_reason(transfer, detail)
+    record_slskd_learning(record, None, False, reason, review_id)
+    skip = waiting_status_row(
+        review_id,
+        record,
+        reason,
+        source=source,
+        status="transfer_evidence_expired",
+        transfer=transfer,
+    )
+    recovery = recover_failed_waiting_candidate(
+        args, result, review_id, record, None, reason, transfer=transfer
+    )
+    if recovery:
+        skip["recovery"] = recovery
+    result["skipped"].append(skip)
+    return skip
 
 
 def cancel_superseded_slskd_transfer(result, review_id, record, row, detected=None):
@@ -5705,26 +5977,15 @@ def run(args):
                     skip["recovery"] = recovery
                 result["skipped"].append(skip)
             elif transfer and transfer.get("status") == "transfer_evidence_expired":
-                age_hours = int((transfer.get("recorded_snapshot_age_seconds") or 0) // 3600)
-                reason = (
-                    "SLSKD no longer has any record of this transfer and the file it staged is not "
-                    f"on disk (last seen {age_hours}h ago)"
-                )
-                record_slskd_learning(record, None, False, reason, review_id)
-                skip = waiting_status_row(
+                expired_transfer_evidence_skip(
+                    args,
+                    result,
                     review_id,
                     record,
-                    reason,
-                    source=source,
-                    status="transfer_evidence_expired",
-                    transfer=transfer,
+                    source,
+                    transfer,
+                    "the file it staged is not on disk",
                 )
-                recovery = recover_failed_waiting_candidate(
-                    args, result, review_id, record, None, reason, transfer=transfer
-                )
-                if recovery:
-                    skip["recovery"] = recovery
-                result["skipped"].append(skip)
             elif transfer and transfer.get("status") == "transfer_lookup_error":
                 result["skipped"].append(waiting_status_row(
                     review_id,
@@ -5846,6 +6107,21 @@ def run(args):
                             rejections=filename_rejections[:5],
                         ))
                         continue
+                    if transfer_status == "transfer_evidence_expired":
+                        # Staged files exist, but none of them is the file this
+                        # transfer was bringing. Without this the expiry fell
+                        # through to the generic branch below and reported
+                        # transfer_stale_unknown, which retires nothing.
+                        expired_transfer_evidence_skip(
+                            args,
+                            result,
+                            review_id,
+                            record,
+                            source,
+                            transfer,
+                            "nothing staged on disk is the file it was bringing",
+                        )
+                        continue
                     if transfer_status != "transfer_succeeded":
                         stale_reason = stale_waiting_failure_reason(record, transfer, stall_policy)
                         if stale_reason:
@@ -5945,7 +6221,25 @@ def run(args):
                 path=(chosen or {}).get("path"),
             ))
             continue
-        known_bad = waiting_candidate_known_bad(probe, review_id, chosen)
+        known_bad, known_bad_evidence_expired = waiting_known_bad_disposition(
+            probe, review_id, chosen, record, transfer
+        )
+        if known_bad and known_bad_evidence_expired:
+            # The staged file got its real look and is the wrong artifact, and
+            # the completion that produced it expired weeks ago. Reporting only
+            # the bad candidate is what kept these rows alive: it retires
+            # nothing, so the same file was re-judged and re-skipped on every
+            # pass forever. Retire the dead evidence instead.
+            expired_transfer_evidence_skip(
+                args,
+                result,
+                review_id,
+                record,
+                source,
+                transfer,
+                known_bad.get("detail") or known_bad.get("reason") or "the file it staged is the wrong one",
+            )
+            continue
         if known_bad:
             result["skipped"].append(waiting_status_row(
                 review_id,
@@ -5963,6 +6257,17 @@ def run(args):
                 )
             continue
         quality_ok, quality_reason = auto_import_quality(chosen, source, item=record, probe_module=probe)
+        if not quality_ok and transfer and transfer.get("status") == "transfer_evidence_expired":
+            expired_transfer_evidence_skip(
+                args,
+                result,
+                review_id,
+                record,
+                source,
+                transfer,
+                quality_reason or "the file it staged is not importable",
+            )
+            continue
         if not quality_ok:
             record_slskd_learning(record, chosen, False, quality_reason, review_id)
             skip = waiting_status_row(

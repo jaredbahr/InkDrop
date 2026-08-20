@@ -28,6 +28,17 @@
     pendingGrabs: new Set(),
     pushedRoute: false,
     returnFocus: null,
+    unselectedProviders: new Set(),
+    // Identifies one logical search across retries. Held here rather than
+    // minted per POST so that a retry after a lost response carries the same
+    // one and the server hands back the original run instead of fanning out
+    // to every provider a second time.
+    requestId: "",
+    // Whether the provider-progress panel is showing live data or the last
+    // thing we managed to fetch. Tracked separately from the data itself so
+    // retaining it (which is right -- blanking the panel mid-run is worse)
+    // cannot be mistaken for it still being current.
+    diagnostics: { available: true, lastSuccessAt: 0, failedAt: 0 },
     sessionId: 0,
     closingSessionId: -1,
   };
@@ -164,6 +175,13 @@
     if (candidate.accepted && candidate.pack_candidate) return { label: "Safe Pack", tone: "good", rank: 1 };
     if (candidate.accepted) return { label: "Safe Match", tone: "good", rank: 0 };
     if (["possible", "possible_match", "review"].includes(raw)) return { label: "Possible Match", tone: "warn", rank: 2 };
+    // "Rejected by policy" is the last branch here, so it used to render for
+    // anything that was not accepted -- including candidates nothing had
+    // actually decided about. An operator reading it went looking for a policy
+    // that did not exist. Only say policy when a reason was recorded.
+    const codes = core.rejection_codes || candidate.rejection_codes || [];
+    const reasons = core.negative_evidence || codes;
+    if (!(reasons && reasons.length)) return { label: "No decision recorded", tone: "bad", rank: 4 };
     return { label: "Rejected by policy", tone: "bad", rank: 4 };
   }
 
@@ -229,14 +247,29 @@
     return [`<option value="">${escapeHtml(emptyLabel)}</option>`, ...values.map((value) => `<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(humanize(value))}</option>`)].join("");
   }
 
+  function diagnosticsStalenessHtml() {
+    if (state.diagnostics?.available !== false) return "";
+    const since = Number(state.diagnostics?.lastSuccessAt || 0);
+    const age = since ? Math.max(0, Math.round((Date.now() - since) / 1000)) : 0;
+    const when = !since
+      ? "Provider progress has not loaded yet."
+      : age < 90
+        ? `Showing provider progress from ${age} second${age === 1 ? "" : "s"} ago.`
+        : `Showing provider progress from ${Math.round(age / 60)} minute${Math.round(age / 60) === 1 ? "" : "s"} ago.`;
+    return `<p class="manual-search-inline-notice" role="status" data-diagnostics-stale>`
+      + `<strong>Provider details unavailable.</strong> ${escapeHtml(when)} `
+      + `The search itself is still running &mdash; this panel is what stopped updating.</p>`;
+  }
+
   function providerProgressHtml() {
-    if (!state.run && !state.attempts.length) return '<p class="manual-search-muted">Search has not started.</p>';
-    if (!state.attempts.length) return `<p class="manual-search-muted">${escapeHtml(statusLabel(state.run?.state))}</p>`;
-    return state.attempts.map((attempt) => {
+    const staleness = diagnosticsStalenessHtml();
+    if (!state.run && !state.attempts.length) return `${staleness}<p class="manual-search-muted">Search has not started.</p>`;
+    if (!state.attempts.length) return `${staleness}<p class="manual-search-muted">${escapeHtml(statusLabel(state.run?.state))}</p>`;
+    return staleness + state.attempts.map((attempt) => {
       const guidance = attemptGuidance(attempt);
       return `
       <label class="manual-search-provider">
-        <input type="checkbox" data-provider-select value="${escapeHtml(attempt.provider_id || "")}" checked>
+        <input type="checkbox" data-provider-select value="${escapeHtml(attempt.provider_id || "")}" ${state.unselectedProviders.has(attempt.provider_id || "") ? "" : "checked"}>
         <span><strong>${escapeHtml(attemptLabel(attempt))}</strong><small>${escapeHtml(attemptState(attempt))}</small>${guidance ? `<small class="manual-search-provider-guidance">${escapeHtml(guidance)}</small>` : ""}</span>
       </label>`;
     }).join("");
@@ -392,14 +425,34 @@
     if (!state.run?.id && !state.run?.run_id) return;
     const runId = state.run.id || state.run.run_id;
     try {
-      const [runData, diagnosticData] = await Promise.all([
+      // A diagnostics failure used to be converted into an empty success, so
+      // the panel silently kept painting whatever it last saw as if it were
+      // current. Retaining the data is right; presenting it as live is not.
+      // The failure is now carried out of the catch instead of erased.
+      const [runData, diagnosticOutcome] = await Promise.all([
         api().request(`/api/manual-search/runs/${encodeURIComponent(runId)}`),
-        api().request(`/api/manual-search/runs/${encodeURIComponent(runId)}/diagnostics`).catch(() => ({ provider_attempts: [], queries: [] })),
+        api().request(`/api/manual-search/runs/${encodeURIComponent(runId)}/diagnostics`)
+          .then((payload) => ({ ok: true, payload }))
+          .catch((error) => ({ ok: false, error })),
       ]);
       state.run = { ...(runData.run || {}), run_id: runId, candidate_counts: runData.candidate_counts || {}, source_profile: state.run.source_profile };
-      const diagnosticAttempts = Array.isArray(diagnosticData.provider_attempts) ? diagnosticData.provider_attempts : [];
-      if (diagnosticAttempts.length || !Array.isArray(state.attempts)) state.attempts = diagnosticAttempts;
-      state.queries = diagnosticData.queries || [];
+      if (diagnosticOutcome.ok) {
+        const diagnosticData = diagnosticOutcome.payload || {};
+        const diagnosticAttempts = Array.isArray(diagnosticData.provider_attempts) ? diagnosticData.provider_attempts : [];
+        if (diagnosticAttempts.length || !Array.isArray(state.attempts)) state.attempts = diagnosticAttempts;
+        state.queries = diagnosticData.queries || [];
+        // Recovery clears the label on the same pass that replaces the data.
+        state.diagnostics = { available: true, lastSuccessAt: Date.now(), failedAt: 0 };
+      } else {
+        // Keep attempts AND queries. Wiping queries while retaining attempts
+        // was its own inconsistency: half the panel went blank and the other
+        // half looked live.
+        state.diagnostics = {
+          available: false,
+          lastSuccessAt: state.diagnostics?.lastSuccessAt || 0,
+          failedAt: Date.now(),
+        };
+      }
       await loadResults();
       render();
       if (!TERMINAL_STATES.has(text(state.run.state).toLowerCase())) {
@@ -416,12 +469,25 @@
     }
   }
 
-  async function startSearch(providers) {
+  function newRequestId() {
+    try {
+      if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+    } catch (error) { /* fall through to the manual id below */ }
+    const bytes = new Uint8Array(16);
+    (window.crypto?.getRandomValues ? window.crypto : {getRandomValues: (b) => b.forEach((_, i) => { b[i] = Math.floor(Math.random() * 256); })})
+      .getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // fresh=true is an explicit "Search Again": the operator asked for a new
+  // run, so it gets a new identity and must not replay the previous answer.
+  async function startSearch(providers, {fresh = false} = {}) {
     if (state.busy) return;
     state.busy = true;
     state.feedback = null;
     render();
     try {
+      if (fresh || !state.requestId) state.requestId = newRequestId();
       const context = state.context || {};
       const body = {
         series_id: context.series_id || "",
@@ -433,6 +499,7 @@
         force_refresh: Boolean(state.run),
         include_rejected: state.includeRejected,
         pack_allowed: context.pack_allowed !== false,
+        request_id: state.requestId,
       };
       const data = await api().request("/api/manual-search/runs", { method: "POST", body });
       state.run = { ...(data.context || {}), ...(data.run || {}), run_id: data.run_id, state: data.state || "queued", source_profile: data.source_profile || {} };
@@ -518,11 +585,18 @@
 
   function bind(element) {
     element.querySelectorAll("[data-close-manual-search]").forEach((button) => button.addEventListener("click", () => close()));
-    element.querySelector("[data-start-search]")?.addEventListener("click", () => startSearch([]));
+    // The button reads "Search" the first time and "Search Again" once a run
+    // exists; either way pressing it is a deliberate new search.
+    element.querySelector("[data-start-search]")?.addEventListener("click", () => startSearch([], {fresh: true}));
     element.querySelector("[data-search-selected]")?.addEventListener("click", () => {
       const providers = Array.from(element.querySelectorAll("[data-provider-select]:checked")).map((input) => input.value);
-      if (providers.length) startSearch(providers);
+      if (providers.length) startSearch(providers, {fresh: true});
     });
+    element.querySelectorAll("[data-provider-select]").forEach((input) => input.addEventListener("change", (event) => {
+      const providerId = event.target.value;
+      if (event.target.checked) state.unselectedProviders.delete(providerId);
+      else state.unselectedProviders.add(providerId);
+    }));
     element.querySelector("[data-refresh-run]")?.addEventListener("click", () => refreshRun());
     element.querySelector("[data-cancel-run]")?.addEventListener("click", cancelSearch);
     element.querySelector("[data-include-rejected]")?.addEventListener("change", async (event) => {

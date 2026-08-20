@@ -367,6 +367,11 @@ def _provider_failure_code(result: dict[str, Any]) -> str:
         return reason
     if reason in {"partial_indexer_search_failed", "http_request_failed"}:
         return "provider_request_failed"
+    if reason in {"indexer_unavailable_partial", "indexer_unavailable_all_selected"}:
+        # Not a request failure -- the request succeeded. The indexers that
+        # would have answered it were in backoff, which is a coverage gap and
+        # has to read as one rather than as "searched, found nothing".
+        return "provider_indexer_unavailable"
     return _diagnostic_reason_code(reason, result.get("result_status") or "provider_failure")
 
 

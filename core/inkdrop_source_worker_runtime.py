@@ -27,6 +27,78 @@ INDEXER_RESULT_ADAPTER_FAMILIES = {
 }
 INDEXER_NO_CANDIDATE_SAMPLE_LIMIT = 5
 
+REFUSAL_EVIDENCE_VERSION = 1
+
+# How far a candidate got. Kept apart on purpose: reading "we looked at it" as
+# "we acted on it" is what produced a phantom 8x execution gap here, and no
+# single status column can carry the distinction.
+REFUSAL_STAGE_CONSIDERED = "considered"
+REFUSAL_STAGE_SELECTED = "selected"
+REFUSAL_STAGE_EXECUTED = "executed"
+
+# Who decided. `not_recorded` is a real, honest value: it means this path
+# refused without naming an authority, and it must stay visible rather than
+# defaulting to whichever subsystem happens to be nearby.
+REFUSAL_AUTHORITY_COMPATIBILITY = "candidate_compatibility"
+REFUSAL_AUTHORITY_PROVIDER_ADAPTER = "provider_adapter"
+REFUSAL_AUTHORITY_NOT_RECORDED = "not_recorded"
+
+
+def refusal_evidence(*, stage, reasons, authority, decided_at, candidate_identity="", detail=None):
+    """One typed record of why a candidate was refused, and by whom.
+
+    Three things it makes durable, each of which was measured missing on
+    2026-08-18 against a 400-row replay sample of the rejected backlog:
+
+    * **every contributing reason.** ``source_attempts.failure_reason`` is one
+      column and holds the first code, so a candidate refused for three
+      reasons reads as one. Projecting that single reason has repeatedly sent
+      people to the wrong subsystem.
+    * **the deciding authority, by name.** 132 of 400 sampled refusals carried
+      reasons target compatibility does raise but kept no verdict proving it
+      decided them, so nothing could say whether the matcher or provider
+      policy refused -- and replaying such a row through the matcher would
+      report a policy refusal as cleared.
+    * **the decision's own clock.** Never ``queue_items.updated_at`` /
+      ``queue_updated_at``: the retry machinery touches those every pass, so
+      they date the last piece of bookkeeping. A refusal decided six weeks ago
+      reads as decided moments ago.
+
+    Returns ``{}`` when there is no reason to record, so callers can attach the
+    result unconditionally without inventing an empty refusal.
+    """
+    codes = []
+    for value in reasons or []:
+        code = str(value or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+    if not codes:
+        return {}
+    try:
+        stamp = float(decided_at)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    if not stamp or stamp <= 0:
+        stamp = time.time()
+    record = {
+        "refusal_evidence_version": REFUSAL_EVIDENCE_VERSION,
+        "stage": str(stage or REFUSAL_STAGE_CONSIDERED).strip(),
+        "authority": str(authority or REFUSAL_AUTHORITY_NOT_RECORDED).strip(),
+        "reasons": codes,
+        # The projected reason is kept alongside the full list rather than
+        # instead of it, so a reader can see exactly what the single column
+        # dropped.
+        "primary_reason": codes[0],
+        "decided_at": stamp,
+        "decided_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp)),
+    }
+    identity = str(candidate_identity or "").strip()
+    if identity:
+        record["candidate_identity"] = identity
+    if isinstance(detail, dict) and detail:
+        record["detail"] = detail
+    return record
+
 
 def _parser_standard_ebooks(payload, row, wanted_item, limit, plan):
     return providers.standard_ebooks_candidates_from_opds(payload, row, wanted_item, limit=limit)
@@ -313,6 +385,37 @@ def attempt_seed_for_verdict(plan, row, verdict, *, staging_root=None):
             task_raw["auto_inspect"] = raw["auto_inspect"]
         task["raw_json"] = task_raw
         raw["download_task_seed"] = task
+    # Attached last so it sees the merged verdict. A candidate that reached
+    # here was evaluated, not acted on, so the stage is `considered`; a handed
+    # off candidate was not refused and gets no record at all, rather than an
+    # empty one that would later read as a refusal with no reasons.
+    handed_off = str(attempt.get("status") or "").strip().lower() == "sent"
+    refusal = refusal_evidence(
+        stage=REFUSAL_STAGE_CONSIDERED,
+        reasons=[
+            *list(compatibility.get("rejection_codes") or []),
+            *list(compatibility.get("review_codes") or []),
+            *list(verdict.get("block_reasons") or []),
+            *list(verdict.get("review_reasons") or []),
+        ],
+        # Named only where the compatibility verdict actually contributed a
+        # code. A seeder floor or category rule reaching this point is the
+        # provider adapter's decision, and mislabelling it would send the next
+        # reader to the matcher.
+        authority=(
+            REFUSAL_AUTHORITY_COMPATIBILITY
+            if (compatibility.get("rejection_codes") or compatibility.get("review_codes"))
+            else REFUSAL_AUTHORITY_PROVIDER_ADAPTER
+        ),
+        # The verdict's own stamp when it carries one, then the attempt's.
+        # Falling through to "now" is correct rather than a guess: the seed is
+        # built at the moment the refusal is decided. What must never appear
+        # here is a queue column.
+        decided_at=verdict.get("ts") or attempt.get("ts") or attempt.get("started_at"),
+        candidate_identity=verdict.get("candidate_family_identity") or verdict.get("candidate_identity"),
+    )
+    if refusal and not handed_off:
+        raw["refusal"] = refusal
     attempt["raw"] = raw
     return {key: value for key, value in attempt.items() if value not in (None, "", [], {})}
 
@@ -321,6 +424,25 @@ def source_search_attempt(row, plan, *, query="", status="searched_no_candidates
     counts = counts if isinstance(counts, dict) else {}
     raw_payload = raw if isinstance(raw, dict) else {}
     raw_payload.setdefault("worker_plan", plan if isinstance(plan, dict) else {})
+    # A search-level refusal is the adapter's own call about what it fetched,
+    # and until now it recorded the reason with nothing saying who decided or
+    # when. 43 of 400 sampled Suwayomi rows sat in that hole. The record says
+    # `considered`, because nothing here was ever selected or executed.
+    evidence = raw_payload.get("no_candidate_evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    refusal = refusal_evidence(
+        stage=REFUSAL_STAGE_CONSIDERED,
+        reasons=[reason, evidence.get("no_candidate_reason")],
+        authority=REFUSAL_AUTHORITY_PROVIDER_ADAPTER,
+        decided_at=None,
+        detail={
+            key: evidence[key]
+            for key in ("payload_result_count", "payload_sample_count")
+            if evidence.get(key) is not None
+        },
+    )
+    if refusal:
+        raw_payload["refusal"] = refusal
     return providers.source_search_attempt_seed(
         row,
         query=query,
@@ -522,7 +644,14 @@ def _quality_rank(attempt):
         return 3
     if "scan" in text:
         return 4
-    if "raw" in text:
+    # "raw" is the one marker here that hides inside ordinary title words --
+    # "Wild Strawberry" ranked below every other copy of itself because
+    # st-RAW-berry matched. The other markers are checked loosely on purpose
+    # ("webrip", "scanlation", "completed" all mean what they extend), so only
+    # this one gets boundaries. normalized_query() keeps punctuation, so an
+    # alphanumeric guard is used instead of \b, which underscores defeat:
+    # "Erai-raws" and "v01_raw_" still read as raw, "Strawberry" does not.
+    if re.search(r"(?<![a-z0-9])raws?(?![a-z0-9])", text):
         return 5
     return 3
 

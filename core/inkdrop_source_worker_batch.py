@@ -19,7 +19,10 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 
+from core import inkdrop_queue_fairness as queue_fairness
 from core import inkdrop_source_worker_coordinator as coordinator
+from core import inkdrop_source_worker_runtime_calibration as runtime_calibration
+from core import inkdrop_source_worker_phase_timing as phase_timing
 from core import inkdrop_source_worker_scheduler as scheduler
 from core import inkdrop_suwayomi_managed_folder as suwayomi_managed_folder
 from core import inkdrop_state
@@ -55,6 +58,7 @@ AUTOMATED_ATTEMPT_COUNT_FIELD = "source_worker_automated_attempt_count"
 COMIC_PACK_BACKLOG_PRIORITY_FIELD = "source_worker_comic_pack_backlog_priority"
 DIRECT_LOCAL_PAGE_PACK_RUNTIME_HEAD_FIELD = "source_worker_direct_local_page_pack_runtime_head"
 INITIAL_SEARCH_PRIORITY_FIELD = "source_worker_initial_search_priority"
+CALIBRATION_PROBE_FIELD = "source_worker_calibration_probe"
 INITIAL_SEARCH_QA_OBSERVATION_ID = "QA-20260718-NEW-SERIES-INITIAL-SEARCH"
 MISSING_RECOVERY_COHORT_FIELD = "source_worker_missing_recovery_cohort"
 MISSING_RECOVERY_COHORTS = (
@@ -1910,7 +1914,128 @@ def _source_http_request_runtime_estimate_seconds(source_http_timeout_seconds=No
     return max(1, estimate)
 
 
-def _http_provider_runtime_estimate(provider_plan, *, source_http_timeout_seconds=None):
+def _uncalibrated_provider_ids(plan, provider_request_seconds=None):
+    """Selected providers on this plan that have no usable measurement yet."""
+
+    calibrated = set(provider_request_seconds or {})
+    return [
+        provider_id
+        for provider_id in _selected_provider_ids(plan)
+        if provider_id and provider_id not in calibrated
+    ]
+
+
+# Cap on probes per pass. Per-provider removes the queue; the cap keeps a cold
+# start -- where every provider is uncalibrated at once -- from admitting an
+# unbounded number of over-budget plans in a single pass. The remainder are
+# probed on the passes that follow, and with the decisive-sample rule each
+# provider needs only one successful probe rather than MIN_SAMPLES of them.
+CALIBRATION_PROBE_MAX_PER_PASS = int(
+    os.environ.get("INKDROP_SOURCE_WORKER_CALIBRATION_PROBES_PER_PASS", 3) or 3
+)
+
+
+def _calibration_probe_plan_indexes(plans, *, provider_request_seconds=None, max_run_seconds=None, source_http_timeout_seconds=None):
+    """Plan indexes to admit purely so unmeasured providers can measure themselves.
+
+    Calibration only trusts a provider after MIN_SAMPLES observations, and
+    observations only come from runs that were admitted. That is fine for a
+    provider whose cheapest plan already fits at the worst-case price -- it
+    runs, samples, and calibrates on its own. It deadlocks for a provider
+    whose *every* plan is priced past the entire pass budget: never admitted,
+    so never sampled, so never calibrated, so never admitted.
+
+    Confirmed live on 2026-08-15, post-deploy: all 16 `suwayomi` plans in the
+    scan carry request_count=66 (1328s at the 20s worst-case price) and all 16
+    `mangadex` plans carry 47-48 (948s), both against a 600s pass. Every other
+    provider bootstrapped itself within minutes; those two could not, and were
+    exactly the plans still being budget-skipped.
+
+    The deadlock is safe to break precisely because these plans are
+    over-*priced*, not actually slow -- the whole finding behind calibration.
+    So admit such plans, ignoring the estimate. Bounded three ways: one per
+    uncalibrated provider per pass (capped at
+    CALIBRATION_PROBE_MAX_PER_PASS), only for a provider with no usable
+    samples at all, and the run itself still stops at `fetch_deadline` and
+    persists partial evidence rather than overrunning the pass. If a probed
+    provider really is as slow as it was priced, its run truncates, the
+    truncated sample is excluded from the percentile, and it simply stays
+    uncalibrated -- the pre-calibration behaviour.
+
+    **One probe per pass was per-pass, not per-provider, and that was the
+    bug.** The single slot went to the *cheapest* over-budget uncalibrated
+    plan, so providers queued behind each other by estimate -- and the
+    provider with the worst price, which is by definition the one most in need
+    of measuring, was always last. Measured live 2026-08-16: MangaDex (948s)
+    took essentially every probe while Suwayomi (1328s) collected **one sample
+    in eight hours**, against a TTL that expires them in 24. Per-provider
+    removes the queue entirely.
+    """
+
+    if not runtime_calibration.enabled():
+        return set()
+    budget = _runtime_budget(max_run_seconds)
+    if budget <= 0:
+        return set()
+    try:
+        cap = max(0, int(CALIBRATION_PROBE_MAX_PER_PASS))
+    except Exception:
+        cap = 3
+    if cap <= 0:
+        return set()
+    # Cheapest over-budget plan per uncalibrated provider.
+    best_by_provider = {}
+    for index, plan in enumerate(plans or []):
+        uncalibrated = _uncalibrated_provider_ids(plan, provider_request_seconds)
+        if not uncalibrated:
+            continue
+        estimate = _plan_runtime_estimate(
+            plan,
+            source_http_timeout_seconds=source_http_timeout_seconds,
+            provider_request_seconds=provider_request_seconds,
+        )
+        # Only plans the ordinary budget could never seat need the probe; a
+        # provider that fits already bootstraps itself without one.
+        if estimate <= budget:
+            continue
+        for provider_id in uncalibrated:
+            current = best_by_provider.get(provider_id)
+            if current is None or estimate < current[0]:
+                best_by_provider[provider_id] = (estimate, index)
+    if not best_by_provider:
+        return set()
+    # When the cap binds, probe the cheapest candidates first: they are the
+    # ones most likely to complete without truncating, so they yield usable
+    # samples soonest.
+    ordered = sorted(best_by_provider.values(), key=lambda item: item[:2])
+    return {index for _estimate, index in ordered[:cap]}
+
+
+def _calibrated_request_seconds(provider_id, worst_case_seconds, provider_request_seconds=None):
+    """Price a request by measurement when we have one, worst case otherwise.
+
+    ``worst_case_seconds`` is the HTTP timeout plus a margin -- a genuine
+    ceiling, since a request cannot outlive its own timeout. So a measured
+    value only ever moves the price *down* toward reality, and a provider
+    with no usable samples keeps exactly today's behaviour. See
+    ``inkdrop_source_worker_runtime_calibration``.
+    """
+
+    if not provider_request_seconds:
+        return worst_case_seconds
+    measured = provider_request_seconds.get(str(provider_id or "").strip().lower())
+    if measured is None:
+        return worst_case_seconds
+    try:
+        measured = float(measured)
+    except (TypeError, ValueError):
+        return worst_case_seconds
+    if measured <= 0:
+        return worst_case_seconds
+    return min(float(worst_case_seconds), measured)
+
+
+def _http_provider_runtime_estimate(provider_plan, *, source_http_timeout_seconds=None, provider_request_seconds=None):
     provider_plan = provider_plan if isinstance(provider_plan, dict) else {}
     if not provider_plan.get("can_execute_with_http_client"):
         return 0
@@ -1927,7 +2052,11 @@ def _http_provider_runtime_estimate(provider_plan, *, source_http_timeout_second
     # was 528-756s, so admission kept scheduling it into slots that expired
     # mid-fetch.
     request_count = max(1, request_count)
-    request_seconds = _source_http_request_runtime_estimate_seconds(source_http_timeout_seconds)
+    request_seconds = _calibrated_request_seconds(
+        provider_id,
+        _source_http_request_runtime_estimate_seconds(source_http_timeout_seconds),
+        provider_request_seconds,
+    )
     estimate = HTTP_PROVIDER_FIXED_RUNTIME_SECONDS + (request_count * request_seconds)
     return max(
         HTTP_PROVIDER_RUNTIME_MIN_SECONDS,
@@ -1935,10 +2064,11 @@ def _http_provider_runtime_estimate(provider_plan, *, source_http_timeout_second
     )
 
 
-def _provider_runtime_estimate(provider_id, provider_plan=None, *, source_http_timeout_seconds=None):
+def _provider_runtime_estimate(provider_id, provider_plan=None, *, source_http_timeout_seconds=None, provider_request_seconds=None):
     http_estimate = _http_provider_runtime_estimate(
         provider_plan,
         source_http_timeout_seconds=source_http_timeout_seconds,
+        provider_request_seconds=provider_request_seconds,
     )
     if http_estimate:
         return http_estimate
@@ -1953,7 +2083,34 @@ def _provider_runtime_estimate(provider_id, provider_plan=None, *, source_http_t
     return 60
 
 
-def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None):
+def _plan_request_count(plan, provider_ids=None):
+    """How many provider requests a plan expected to make, for cost measurement.
+
+    This is the same ``request_count`` admission priced the plan by, so the
+    recorded seconds-per-request divides the observed cost by the number that
+    will be multiplied back out next pass.
+    """
+
+    wanted = {
+        str(value or "").strip().lower()
+        for value in (provider_ids or [])
+        if str(value or "").strip()
+    }
+    total = 0
+    for row in ((plan or {}).get("provider_attempt_plan") or []):
+        if not isinstance(row, dict):
+            continue
+        provider_id = str(row.get("provider_id") or "").strip().lower()
+        if wanted and provider_id not in wanted:
+            continue
+        try:
+            total += max(0, int(row.get("request_count") or 0))
+        except (TypeError, ValueError):
+            continue
+    return max(1, total)
+
+
+def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None, provider_request_seconds=None):
     provider_ids = _selected_provider_ids(plan)
     provider_plan_by_id = {
         str((row or {}).get("provider_id") or "").strip().lower(): row
@@ -1977,6 +2134,7 @@ def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None):
             provider_id,
             provider_plan_by_id.get(provider_id),
             source_http_timeout_seconds=source_http_timeout_seconds,
+            provider_request_seconds=provider_request_seconds,
         )
         for provider_id in unique
     )
@@ -2511,6 +2669,102 @@ def _local_page_pack_fast_lane_priority(plan):
     return 0
 
 
+AGEING_LANE_RESERVE_FIELD = "source_worker_ageing_lane_reserve"
+
+
+def _is_ageing_lane_plan(plan):
+    return str((plan or {}).get(queue_fairness.LANE_FIELD) or "") == queue_fairness.LANE_AGED
+
+
+def _ageing_lane_head_priority(plan):
+    """Keep a reserved aged row from being the first thing the budget drops.
+
+    The stages between the scan and execution both sort rows that have already
+    been attempted to the back -- _spread_by_source_attempt_coverage groups
+    them last, and _runtime_budget_order's coverage key repeats it. That is
+    right for the ordinary rotation and fatal for the aged lane, whose rows are
+    by definition ones we have already tried. Without a head slot the lane's
+    share would be assembled by the scan and then thrown away here.
+
+    Bounded by the reservation that sets the field: at the live eligible limit
+    of 10 that is 2 rows, so the guarantee costs a quarter of the pass and
+    cannot grow into it.
+    """
+    reserve = (plan or {}).get(AGEING_LANE_RESERVE_FIELD)
+    return 0 if isinstance(reserve, dict) and reserve.get("reserved") else 1
+
+
+def _reserve_ageing_lane_slots(plans, window, limit):
+    """Hold the aged lane's capped share of the pass open.
+
+    Mirrors _reserve_initial_search_opportunity: refill from the full eligible
+    pool, keep annotations already applied to rows in the window, and never
+    take more than the quota. Rows are admitted in scan order, which already
+    ranks them by bounded ageing score spread across series.
+    """
+    plans = list(plans or [])
+    window = list(window or [])
+    try:
+        limit = max(1, min(int(limit), 500))
+    except Exception:
+        return window
+    slots = int(queue_fairness.lane_quotas(limit).get(queue_fairness.LANE_AGED) or 0)
+    if slots <= 0:
+        return window
+
+    def plan_key(plan):
+        queue_id = str((plan or {}).get("queue_id") or "").strip()
+        return f"queue:{queue_id}" if queue_id else f"object:{id(plan)}"
+
+    present = [plan for plan in window if _is_ageing_lane_plan(plan)]
+    missing = max(0, slots - len(present))
+    if missing <= 0:
+        return window[:limit]
+    used = {plan_key(plan) for plan in window}
+    seen_series = {_series_key(plan) for plan in present}
+    additions = []
+    for plan in plans:
+        if missing <= 0:
+            break
+        if not _is_ageing_lane_plan(plan) or plan_key(plan) in used:
+            continue
+        series_key = _series_key(plan)
+        if series_key in seen_series:
+            continue
+        seen_series.add(series_key)
+        used.add(plan_key(plan))
+        row = dict(plan or {})
+        row[AGEING_LANE_RESERVE_FIELD] = {
+            "reserved": True,
+            "ageing_score": _float(row.get(queue_fairness.AGEING_SCORE_FIELD), 0.0),
+            "stall_seconds": int(_float(row.get(queue_fairness.STALL_SECONDS_FIELD), 0.0)),
+            "real_attempts": int(_float(row.get(queue_fairness.REAL_ATTEMPT_FIELD), 0.0)),
+            "eligible_limit": int(limit),
+            "lane_slots": int(slots),
+            "reason": "waited long enough to have earned a capped share of this pass",
+        }
+        additions.append(row)
+        missing -= 1
+    if not additions:
+        return window[:limit]
+    for plan in present:
+        if not isinstance(plan.get(AGEING_LANE_RESERVE_FIELD), dict):
+            plan[AGEING_LANE_RESERVE_FIELD] = {
+                "reserved": True,
+                "ageing_score": _float(plan.get(queue_fairness.AGEING_SCORE_FIELD), 0.0),
+                "stall_seconds": int(_float(plan.get(queue_fairness.STALL_SECONDS_FIELD), 0.0)),
+                "real_attempts": int(_float(plan.get(queue_fairness.REAL_ATTEMPT_FIELD), 0.0)),
+                "eligible_limit": int(limit),
+                "lane_slots": int(slots),
+                "reason": "waited long enough to have earned a capped share of this pass",
+            }
+    # Drop from the tail rather than the head: the head of the window is where
+    # the fast lane and the established reservations live.
+    keep = [plan for plan in window if plan_key(plan) not in {plan_key(a) for a in additions}]
+    trimmed = keep[: max(0, limit - len(additions))]
+    return (trimmed + additions)[:limit]
+
+
 def _runtime_remaining_seconds(started_monotonic, max_run_seconds, *, reserved_seconds=0.0):
     budget = _runtime_budget(max_run_seconds)
     if budget <= 0:
@@ -2519,7 +2773,7 @@ def _runtime_remaining_seconds(started_monotonic, max_run_seconds, *, reserved_s
     return max(0.0, budget - elapsed - _float(reserved_seconds, 0.0) - RUNTIME_CLEANUP_SECONDS)
 
 
-def _source_floor_head_plan_ids(plans, *, source_http_timeout_seconds=None, max_run_seconds=None, now=None):
+def _source_floor_head_plan_ids(plans, *, source_http_timeout_seconds=None, max_run_seconds=None, now=None, provider_request_seconds=None):
     """One guaranteed head-of-line slot per distinct source lane, per pass.
 
     Without this, _runtime_budget_order sorts strictly by estimate bucket, so
@@ -2557,7 +2811,11 @@ def _source_floor_head_plan_ids(plans, *, source_http_timeout_seconds=None, max_
         lane = _provider_lane_key(plan, provider_counts)
         if not lane:
             continue
-        estimate = _plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds)
+        estimate = _plan_runtime_estimate(
+            plan,
+            source_http_timeout_seconds=source_http_timeout_seconds,
+            provider_request_seconds=provider_request_seconds,
+        )
         starved = _runtime_budget_starved_age_seconds(plan, now=now) > 0
         current = lane_head.get(lane)
         if current is None:
@@ -2619,7 +2877,7 @@ def _source_floor_head_priority(plan, head_plan_ranks):
     return rank if rank is not None else len(head_plan_ranks)
 
 
-def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_seconds=None, now=None):
+def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_seconds=None, now=None, provider_request_seconds=None):
     plans = list(plans or [])
     if _runtime_budget(max_run_seconds) <= 0 or len(plans) <= 1:
         return plans
@@ -2633,6 +2891,7 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
         source_http_timeout_seconds=source_http_timeout_seconds,
         max_run_seconds=max_run_seconds,
         now=now,
+        provider_request_seconds=provider_request_seconds,
     )
     direct_local_page_pack_head_ids = {
         id(plan)
@@ -2641,10 +2900,11 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
     }
     return [
         row
-        for _initial_search, _comic_head, _runtime_starved, _runtime_starved_age, _source_floor, _direct_local_head, _local_head, _source_retry_starved, _source_retry_starved_age, _round, _fast_lane, _coverage, _bucket, _backlog_priority, _impact, _index, row in sorted(
+        for _initial_search, _ageing_lane, _comic_head, _runtime_starved, _runtime_starved_age, _source_floor, _direct_local_head, _local_head, _source_retry_starved, _source_retry_starved_age, _round, _fast_lane, _coverage, _bucket, _backlog_priority, _impact, _index, row in sorted(
             (
                 (
                     0 if (plan or {}).get(INITIAL_SEARCH_PRIORITY_FIELD) else 1,
+                    _ageing_lane_head_priority(plan),
                     _runtime_comic_pack_head_priority(plan, comic_pack_head_ids),
                     _runtime_budget_starved_priority(plan, runtime_starved_head_ids),
                     _runtime_budget_starved_age_priority(plan, runtime_starved_head_ids, now=now),
@@ -2656,7 +2916,7 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
                     _series_round_index(plan),
                     _local_page_pack_fast_lane_priority(plan),
                     0 if int((plan or {}).get(AUTOMATED_ATTEMPT_COUNT_FIELD) or 0) <= 0 else 1,
-                    int(_plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds) // bucket_seconds),
+                    int(_plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds, provider_request_seconds=provider_request_seconds) // bucket_seconds),
                     -int((plan or {}).get(COMIC_PACK_BACKLOG_PRIORITY_FIELD) or 0),
                     -_series_backlog_count(plan),
                     index,
@@ -2664,27 +2924,60 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
                 )
                 for index, plan in enumerate(plans)
             ),
-            key=lambda item: item[:16],
+            key=lambda item: item[:17],
         )
     ]
 
 
-def _apply_runtime_budget(plans, *, max_run_seconds=None, started_monotonic=None, source_http_timeout_seconds=None):
+def _apply_runtime_budget(plans, *, max_run_seconds=None, started_monotonic=None, source_http_timeout_seconds=None, provider_request_seconds=None):
     selected = []
     skipped = []
     reserved = 0.0
-    for plan in _runtime_budget_order(
+    ordered = _runtime_budget_order(
         plans,
         max_run_seconds=max_run_seconds,
         source_http_timeout_seconds=source_http_timeout_seconds,
-    ):
-        estimate = _plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds)
+        provider_request_seconds=provider_request_seconds,
+    )
+    probe_indexes = _calibration_probe_plan_indexes(
+        ordered,
+        provider_request_seconds=provider_request_seconds,
+        max_run_seconds=max_run_seconds,
+        source_http_timeout_seconds=source_http_timeout_seconds,
+    )
+    for index, plan in enumerate(ordered):
+        estimate = _plan_runtime_estimate(
+            plan,
+            source_http_timeout_seconds=source_http_timeout_seconds,
+            provider_request_seconds=provider_request_seconds,
+        )
         remaining = _runtime_remaining_seconds(
             started_monotonic,
             max_run_seconds,
             reserved_seconds=reserved,
         )
         if remaining is not None and remaining < estimate:
+            if index in probe_indexes:
+                # Deadlock-breaker: this provider has no measurement and no
+                # plan cheap enough to earn one. Let it measure itself once.
+                plan = dict(plan or {})
+                plan[CALIBRATION_PROBE_FIELD] = {
+                    "reserved": True,
+                    "provider_ids": _uncalibrated_provider_ids(plan, provider_request_seconds),
+                    "runtime_estimate_seconds": int(estimate),
+                    "runtime_remaining_seconds": int(remaining),
+                    "reason": "provider has no runtime measurement and no plan cheap enough to earn one",
+                }
+                selected.append(plan)
+                # Reserve a nominal cost, not the estimate (which is the
+                # number we are deliberately not believing) and not the whole
+                # remaining budget (which would starve the rest of the pass to
+                # pay for one measurement). This planning path is advisory
+                # anyway -- the executing path recomputes `remaining` from real
+                # elapsed time each iteration, so a probe that does turn out
+                # expensive is absorbed there rather than here.
+                reserved += HTTP_PROVIDER_RUNTIME_MIN_SECONDS
+                continue
             row = dict(plan or {})
             row["runtime_estimate_seconds"] = int(estimate)
             row["runtime_remaining_seconds"] = int(remaining)
@@ -2714,6 +3007,7 @@ def _runnable_plans(plans, *, eligible_limit=None, operator_payloads=None, defau
             now=now,
         )
         selected = _reserve_initial_search_opportunity(selection_pool, selected, selection_limit)
+        selected = _reserve_ageing_lane_slots(selection_pool, selected, selection_limit)
         selected = _reserve_aged_zero_provider_coverage_slot(selection_pool, selected, selection_limit)
         if _missing_recovery_enabled():
             selected = _apply_missing_recovery_cohort(
@@ -2722,6 +3016,11 @@ def _runnable_plans(plans, *, eligible_limit=None, operator_payloads=None, defau
                 selection_limit,
                 now=now,
             )
+        # Last, so the composition that leaves the planner is the composition
+        # the contract specifies. Every reserve step above can add rows; none
+        # of them enforce the aged ceiling or the steady floor for the final
+        # limit, which is how a pass reached 5 aged / 4 steady / 1 fast.
+        selected = _enforce_lane_quotas(selection_pool, selected, selection_limit)
     elif default_limit not in (None, ""):
         selected = _spread_by_source_attempt_coverage(selected)
         selection_limit = _bounded_limit(default_limit, default=len(selected) or 1, maximum=500)
@@ -2732,6 +3031,7 @@ def _runnable_plans(plans, *, eligible_limit=None, operator_payloads=None, defau
             now=now,
         )
         selected = _reserve_initial_search_opportunity(selection_pool, selected, selection_limit)
+        selected = _reserve_ageing_lane_slots(selection_pool, selected, selection_limit)
         selected = _reserve_aged_zero_provider_coverage_slot(selection_pool, selected, selection_limit)
         if _missing_recovery_enabled():
             selected = _apply_missing_recovery_cohort(
@@ -2740,6 +3040,11 @@ def _runnable_plans(plans, *, eligible_limit=None, operator_payloads=None, defau
                 selection_limit,
                 now=now,
             )
+        # Last, so the composition that leaves the planner is the composition
+        # the contract specifies. Every reserve step above can add rows; none
+        # of them enforce the aged ceiling or the steady floor for the final
+        # limit, which is how a pass reached 5 aged / 4 steady / 1 fast.
+        selected = _enforce_lane_quotas(selection_pool, selected, selection_limit)
     selected = _annotate_series_round_indexes(selected)
     selected = _mark_direct_local_page_pack_runtime_heads(selected)
     selected = _slice_selected_provider_lanes(
@@ -2747,6 +3052,117 @@ def _runnable_plans(plans, *, eligible_limit=None, operator_payloads=None, defau
         comic_pack_child_lane_limit=comic_pack_child_lane_limit,
     )
     return selected
+
+
+def _lane_counts_from_rows(rows):
+    """Lane tally for executed runs, which carry the lane directly."""
+    counts = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        lane = str(row.get("queue_lane") or "").strip().lower() or "unset"
+        counts[lane] = counts.get(lane, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _lane_counts(plans):
+    """How many plans sat in each fairness lane. Empty lane counts as unset."""
+    counts = {}
+    for plan in plans or []:
+        if not isinstance(plan, dict):
+            continue
+        lane = _plan_lane(plan) or "unset"
+        counts[lane] = counts.get(lane, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _plan_lane(plan):
+    return str((plan or {}).get(queue_fairness.LANE_FIELD) or "")
+
+
+def _enforce_lane_quotas(plans, window, limit):
+    """Re-apply the lane contract to the window that actually leaves the planner.
+
+    The quotas were being applied to the 50-row scan and then lost: the scan is
+    labelled and capped for fifty seats, provider readiness/coverage narrows the
+    result to ten, and nothing re-derived the caps for ten. Measured in
+    production 2026-08-18, a full scan-50 -> eligible-10 pass finished
+    5 aged / 4 steady / 1 fast, against a contract of at most 2 aged and at
+    least 5 steady. The caps were real earlier and gone by the end, which is the
+    only place they matter -- this is the composition that gets executed.
+
+    The quotas are read from queue_fairness.lane_quotas() for the FINAL limit
+    rather than recomputed here, so the narrowing stage and the scan stage
+    cannot disagree about what the contract is.
+
+    Order is deliberate and encodes the approved contract rather than restating
+    it. Fast is filled first and is never trimmed to make room for another
+    lane, because "a newly added series is searched immediately" was a
+    condition of that approval and not a preference: new work cannot be
+    displaced by ageing pressure. Aged is then capped at its ceiling, and
+    steady is backfilled toward its floor from rows the narrowing already
+    accepted.
+    """
+
+    window = list(window or [])
+    plans = list(plans or [])
+    try:
+        limit = max(1, min(int(limit), 500))
+    except Exception:
+        return window
+    quotas = queue_fairness.lane_quotas(limit)
+    fast_cap = int(quotas.get(queue_fairness.LANE_FAST) or 0)
+    aged_cap = int(quotas.get(queue_fairness.LANE_AGED) or 0)
+    steady_floor = int(quotas.get(queue_fairness.LANE_STEADY) or 0)
+
+    def plan_key(plan):
+        queue_id = str((plan or {}).get("queue_id") or "").strip()
+        return f"queue:{queue_id}" if queue_id else f"object:{id(plan)}"
+
+    kept = []
+    aged_kept = 0
+    dropped_aged = []
+    for plan in window:
+        lane = _plan_lane(plan)
+        if lane == queue_fairness.LANE_AGED:
+            if aged_kept >= aged_cap:
+                # Ranked in scan order, so the ones beyond the ceiling are the
+                # weakest aged candidates rather than an arbitrary slice.
+                dropped_aged.append(plan)
+                continue
+            aged_kept += 1
+        kept.append(plan)
+
+    used = {plan_key(plan) for plan in kept}
+
+    def backfill(match_lane, room):
+        added = 0
+        for plan in plans:
+            if added >= room:
+                break
+            if plan_key(plan) in used or _plan_lane(plan) != match_lane:
+                continue
+            used.add(plan_key(plan))
+            kept.append(plan)
+            added += 1
+        return added
+
+    # New content first: any fast row the narrowing left behind is admitted
+    # before the freed aged seats are spent on anything else.
+    fast_present = sum(1 for plan in kept if _plan_lane(plan) == queue_fairness.LANE_FAST)
+    if fast_present < fast_cap and len(kept) < limit:
+        backfill(queue_fairness.LANE_FAST, min(fast_cap - fast_present, limit - len(kept)))
+
+    steady_present = sum(1 for plan in kept if _plan_lane(plan) == queue_fairness.LANE_STEADY)
+    if steady_present < steady_floor and len(kept) < limit:
+        backfill(queue_fairness.LANE_STEADY, min(steady_floor - steady_present, limit - len(kept)))
+
+    # Anything the pool could not fill stays empty rather than being handed back
+    # to ageing: a quota is a ceiling for aged and a floor for steady, and
+    # refilling from the dropped aged rows would reinstate the exact overrun
+    # this exists to remove. Unfilled seats are the honest outcome when the
+    # readiness-narrowed pool has nothing else runnable.
+    return kept[:limit]
 
 
 def _reserve_aged_zero_provider_coverage_slot(plans, window, limit):
@@ -2964,7 +3380,7 @@ def _run_summary(
     }
 
 
-def _budget_summary(max_run_seconds, budget_skipped_plans, *, source_http_timeout_seconds=None):
+def _budget_summary(max_run_seconds, budget_skipped_plans, *, source_http_timeout_seconds=None, provider_request_seconds=None):
     budget = _runtime_budget(max_run_seconds)
     skipped = list(budget_skipped_plans or [])
     timeout = _float(source_http_timeout_seconds, 0.0)
@@ -2976,6 +3392,12 @@ def _budget_summary(max_run_seconds, budget_skipped_plans, *, source_http_timeou
         "source_http_request_runtime_estimate_seconds": (
             _source_http_request_runtime_estimate_seconds(source_http_timeout_seconds) if budget > 0 else 0
         ),
+        # What admission actually priced each provider's requests at this pass,
+        # so a skip can be read back against the measurement that caused it.
+        "calibrated_request_seconds": {
+            provider_id: round(float(seconds), 3)
+            for provider_id, seconds in sorted((provider_request_seconds or {}).items())
+        },
         "budget_skipped": len(skipped),
         "budget_skipped_queue_ids": [plan.get("queue_id") for plan in skipped if plan.get("queue_id")],
     }
@@ -3106,6 +3528,10 @@ def run_source_worker_batch(
     )
     pending_download_client_handoff = {}
     claim_skips = []
+    # Telemetry write failures are collected rather than raised, but they are
+    # still reported: a phase table that silently stays empty looks exactly
+    # like a pass that did no work.
+    phase_timing_failures = []
     pending_handoff_queue_ids = []
     if execute_jobs and handoff_download_clients:
         pending_handoff_queue_ids = coordinator.pending_download_client_handoff_queue_ids(
@@ -3203,6 +3629,18 @@ def run_source_worker_batch(
         int(pending_download_client_handoff.get("tasks_handed_off") or 0)
         or int(pending_download_client_handoff.get("tasks_failed") or 0)
     )
+    # Read once per pass, not per plan: admission calls _plan_runtime_estimate
+    # hundreds of times while ordering, and each of those would otherwise be a
+    # separate read against a database this worker is also writing to.
+    provider_request_seconds = runtime_calibration.provider_request_seconds(
+        db_path,
+        now=now,
+        # The price a provider carries without a measurement. Passing it
+        # lets calibration act on a first sample that contradicts it by an
+        # order of magnitude, instead of waiting for MIN_SAMPLES to correct
+        # a 100x error.
+        worst_case_seconds=_source_http_request_runtime_estimate_seconds(source_http_timeout_seconds),
+    )
     if recovering_pending_handoff:
         pre_schedule_cleanup = {
             "retryable_source_candidate_searching_requeued": 0,
@@ -3263,6 +3701,7 @@ def run_source_worker_batch(
                 eligible,
                 max_run_seconds=max_run_seconds,
                 source_http_timeout_seconds=source_http_timeout_seconds,
+                provider_request_seconds=provider_request_seconds,
             )
             eligible = []
             budget_skipped = []
@@ -3272,6 +3711,7 @@ def run_source_worker_batch(
                 max_run_seconds=max_run_seconds,
                 started_monotonic=started_monotonic,
                 source_http_timeout_seconds=source_http_timeout_seconds,
+                provider_request_seconds=provider_request_seconds,
             )
             execution_candidates = eligible
 
@@ -3281,6 +3721,7 @@ def run_source_worker_batch(
     provider_pass_failure_reasons = {}
     provider_pass_failure_slices = []
     provider_pass_failure_skips = []
+    calibration_probes = []
     pending_direct_stage = {}
     managed_folder_stage = {}
     if execute_jobs and not recovering_pending_handoff:
@@ -3362,7 +3803,13 @@ def run_source_worker_batch(
                 "tasks_staged": sum(int((run.get("result") or {}).get("tasks_staged") or 0) for run in pending_runs),
                 "tasks_failed": sum(int((run.get("result") or {}).get("tasks_failed") or 0) for run in pending_runs),
             }
-        for plan in execution_candidates:
+        calibration_probe_indexes = _calibration_probe_plan_indexes(
+            execution_candidates,
+            provider_request_seconds=provider_request_seconds,
+            max_run_seconds=max_run_seconds,
+            source_http_timeout_seconds=source_http_timeout_seconds,
+        )
+        for execution_index, plan in enumerate(execution_candidates):
             plan, provider_failure_budget = _provider_pass_failure_budget_for_plan(
                 plan,
                 provider_pass_failures,
@@ -3374,17 +3821,44 @@ def run_source_worker_batch(
             if provider_failure_budget:
                 provider_pass_failure_slices.append(provider_failure_budget)
             remaining = _runtime_remaining_seconds(started_monotonic, max_run_seconds)
-            estimate = _plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds)
+            estimate = _plan_runtime_estimate(
+                plan,
+                source_http_timeout_seconds=source_http_timeout_seconds,
+                provider_request_seconds=provider_request_seconds,
+            )
             if remaining is not None and remaining < estimate:
                 rotated_plan = _rotate_local_page_pack_fast_lane_for_runtime_budget(plan)
                 rotated_estimate = (
-                    _plan_runtime_estimate(rotated_plan, source_http_timeout_seconds=source_http_timeout_seconds)
+                    _plan_runtime_estimate(
+                        rotated_plan,
+                        source_http_timeout_seconds=source_http_timeout_seconds,
+                        provider_request_seconds=provider_request_seconds,
+                    )
                     if rotated_plan is not None
                     else None
                 )
                 if rotated_plan is not None and rotated_estimate is not None and remaining >= rotated_estimate:
                     plan = rotated_plan
                     estimate = rotated_estimate
+                elif execution_index in calibration_probe_indexes:
+                    # Deadlock-breaker, once per provider per pass: it has no
+                    # measurement and no plan cheap enough to earn one, so the
+                    # estimate that is blocking it can never be corrected by
+                    # waiting. fetch_deadline still bounds the run.
+                    plan = dict(plan or {})
+                    plan[CALIBRATION_PROBE_FIELD] = {
+                        "reserved": True,
+                        "provider_ids": _uncalibrated_provider_ids(plan, provider_request_seconds),
+                        "runtime_estimate_seconds": int(estimate),
+                        "runtime_remaining_seconds": int(remaining),
+                        "reason": "provider has no runtime measurement and no plan cheap enough to earn one",
+                    }
+                    calibration_probes.append(
+                        {
+                            "queue_id": plan.get("queue_id"),
+                            **plan[CALIBRATION_PROBE_FIELD],
+                        }
+                    )
                 else:
                     if not dry_run:
                         _persist_runtime_budget_skip_evidence(
@@ -3453,6 +3927,7 @@ def run_source_worker_batch(
             # volume page packs) stop cleanly at this deadline and persist the
             # partial evidence instead of dying when the slot expires.
             fetch_deadline = None if remaining is None else time.time() + max(0.0, remaining)
+            run_started_monotonic = time.monotonic()
             try:
                 result = coordinator.run_source_worker_for_queue(
                     db_path,
@@ -3480,9 +3955,54 @@ def run_source_worker_batch(
             finally:
                 if claim and claim.get("acquired"):
                     inkdrop_state.release_queue_claim(db_path, queue_id, claim_owner)
+            if not dry_run:
+                # Deliberately after the run returned, not in the finally: a
+                # run that raised did not measure a provider's cost, it
+                # measured how fast it failed, and pricing admission off that
+                # would make a repeatedly-failing provider look cheap.
+                #
+                # A run stopped at fetch_deadline does return normally (it
+                # persists partial evidence rather than dying), but its
+                # elapsed time only proves a lower bound on the real cost, so
+                # it is stored and kept out of the percentile.
+                run_elapsed_seconds = max(0.0, time.monotonic() - run_started_monotonic)
+                run_truncated = (
+                    fetch_deadline is not None and time.time() >= fetch_deadline
+                )
+                runtime_calibration.record_observation(
+                    db_path,
+                    selected_provider_ids,
+                    request_count=_plan_request_count(plan, selected_provider_ids),
+                    elapsed_seconds=run_elapsed_seconds,
+                    truncated=run_truncated,
+                    now=now,
+                )
+                # Same boundary, same rules: one flush per item, and a failure
+                # here reports itself rather than failing the pass.
+                phase_timing_result = phase_timing.record_item_phases(
+                    db_path,
+                    queue_id,
+                    (result or {}).get("phase_timing"),
+                    provider_ids=selected_provider_ids,
+                    # The fairness lane exists only on the in-memory plan --
+                    # it is on 0 rows of source_attempts and 0 of queue_items,
+                    # which is why a prediction written against it came back
+                    # UNMEASURABLE rather than pass or fail. Riding along on a
+                    # row already being written costs nothing extra.
+                    lane=_plan_lane(plan),
+                    item_elapsed_seconds=run_elapsed_seconds,
+                    truncated=run_truncated,
+                    now=now,
+                )
+                if not phase_timing_result.get("ok"):
+                    phase_timing_failures.append(phase_timing_result.get("reason") or "error")
             runs.append(
                 {
                     "queue_id": plan.get("queue_id"),
+                    # Carried explicitly: the run row has no plan on it, so
+                    # counting lanes off `row["plan"]` would silently produce
+                    # an empty tally rather than an error.
+                    "queue_lane": _plan_lane(plan),
                     "provider_ids": selected_provider_ids,
                     "ok": bool(result.get("ok")),
                     "reason": result.get("reason") or "",
@@ -3559,11 +4079,13 @@ def run_source_worker_batch(
             max_run_seconds,
             budget_skipped,
             source_http_timeout_seconds=source_http_timeout_seconds,
+            provider_request_seconds=provider_request_seconds,
         ),
         "runtime_budget_dynamic_fill": dynamic_runtime_fill,
         "selected_queue_ids": [plan.get("queue_id") for plan in eligible],
         "selected_plans": eligible,
         "budget_skipped_queue_ids": [plan.get("queue_id") for plan in budget_skipped if plan.get("queue_id")],
+        "calibration_probes": calibration_probes,
         "provider_pass_failure_skipped_queue_ids": [
             plan.get("queue_id") for plan in provider_pass_failure_skips if plan.get("queue_id")
         ],
@@ -3579,6 +4101,20 @@ def run_source_worker_batch(
         "pending_direct_stage": pending_direct_stage,
         "pending_download_client_handoff": pending_download_client_handoff,
         "managed_folder_stage": managed_folder_stage,
+        # Named on the run so an operator can see telemetry stopped writing
+        # without having to notice an empty table.
+        "phase_timing": {
+            "enabled": phase_timing.enabled(),
+            "write_failures": len(phase_timing_failures),
+            "write_failure_reasons": sorted(set(phase_timing_failures)),
+        },
+        # "Selected but not run" was unmeasurable because selection was never
+        # recorded anywhere. Both halves are counted here, from data the pass
+        # already holds, so the lane stops being invisible.
+        "queue_lane_counts": {
+            "scheduled": _lane_counts((schedule or {}).get("plans") or []),
+            "run": _lane_counts_from_rows(runs),
+        },
         "summary": _run_summary(
             schedule,
             runs,

@@ -27,6 +27,11 @@ from core import inkdrop_bencode
 from core import inkdrop_db
 
 try:
+    from core import inkdrop_source_worker_coordinator
+except Exception:
+    inkdrop_source_worker_coordinator = None
+
+try:
     from core import inkdrop_state
 except Exception:
     inkdrop_state = None
@@ -299,6 +304,14 @@ def review(reason, payload):
     with REVIEW_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
     mark_manual_review_logged(review_id, now=record["ts"])
+    # Only rows that actually persisted announce -- should_persist_review()
+    # above already dropped the soft/diagnostic reasons. Imported lazily
+    # because inkdrop_notifications reaches back into this package.
+    try:
+        from core import inkdrop_notifications
+        inkdrop_notifications.notify_manual_review_from_payload(INKDROP_STATE_DB, reason, payload)
+    except Exception:
+        pass
     return record
 
 
@@ -2150,56 +2163,131 @@ def query_variants(title, issue_number, is_manga=False, alt_titles=(), unit_mode
                 for padded_token in padded[:1]:
                     variants.extend([f"{name} chapter {padded_token}", f"{name} ch {padded_token}"])
             elif (unit_model or "").lower() in {"volume", "pack", "mixed_volume_preferred"}:
+                # "v01"/"v24" is the dominant manga volume convention on every
+                # indexer we query, so it leads. The bare "{name} {token}" form
+                # trailed last for a measured reason: live 2026-08-15,
+                # "Chainsaw Man 24 2019" returned 32 results, every one of them
+                # anime video rather than manga -- a bare trailing number
+                # collides with season/episode naming.
+                for padded_token in padded[1:]:
+                    variants.append(f"{name} v{padded_token}")
                 variants.extend([
                     f"{name} Vol. {token}",
                     f"{name} Volume {token}",
-                    f"{name} {token}",
                 ])
                 for padded_token in padded:
-                    variants.extend([f"{name} v{padded_token}", f"{name} {padded_token}"])
+                    variants.append(f"{name} {padded_token}")
+                variants.append(f"{name} {token}")
             else:
+                for padded_token in padded[1:]:
+                    variants.append(f"{name} v{padded_token}")
                 variants.extend([
                     f"{name} Vol. {token}",
                     f"{name} Volume {token}",
                     f"{name} Chapter {token}",
                     f"{name} Ch. {token}",
-                    f"{name} {token}",
                 ])
                 for padded_token in padded:
-                    variants.extend([f"{name} v{padded_token}", f"{name} {padded_token}"])
+                    variants.append(f"{name} {padded_token}")
+                variants.append(f"{name} {token}")
         return add_year_variants(unique(variants), year)
     variants = []
     for name in titles:
-        variants.append(f"{name} {token}")
+        # Zero-padded first, unpadded second. Scene comic naming is always
+        # 3-digit ("Injustice 2 006"), and the unpadded form is not merely
+        # weaker -- measured against live Prowlarr 2026-08-15, "Injustice 2 6"
+        # returned 0 results where "Injustice 2 006" returned a hit. The
+        # unpadded variant is kept (some indexers and SLSKD filenames do use
+        # it) but must not consume the per-issue query budget ahead of the
+        # form that actually matches. Worst affected are series whose title
+        # ends in a digit, where the unpadded query reads as two numbers.
         variants.extend(f"{name} {padded_token}" for padded_token in padded[:1])
+        variants.append(f"{name} {token}")
         if n == 1 and edition_like(name):
             base = stripped_edition_title(name)
             variants.extend([name, base])
     return add_year_variants(unique(variants), year)
 
 
+def row_is_unitless_work(row):
+    """Whether this row is for a work that has no unit of its own.
+
+    Reads the same issue-title rule the durable proof is built from, so the
+    query side and the matcher side answer this question with one classifier
+    rather than two. See item_is_unitless_work() in the SLSKD probe for why
+    the weaker, identity-free form is safe on the query side.
+    """
+
+    row = row if isinstance(row, dict) else {}
+    if row.get("unitless_work_proof") is True:
+        return True
+    # getattr, not a direct call: a coordinator that predates this classifier
+    # must make the answer "no" rather than raise. These modules ship together,
+    # so this is a partial-rollout guard rather than an expected path.
+    classifier = getattr(
+        inkdrop_source_worker_coordinator, "unitless_work_issue_title", None
+    )
+    if not callable(classifier):
+        return False
+    return bool(classifier(row.get("issue_title")))
+
+
+def display_search_title(title):
+    """The bare series title, cleaned the way a generated variant would be."""
+
+    text = " ".join(str(title or "").split()).strip()
+    return text
+
+
 def query_variants_for_row(row, is_manga=False, unit_model=None):
     row = row if isinstance(row, dict) else {}
     title = row.get("title")
     issue_number = row.get("issue_number")
+    # Resolve "is this manga" once, from the row's own media_type as well as
+    # the caller's flag, and use that single answer for the variant shape, the
+    # year decision and the staleness check alike.
+    #
+    # Callers that omitted is_manga left query_variants() to fall back on
+    # is_manga_title(), a hardcoded title/publisher list that does not contain
+    # every series -- "Chainsaw Man" among them. Such a row took the *comic*
+    # branch (bare trailing number, no "v" form) and row_query_year() fell
+    # through to the **series start** year, producing "Chainsaw Man 24 2019"
+    # for a 2026 volume. Measured live 2026-08-15 that query returned 32
+    # results, all of them anime video. row_is_manga() reads media_type, which
+    # is populated on these rows, so the branch no longer depends on a title
+    # happening to appear in a constant.
+    effective_is_manga = bool(is_manga) or row_is_manga(row)
     preferred = []
     stale_preferred = []
     for value in (row.get("search_query"), row.get("query")):
         value = str(value or "").strip()
         if not value:
             continue
-        if stale_series_year_preferred_query(value, row, is_manga=is_manga, unit_model=unit_model):
+        if stale_series_year_preferred_query(value, row, is_manga=effective_is_manga, unit_model=unit_model):
             stale_preferred.append(value)
         else:
             preferred.append(value)
     generated = query_variants(
         title,
         issue_number,
-        is_manga=is_manga,
+        is_manga=effective_is_manga,
         alt_titles=[row.get("alt_title")],
         unit_model=unit_model,
-        year=row_query_year(row, is_manga=is_manga, unit_model=unit_model),
+        year=row_query_year(row, is_manga=effective_is_manga, unit_model=unit_model),
     )
+    if row_is_unitless_work(row):
+        # A work with no unit gets the bare title pinned first, the way SLSKD's
+        # rung zero already works. Without it this pool has no clean rung at
+        # all: query_variants() is built entirely from the issue token, and the
+        # stored query already carries it, so every variant asks for a number
+        # no correct filename can hold. Measured on the live library
+        # 2026-08-18: 40 of 61 unresolved rows in this class had no unnumbered
+        # variant anywhere in the pool -- On a Sunbeam got four queries and all
+        # four were numbered. The numbered forms stay, behind the anchor,
+        # because a collected reprint sometimes really is filed as "... 1".
+        anchor = display_search_title(title)
+        if anchor:
+            return unique([anchor, *preferred, *generated, *stale_preferred])
     return unique([*preferred, *generated, *stale_preferred])
 
 
@@ -5001,6 +5089,9 @@ def prowlarr_search_with_budget(acquire, query, media_type, args, *, search_dead
         raise TimeoutError("search budget exhausted before Prowlarr request")
     timeout = getattr(args, "prowlarr_timeout_seconds", None)
     if remaining is not None:
+        # Third default for this env var; see inkdrop_acquire. Note this also
+        # shrinks the timeout as the pass budget drains, so the last query of a
+        # pass runs under whatever is left rather than the configured value.
         base_timeout = timeout if timeout is not None else env_float("INKDROP_PROWLARR_SEARCH_TIMEOUT_SECONDS", 12.0)
         timeout = max(1.0, min(remaining, float(base_timeout)))
     return acquire.prowlarr_search(

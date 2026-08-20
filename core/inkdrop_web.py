@@ -14,8 +14,10 @@ import importlib.util
 import ipaddress
 from core import inkdrop_acquire_adapter
 from core import inkdrop_cloudflare_bypass_proxy
+from core import inkdrop_prowlarr_indexer_health
 from core import inkdrop_qbittorrent_auth
 from core import inkdrop_library_frontends
+from core import inkdrop_library_reconcile
 from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
 from core import inkdrop_state
@@ -45,6 +47,7 @@ from core import inkdrop_source_worker_coordinator
 from core import inkdrop_process_lifecycle
 from core import inkdrop_library_adoption
 from core import inkdrop_archive_conversion
+from core import inkdrop_scan_runs
 from core import inkdrop_notifications
 from core import inkdrop_notification_store
 from core import inkdrop_release_calendar
@@ -443,6 +446,14 @@ HTML = r"""<!doctype html>
             <div class="manual-review-decision-actions-secondary" id="manualReviewDecisionAdvancedActions"></div>
           </details>
         </div>
+        <!-- A failed decision leaves this panel open, and on a narrow
+             viewport the toast that used to be the only report of the failure
+             paints behind this overlay: .activity-region sits inside the nav
+             shell's own stacking context (z-index 20/30), below the modal
+             layer (120), so no z-index on the toast can lift it out. The
+             failure is reported here instead, pinned outside the scrolling
+             body so it is visible wherever the person has scrolled to. -->
+        <div class="manual-review-decision-status" id="manualReviewDecisionStatus" role="status" hidden></div>
         <div class="series-remove-foot manual-review-decision-actions" id="manualReviewDecisionActions">
           <button type="button" onclick="closeManualReviewDecisionModal()">Close</button>
         </div>
@@ -1565,13 +1576,13 @@ HTML = r"""<!doctype html>
           tone: "",
           eyebrow: "Operations",
           title: "Reliability",
-          description: "Every Wanted/in-progress item's real path through the pipeline, and why it's stuck.",
+          description: "What is actually happening to everything you're waiting on, and what to do about it.",
           // No stats here on purpose, same reasoning as History/Blocklist above:
-          // the rollup buckets (budget-starved, known-bad blocked, import
-          // recheck loop, no source found yet) are live-computed from
-          // source_attempts/queue_items specifically for this page and
-          // rendered by the island itself -- a header chip reading the global
-          // state payload has no way to agree with them.
+          // the twelve rollup buckets and the health signals above them are
+          // live-computed from source_attempts/queue_items/download_tasks
+          // specifically for this page and rendered by the island itself -- a
+          // header chip reading the global state payload has no way to agree
+          // with them.
           stats: [],
           actions: [],
         },
@@ -6443,10 +6454,14 @@ HTML = r"""<!doctype html>
         "/api/system/logs/download": "Downloading application logs",
         "/api/system/support-bundle/download": "Building support bundle",
         "/api/library-adoption/plan": "Scanning folder for existing issues",
+        "/api/library-adoption/plan/start": "Starting the folder scan",
+        "/api/library-adoption/plan/status": "Checking folder scan progress",
+        "/api/library-adoption/plan/latest": "Loading the last folder scan",
         "/api/library-adoption/apply": "Registering adopted issues",
         "/api/inkdrop-library/convert-archives/plan": "Checking which comics need converting to CBZ",
         "/api/inkdrop-library/convert-archives/apply": "Converting comics to CBZ",
         "/api/inkdrop-library/convert-archives/status": "Checking CBZ conversion progress",
+        "/api/inkdrop-library/convert-archives/latest": "Loading the last library check",
         "/api/inkdrop-settings/backup/preview": "Previewing settings restore",
         "/api/inkdrop-settings/backup/restore": "Restoring portable settings",
         "/api/manga-unit/set": "Updating manga mode",
@@ -7541,6 +7556,52 @@ HTML = r"""<!doctype html>
       return body;
     }
 
+    function backgroundMaintenanceJobTitle(name) {
+      return String(name || "Task").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+
+    function appendBackgroundMaintenanceSection(parent, automatic={}) {
+      if (!parent || !inkdropUserIsAdministrator()) return null;
+      const jobs = Array.isArray(automatic?.scheduler_jobs) ? automatic.scheduler_jobs : [];
+      const body = appendSystemSection(parent, "Background Maintenance", "Scheduled worker jobs");
+      if (!automatic || automatic.scheduler_active === false) {
+        appendSystemEmpty(body, "The worker has not reported on background maintenance jobs yet.");
+        return body;
+      }
+      if (!jobs.length) {
+        appendSystemEmpty(body, "No background maintenance jobs are configured.");
+        return body;
+      }
+      const table = document.createElement("div");
+      table.className = "system-table";
+      appendSystemTableRow(table, ["Task", "Status", "Last Run", "Detail"], {head: true});
+      for (const job of jobs.slice(0, 30)) {
+        const failing = Number(job?.consecutive_failures || 0) > 0;
+        const late = !job?.active && Number(job?.late_by_seconds || 0) > 5;
+        const statusLabel = failing ? "Failing" : late ? "Behind schedule" : job?.active ? "Running" : "OK";
+        const tone = failing ? "bad" : late ? "warn" : "good";
+        const lastRun = job?.last_completed_at ? formatAgeFromSeconds(job.last_completed_at) : "Never";
+        const detailBits = [];
+        if (failing) {
+          const rcDetail = job?.last_rc !== null && job?.last_rc !== undefined ? ` (exit code ${job.last_rc})` : "";
+          detailBits.push(`Failed ${job.consecutive_failures} time${job.consecutive_failures === 1 ? "" : "s"} in a row${rcDetail}; retrying automatically.`);
+        } else if (late) {
+          detailBits.push(`About ${Math.round(job.late_by_seconds)}s behind schedule; will catch up on its own.`);
+        } else {
+          detailBits.push(job?.last_outcome ? `Last outcome: ${coreStateLabel(job.last_outcome)}.` : "No issues reported.");
+        }
+        if (job?.critical) detailBits.push("Required for Automatic Search.");
+        appendSystemTableRow(table, [
+          backgroundMaintenanceJobTitle(job?.name),
+          systemStatusBadge(statusLabel, tone),
+          lastRun,
+          detailBits.join(" "),
+        ]);
+      }
+      body.appendChild(table);
+      return body;
+    }
+
     function humanizeSystemLoadIssueDetail(text) {
       const raw = String(text || "").trim();
       const separatorIndex = raw.indexOf(": ");
@@ -7654,6 +7715,7 @@ HTML = r"""<!doctype html>
       }
       if (systemAreaIncludesSection(activeArea, "advanced")) {
         appendAdvancedDiagnosticsLauncher(grid);
+        appendBackgroundMaintenanceSection(grid, status.automatic_search_state || {});
       }
       if (systemAreaIncludesSection(activeArea, "health")) {
         const healthBody = appendSystemSection(grid, "Health", errors.length ? `${errors.length} load issue${errors.length === 1 ? "" : "s"}` : "status");
@@ -8571,7 +8633,16 @@ HTML = r"""<!doctype html>
       let calendarDoc = null;
       let loadError = "";
       try {
-        const res = await fetch(`/api/inkdrop-state/calendar?days_back=${inkdropCalendarWindowDays}&days_ahead=28`, {cache: "no-store"});
+        // Same operator-day rule as the Pull List below: days_back/days_ahead
+        // are counted from "today", and without this the server counts them
+        // from its own UTC day. This page is currently hidden from the nav,
+        // but it is the endpoint's other caller and should not be the one
+        // place the rule is missing when it comes back.
+        const calendarToday = inkdropPullListIsoDate(inkdropPullListToday());
+        const res = await fetch(
+          `/api/inkdrop-state/calendar?days_back=${inkdropCalendarWindowDays}&days_ahead=28&today=${encodeURIComponent(calendarToday)}`,
+          {cache: "no-store"},
+        );
         const data = await res.json();
         if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
         calendarDoc = data.calendar || {};
@@ -8698,23 +8769,40 @@ HTML = r"""<!doctype html>
     let inkdropPullListLoadSeq = 0;
     const PULL_LIST_WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
-    function inkdropPullListTodayUTC() {
+    // The reader's own day, not the server's. A comic's release date is a
+    // bare wall-clock date -- the day it reaches shops -- so "this week" is
+    // the week the person looking at the screen is in. Computing it in UTC
+    // showed an operator in Sydney last week's box all Monday morning, and
+    // one in Los Angeles next week's from Sunday evening. The browser is the
+    // only part of the system that knows the operator's timezone: there is
+    // no timezone setting, and the container clock is UTC unless someone set
+    // TZ themselves.
+    function inkdropPullListToday() {
       const now = new Date();
-      return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate());
     }
 
+    // Local calendar fields, deliberately not toISOString(): that converts to
+    // UTC first, which for a local-midnight Date hands back the neighbouring
+    // day for anyone west of Greenwich -- reintroducing the same bug one
+    // layer down.
     function inkdropPullListIsoDate(date) {
-      return date.toISOString().slice(0, 10);
+      const pad = (value) => String(value).padStart(2, "0");
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
     }
 
     function inkdropPullListWeekBounds(offset=0) {
-      const today = inkdropPullListTodayUTC();
-      const mondayOffset = (today.getUTCDay() + 6) % 7; // Sun=0..Sat=6 -> Mon=0..Sun=6
+      const today = inkdropPullListToday();
+      const mondayOffset = (today.getDay() + 6) % 7; // Sun=0..Sat=6 -> Mon=0..Sun=6
       const start = new Date(today);
-      start.setUTCDate(today.getUTCDate() - mondayOffset + offset * 7);
+      start.setDate(today.getDate() - mondayOffset + offset * 7);
       const end = new Date(start);
-      end.setUTCDate(start.getUTCDate() + 6);
-      return {start: inkdropPullListIsoDate(start), end: inkdropPullListIsoDate(end)};
+      end.setDate(start.getDate() + 6);
+      return {
+        start: inkdropPullListIsoDate(start),
+        end: inkdropPullListIsoDate(end),
+        today: inkdropPullListIsoDate(today),
+      };
     }
 
     function pullListPeriodPhrase(offset) {
@@ -8764,11 +8852,17 @@ HTML = r"""<!doctype html>
       }
       if (refreshBtn) refreshBtn.onclick = () => loadInkdropPullListPage(true);
 
-      const {start, end} = inkdropPullListWeekBounds(inkdropPullListWeekOffset);
+      const {start, end, today} = inkdropPullListWeekBounds(inkdropPullListWeekOffset);
       let pullDoc = null;
       let loadError = "";
       try {
-        const res = await fetch(`/api/inkdrop-state/calendar?start=${start}&end=${end}`, {cache: "no-store"});
+        // today travels with the window: the server marks is_today and
+        // released against it, and it has no other way to know the
+        // operator's date.
+        const res = await fetch(
+          `/api/inkdrop-state/calendar?start=${start}&end=${end}&today=${encodeURIComponent(today)}`,
+          {cache: "no-store"},
+        );
         const data = await res.json();
         if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
         pullDoc = data.calendar || {};
@@ -11745,18 +11839,45 @@ HTML = r"""<!doctype html>
       };
     }
 
+    // "Downloading via SLSKD" is true of every downloading row at once. The
+    // bar's accessible name has to say which item it is tracking, so it leads
+    // with the series and issue and keeps the stage as trailing context.
+    function queueRowProgressAccessibleName(row={}, progress={}) {
+      const series = inkdropArrTableRowTitle("queue", row);
+      const issue = String(
+        row?.issue_label || row?.issue_or_volume || row?.unit_label
+        || (row?.issue_number ? `#${row.issue_number}` : "")
+        || ""
+      ).trim();
+      const item = [series, issue].filter(Boolean).join(" ").trim();
+      const stage = String(progress?.label || "").trim();
+      if (!item) return stage || "Queue progress";
+      return stage ? `${item} — ${stage}` : item;
+    }
+
     function renderQueueRowProgress(parent, row={}, model={}, options={}) {
       const progress = queueRowProgressModel(row, model);
       if (!parent || !progress) return null;
       const box = document.createElement("div");
       box.className = `queue-row-progress${progress.determinate ? "" : " indeterminate"}${options?.compact ? " compact" : ""}${progress.stalled ? " stalled" : ""}${progress.error ? " bad" : ""}`;
       box.dataset.queueRowProgress = options?.compact ? "inline" : "detail";
-      box.setAttribute("aria-label", progress.label || "Queue progress");
+      // The visible label is the stage ("Downloading via SLSKD"), which is the
+      // same string on every row that happens to be downloading. As an
+      // accessible name that made concurrent transfers indistinguishable, so
+      // the name leads with the item the bar belongs to. The visible chrome
+      // below is unchanged -- the row already shows its own title.
+      box.setAttribute("aria-label", queueRowProgressAccessibleName(row, progress));
       if (progress.determinate) {
         box.setAttribute("role", "progressbar");
         box.setAttribute("aria-valuemin", "0");
         box.setAttribute("aria-valuemax", "100");
         box.setAttribute("aria-valuenow", String(Math.round(progress.percent)));
+        // Without this a screen reader announces a bare "42". The sighted user
+        // reads "42% · 1.2 MB/s · ETA 3m" off the same bar.
+        box.setAttribute("aria-valuetext", [
+          progress.statusText || transferProgressText(progress.percent),
+          progress.meta,
+        ].filter(Boolean).join(", "));
       } else {
         box.setAttribute("role", "status");
         box.setAttribute("aria-live", "polite");
@@ -16415,11 +16536,12 @@ HTML = r"""<!doctype html>
       ].some(pattern => pattern.test(text));
     }
 
-    function seriesDetailIssueDisplayTitle(row={}, model={}) {
+    function seriesDetailIssueDisplayTitle(row={}) {
       const issueTitle = String(row.issue_title || "").trim();
       if (issueTitle && !seriesDetailIssueLooksOperationalTitle(issueTitle)) return issueTitle;
-      const detailTitle = String(model?.detail || "").split(" · ")[0].trim();
-      if (detailTitle && !seriesDetailIssueLooksOperationalTitle(detailTitle)) return detailTitle;
+      // row.next_action/activity_summary are always operational/status text
+      // by construction -- never a real issue title -- so they are not used
+      // as a title-fallback source.
       const number = String(row.issue_number || row.normalized_number || "").trim();
       if (number) return number.startsWith("#") ? `Issue ${number}` : `Issue #${number}`;
       const releaseDate = String(row.release_date || "").trim();
@@ -16546,13 +16668,13 @@ HTML = r"""<!doctype html>
         );
       }
       if (!row.removed_by_user) appendSeriesDetailAction(commandbar, "Move Library", "Change this series' content type or library root folder", () => openSeriesLibraryModal(row));
-      if (!row.removed_by_user && Number(row.duplicate_series_group_count || 0) > 1) {
+      if (!row.removed_by_user && Number(row.duplicate_series_group_count || 0) > 1 && row.duplicate_series_comparable) {
         appendSeriesDetailAction(
           commandbar,
-          "Compare & Merge",
-          "Compare this series against its duplicate-title match and merge them, keeping one and retiring the other",
-          () => openSeriesMergeFlow(row),
-          "warn",
+          "Compare",
+          "Show a read-only comparison of this series against the other rows sharing its title. Merging is unavailable.",
+          () => openSeriesCompareFlow(row),
+          "",
         );
       }
       if (String(row.media_type || "").toLowerCase() === "manga" && !row.removed_by_user) {
@@ -17594,6 +17716,68 @@ HTML = r"""<!doctype html>
       return raw;
     }
 
+    // What each gate actually objected to, in the words a person needs to
+    // make the call. Only a handful of reasons write a `detail` sentence; the
+    // rest arrived as a title-cased code ("Comic Archive Regrab Needed") that
+    // names the gate without saying what it found, which is not enough to
+    // approve or reject anything. This is the written answer for the reasons
+    // that carry no sentence of their own -- the row's own `detail`/`note`
+    // still win over it whenever they exist.
+    const MANUAL_REVIEW_REASON_EXPLANATION = Object.freeze({
+      ambiguous_series_alias: {label: "Two series share this title", why: "More than one monitored series uses this title, so InkDrop cannot tell which one this file belongs to."},
+      artifact_acceptance_gate: {label: "Archive contents look wrong", why: "The archive's contents do not look like the issue it claims to be."},
+      comic_archive_regrab_needed: {label: "Damaged archive", why: "The archive is damaged or incomplete and cannot be imported as-is."},
+      pack_import_bad_archive: {label: "Damaged pack archive", why: "The pack archive is damaged or incomplete and cannot be unpacked."},
+      source_target_identity_mismatch: {label: "Filename contradicts the series", why: "The filename and path do not match the series InkDrop matched this to."},
+      import_blocked_canonical_identity: {label: "No trusted issue identity", why: "The file does not carry an issue or chapter identity InkDrop can trust."},
+      weak_filename_import_guard: {label: "Filename does not prove the issue", why: "The filename does not prove which issue or chapter this is."},
+      weak_filename_unit_evidence: {label: "Filename does not prove the issue", why: "The filename starts with a bare number and never says issue, chapter or volume."},
+      pack_candidate_requires_pack_handling: {label: "Looks like a pack, not one issue", why: "The filename reads as a pack or a range of issues, so it needs pack review rather than a single-issue import."},
+      pack_candidate_requires_review: {label: "Pack needs review", why: "This is a pack of several issues, so it needs pack review before anything is imported."},
+      rss_pack_requires_review: {label: "Pack needs review", why: "This feed result is a pack of several issues, so it needs pack review first."},
+      pack_import_supplemental_release_blocked: {label: "Supplemental release, not the wanted issues", why: "The pack is a supplemental release, not the issues that are wanted."},
+      pack_import_no_importable_files: {label: "Nothing importable in the pack", why: "The pack unpacked, but nothing inside it is a comic or chapter InkDrop can import."},
+      pack_import_verification_failed: {label: "Pack imported but not found in the library", why: "The pack's files were imported, but they did not show up in the library afterwards."},
+      ambiguous_manga_unit_filename: {label: "Chapter or volume is unclear", why: "The filename could be read as either a chapter or a volume, and the two would file differently."},
+      wrong_language_source: {label: "Wrong language", why: "The archive is not in the language this library is set to keep."},
+      language_blocked: {label: "Wrong language", why: "The archive is not in the language this library is set to keep."},
+      wrong_unit_type_chapter_for_comic_issue: {label: "Chapter offered for a comic issue", why: "This is a manga chapter, and the wanted item is a comic issue."},
+      duplicate_copy_suffix: {label: "Looks like a duplicate copy", why: "The filename ends with a duplicate-copy marker, so this may be a second copy of a file already imported."},
+      wrong_series_or_subseries: {label: "Wrong series", why: "The file looks like it belongs to a different series or sub-series."},
+      manual_inbox_imported_as_collection: {label: "Treated as a collected edition", why: "This file covers a run of issues, so InkDrop treated it as a collected edition rather than one issue."},
+      suwayomi_unit_unknown_manual_review: {label: "Unknown chapter or volume", why: "InkDrop cannot tell which chapter or volume this Suwayomi download is."},
+      import_verification_failed: {label: "Imported but not found in the library", why: "The import finished, but the files did not show up in the library afterwards."},
+      qbit_torrent_completed_outside_expected_save_path: {label: "Finished in an unexpected folder", why: "The download finished somewhere other than the folder InkDrop expected."},
+      trusted_issue_missing_source_number: {label: "No issue number to trust", why: "The candidate is trusted, but nothing in it proves the issue or chapter number."},
+      ambiguous_results: {label: "Two results match equally", why: "Two or more results match this equally well, so InkDrop will not pick one for you."},
+      destination_conflict: {label: "Something is already in that spot", why: "A different file is already sitting where this one would be written."},
+      policy_block: {label: "Blocked by a library policy", why: "A library policy blocks this file from being imported."},
+    });
+
+    // The panel must always be able to answer "why is this here?". Prefer what
+    // the row actually recorded, fall back to the written explanation, and
+    // only humanise the raw code as a last resort.
+    function manualReviewRejectionCopy(row={}) {
+      const reasonCode = String(row?.review_reason || row?.reason || "").trim().toLowerCase().replace(/-/g, "_");
+      // Some gates set `detail` to the reason code with the underscores taken
+      // out ("wrong language source"), which restates the label instead of
+      // explaining it. Treat that as no detail at all and use the written
+      // sentence below.
+      const restatesCode = value => Boolean(reasonCode)
+        && value.toLowerCase().replace(/[\s-]+/g, "_") === reasonCode;
+      const detail = String(row?.detail || "").trim();
+      if (detail && !restatesCode(detail)) return detail;
+      const note = String(row?.note || "").trim();
+      if (note && !restatesCode(note)) return note;
+      const written = MANUAL_REVIEW_REASON_EXPLANATION[reasonCode];
+      if (written?.why) return written.why;
+      const rawReason = String(row?.reason || "").trim();
+      // A reason that is already a sentence (some gates pass their own text
+      // straight through) is more useful than the code it sits next to.
+      if (rawReason && /\s/.test(rawReason)) return rawReason;
+      return reasonCode ? coreStateLabel(reasonCode) : "";
+    }
+
     function manualReviewProblemCopy(row={}) {
       const retryOnly = manualReviewRetryOnlyState(row);
       if (retryOnly) return retryOnly.reason;
@@ -17601,6 +17785,15 @@ HTML = r"""<!doctype html>
       if (reason === "trusted_issue_missing_source_number") {
         return "Trusted candidate is missing an issue/chapter number.";
       }
+      // Headline the plain-language name of the problem. The raw code
+      // title-cased ("Artifact Acceptance Gate", "Comic Archive Regrab
+      // Needed") names the gate that fired rather than what is wrong, which
+      // is the internal vocabulary leaking into the one line a person reads
+      // first.
+      const reasonCode = reason.toLowerCase().replace(/-/g, "_");
+      const written = MANUAL_REVIEW_REASON_EXPLANATION[reasonCode]
+        || MANUAL_REVIEW_REASON_EXPLANATION[String(row?.review_reason || "").trim().toLowerCase().replace(/-/g, "_")];
+      if (written?.label) return written.label;
       const label = manualReviewReasonLabel(row);
       return label ? compactStatusSentence(label, "", 140) : "InkDrop needs a human decision before continuing.";
     }
@@ -17612,6 +17805,12 @@ HTML = r"""<!doctype html>
       if (reason === "trusted_issue_missing_source_number") {
         return "InkDrop found a trusted candidate, but cannot prove the issue/chapter number. Choose an action before import.";
       }
+      // The sentence under the headline is what InkDrop actually objected to.
+      // It used to be next_action, whose fallback ("Open Review Decision
+      // to...") is absurd inside the panel that already is Review Decision,
+      // and which never said why the row was stopped in the first place.
+      const why = manualReviewRejectionCopy(row);
+      if (why) return why;
       const next = manualReviewDecisionNextAction(row);
       return next || "Review the candidate and choose whether InkDrop should import it, reject it, ignore it, or keep searching.";
     }
@@ -17805,6 +18004,20 @@ HTML = r"""<!doctype html>
       parent.append(key, val);
     }
 
+    // Report a decision outcome inside the open decision panel. reviewAction()
+    // toasts as well, but the toast is unreachable behind this overlay on any
+    // viewport narrow enough to render it as a full-screen modal, so a failed
+    // Approve/Reject/Ignore read as "nothing happened". No-ops when the panel
+    // is closed, so the shared reviewAction() can call it unconditionally.
+    function setManualReviewDecisionStatus(message, tone="bad") {
+      const status = $("manualReviewDecisionStatus");
+      if (!status) return;
+      const text = String(message || "").trim();
+      status.textContent = text;
+      status.className = `manual-review-decision-status ${tone}`;
+      status.hidden = !text;
+    }
+
     function manualReviewActionButton(action={}) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -17968,16 +18181,37 @@ HTML = r"""<!doctype html>
       const navPosition = $("manualReviewDecisionNavPosition");
       const navPrev = $("manualReviewDecisionPrev");
       const navNext = $("manualReviewDecisionNext");
-      const subject = item.series || item.title || item.query || "Manual Review item";
+      // When the series is exactly what could not be settled the row carries
+      // the literal "Unknown", which headlined the panel as "Unknown" and
+      // named nothing at all. Fall through to the file being decided on.
+      const namedSeries = String(item.series || item.matched_series || "").trim();
+      const stagedLeaf = String(item.local_file_name || "").trim()
+        || (/^([A-Za-z]:[\\/]|\/)/.test(String(item.source || "")) ? String(item.source).split(/[\\/]/).pop() : "");
+      const subject = (namedSeries && namedSeries !== "Unknown" ? namedSeries : "")
+        || item.title || item.query || stagedLeaf || "Manual Review item";
       if (title) title.textContent = subject;
       if (subtitle) subtitle.textContent = [manualReviewExpectedTypeCopy(item), formatAgeFromSeconds(item.activity_at || item.updated_at) ? `waiting ${formatAgeFromSeconds(item.activity_at || item.updated_at)}` : ""].filter(Boolean).join(" · ");
       if (problem) problem.textContent = manualReviewProblemCopy(item);
       if (copy) copy.textContent = manualReviewRecommendedCopy(item);
       if (expectedFacts) {
         expectedFacts.innerHTML = "";
-        appendManualReviewDecisionFact(expectedFacts, "Series", item.series || item.matched_series || subject);
+        // Import-path rows carry `matched_series` and nothing else about the
+        // wanted item, so Type/Issue are usually blank and the column would
+        // render as a lone series name. Say plainly when the series itself is
+        // what could not be settled -- that IS the decision in that case --
+        // and otherwise admit the unit is unknown rather than showing nothing.
+        const expectedSeries = item.series || item.matched_series || "";
+        appendManualReviewDecisionFact(
+          expectedFacts,
+          "Series",
+          expectedSeries && expectedSeries !== "Unknown" ? expectedSeries : "Not settled yet",
+        );
         appendManualReviewDecisionFact(expectedFacts, "Type", manualReviewExpectedTypeCopy(item));
-        appendManualReviewDecisionFact(expectedFacts, "Issue", manualReviewIssueCopy(item) || item.issue || item.query);
+        appendManualReviewDecisionFact(
+          expectedFacts,
+          "Issue",
+          manualReviewIssueCopy(item) || item.issue || item.query || "Not recorded on this row",
+        );
       }
       if (candidateFacts) {
         candidateFacts.innerHTML = "";
@@ -17992,16 +18226,21 @@ HTML = r"""<!doctype html>
         appendManualReviewDecisionFact(candidateFacts, "Type", manualReviewCandidateTypeCopy(item));
         appendManualReviewDecisionFact(candidateFacts, "Source", sourceIsPath ? "SLSKD staged file" : manualReviewSourceCopy(item));
         appendManualReviewDecisionFact(candidateFacts, "Confidence", manualReviewCandidateConfidenceCopy(item));
-        // The SPECIFIC recorded rejection: some rows carry a full sentence in
-        // `reason` (distinct from the coded reason_code); show it verbatim so
-        // the panel answers "why is this here" without the generic label.
-        const reasonText = String(item.reason || "").trim();
-        const reasonCode = String(item.reason_code || item.review_reason || "").trim();
-        const specificReason = String(item.detail || "").trim()
-          || (reasonText && reasonText !== reasonCode ? reasonText : "");
-        appendManualReviewDecisionFact(candidateFacts, "Rejection reason", specificReason);
+        // Nothing here may come back blank: a panel that names the gate but
+        // never says what it found cannot be acted on. manualReviewRejectionCopy
+        // falls back through detail -> note -> written explanation -> code.
+        appendManualReviewDecisionFact(candidateFacts, "Rejection reason", manualReviewRejectionCopy(item));
+        // Whatever the rejecting gate itself recorded -- the competing series
+        // for an ambiguous alias, the archive's failure, the detected unit.
+        // Server-built (see manual_review_decision_evidence) because the row
+        // projection drops the raw keys these come from.
+        for (const fact of Array.isArray(item.review_evidence) ? item.review_evidence : []) {
+          appendManualReviewDecisionFact(candidateFacts, fact?.label || "Evidence", fact?.value || "");
+        }
       }
       if (safety) safety.textContent = "Approve only if this file is the correct issue/chapter. Reject keeps InkDrop searching. Ignore hides this wanted item from Manual Review without deleting files.";
+      // A previous row's failure must not read as this one's.
+      setManualReviewDecisionStatus("");
       const {primary, advanced} = manualReviewDecisionActions(item);
       if (actions) {
         actions.innerHTML = "";
@@ -18036,6 +18275,7 @@ HTML = r"""<!doctype html>
 
     function closeManualReviewDecisionModal() {
       selectedManualReviewRow = null;
+      setManualReviewDecisionStatus("");
       const modal = $("manualReviewDecisionModal");
       if (modal) {
         modal.hidden = true;
@@ -18439,8 +18679,13 @@ HTML = r"""<!doctype html>
         const duplicateWorkloadLabel = duplicateWorkloadClass
           ? ` · ${duplicateWorkloadClass}`
           : "";
+        // Lead with what the group actually is. Calling a deliberate
+        // ComicVine/MangaDex companion pair a "duplicate" is the lie that made
+        // an operator reach for a merge in the first place.
+        const relationshipLabel = String(row.duplicate_series_relationship_label || "");
+        const sharesTitleLabel = relationshipLabel || duplicateLabel;
         const duplicateBit = duplicateCount > 1
-          ? `${duplicateLabel}: ${duplicateCount} rows${duplicateClassWork ? ` · ${compactNumber(duplicateClassWork)} active/wanted in group` : ""}${duplicateClassLabel ? ` · ${duplicateClassLabel}` : ""}${duplicateWorkloadLabel}`
+          ? `${sharesTitleLabel}: ${duplicateCount} rows share this title${duplicateClassWork ? ` · ${compactNumber(duplicateClassWork)} active/wanted in group` : ""}${duplicateClassLabel ? ` · ${duplicateClassLabel}` : ""}${duplicateWorkloadLabel}`
           : "";
         const bits = [
           ownershipLabel,
@@ -18474,11 +18719,11 @@ HTML = r"""<!doctype html>
                 onClick: () => runSeriesSearch(row),
               }]
               : []),
-            ...(row.id && !row.removed_by_user && Number(row.duplicate_series_group_count || 0) > 1
+            ...(row.id && !row.removed_by_user && Number(row.duplicate_series_group_count || 0) > 1 && row.duplicate_series_comparable
               ? [{
-                label: "Compare & Merge",
-                title: "Compare this series against its duplicate-title match and merge them",
-                onClick: () => openSeriesMergeFlow(row),
+                label: "Compare",
+                title: "Show a read-only comparison against the other rows sharing this title. Merging is unavailable.",
+                onClick: () => openSeriesCompareFlow(row),
               }]
               : []),
           ],
@@ -22381,7 +22626,7 @@ HTML = r"""<!doctype html>
       // (the Climber-class mismatch this action exists to correct). Show
       // both the canonical target and the literal release string that was
       // matched, so the confirmation is actually judgeable.
-      const issueLabel = seriesDetailIssueDisplayTitle(row, {});
+      const issueLabel = seriesDetailIssueDisplayTitle(row);
       const seriesLabel = String(row?.series || row?.title || seriesRow?.title || "").trim();
       const subject = seriesLabel ? `${seriesLabel} -- ${issueLabel}` : issueLabel;
       const matchedTitle = String(row?.last_attempt?.title || "").trim();
@@ -22459,7 +22704,7 @@ HTML = r"""<!doctype html>
       if (!element) return;
       element.className = baseClass;
       const normalized = String(tone || "").trim().toLowerCase();
-      if (["warn", "good", "bad"].includes(normalized)) element.classList.add(normalized);
+      if (["warn", "good", "bad", "info"].includes(normalized)) element.classList.add(normalized);
     }
 
     function updateSeriesRemoveFileMode() {
@@ -22537,6 +22782,10 @@ HTML = r"""<!doctype html>
           accept.disabled = false;
           accept.textContent = options.confirmLabel || "Confirm";
         }
+        // A read-only dialog has nothing to cancel: a lone "Close" is honest
+        // where "Cancel/Confirm" implies the dialog is about to do something.
+        const cancel = $("inkdropConfirmCancel");
+        if (cancel) cancel.hidden = Boolean(options.hideCancel);
         modal.hidden = false;
         document.body.dataset.inkdropConfirmModalOpen = "true";
         modal.onclick = event => {
@@ -22732,56 +22981,8 @@ HTML = r"""<!doctype html>
       openSeriesRemoveModal(row);
     }
 
-    async function openSeriesMergeFlow(row) {
-      const seriesId = String(row?.id || row?.series_id || "").trim();
-      if (!seriesId) return;
-      const groupIds = Array.isArray(row?.duplicate_series_group_ids) ? row.duplicate_series_group_ids.map(String) : [];
-      const otherIds = groupIds.filter(id => id && id !== seriesId);
-      if (!otherIds.length) {
-        toast("No duplicate-title series found for this row.", false, "inkdropCore");
-        return;
-      }
-      let otherId = otherIds[0];
-      if (otherIds.length > 1) {
-        const chosen = await openInkdropTextModal({
-          title: "Choose Which Duplicate To Compare",
-          actionTitle: "Type the exact series id",
-          copy: `This title has ${otherIds.length} other duplicate rows. Merges are done one pair at a time -- type the id of the one to compare against first, then repeat this action for the rest afterward.`,
-          subject: row.title || seriesId,
-          label: "Other series id",
-          placeholder: otherIds[0],
-          confirmLabel: "Continue",
-          tone: "warn",
-          meta: otherIds.map(id => ({text: id, tone: ""})),
-          details: [],
-        });
-        if (chosen === null) return;
-        const typedId = String(chosen || "").trim();
-        if (!otherIds.includes(typedId)) {
-          toast("Cancelled: id did not match one of the listed duplicates.", false, "inkdropCore");
-          return;
-        }
-        otherId = typedId;
-      }
-
-      let candidate;
-      try {
-        const data = await window.InkDropApi.request("/api/inkdrop-state/series-merge/candidate", {
-          method: "POST",
-          body: {seriesIdA: seriesId, seriesIdB: otherId},
-        });
-        candidate = data.result?.candidate;
-        if (!candidate || candidate.ok === false) {
-          throw new Error(candidate?.error || data.error || "Could not load a comparison for these series.");
-        }
-      } catch (err) {
-        toast(`Merge comparison failed: ${err?.message || err}`, false, "inkdropCore");
-        return;
-      }
-
-      const a = candidate.series_a;
-      const b = candidate.series_b;
-      const sideLine = item => [
+    function seriesCompareSideLine(item) {
+      return [
         item.title,
         item.publisher || "unknown publisher",
         item.year || "unknown year",
@@ -22791,83 +22992,93 @@ HTML = r"""<!doctype html>
         `${item.active_queue_count} active`,
         `${item.verified_imports} verified import${item.verified_imports === 1 ? "" : "s"}`,
       ].join(" · ");
+    }
 
-      const suggestedTitle = candidate.suggested_target_series_id === a.series_id ? a.title : b.title;
-
-      const conflictWarning = candidate.duplicate_series_group_class === "active_identity_conflict"
-        ? "Both rows have active work -- review carefully before merging."
-        : "";
-      const distinctYears = candidate.duplicate_series_distinct_years?.length > 1;
-      const distinctPublishers = candidate.duplicate_series_distinct_publishers?.length > 1;
-      const contextWarning = candidate.duplicate_series_distinct_context
-        ? `Different ${[distinctYears ? "years" : "", distinctPublishers ? "publishers" : ""].filter(Boolean).join("/")} evidence exists -- confirm these are really the same series, not distinct volumes.`
-        : "";
-
-      const typedKeep = await openInkdropTextModal({
-        title: "Merge Duplicate Series",
-        actionTitle: "Type the exact title of the series to KEEP",
-        copy: `Moves every issue, wanted item, queue row, and history entry from the other side onto whichever series you type below. The other series is parked (not deleted) -- its full pre-merge state stays on disk. Suggested keeper: "${suggestedTitle}" (${candidate.suggested_target_reason}) -- type the other title instead to flip this.`,
-        subject: `${a.title}  vs.  ${b.title}`,
-        label: "Series to keep (exact title)",
-        placeholder: suggestedTitle,
-        confirmLabel: "Continue",
-        tone: candidate.duplicate_series_group_class === "active_identity_conflict" ? "bad" : "warn",
-        meta: [
-          {text: `${candidate.shared_issue_count} shared issue #s`, tone: "good"},
-          {text: `${candidate.only_in_a_count} only in "${a.title}"`, tone: ""},
-          {text: `${candidate.only_in_b_count} only in "${b.title}"`, tone: ""},
-        ],
-        details: [`A: ${sideLine(a)}`, `B: ${sideLine(b)}`, conflictWarning, contextWarning].filter(Boolean),
+    function seriesCompareEvidenceLines(candidate) {
+      const lines = [];
+      const a = candidate.series_a;
+      const b = candidate.series_b;
+      lines.push({text: `A · ${seriesCompareSideLine(a)}`, tone: ""});
+      lines.push({text: `B · ${seriesCompareSideLine(b)}`, tone: ""});
+      if (candidate.duplicate_series_relationship_note) {
+        lines.push({
+          text: `${candidate.duplicate_series_relationship_label}: ${candidate.duplicate_series_relationship_note}`,
+          tone: candidate.duplicate_series_relationship === "unresolved" ? "warn" : "good",
+        });
+      }
+      lines.push({
+        text: `Coverage: ${candidate.shared_issue_count} issue number(s) on both sides · ${candidate.only_in_a_count} only in A · ${candidate.only_in_b_count} only in B`,
+        tone: "",
       });
-      if (typedKeep === null) return;
-      const typedTitle = String(typedKeep || "").trim();
-      let target, shadow;
-      if (typedTitle === a.title) { target = a; shadow = b; }
-      else if (typedTitle === b.title) { target = b; shadow = a; }
-      else {
-        toast("Merge cancelled: title did not exactly match either series.", false, "inkdropCore");
+      const evidence = Array.isArray(candidate.shared_issue_evidence) ? candidate.shared_issue_evidence : [];
+      if (!evidence.length) return lines;
+      const matched = Number(candidate.shared_issue_title_match_count || 0);
+      lines.push({
+        text: `${matched} of the ${evidence.length} shared number(s) below also share an issue title. Numbers alone prove nothing -- every volume restarts at #1.`,
+        tone: matched ? "" : "warn",
+      });
+      for (const line of evidence.slice(0, 8)) {
+        const left = `${line.a_title || "untitled"}${line.a_release_date ? ` (${line.a_release_date})` : ""}`;
+        const right = `${line.b_title || "untitled"}${line.b_release_date ? ` (${line.b_release_date})` : ""}`;
+        // A matching title is the only positive evidence of sameness here, so it
+        // is the only thing worth colouring. A mismatch is ordinary information,
+        // not an error, and painting it red reads as "something went wrong".
+        lines.push({text: `#${line.issue_number} — A: ${left}  ·  B: ${right}`, tone: line.titles_match ? "good" : ""});
+      }
+      if (evidence.length > 8) lines.push({text: `+${evidence.length - 8} more shared number(s) not shown`, tone: ""});
+      return lines;
+    }
+
+    async function openSeriesCompareFlow(row) {
+      const seriesId = String(row?.id || row?.series_id || "").trim();
+      if (!seriesId) return;
+      const groupIds = Array.isArray(row?.duplicate_series_group_ids) ? row.duplicate_series_group_ids.map(String) : [];
+      const otherIds = groupIds.filter(id => id && id !== seriesId);
+      if (!otherIds.length) {
+        toast("No other series shares this title.", false, "inkdropCore");
+        return;
+      }
+      // Every other row in the group is compared in one pass, so the operator
+      // never has to name an internal series id to pick a side.
+      const compareIds = otherIds.slice(0, 4);
+      let candidates;
+      try {
+        candidates = await Promise.all(compareIds.map(otherId => window.InkDropApi
+          .request("/api/inkdrop-state/series-merge/candidate", {method: "POST", body: {seriesIdA: seriesId, seriesIdB: otherId}})
+          .then(data => data.result?.candidate)));
+      } catch (err) {
+        toast(`Comparison failed: ${err?.message || err}`, false, "inkdropCore");
+        return;
+      }
+      candidates = (candidates || []).filter(candidate => candidate && candidate.ok !== false);
+      if (!candidates.length) {
+        toast("Could not load a comparison for these series.", false, "inkdropCore");
         return;
       }
 
-      const ok = await openInkdropConfirmModal({
-        title: "Apply Series Merge",
-        actionTitle: `Merge "${shadow.title}" into "${target.title}"`,
-        copy: `"${shadow.title}" will be parked and its issues/wanted/queue/history moved onto "${target.title}". This cannot be undone from the UI.`,
-        subject: target.title,
-        confirmLabel: "Merge Series",
-        tone: "bad",
-        meta: [
-          {text: `Keeping: ${target.title}`, tone: "good"},
-          {text: `Retiring: ${shadow.title}`, tone: "bad"},
-        ],
-        details: [
-          "Issues are matched by issue number; anything unmatched is carried over, not dropped.",
-          "The retired series stays on disk (parked, not deleted) with its full pre-merge snapshot.",
-        ],
-      });
-      if (!ok) return;
-
-      try {
-        const data = await window.InkDropApi.request("/api/inkdrop-state/series-merge/apply", {
-          method: "POST",
-          body: {
-            shadowSeriesId: shadow.series_id,
-            targetSeriesId: target.series_id,
-            confirmShadowSeriesId: shadow.series_id,
-            confirmTargetSeriesId: target.series_id,
-            enableApply: true,
-            dryRun: false,
-          },
-        });
-        const result = data.result?.merge;
-        if (!result || result.ok === false || (result.blockers && result.blockers.length) || result.reason) {
-          throw new Error((result?.blockers || []).join(", ") || result?.reason || result?.error || "Merge was not applied.");
-        }
-        toast(`Merged "${shadow.title}" into "${target.title}": ${result.issue_mapped} issue(s), ${result.wanted_moved} wanted, ${result.queue_moved} queue row(s) moved.`, true, "inkdropCore");
-        await loadInkdropSection("series", {series_id: target.series_id}, {scroll: "top"});
-      } catch (err) {
-        toast(`Merge failed: ${err?.message || err}`, false, "inkdropCore");
+      const details = [];
+      for (const candidate of candidates) {
+        details.push(...seriesCompareEvidenceLines(candidate));
       }
+      if (otherIds.length > compareIds.length) {
+        details.push({text: `${otherIds.length - compareIds.length} further same-title row(s) not compared here`, tone: "warn"});
+      }
+
+      await openInkdropConfirmModal({
+        title: "Compare Same-Title Series",
+        actionTitle: `Comparing "${row.title || seriesId}"`,
+        copy: "This is a read-only comparison. InkDrop cannot merge series: a merge would strand collected-edition links, companion links and source/language policy on the retired row, so the operation is disabled until that is fixed. Nothing here changes your library, your database or your files.",
+        subject: row.title || seriesId,
+        confirmLabel: "Close",
+        hideCancel: true,
+        tone: "info",
+        meta: [
+          {text: `${candidates.length} comparison${candidates.length === 1 ? "" : "s"}`, tone: ""},
+          {text: "Read-only", tone: "good"},
+          {text: "Merge unavailable", tone: "warn"},
+        ],
+        details,
+      });
     }
 
     async function recoverRemovedSeriesResult(row={}) {
@@ -26377,6 +26588,48 @@ HTML = r"""<!doctype html>
       tbody.appendChild(row);
     }
 
+    // Two phases with very different shapes: walking the disk has no total to
+    // divide by, identifying folders does. Reported separately rather than
+    // averaged into one bar that would sit at 99% through the slow half.
+    function libraryAdoptionProgressView(task={}) {
+      const updatedAtMs = Number(task.updated_at || task.started_at || 0) * 1000;
+      const idleSeconds = updatedAtMs ? Math.max(0, Math.round((Date.now() - updatedAtMs) / 1000)) : 0;
+      const stalled = idleSeconds >= 30;
+      const currentName = archiveConversionBaseName(task.current_path);
+      if (task.phase === "identifying") {
+        const done = Number(task.folders_done || 0);
+        const total = Number(task.folders_total || 0);
+        const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null;
+        return {
+          label: "Working out what each folder is",
+          statusText: percent !== null ? `${percent}%` : "Identifying",
+          percent,
+          determinate: percent !== null,
+          stalled,
+          meta: [
+            total > 0 ? `${done.toLocaleString()} of ${total.toLocaleString()} folders` : `${done.toLocaleString()} folders`,
+            currentName ? `Now on: ${currentName}` : "",
+            stalled ? `No update in ${idleSeconds}s -- looking a title up with a metadata provider can take a moment` : "",
+          ].filter(Boolean).join(" · "),
+        };
+      }
+      const scanned = Number(task.scanned || 0);
+      const matched = Number(task.matched || 0);
+      return {
+        label: "Reading the folder",
+        statusText: "Scanning",
+        percent: null,
+        determinate: false,
+        stalled,
+        meta: [
+          scanned > 0 ? `${scanned.toLocaleString()} files seen` : "Starting…",
+          `${matched.toLocaleString()} comic${matched === 1 ? "" : "s"} or manga found`,
+          currentName ? `Now reading: ${currentName}` : "",
+          stalled ? `No update in ${idleSeconds}s -- a deep folder tree can take a while` : "",
+        ].filter(Boolean).join(" · "),
+      };
+    }
+
     function appendLibraryAdoptionPanel(parent) {
       appendSettingsFormSectionTitle(parent, "Library adoption");
       const panel = document.createElement("section");
@@ -26411,46 +26664,128 @@ HTML = r"""<!doctype html>
       status.setAttribute("role", "status");
       status.setAttribute("aria-live", "polite");
       status.textContent = "No folder scanned yet.";
+      const ageLine = document.createElement("div");
+      ageLine.className = "library-adoption-age";
+      const inlineProgress = document.createElement("div");
+      inlineProgress.className = "library-adoption-inline-progress";
       const resultsWrap = document.createElement("div");
       resultsWrap.className = "library-adoption-results";
+
+      function setScanButtonBusy(busy) {
+        scanButton.disabled = busy;
+        scanButton.textContent = busy ? "Scanning…" : "Scan folder";
+      }
+
+      function renderLibraryAdoptionPlan(task) {
+        const plan = task?.plan || {};
+        inlineProgress.replaceChildren();
+        resultsWrap.replaceChildren();
+        if (!plan.ok) {
+          status.textContent = `Scan failed: ${(plan.errors || []).join(", ") || task?.error || "unknown error"}`;
+          ageLine.replaceChildren();
+          return;
+        }
+        const root = task?.root || plan.root || rootInput.value.trim();
+        const mediaType = task?.media_type || plan.media_type || typeSelect.value;
+        const summary = plan.summary || {};
+        status.textContent = `${summary.already_imported || 0} already tracked, ${summary.existing_series_folder_candidates || 0} matching known series, ${summary.new_series_candidates || 0} new.${plan.truncated ? " (scan truncated at file limit)" : ""}`;
+        renderScanRunAgeLine(ageLine, task, {
+          verb: "Scanned",
+          rerunText: "Scan again so the folders below match what is on disk.",
+        });
+        if (!plan.candidates?.length) return;
+        const table = document.createElement("table");
+        table.className = "library-adoption-table";
+        const thead = document.createElement("thead");
+        thead.innerHTML = "<tr><th>Folder</th><th>Status</th><th>Files</th><th>Series</th><th></th></tr>";
+        const tbody = document.createElement("tbody");
+        const context = {root, mediaType, status};
+        for (const candidate of plan.candidates) {
+          renderLibraryAdoptionCandidateRow(tbody, candidate, context);
+        }
+        table.append(thead, tbody);
+        resultsWrap.appendChild(table);
+      }
+
+      function pollLibraryAdoptionTask(taskId) {
+        api("/api/library-adoption/plan/status", {taskId}, {timeoutMs: 30000}).then(data => {
+          const task = data?.task;
+          if (!task) {
+            setScanButtonBusy(false);
+            status.textContent = "Lost track of the scan. Start it again.";
+            inlineProgress.replaceChildren();
+            return;
+          }
+          if (task.state === "running") {
+            status.textContent = "";
+            renderArchiveConversionProgressBar(inlineProgress, libraryAdoptionProgressView(task), {compact: true});
+            setTimeout(() => pollLibraryAdoptionTask(taskId), 1000);
+            return;
+          }
+          setScanButtonBusy(false);
+          if (task.state === "interrupted") {
+            const age = scanRunAgeText(task.age_seconds);
+            status.textContent = `The last scan stopped when InkDrop restarted${age && age !== "just now" ? ` ${age}` : ""}. Scan again to pick it back up.`;
+            inlineProgress.replaceChildren();
+            ageLine.replaceChildren();
+            return;
+          }
+          renderLibraryAdoptionPlan(task);
+        }).catch(error => {
+          setScanButtonBusy(false);
+          status.textContent = `Lost track of the scan: ${error?.message || error}`;
+        });
+      }
+
       scanButton.onclick = async () => {
         const root = rootInput.value.trim();
         if (!root) {
           status.textContent = "Enter a folder path first.";
           return;
         }
-        scanButton.disabled = true;
-        status.textContent = "Scanning…";
+        setScanButtonBusy(true);
+        status.textContent = "Starting the scan…";
+        ageLine.replaceChildren();
+        inlineProgress.replaceChildren();
         resultsWrap.replaceChildren();
         try {
-          const data = await api("/api/library-adoption/plan", {root, mediaType: typeSelect.value}, {timeoutMs: 60000});
-          const plan = data?.plan || {};
-          if (!plan.ok) {
-            status.textContent = `Scan failed: ${(plan.errors || []).join(", ") || "unknown error"}`;
-            return;
-          }
-          const summary = plan.summary || {};
-          status.textContent = `${summary.already_imported || 0} already tracked, ${summary.existing_series_folder_candidates || 0} matching known series, ${summary.new_series_candidates || 0} new. ${plan.truncated ? " (scan truncated at file limit)" : ""}`;
-          if (!plan.candidates?.length) return;
-          const table = document.createElement("table");
-          table.className = "library-adoption-table";
-          const thead = document.createElement("thead");
-          thead.innerHTML = "<tr><th>Folder</th><th>Status</th><th>Files</th><th>Series</th><th></th></tr>";
-          const tbody = document.createElement("tbody");
-          const context = {root, mediaType: typeSelect.value, status};
-          for (const candidate of plan.candidates) {
-            renderLibraryAdoptionCandidateRow(tbody, candidate, context);
-          }
-          table.append(thead, tbody);
-          resultsWrap.appendChild(table);
+          const data = await api("/api/library-adoption/plan/start", {root, mediaType: typeSelect.value}, {timeoutMs: 30000});
+          if (data?.already_running) status.textContent = "A folder scan is already running.";
+          pollLibraryAdoptionTask(data.taskId);
         } catch (error) {
+          setScanButtonBusy(false);
           status.textContent = `Scan failed: ${error?.message || error}`;
-        } finally {
-          scanButton.disabled = false;
         }
       };
-      panel.append(intro, form, status, resultsWrap);
+
+      panel.append(intro, form, status, ageLine, inlineProgress, resultsWrap);
       parent.appendChild(panel);
+
+      // Reopening Settings a day later should show the folders the last scan
+      // found, with the path and media type it used, not an empty form.
+      (async () => {
+        let task = null;
+        try {
+          task = await api("/api/library-adoption/plan/latest", {}, {timeoutMs: 15000}).then(d => d?.task || null);
+        } catch (error) {
+          return;
+        }
+        if (!task) return;
+        if (task.root) rootInput.value = task.root;
+        if (task.media_type) typeSelect.value = task.media_type;
+        if (task.state === "running") {
+          setScanButtonBusy(true);
+          status.textContent = "Picking up a scan that is still running…";
+          pollLibraryAdoptionTask(task.task_id);
+          return;
+        }
+        if (task.state === "interrupted") {
+          const age = scanRunAgeText(task.age_seconds);
+          status.textContent = `The last scan stopped when InkDrop restarted${age && age !== "just now" ? ` ${age}` : ""}. Scan again to pick it back up.`;
+          return;
+        }
+        if (task.state === "completed") renderLibraryAdoptionPlan(task);
+      })();
     }
 
     const NOTIFICATION_STATUS_TONE = {
@@ -26502,9 +26837,17 @@ HTML = r"""<!doctype html>
     // actually being configured underneath. `onDelete` is optional: readers
     // are fixed providers, not deletable instances, so their cards only get
     // Configure/Test.
-    function buildConnectionCard(grid, {title, subtitle, enabled, pills, mutedPillText, scopeText, onConfigure, onTest, testTitle, onDelete, statusTitle}) {
+    function buildConnectionCard(grid, {title, subtitle, enabled, pills, mutedPillText, scopeText, onConfigure, onTest, testTitle, onDelete, statusTitle, offNote}) {
       const card = document.createElement("article");
-      card.className = "notifications-channel-card";
+      // A one-word chip was the only thing separating a switched-off card from
+      // a working one: everything below it -- green trigger pills, the series
+      // scope line, a live Test button -- read exactly the same either way, so
+      // "Off" was easy to look straight past. The class dims the whole card and
+      // the pills below go quiet with it, so the state reads before the chip
+      // does. Wording matches the Download Clients cards ("Enabled"/"Disabled")
+      // rather than inventing a second vocabulary for the same idea one
+      // settings page over.
+      card.className = enabled ? "notifications-channel-card" : "notifications-channel-card is-disabled";
 
       const head = document.createElement("div");
       head.className = "notifications-channel-card-head";
@@ -26512,7 +26855,7 @@ HTML = r"""<!doctype html>
       heading.textContent = title;
       const badge = document.createElement("span");
       badge.className = `status-badge ${enabled ? "good" : "warn"}`;
-      badge.textContent = enabled ? "On" : "Off";
+      badge.textContent = enabled ? "Enabled" : "Disabled";
       badge.title = statusTitle || (enabled ? `${title} is connected and enabled.` : `${title} is not enabled -- Configure to connect it.`);
       head.append(heading, badge);
       card.appendChild(head);
@@ -26529,7 +26872,10 @@ HTML = r"""<!doctype html>
       if (pills && pills.length) {
         for (const label of pills) {
           const pill = document.createElement("span");
-          pill.className = "notifications-trigger-pill";
+          // A green "On Grabbed" pill on a switched-off card claims something
+          // that is not happening. The triggers are still saved -- they just
+          // aren't firing -- so they go muted rather than disappearing.
+          pill.className = enabled ? "notifications-trigger-pill" : "notifications-trigger-pill muted";
           pill.textContent = label;
           pillsWrap.appendChild(pill);
         }
@@ -26540,6 +26886,13 @@ HTML = r"""<!doctype html>
         pillsWrap.appendChild(pill);
       }
       card.appendChild(pillsWrap);
+
+      if (!enabled && offNote) {
+        const note = document.createElement("p");
+        note.className = "setting-description notifications-channel-off-note";
+        note.textContent = offNote;
+        card.appendChild(note);
+      }
 
       if (scopeText) {
         const scope = document.createElement("p");
@@ -26600,6 +26953,7 @@ HTML = r"""<!doctype html>
           scopeText: "",
           onConfigure: () => openLibraryAdapterModal(provider, onSaved),
           onTest: (button) => testProviderSettings(provider.id, {button}),
+          offNote: `InkDrop isn't talking to ${readerLabel} yet. Configure it to connect.`,
           testTitle: `Runs a real connectivity check against ${provider.display_name || id} right now.`,
           statusTitle: provider.enabled
             ? `${readerLabel} is connected. "On Import" below controls whether it's asked to rescan after each import.`
@@ -26617,17 +26971,32 @@ HTML = r"""<!doctype html>
     // the list.
     function appendNotificationsChannelCards(grid, config, onSaved) {
       const eventLabelById = new Map((config.event_types || []).map(eventType => [eventType.id, eventType.label]));
+      // The subsystem-wide switch is separate from each connector's own one and
+      // isn't editable here. When it's off, a connector can be switched on and
+      // still send nothing -- so say which of the two is stopping it instead of
+      // showing a card that looks fine and quietly does nothing.
+      const notificationsEnabled = config.notifications_enabled !== false;
       for (const channel of config.connectors || []) {
-        const activeEvents = (channel.events || []).map(id => eventLabelById.get(id)).filter(Boolean).map(label => `On ${label}`);
+        const label = notificationConnectorLabel(channel);
+        const activeEvents = (channel.events || []).map(id => eventLabelById.get(id)).filter(Boolean).map(eventLabel => `On ${eventLabel}`);
         const scopeText = (channel.series_filter || []).length
           ? `Scoped to ${channel.series_filter.length} series`
           : "All series";
+        const enabled = channel.enabled !== false && notificationsEnabled;
         buildConnectionCard(grid, {
-          title: notificationConnectorLabel(channel),
-          subtitle: channel.display_name && channel.display_name !== notificationConnectorLabel(channel) ? channel.display_name : "",
-          enabled: channel.enabled,
+          title: label,
+          subtitle: channel.display_name && channel.display_name !== label ? channel.display_name : "",
+          enabled,
           pills: activeEvents,
           scopeText,
+          statusTitle: channel.enabled === false
+            ? `${label} is switched off. Its triggers and settings are kept -- Configure to turn it back on.`
+            : notificationsEnabled
+              ? `${label} is switched on and sending.`
+              : `${label} is switched on, but notifications are off for the whole install, so nothing is sent.`,
+          offNote: channel.enabled === false
+            ? "Switched off. Its triggers stay saved, but nothing is sent."
+            : "Notifications are off for this whole install, so nothing is sent.",
           onConfigure: () => openNotificationsChannelModal(channel, config, onSaved),
           onTest: async () => {
             try {
@@ -27044,11 +27413,21 @@ HTML = r"""<!doctype html>
       const testButton = document.createElement("button");
       testButton.type = "button";
       testButton.textContent = "Send Test Notification";
-      testButton.title = "Sends a real test message right now to this connection only.";
+      testButton.title = "Sends a real test message right now to this connection only, using the credentials currently in this form.";
       testButton.onclick = async () => {
         testButton.disabled = true;
         try {
-          const result = await api("/api/notifications/connector/test", {id: channel.id});
+          // Test what's on screen, not what was last saved. Without this a
+          // just-pasted webhook reported "not configured", and a webhook
+          // edited to a new value reported "sent" for the *old* one.
+          // Blank fields are omitted so an untouched masked secret still
+          // tests the stored credential.
+          const settingsPatch = {};
+          for (const field of typeSchema.config_fields || []) {
+            const value = String(secretInputs[field.key]?.value || "");
+            if (value.trim()) settingsPatch[field.key] = value;
+          }
+          const result = await api("/api/notifications/connector/test", {id: channel.id, settings: settingsPatch});
           const detail = result?.result?.detail || (result?.result?.sent ? "sent" : "failed");
           toast(`${notificationConnectorLabel(channel)}: ${detail}`, !!result?.result?.sent, "inkdropSettings");
         } catch (error) {
@@ -27269,7 +27648,7 @@ HTML = r"""<!doctype html>
       retentionInput.min = "1";
       retentionInput.max = "365";
       retentionInput.value = settings.history_retention_days ?? 30;
-      appendProviderSettingRow(parent, "History retention (days)", retentionInput, {description: "Delivery history older than this is cleared out automatically."});
+      appendProviderSettingRow(parent, "History retention (days)", retentionInput, {description: "How long a sent or failed notification stays in the delivery history. Rows that record a non-send — a duplicate suppressed by the dedup window, a series filtered out, a channel switched off — are cleared after two days instead, since they are the bulk of the history and nothing reads them back."});
 
       const saveRow = document.createElement("div");
       saveRow.className = "settings-form-row";
@@ -27308,25 +27687,222 @@ HTML = r"""<!doctype html>
       };
     }
 
-    // Collapsed by default: a running list that only ever grows (the old
-    // behavior loaded 25 rows immediately and "Load more" just kept
-    // appending, with no way back to a short view) reads as an endless dump
-    // instead of a history. Show the 5 most recent up front; "Show full
-    // history" is what actually loads the paginated view.
-    const NOTIFICATIONS_HISTORY_SUMMARY_LIMIT = 5;
     const NOTIFICATIONS_HISTORY_PAGE_LIMIT = 25;
 
+    // Delivery history is a small click-to-open control, not an
+    // always-rendered inline table -- the Connect page lists every
+    // configured integration, and a running notification log doesn't
+    // belong sitting open among them by default. "View delivery history"
+    // opens a modal/overlay with the same paginated list + row-click detail
+    // this used to render inline.
     function appendNotificationsHistory(parent) {
       appendSettingsFormSectionTitle(parent, "Delivery history");
       const intro = document.createElement("p");
       intro.className = "setting-description";
-      intro.textContent = "Click a row for the full subject, message, and error detail.";
+      intro.textContent = "Every notification InkDrop has sent or attempted, most recent first.";
       parent.appendChild(intro);
+      const actionsRow = document.createElement("div");
+      actionsRow.className = "settings-form-row";
+      const viewButton = document.createElement("button");
+      viewButton.type = "button";
+      viewButton.textContent = "View delivery history";
+      viewButton.onclick = () => openNotificationsHistoryListModal();
+      actionsRow.appendChild(viewButton);
+      parent.appendChild(actionsRow);
+    }
+
+    // ---------------------------------------------------------------------
+    // Shared modal layer stack.
+    //
+    // Written for the two notification-history dialogs, which stack (a row in
+    // the list opens a delivery detail on top of it), but deliberately generic
+    // -- the other dialogs in this file each hand-roll their own lifecycle and
+    // should move onto this as they are touched.
+    //
+    // What it exists to stop, all of which the two dialogs below did:
+    //
+    //   * Every dialog registering its own document-level Escape handler, and
+    //     never removing it. Both handlers stayed live for the life of the
+    //     page, so with both dialogs open one Escape closed both layers at
+    //     once, and an Escape with nothing open still ran close() on hidden
+    //     modals. The stack owns exactly one listener and routes the key to
+    //     the top layer only.
+    //   * A parent dialog staying aria-modal="true" behind its child, so
+    //     assistive tech saw two modals at once. The parent goes inert.
+    //   * No Tab containment: Tab walked straight out of the dialog into the
+    //     settings page behind it.
+    //   * No focus handoff: opening a dialog left focus wherever it was, and
+    //     closing it dropped focus to <body> instead of the control that
+    //     opened it.
+    const inkdropModalStack = [];
+
+    function inkdropModalFocusable(root) {
+      if (!root) return [];
+      const selector = 'a[href], button:not([disabled]), input:not([disabled]),'
+        + ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+      // getClientRects() is the cheap "is this actually on screen" test --
+      // it excludes hidden rows, display:none branches and collapsed content
+      // without needing layout knowledge of each dialog.
+      return Array.from(root.querySelectorAll(selector)).filter(el => el.getClientRects().length > 0);
+    }
+
+    function inkdropModalTopLayer() {
+      return inkdropModalStack.length ? inkdropModalStack[inkdropModalStack.length - 1] : null;
+    }
+
+    function setInkdropModalInert(modal, inert) {
+      if (!modal) return;
+      if (inert) {
+        modal.setAttribute("inert", "");
+        modal.setAttribute("aria-hidden", "true");
+        // Only one aria-modal in the tree at a time, or a screen reader is
+        // told two dialogs both own the document.
+        modal.removeAttribute("aria-modal");
+      } else {
+        modal.removeAttribute("inert");
+        modal.removeAttribute("aria-hidden");
+        modal.setAttribute("aria-modal", "true");
+      }
+    }
+
+    function inkdropModalStackKeydown(event) {
+      const layer = inkdropModalTopLayer();
+      if (!layer) return;
+      if (event.key === "Escape") {
+        // Only the top layer closes. stopPropagation keeps a still-registered
+        // per-dialog handler elsewhere on the page from also acting on it.
+        event.preventDefault();
+        event.stopPropagation();
+        layer.close();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = inkdropModalFocusable(layer.modal);
+      if (!focusable.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      const outside = !layer.modal.contains(active);
+      if (event.shiftKey && (active === first || outside)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || outside)) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    function pushInkdropModalLayer(modal, options={}) {
+      if (!modal) return null;
+      if (inkdropModalStack.some(layer => layer.modal === modal)) return null;
+      const parent = inkdropModalTopLayer();
+      if (parent) setInkdropModalInert(parent.modal, true);
+      setInkdropModalInert(modal, false);
+      const restore = options.restoreFocus !== undefined
+        ? options.restoreFocus
+        : (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+      const layer = {
+        modal,
+        close: typeof options.close === "function" ? options.close : () => {},
+        restoreFocus: restore,
+      };
+      inkdropModalStack.push(layer);
+      // One listener for the whole stack, in the capture phase so the top
+      // layer decides before anything downstream sees the key.
+      if (inkdropModalStack.length === 1) {
+        document.addEventListener("keydown", inkdropModalStackKeydown, true);
+      }
+      // Deferred: the caller is usually still filling the dialog body when it
+      // pushes, so the intended target may not exist yet.
+      window.setTimeout(() => {
+        if (inkdropModalTopLayer() !== layer) return;
+        const requested = typeof options.initialFocus === "function"
+          ? options.initialFocus()
+          : options.initialFocus;
+        const target = (requested && document.contains(requested))
+          ? requested
+          : inkdropModalFocusable(modal)[0];
+        if (target && document.contains(target)) target.focus();
+      }, 0);
+      return layer;
+    }
+
+    function popInkdropModalLayer(modal) {
+      const index = inkdropModalStack.findIndex(layer => layer.modal === modal);
+      if (index < 0) return;
+      const [layer] = inkdropModalStack.splice(index, 1);
+      if (!inkdropModalStack.length) {
+        document.removeEventListener("keydown", inkdropModalStackKeydown, true);
+      }
+      const parent = inkdropModalTopLayer();
+      if (parent) setInkdropModalInert(parent.modal, false);
+      if (layer.restoreFocus && document.contains(layer.restoreFocus)) {
+        layer.restoreFocus.focus();
+      }
+    }
+
+    function ensureNotificationsHistoryListModal() {
+      let modal = $("notificationsHistoryListModal");
+      if (modal) return modal;
+      modal = document.createElement("section");
+      modal.id = "notificationsHistoryListModal";
+      modal.className = "series-remove-modal notifications-history-list-modal";
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-labelledby", "notificationsHistoryListTitle");
+      modal.hidden = true;
+      const dialog = document.createElement("div");
+      dialog.className = "series-remove-dialog";
+      const head = document.createElement("div");
+      head.className = "series-remove-head";
+      const title = document.createElement("h3");
+      title.id = "notificationsHistoryListTitle";
+      title.textContent = "Delivery history";
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "series-remove-close";
+      closeButton.setAttribute("aria-label", "Close delivery history");
+      closeButton.textContent = "×";
+      closeButton.onclick = () => closeNotificationsHistoryListModal();
+      head.append(title, closeButton);
+      const body = document.createElement("div");
+      body.id = "notificationsHistoryListBody";
+      body.className = "series-remove-body";
+      dialog.append(head, body);
+      modal.appendChild(dialog);
+      modal.onclick = event => {
+        if (event.target === modal) closeNotificationsHistoryListModal();
+      };
+      document.body.appendChild(modal);
+      return modal;
+    }
+
+    function closeNotificationsHistoryListModal() {
+      const modal = $("notificationsHistoryListModal");
+      if (!modal) return;
+      // Close the detail on top first, so the stack unwinds in order and
+      // focus lands back on the row that opened it rather than nowhere.
+      if ($("notificationsDeliveryDetailModal")?.hidden === false) {
+        closeNotificationsDeliveryDetailModal();
+      }
+      modal.hidden = true;
+      document.body.dataset.notificationsHistoryListModalOpen = "false";
+      popInkdropModalLayer(modal);
+    }
+
+    function openNotificationsHistoryListModal() {
+      const modal = ensureNotificationsHistoryListModal();
+      const body = $("notificationsHistoryListBody");
+      body.replaceChildren();
+
       const status = document.createElement("p");
       status.className = "setting-description";
       status.setAttribute("role", "status");
       status.textContent = "Loading…";
-      parent.appendChild(status);
+      body.appendChild(status);
       const table = document.createElement("table");
       table.className = "notifications-history-table";
       const thead = document.createElement("thead");
@@ -27334,19 +27910,12 @@ HTML = r"""<!doctype html>
       const tbody = document.createElement("tbody");
       table.append(thead, tbody);
       table.hidden = true;
-      parent.appendChild(table);
-      const actionsRow = document.createElement("div");
-      actionsRow.className = "settings-form-row";
-      const expandButton = document.createElement("button");
-      expandButton.type = "button";
-      expandButton.textContent = "Show full history";
-      expandButton.hidden = true;
+      body.appendChild(table);
       const loadMoreButton = document.createElement("button");
       loadMoreButton.type = "button";
       loadMoreButton.textContent = "Load more";
       loadMoreButton.hidden = true;
-      actionsRow.append(expandButton, loadMoreButton);
-      parent.appendChild(actionsRow);
+      body.appendChild(loadMoreButton);
 
       let oldestSeen = null;
       const appendRow = row => {
@@ -27364,42 +27933,29 @@ HTML = r"""<!doctype html>
         const statusCell = document.createElement("td");
         statusCell.appendChild(notificationStatusBadge(row));
         tr.append(when, eventCell, channelCell, statusCell);
-        tr.onclick = () => openNotificationsDeliveryDetailModal(row);
+        tr.onclick = () => openNotificationsDeliveryDetailModal(row, tr);
         tr.onkeydown = event => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            openNotificationsDeliveryDetailModal(row);
+            openNotificationsDeliveryDetailModal(row, tr);
           }
         };
         tbody.appendChild(tr);
         oldestSeen = row.created_at;
       };
 
-      const loadSummary = async () => {
-        try {
-          const data = await getJsonWithTimeout(`/api/notifications/deliveries?limit=${NOTIFICATIONS_HISTORY_SUMMARY_LIMIT}`, 12000, "Loading delivery history");
-          const rows = data?.deliveries || [];
-          if (!rows.length) {
-            status.textContent = "No notifications have been sent yet.";
-            return;
-          }
-          status.textContent = "";
-          table.hidden = false;
-          for (const row of rows) appendRow(row);
-          // A full summary page means there could be more beyond it -- only
-          // offer to expand when that's actually plausible.
-          expandButton.hidden = rows.length < NOTIFICATIONS_HISTORY_SUMMARY_LIMIT;
-        } catch (error) {
-          status.textContent = `Could not load delivery history: ${error?.message || error}`;
-        }
-      };
-
-      const loadMorePage = async () => {
+      const loadPage = async () => {
         loadMoreButton.disabled = true;
         try {
           const query = oldestSeen ? `?limit=${NOTIFICATIONS_HISTORY_PAGE_LIMIT}&before=${oldestSeen}` : `?limit=${NOTIFICATIONS_HISTORY_PAGE_LIMIT}`;
           const data = await getJsonWithTimeout(`/api/notifications/deliveries${query}`, 12000, "Loading delivery history");
           const rows = data?.deliveries || [];
+          if (!oldestSeen && !rows.length) {
+            status.textContent = "No notifications have been sent yet.";
+            return;
+          }
+          status.textContent = "";
+          table.hidden = false;
           for (const row of rows) appendRow(row);
           loadMoreButton.hidden = rows.length < NOTIFICATIONS_HISTORY_PAGE_LIMIT;
         } catch (error) {
@@ -27408,14 +27964,18 @@ HTML = r"""<!doctype html>
           loadMoreButton.disabled = false;
         }
       };
+      loadMoreButton.onclick = loadPage;
 
-      expandButton.onclick = () => {
-        expandButton.hidden = true;
-        loadMoreButton.hidden = false;
-        loadMorePage();
-      };
-
-      loadSummary();
+      modal.hidden = false;
+      document.body.dataset.notificationsHistoryListModalOpen = "true";
+      pushInkdropModalLayer(modal, {
+        close: closeNotificationsHistoryListModal,
+        // The rows arrive asynchronously, so the close button is the only
+        // control guaranteed to exist when focus moves -- and it is the
+        // conventional landing point for a dialog that is a list.
+        initialFocus: () => modal.querySelector(".series-remove-close"),
+      });
+      loadPage();
     }
 
     function ensureNotificationsDeliveryDetailModal() {
@@ -27453,7 +28013,7 @@ HTML = r"""<!doctype html>
       return modal;
     }
 
-    function openNotificationsDeliveryDetailModal(row) {
+    function openNotificationsDeliveryDetailModal(row, invoker=null) {
       const modal = ensureNotificationsDeliveryDetailModal();
       const title = $("notificationsDeliveryDetailTitle");
       if (title) title.textContent = row.subject || "Notification detail";
@@ -27485,12 +28045,14 @@ HTML = r"""<!doctype html>
       }
       modal.hidden = false;
       document.body.dataset.notificationsDeliveryDetailModalOpen = "true";
-      if (!modal._escHandler) {
-        modal._escHandler = event => {
-          if (event.key === "Escape") closeNotificationsDeliveryDetailModal();
-        };
-        document.addEventListener("keydown", modal._escHandler);
-      }
+      pushInkdropModalLayer(modal, {
+        close: closeNotificationsDeliveryDetailModal,
+        initialFocus: () => modal.querySelector(".series-remove-close"),
+        // Restore to the row that opened this, not to whatever the browser
+        // happened to focus -- a mouse click on a <tr role="button"> does not
+        // reliably leave it as document.activeElement.
+        restoreFocus: invoker instanceof HTMLElement ? invoker : null,
+      });
     }
 
     function closeNotificationsDeliveryDetailModal() {
@@ -27498,6 +28060,7 @@ HTML = r"""<!doctype html>
       if (!modal) return;
       modal.hidden = true;
       document.body.dataset.notificationsDeliveryDetailModalOpen = "false";
+      popInkdropModalLayer(modal);
     }
 
     // The OPDS server itself has no settings to configure -- it's always on,
@@ -27659,12 +28222,16 @@ HTML = r"""<!doctype html>
       container.replaceChildren();
       const box = document.createElement("div");
       box.className = `queue-row-progress${view.determinate ? "" : " indeterminate"}${options.compact ? " compact" : ""}${view.stalled ? " stalled" : ""}`;
-      box.setAttribute("aria-label", view.label);
+      // A role="progressbar" announces its label and value, never its contents,
+      // so the counts in the meta line below have to ride along in the label or
+      // a screen reader hears a bare percentage.
+      box.setAttribute("aria-label", view.meta ? `${view.label}. ${view.meta}` : view.label);
       if (view.determinate) {
         box.setAttribute("role", "progressbar");
         box.setAttribute("aria-valuemin", "0");
         box.setAttribute("aria-valuemax", "100");
         box.setAttribute("aria-valuenow", String(view.percent));
+        box.setAttribute("aria-valuetext", [view.statusText, view.meta].filter(Boolean).join(", "));
       } else {
         box.setAttribute("role", "status");
         box.setAttribute("aria-live", "polite");
@@ -27695,121 +28262,49 @@ HTML = r"""<!doctype html>
       container.appendChild(box);
     }
 
-    function ensureArchiveConversionProgressModal() {
-      let modal = $("archiveConversionProgressModal");
-      if (modal) return modal;
-      modal = document.createElement("section");
-      modal.id = "archiveConversionProgressModal";
-      modal.className = "series-remove-modal archive-conversion-progress-modal";
-      modal.setAttribute("role", "dialog");
-      modal.setAttribute("aria-modal", "true");
-      modal.setAttribute("aria-labelledby", "archiveConversionProgressTitle");
-      modal.hidden = true;
-      const dialog = document.createElement("div");
-      dialog.className = "series-remove-dialog";
-      const head = document.createElement("div");
-      head.className = "series-remove-head";
-      const title = document.createElement("h3");
-      title.id = "archiveConversionProgressTitle";
-      title.textContent = "Checking your library";
-      const closeButton = document.createElement("button");
-      closeButton.type = "button";
-      closeButton.className = "series-remove-close";
-      closeButton.setAttribute("aria-label", "Close progress dialog");
-      closeButton.textContent = "×";
-      closeButton.onclick = () => closeArchiveConversionProgressModal();
-      head.append(title, closeButton);
-      const body = document.createElement("div");
-      body.className = "series-remove-body";
-      const barWrap = document.createElement("div");
-      barWrap.id = "archiveConversionProgressBarWrap";
-      const note = document.createElement("span");
-      note.className = "series-remove-copy";
-      note.textContent = "This keeps running in the background if you close this window -- reopen it any time from the panel below.";
-      body.append(barWrap, note);
-      const foot = document.createElement("div");
-      foot.className = "series-remove-foot";
-      const footClose = document.createElement("button");
-      footClose.type = "button";
-      footClose.textContent = "Close";
-      footClose.onclick = () => closeArchiveConversionProgressModal();
-      foot.appendChild(footClose);
-      dialog.append(head, body, foot);
-      modal.appendChild(dialog);
-      modal.onclick = event => {
-        if (event.target === modal) closeArchiveConversionProgressModal();
-      };
-      document.body.appendChild(modal);
-      return modal;
+    // --- durable scan results -------------------------------------------
+    //
+    // Both long library scans (the CBZ check and the adoption folder scan) keep
+    // their answer on the server now, so these two helpers are shared: one to
+    // say how old a stored result is, one to say what has moved since. The
+    // panels used to have neither, because there was nothing old to describe --
+    // the answer died with the page.
+
+    function scanRunAgeText(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value) || value < 0) return "";
+      if (value < 90) return "just now";
+      const minutes = Math.round(value / 60);
+      if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+      const hours = Math.round(value / 3600);
+      if (hours < 36) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+      const days = Math.round(value / 86400);
+      return `${days} day${days === 1 ? "" : "s"} ago`;
     }
 
-    function openArchiveConversionProgressModal() {
-      const modal = ensureArchiveConversionProgressModal();
-      modal.hidden = false;
-      document.body.dataset.archiveConversionProgressModalOpen = "true";
-      if (!modal._escHandler) {
-        modal._escHandler = event => {
-          if (event.key === "Escape") closeArchiveConversionProgressModal();
-        };
-        document.addEventListener("keydown", modal._escHandler);
+    // A stored result is a photograph. Converting or adopting against a
+    // week-old photograph is the whole risk of keeping one, so the panel says
+    // plainly what has changed rather than presenting an old count as current.
+    function renderScanRunAgeLine(container, task, {verb, rerunText, extraReasons=[]}) {
+      if (!container) return;
+      container.replaceChildren();
+      if (!task) return;
+      const parts = [];
+      const age = scanRunAgeText(task.age_seconds);
+      if (age) parts.push(age === "just now" ? `${verb} just now.` : `${verb} ${age}.`);
+      const reasons = [...(task.staleness?.reasons || []), ...extraReasons];
+      const line = document.createElement("p");
+      line.className = "setting-description scan-run-age";
+      if (reasons.length) {
+        line.classList.add("stale");
+        const listed = reasons.length > 1
+          ? `${reasons.slice(0, -1).join(", ")} and ${reasons[reasons.length - 1]}`
+          : reasons[0];
+        parts.push(`Since then, ${listed}.`);
+        parts.push(rerunText);
       }
-    }
-
-    function closeArchiveConversionProgressModal() {
-      const modal = $("archiveConversionProgressModal");
-      if (!modal) return;
-      modal.hidden = true;
-      document.body.dataset.archiveConversionProgressModalOpen = "false";
-    }
-
-    function updateArchiveConversionProgressModal(task, kind) {
-      const modal = $("archiveConversionProgressModal");
-      if (!modal || modal.hidden) return;
-      const view = archiveConversionProgressView(task, kind);
-      const title = $("archiveConversionProgressTitle");
-      if (title) title.textContent = view.label;
-      renderArchiveConversionProgressBar($("archiveConversionProgressBarWrap"), view, {compact: false});
-    }
-
-    // Without this, a modal left open past completion freezes on its last
-    // "running" snapshot forever -- the exact "is it still working or stuck"
-    // confusion this whole feature exists to fix, just relocated into the popup.
-    function finishArchiveConversionProgressModal(titleText, message) {
-      const modal = $("archiveConversionProgressModal");
-      if (!modal) return;
-      const title = $("archiveConversionProgressTitle");
-      if (title) title.textContent = titleText;
-      const barWrap = $("archiveConversionProgressBarWrap");
-      if (barWrap) {
-        barWrap.replaceChildren();
-        const done = document.createElement("p");
-        done.className = "series-remove-copy";
-        done.textContent = message;
-        barWrap.appendChild(done);
-      }
-    }
-
-    const ARCHIVE_CONVERSION_ACTIVE_TASK_KEY = "inkdrop.archiveConversion.activeTask";
-
-    function rememberArchiveConversionActiveTask(taskId, kind) {
-      try {
-        window.localStorage.setItem(ARCHIVE_CONVERSION_ACTIVE_TASK_KEY, JSON.stringify({taskId, kind}));
-      } catch (error) { /* storage unavailable -- progress still works, just won't resume across a reload */ }
-    }
-
-    function forgetArchiveConversionActiveTask() {
-      try {
-        window.localStorage.removeItem(ARCHIVE_CONVERSION_ACTIVE_TASK_KEY);
-      } catch (error) { /* ignore */ }
-    }
-
-    function readArchiveConversionActiveTask() {
-      try {
-        const raw = window.localStorage.getItem(ARCHIVE_CONVERSION_ACTIVE_TASK_KEY);
-        return raw ? JSON.parse(raw) : null;
-      } catch (error) {
-        return null;
-      }
+      line.textContent = parts.join(" ");
+      if (line.textContent) container.appendChild(line);
     }
 
     function appendArchiveConversionPanel(parent) {
@@ -27849,138 +28344,189 @@ HTML = r"""<!doctype html>
       status.setAttribute("role", "status");
       status.setAttribute("aria-live", "polite");
       status.textContent = "Not checked yet.";
+      const ageLine = document.createElement("div");
+      ageLine.className = "archive-conversion-age";
       const inlineProgress = document.createElement("div");
       inlineProgress.className = "archive-conversion-inline-progress";
-      const viewProgressButton = document.createElement("button");
-      viewProgressButton.type = "button";
-      viewProgressButton.textContent = "View progress";
-      viewProgressButton.hidden = true;
-      viewProgressButton.onclick = () => openArchiveConversionProgressModal();
       const resultsWrap = document.createElement("div");
       resultsWrap.className = "archive-conversion-results";
       let lastPlan = null;
+      let lastApplyFinishedAt = 0;
+
+      function setCheckButtonBusy(busy) {
+        checkButton.disabled = busy;
+        checkButton.textContent = busy ? "Checking…" : "Check my library";
+      }
+
+      function setConvertButtonBusy(busy) {
+        convertButton.disabled = busy;
+        convertButton.textContent = busy ? "Converting…" : "Convert them";
+      }
+
+      // A conversion run rewrites the very files the last check counted, so a
+      // plan taken before it is describing a library that no longer exists.
+      // The server-side fingerprint cannot see this on its own -- a CBR turning
+      // into a CBZ is the same file to it -- so the panel says it directly.
+      function planExtraStaleReasons(planTask) {
+        const planFinishedAt = Number(planTask?.finished_at || 0);
+        if (!lastApplyFinishedAt || !planFinishedAt || lastApplyFinishedAt <= planFinishedAt) return [];
+        return ["comics were converted after this check ran"];
+      }
+
+      function renderArchiveConversionPlan(planTask) {
+        lastPlan = planTask?.plan || {};
+        const tooling = lastPlan.rar_tooling || {};
+        const needsRar = lastPlan.needs_rar_tooling || 0;
+        let toolingNote = "";
+        if (needsRar > 0) {
+          toolingNote = tooling.available
+            ? ` ${needsRar} need unrar, which is installed.`
+            : ` ${needsRar} need unrar, which is not installed on this server, so those cannot be converted yet.`;
+        }
+        status.textContent = `${lastPlan.convertible_count || 0} comics to convert.${toolingNote}`;
+        inlineProgress.replaceChildren();
+        renderScanRunAgeLine(ageLine, planTask, {
+          verb: "Checked",
+          rerunText: "Check again before converting so the count matches what is on disk.",
+          extraReasons: planExtraStaleReasons(planTask),
+        });
+        resultsWrap.replaceChildren();
+        // A misconfigured or unmounted library root reports back as "0 comics
+        // to convert" same as a genuinely clean library -- without surfacing
+        // which roots we couldn't even read, that reads as the tool silently
+        // doing nothing.
+        const skippedRoots = (lastPlan.skipped_roots || []).filter(entry => entry?.root);
+        if (skippedRoots.length) {
+          const warn = document.createElement("p");
+          warn.className = "archive-conversion-warning";
+          warn.textContent = `Could not scan: ${skippedRoots.map(entry => `${entry.root} (${entry.reason === "root_missing" ? "folder not found" : entry.reason})`).join(", ")}.`;
+          resultsWrap.appendChild(warn);
+        }
+        const mislabeled = (lastPlan.results || []).filter(r => r.classification === "rar_named_cbz");
+        if (mislabeled.length) {
+          const note = document.createElement("p");
+          note.textContent = `${mislabeled.length} files are named .cbz but are really RAR inside. Your reader may be failing on these silently.`;
+          resultsWrap.appendChild(note);
+        }
+        convertButton.disabled = !(lastPlan.convertible_count > 0) || lastPlan.blocked_on_rar_tooling;
+      }
+
+      function renderArchiveConversionSummary(applyTask) {
+        const summary = applyTask?.summary || {};
+        lastApplyFinishedAt = Number(applyTask?.finished_at || 0);
+        if (applyTask?.state === "failed" && summary.reason) {
+          status.textContent = `Conversion stopped: ${summary.reason === "rar_tooling_missing" ? "unrar/7z is not installed on this server." : summary.reason}`;
+          inlineProgress.replaceChildren();
+          return;
+        }
+        status.textContent = `Done: ${summary.converted || 0} converted, ${summary.failed || 0} failed, ${summary.skipped || 0} skipped.`;
+        inlineProgress.replaceChildren();
+        renderScanRunAgeLine(ageLine, applyTask, {
+          verb: "Converted",
+          rerunText: "Check your library again to see what is left.",
+        });
+        resultsWrap.replaceChildren();
+        const failures = (summary.results || []).filter(r => !r.converted && r.reason && r.reason !== "unsupported_container" && r.reason !== "rar_named_cbz" && r.reason !== "zip_named_cbr");
+        if (failures.length) {
+          const list = document.createElement("ul");
+          for (const failure of failures.slice(0, 50)) {
+            const item = document.createElement("li");
+            item.textContent = `${failure.source}: ${failure.reason}`;
+            list.appendChild(item);
+          }
+          resultsWrap.appendChild(list);
+        }
+      }
+
+      // A run whose process died mid-scan comes back marked interrupted. Saying
+      // so is the point -- the old code had no way to tell that apart from a
+      // finished scan that genuinely found nothing.
+      function renderInterruptedRun(task, what) {
+        const age = scanRunAgeText(task?.age_seconds);
+        status.textContent = `The last ${what} stopped when InkDrop restarted${age && age !== "just now" ? ` ${age}` : ""}. Run it again to pick up where it left off.`;
+        inlineProgress.replaceChildren();
+        ageLine.replaceChildren();
+      }
 
       function pollArchiveConversionPlanTask(taskId) {
         api("/api/inkdrop-library/convert-archives/status", {taskId}, {timeoutMs: 30000}).then(data => {
-          const task = data?.task || {};
+          const task = data?.task;
+          if (!task) {
+            setCheckButtonBusy(false);
+            status.textContent = "Lost track of the check run. Start it again.";
+            inlineProgress.replaceChildren();
+            return;
+          }
           if (task.state === "running") {
-            const view = archiveConversionProgressView(task, "plan");
-            status.textContent = `${view.label}… ${view.meta}`;
-            renderArchiveConversionProgressBar(inlineProgress, view, {compact: true});
-            updateArchiveConversionProgressModal(task, "plan");
+            // The bar below carries the label, the percent and the counts.
+            // Repeating all of it in the status line above is the redundancy
+            // this panel already had one copy too many of.
+            status.textContent = "";
+            renderArchiveConversionProgressBar(inlineProgress, archiveConversionProgressView(task, "plan"), {compact: true});
             setTimeout(() => pollArchiveConversionPlanTask(taskId), 1000);
             return;
           }
-          forgetArchiveConversionActiveTask();
-          checkButton.disabled = false;
-          checkButton.textContent = checkButton.dataset.originalText || "Check my library";
-          viewProgressButton.hidden = true;
+          setCheckButtonBusy(false);
+          if (task.state === "interrupted") {
+            renderInterruptedRun(task, "check");
+            return;
+          }
           if (task.state === "failed") {
             status.textContent = `Check failed: ${task.error || "unknown error"}`;
             inlineProgress.replaceChildren();
-            finishArchiveConversionProgressModal("Check failed", status.textContent);
             return;
           }
-          lastPlan = task.plan || {};
-          const tooling = lastPlan.rar_tooling || {};
-          const needsRar = lastPlan.needs_rar_tooling || 0;
-          let toolingNote = "";
-          if (needsRar > 0) {
-            toolingNote = tooling.available
-              ? ` ${needsRar} need unrar, which is installed.`
-              : ` ${needsRar} need unrar, which is not installed on this server, so those cannot be converted yet.`;
-          }
-          status.textContent = `${lastPlan.convertible_count || 0} comics to convert.${toolingNote}`;
-          inlineProgress.replaceChildren();
-          finishArchiveConversionProgressModal("Check complete", status.textContent);
-          resultsWrap.replaceChildren();
-          // A misconfigured or unmounted library root reports back as "0 comics
-          // to convert" same as a genuinely clean library -- without surfacing
-          // which roots we couldn't even read, that reads as the tool silently
-          // doing nothing.
-          const skippedRoots = (lastPlan.skipped_roots || []).filter(entry => entry?.root);
-          if (skippedRoots.length) {
-            const warn = document.createElement("p");
-            warn.className = "archive-conversion-warning";
-            warn.textContent = `Could not scan: ${skippedRoots.map(entry => `${entry.root} (${entry.reason === "root_missing" ? "folder not found" : entry.reason})`).join(", ")}.`;
-            resultsWrap.appendChild(warn);
-          }
-          const mislabeled = (lastPlan.results || []).filter(r => r.classification === "rar_named_cbz");
-          if (mislabeled.length) {
-            const note = document.createElement("p");
-            note.textContent = `${mislabeled.length} files are named .cbz but are really RAR inside. Your reader may be failing on these silently.`;
-            resultsWrap.appendChild(note);
-          }
-          convertButton.disabled = !(lastPlan.convertible_count > 0) || lastPlan.blocked_on_rar_tooling;
+          renderArchiveConversionPlan(task);
         }).catch(error => {
-          checkButton.disabled = false;
-          checkButton.textContent = checkButton.dataset.originalText || "Check my library";
+          setCheckButtonBusy(false);
           status.textContent = `Lost track of the check run: ${error?.message || error}`;
-          finishArchiveConversionProgressModal("Lost track of the check run", status.textContent);
         });
       }
 
       function pollArchiveConversionTask(taskId) {
         api("/api/inkdrop-library/convert-archives/status", {taskId}, {timeoutMs: 30000}).then(data => {
-          const task = data?.task || {};
+          const task = data?.task;
+          if (!task) {
+            setConvertButtonBusy(false);
+            checkButton.disabled = false;
+            status.textContent = "Lost track of the conversion run. Check your library again to see what is left.";
+            inlineProgress.replaceChildren();
+            return;
+          }
           if (task.state === "running") {
-            const view = archiveConversionProgressView(task, "apply");
-            status.textContent = `${view.label}… ${view.meta}`;
-            renderArchiveConversionProgressBar(inlineProgress, view, {compact: true});
-            updateArchiveConversionProgressModal(task, "apply");
+            status.textContent = "";
+            renderArchiveConversionProgressBar(inlineProgress, archiveConversionProgressView(task, "apply"), {compact: true});
             setTimeout(() => pollArchiveConversionTask(taskId), 1500);
             return;
           }
-          forgetArchiveConversionActiveTask();
-          convertButton.disabled = false;
-          convertButton.textContent = "Convert them";
+          setConvertButtonBusy(false);
           checkButton.disabled = false;
-          viewProgressButton.hidden = true;
-          const summary = task.summary || {};
-          if (task.state === "failed" && summary.reason) {
-            status.textContent = `Conversion stopped: ${summary.reason === "rar_tooling_missing" ? "unrar/7z is not installed on this server." : summary.reason}`;
-            inlineProgress.replaceChildren();
-            finishArchiveConversionProgressModal("Conversion stopped", status.textContent);
+          if (task.state === "interrupted") {
+            renderInterruptedRun(task, "conversion");
             return;
           }
-          status.textContent = `Done: ${summary.converted || 0} converted, ${summary.failed || 0} failed, ${summary.skipped || 0} skipped.`;
-          inlineProgress.replaceChildren();
-          finishArchiveConversionProgressModal("Conversion complete", status.textContent);
-          resultsWrap.replaceChildren();
-          const failures = (summary.results || []).filter(r => !r.converted && r.reason && r.reason !== "unsupported_container" && r.reason !== "rar_named_cbz" && r.reason !== "zip_named_cbr");
-          if (failures.length) {
-            const list = document.createElement("ul");
-            for (const failure of failures.slice(0, 50)) {
-              const item = document.createElement("li");
-              item.textContent = `${failure.source}: ${failure.reason}`;
-              list.appendChild(item);
-            }
-            resultsWrap.appendChild(list);
-          }
+          renderArchiveConversionSummary(task);
         }).catch(error => {
           status.textContent = `Lost track of the conversion run: ${error?.message || error}`;
-          finishArchiveConversionProgressModal("Lost track of the conversion run", status.textContent);
         });
       }
 
       checkButton.onclick = async () => {
-        checkButton.disabled = true;
-        checkButton.dataset.originalText = checkButton.dataset.originalText || checkButton.textContent;
-        checkButton.textContent = "Checking…";
+        setCheckButtonBusy(true);
+        // The count behind "Convert them" is exactly what this check is about
+        // to replace, so it is not something to act on until the new one lands.
+        convertButton.disabled = true;
         status.textContent = "Checking your library…";
         inlineProgress.replaceChildren();
+        ageLine.replaceChildren();
         resultsWrap.replaceChildren();
         try {
           const data = await api("/api/inkdrop-library/convert-archives/plan", {
             includeMislabeledCbz: mislabeledInput.checked,
           }, {timeoutMs: 30000});
-          rememberArchiveConversionActiveTask(data.taskId, "plan");
-          viewProgressButton.hidden = false;
-          openArchiveConversionProgressModal();
           pollArchiveConversionPlanTask(data.taskId);
         } catch (error) {
-          checkButton.disabled = false;
-          checkButton.textContent = checkButton.dataset.originalText || "Check my library";
+          setCheckButtonBusy(false);
           status.textContent = `Check failed: ${error?.message || error}`;
         }
       };
@@ -27989,56 +28535,82 @@ HTML = r"""<!doctype html>
         const count = lastPlan?.convertible_count || 0;
         const destination = keepInput.checked ? "the quarantine folder" : "nowhere -- they will be deleted";
         if (!window.confirm(`Convert ${count} comic(s) to CBZ? Original files go to ${destination}.`)) return;
-        convertButton.disabled = true;
+        setConvertButtonBusy(true);
         checkButton.disabled = true;
-        convertButton.textContent = "Converting…";
         status.textContent = "Starting…";
+        ageLine.replaceChildren();
         try {
           const data = await api("/api/inkdrop-library/convert-archives/apply", {
             discardOriginals: !keepInput.checked,
             includeMislabeledCbz: mislabeledInput.checked,
           }, {timeoutMs: 30000});
           checkButton.disabled = false;
-          rememberArchiveConversionActiveTask(data.taskId, "apply");
-          viewProgressButton.hidden = false;
-          openArchiveConversionProgressModal();
           if (data?.already_running) {
             status.textContent = "A conversion run is already in progress.";
-            pollArchiveConversionTask(data.taskId);
-            return;
           }
           pollArchiveConversionTask(data.taskId);
         } catch (error) {
-          convertButton.disabled = false;
+          setConvertButtonBusy(false);
           checkButton.disabled = false;
-          convertButton.textContent = "Convert them";
           status.textContent = `Could not start conversion: ${error?.message || error}`;
         }
       };
 
-      panel.append(intro, checkButton, convertButton, viewProgressButton, optionsWrap, status, inlineProgress, resultsWrap);
+      const actions = document.createElement("div");
+      actions.className = "archive-conversion-actions";
+      actions.append(checkButton, convertButton);
+      panel.append(intro, actions, optionsWrap, status, ageLine, inlineProgress, resultsWrap);
       parent.appendChild(panel);
 
-      // A page reload or Settings re-render loses the taskId that was live in
-      // this closure, but the background thread keeps running on the server.
-      // Without this, "is it stuck?" becomes unanswerable until the run
-      // finishes on its own -- resume polling instead of showing "Not
-      // checked yet." over a run that never stopped.
-      const activeTask = readArchiveConversionActiveTask();
-      if (activeTask?.taskId && activeTask.kind === "plan") {
-        checkButton.disabled = true;
-        checkButton.dataset.originalText = checkButton.dataset.originalText || checkButton.textContent;
-        checkButton.textContent = "Checking…";
-        status.textContent = "Resuming an in-progress check…";
-        viewProgressButton.hidden = false;
-        pollArchiveConversionPlanTask(activeTask.taskId);
-      } else if (activeTask?.taskId && activeTask.kind === "apply") {
-        convertButton.disabled = true;
-        checkButton.disabled = true;
-        convertButton.textContent = "Converting…";
-        status.textContent = "Resuming an in-progress conversion…";
-        viewProgressButton.hidden = false;
-        pollArchiveConversionTask(activeTask.taskId);
+      // The server owns the answer now, so a reload, a Settings re-render, or a
+      // container restart all land here and ask it what happened -- instead of
+      // showing "Not checked yet." over a scan that is still running or a
+      // result that took an hour to produce.
+      restoreArchiveConversionPanel();
+
+      async function restoreArchiveConversionPanel() {
+        let planTask = null;
+        let applyTask = null;
+        try {
+          [planTask, applyTask] = await Promise.all([
+            api("/api/inkdrop-library/convert-archives/latest", {kind: "plan"}, {timeoutMs: 15000}).then(d => d?.task || null).catch(() => null),
+            api("/api/inkdrop-library/convert-archives/latest", {kind: "apply"}, {timeoutMs: 15000}).then(d => d?.task || null).catch(() => null),
+          ]);
+        } catch (error) {
+          return;
+        }
+        if (applyTask?.finished_at) lastApplyFinishedAt = Number(applyTask.finished_at) || 0;
+        if (applyTask?.state === "running") {
+          setConvertButtonBusy(true);
+          checkButton.disabled = true;
+          status.textContent = "Picking up a conversion that is still running…";
+          pollArchiveConversionTask(applyTask.task_id);
+          return;
+        }
+        if (planTask?.state === "running") {
+          setCheckButtonBusy(true);
+          convertButton.disabled = true;
+          status.textContent = "Picking up a check that is still running…";
+          pollArchiveConversionPlanTask(planTask.task_id);
+          return;
+        }
+        // Neither is live. Show whichever ran last, so the panel opens on the
+        // most recent thing that actually happened.
+        const planAt = Number(planTask?.finished_at || 0);
+        const applyAt = Number(applyTask?.finished_at || 0);
+        if (applyTask && applyAt > planAt && applyTask.state !== "interrupted") {
+          renderArchiveConversionSummary(applyTask);
+          if (planTask?.state === "completed") lastPlan = planTask.plan || {};
+          convertButton.disabled = true;
+          return;
+        }
+        if (planTask?.state === "completed") {
+          renderArchiveConversionPlan(planTask);
+        } else if (planTask?.state === "interrupted") {
+          renderInterruptedRun(planTask, "check");
+        } else if (planTask?.state === "failed") {
+          status.textContent = `The last check failed: ${planTask.error || "unknown error"}`;
+        }
       }
     }
 
@@ -29691,10 +30263,36 @@ HTML = r"""<!doctype html>
         const providerRenderLimit = providerTileGroup
           ? (isActiveRouteGroup ? visibleProviders.length : settingsProviderRenderLimit(group.key, visibleProviders.length))
           : visibleProviders.length;
-        const renderedProviders = providerTileGroup
+        let renderedProviders = providerTileGroup
           ? visibleProviders.slice(0, providerRenderLimit)
           : visibleProviders;
+        // Two different things share this area and were reading as one list:
+        // clients the user runs elsewhere and connects InkDrop to, and sources
+        // built into InkDrop that only need switching on. A user seeing
+        // GetComics and qBittorrent in the same undifferentiated list can't
+        // tell which of them they are expected to go and install. Clients first,
+        // then a labelled break, then the built-ins.
+        const isBuiltInSourceRow = provider => String(provider?.provider_type || "").toLowerCase() !== "download_client";
+        let builtInSourceLabelPending = false;
+        if (group.key === "download_clients") {
+          const clients = renderedProviders.filter(provider => !isBuiltInSourceRow(provider));
+          const builtIns = renderedProviders.filter(isBuiltInSourceRow);
+          renderedProviders = clients.concat(builtIns);
+          builtInSourceLabelPending = builtIns.length > 0;
+        }
         for (const provider of renderedProviders) {
+        if (builtInSourceLabelPending && isBuiltInSourceRow(provider)) {
+          builtInSourceLabelPending = false;
+          const divider = document.createElement("div");
+          divider.className = "settings-subsection-divider";
+          divider.dataset.settingsSubsection = "built-in-sources";
+          const dividerTitle = document.createElement("h3");
+          dividerTitle.textContent = "Built-in sources";
+          const dividerCopy = document.createElement("p");
+          dividerCopy.textContent = "Already part of InkDrop — there is nothing to install or connect. Switch on the ones you want InkDrop to search.";
+          divider.append(dividerTitle, dividerCopy);
+          providerTarget.appendChild(divider);
+        }
         // Kavita/Komga render as connection cards in appendNotificationsSettingsPanel's
         // grid instead (alongside Discord/Pushover) -- counts/areaCount above still
         // include them (unchanged filter), this just skips building their tile a
@@ -36944,6 +37542,7 @@ HTML = r"""<!doctype html>
       const key = `${path}:${JSON.stringify(payload || {})}`;
       if (inkdropReviewActionsInFlight.has(key)) return;
       inkdropReviewActionsInFlight.add(key);
+      setManualReviewDecisionStatus("");
       try {
         const data = await api(path, payload);
         $("output").textContent = JSON.stringify(data.result, null, 2);
@@ -36956,6 +37555,9 @@ HTML = r"""<!doctype html>
         refreshStatus();
       } catch (err) {
         $("output").textContent = err?.message || String(err);
+        // The panel stays open on failure, so the person is still looking at
+        // it -- say so there, not only in a toast this overlay can cover.
+        setManualReviewDecisionStatus(err?.message || "That decision did not go through. Nothing was changed.");
         toast(err.message, false);
       } finally {
         inkdropReviewActionsInFlight.delete(key);
@@ -37091,9 +37693,10 @@ HTML = HTML.replace("__INKDROP_UI_REACT_VERSION__", INKDROP_UI_REACT_VERSION)
 # Standalone lightweight mobile status view. Deliberately its own tiny HTML
 # document rather than a responsive mode of the desktop shell above -- a
 # phone loads this page's ~small CSS/JS instead of the full app shell/React
-# bundle. Read-only for now (Phase 1): a library-status glance and a list of
-# items needing operator attention (Manual Review), both via the same JSON
-# APIs and session-cookie auth the desktop shell already uses. All content
+# bundle. It covers a library-status glance, adding a series, and acting on
+# the items needing operator attention (Manual Review) -- every read and every
+# write goes through the same JSON APIs and session-cookie auth the desktop
+# shell already uses; this page adds no endpoints of its own. All content
 # is rendered client-side by inkdrop-mobile.js into the placeholder sections
 # below; this template only owns the page shell and screen containers.
 MOBILE_HTML = r"""<!doctype html>
@@ -37177,7 +37780,8 @@ MOBILE_HTML = r"""<!doctype html>
   <meta name="theme-color" content="#12141a">
   <meta name="robots" content="noindex">
   <title>InkDrop</title>
-  <link rel="icon" href="/inkdrop-logo-mark.png">
+  <link rel="icon" type="image/png" href="/inkdrop-logo-mark-mobile.png?v=__INKDROP_MOBILE_LOGO_VERSION__">
+  <link rel="apple-touch-icon" href="/inkdrop-logo-mark-mobile.png?v=__INKDROP_MOBILE_LOGO_VERSION__">
   <link rel="stylesheet" href="/static/css/mobile.css?v=__INKDROP_MOBILE_CSS_VERSION__">
 </head>
 <body>
@@ -37214,6 +37818,39 @@ MOBILE_HTML = r"""<!doctype html>
         <div id="mobileHomeContent" class="m-screen-content"></div>
       </section>
 
+      <section id="mobileSeries" class="m-screen" hidden>
+        <div class="m-screen-content">
+          <form id="mobileSeriesForm" class="m-add-form">
+            <div class="m-add-row">
+              <input id="mobileSeriesQuery" name="library" type="search" enterkeyhint="done"
+                     autocomplete="off" autocapitalize="words" placeholder="Filter your series" aria-label="Filter your series">
+            </div>
+            <p id="mobileSeriesStatus" class="m-add-status" role="status" hidden></p>
+          </form>
+          <div id="mobileSeriesResults" class="m-item-list"></div>
+        </div>
+      </section>
+
+      <section id="mobileAdd" class="m-screen" hidden>
+        <div class="m-screen-content">
+          <form id="mobileAddForm" class="m-add-form">
+            <div class="m-add-row">
+              <input id="mobileAddQuery" name="series" type="search" enterkeyhint="search"
+                     autocomplete="off" autocapitalize="words" placeholder="Series title" aria-label="Series title">
+              <button id="mobileAddSubmit" class="m-btn-primary" type="submit">Search</button>
+            </div>
+            <label class="m-check">
+              <input id="mobileAddAuto" type="checkbox" checked>
+              <span>Start searching for missing issues right away</span>
+            </label>
+            <p id="mobileAddStatus" class="m-add-status" role="status" hidden></p>
+          </form>
+          <div id="mobileAddResults" class="m-item-list">
+            <div class="m-empty">Search ComicVine, MangaDex and Metron by title. Adding a series here monitors it and starts filling in what is missing, exactly as adding it on desktop does.</div>
+          </div>
+        </div>
+      </section>
+
       <section id="mobileStuck" class="m-screen" hidden>
         <div id="mobileStuckContent" class="m-screen-content"></div>
       </section>
@@ -37224,19 +37861,49 @@ MOBILE_HTML = r"""<!doctype html>
         <span class="m-nav-icon" aria-hidden="true">&#8962;</span>
         <span>Home</span>
       </button>
+      <button class="m-nav-btn" data-screen="series" type="button">
+        <span class="m-nav-icon" aria-hidden="true">&#9776;</span>
+        <span>Series</span>
+      </button>
+      <button class="m-nav-btn" data-screen="add" type="button">
+        <span class="m-nav-icon" aria-hidden="true">&#43;</span>
+        <span>Add</span>
+      </button>
       <button class="m-nav-btn" data-screen="stuck" type="button">
         <span class="m-nav-icon" aria-hidden="true">&#9873;</span>
         <span>Needs Attention</span>
         <span id="mobileStuckBadge" class="m-badge" hidden>0</span>
       </button>
     </nav>
+
+    <div id="mobileSheet" class="m-sheet" role="dialog" aria-modal="true" aria-labelledby="mobileSheetTitle" hidden>
+      <div class="m-sheet-panel">
+        <h2 id="mobileSheetTitle"></h2>
+        <p id="mobileSheetSubject" class="m-sheet-subject" hidden></p>
+        <p id="mobileSheetCopy" class="m-sheet-copy"></p>
+        <div class="m-sheet-actions">
+          <button id="mobileSheetCancel" class="m-btn-quiet" type="button">Cancel</button>
+          <button id="mobileSheetConfirm" class="m-btn-primary" type="button">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <p id="mobileToast" class="m-toast" role="status" hidden></p>
   </div>
+  <!-- The shared mutation helper, loaded before the page script and without
+       defer so window.InkDropApi exists by the time inkdrop-mobile.js runs.
+       Every write from this page goes through it so the CSRF cookie/header
+       contract lives in exactly one place, the same one the desktop shell
+       uses. -->
+  <script src="/static/js/inkdrop-api.js?v=__INKDROP_UI_JS_VERSION__"></script>
   <script src="/static/js/inkdrop-mobile.js?v=__INKDROP_MOBILE_JS_VERSION__"></script>
 </body>
 </html>
 """
+MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_UI_JS_VERSION__", INKDROP_UI_JS_VERSION)
 MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_MOBILE_CSS_VERSION__", INKDROP_MOBILE_CSS_VERSION)
 MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_MOBILE_JS_VERSION__", INKDROP_MOBILE_JS_VERSION)
+MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_MOBILE_LOGO_VERSION__", INKDROP_LOGO_MARK_MOBILE_VERSION)
 
 
 def command_env(extra=None):
@@ -37446,6 +38113,7 @@ def download_client_instance_path(path):
 INKDROP_AUTH_SETUP_SAFE_PATHS = {
     "/",
     "/inkdrop-logo-mark.png",
+    "/inkdrop-logo-mark-mobile.png",
     "/static/img/inkdrop-auth-backdrop.webp",
     "/api/inkdrop-auth/status",
     "/api/auth/status",
@@ -40074,6 +40742,128 @@ def mangadex_cover_url(manga_id, relationships):
     return ""
 
 
+def mangadex_cover_volume_value(attributes):
+    """Numeric sort value for a MangaDex cover's ``volume``, unnumbered last.
+
+    Volumes arrive as strings and are not always integers: an alternate edition
+    of book one is filed as ``1.1``, so float ordering already prefers the
+    original printing over the reissue. A cover with no volume at all sorts
+    behind every numbered one rather than winning by accident.
+    """
+
+    attributes = attributes if isinstance(attributes, dict) else {}
+    text = str(attributes.get("volume") or "").strip()
+    if not text:
+        return float("inf")
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def mangadex_select_front_cover(covers, preferred_locales=None, original_language=None):
+    """Pick the first volume's cover art -- the front cover a reader recognises.
+
+    ``includes[]=cover_art`` on /manga returns exactly one cover_art relationship
+    and MangaDex picks it, in practice the most recently uploaded volume. For a
+    finished run that is the *last* book: Eden: It's an Endless World! showed
+    volume 18 of 18 as the series cover, and 9 of the 11 MangaDex series in a
+    real library were showing some volume other than the first. Every one of them
+    had a volume 1 cover available -- InkDrop just never asked for it.
+
+    Volume order decides first, because book one's art is the series' identity in
+    any language. Locale only breaks ties within a volume, preferring the reader's
+    configured translation, then the original language, then the language most of
+    the title's own covers are in. That last step matters: Berserk has volume 1
+    covers in four languages and none of them English, and taking whichever the
+    API listed first handed an English reader the Ukrainian printing. The bulk
+    locale is the original edition in practice.
+    """
+
+    preferred = []
+    for value in list(preferred_locales or []) + [original_language]:
+        text = str(value or "").strip().lower()
+        if text and text not in preferred:
+            preferred.append(text)
+
+    def attributes_of(row):
+        return row.get("attributes") if isinstance(row.get("attributes"), dict) else row
+
+    locale_counts = {}
+    for row in covers or []:
+        if not isinstance(row, dict):
+            continue
+        locale = str(attributes_of(row).get("locale") or "").strip().lower()
+        locale_counts[locale] = locale_counts.get(locale, 0) + 1
+
+    ranked = []
+    for index, row in enumerate(covers or []):
+        if not isinstance(row, dict):
+            continue
+        attrs = attributes_of(row)
+        filename = str(attrs.get("fileName") or "").strip()
+        if not filename:
+            continue
+        locale = str(attrs.get("locale") or "").strip().lower()
+        locale_rank = preferred.index(locale) if locale in preferred else len(preferred)
+        ranked.append((
+            mangadex_cover_volume_value(attrs),
+            locale_rank,
+            -locale_counts.get(locale, 0),
+            index,
+            filename,
+        ))
+    if not ranked:
+        return ""
+    ranked.sort()
+    return ranked[0][-1]
+
+
+def mangadex_cover_records(manga_id, timeout=10):
+    """List a title's cover art, lowest volume first.
+
+    One page is enough on purpose: ``order[volume]=asc`` puts volume 1 on it even
+    for Berserk, which has more covers than the 100-row page limit. Paging the
+    whole set would cost several extra round trips per add for art we would
+    discard anyway.
+    """
+
+    manga_id = str(manga_id or "").strip()
+    if not manga_id:
+        return []
+    data = mangadex_get(
+        "/cover",
+        [("manga[]", manga_id), ("limit", MANGADEX_COVER_PAGE_LIMIT), ("order[volume]", "asc")],
+        timeout=timeout,
+    )
+    rows = data.get("data") if isinstance(data, dict) else []
+    return [row for row in rows or [] if isinstance(row, dict)]
+
+
+def mangadex_front_cover_url(manga_id, relationships, preferred_locales=None, original_language=None, timeout=10):
+    """Front cover for a title, falling back to whatever /manga handed us.
+
+    The cover list is a second request, so it is allowed to fail: a slow or
+    rate-limited MangaDex must leave the series with the old arbitrary cover, not
+    with no cover at all.
+    """
+
+    fallback = mangadex_cover_url(manga_id, relationships)
+    manga_id = str(manga_id or "").strip()
+    if not manga_id:
+        return fallback
+    try:
+        covers = mangadex_cover_records(manga_id, timeout=timeout)
+    except Exception:
+        return fallback
+    filename = mangadex_select_front_cover(
+        covers, preferred_locales=preferred_locales, original_language=original_language
+    )
+    if not filename:
+        return fallback
+    return f"{MANGADEX_COVER_URL}/{manga_id}/{filename}.256.jpg"
+
+
 def mangadex_result_score(query, title, attributes, preferred_languages=None):
     query_key = normalize_key(query)
     title_key = normalize_key(title)
@@ -40205,7 +40995,12 @@ def mangadex_manga_detail(manga_id):
         "issueCount": last_chapter or last_volume or "",
         "description": description,
         "siteUrl": f"{MANGADEX_SITE_URL}/{manga_id}",
-        "image": mangadex_cover_url(manga_id, item.get("relationships") or []),
+        "image": mangadex_front_cover_url(
+            manga_id,
+            item.get("relationships") or [],
+            preferred_locales=settings.get("translated_languages"),
+            original_language=attrs.get("originalLanguage"),
+        ),
         "status": attrs.get("status"),
         "contentRating": attrs.get("contentRating"),
         "publicationDemographic": attrs.get("publicationDemographic"),
@@ -40407,6 +41202,25 @@ def mangadex_covered_metadata_ids(series_id, title, chapters, coverage_series_id
     return covered
 
 
+def merge_mangadex_add_detail(detail, volume):
+    """Overlay the clicked search row on the canonical detail, cover excepted.
+
+    The client posts back the search result it clicked, and search deliberately
+    runs on the cheap single-relationship cover so a lookup stays one request per
+    query. Letting that row win here would put the arbitrary cover straight back
+    onto every newly added series -- the detail lookup is the only caller that
+    paid for the front cover, so its image is the one that survives.
+    """
+
+    detail = dict(detail or {})
+    volume = volume if isinstance(volume, dict) else {}
+    front_cover = detail.get("image")
+    detail.update({key: value for key, value in volume.items() if value not in (None, "", [], {})})
+    if front_cover:
+        detail["image"] = front_cover
+    return detail
+
+
 def add_mangadex_series(payload):
     payload = payload if isinstance(payload, dict) else {}
     volume = payload.get("volume") if isinstance(payload.get("volume"), dict) else payload
@@ -40415,8 +41229,7 @@ def add_mangadex_series(payload):
         raise ValueError("MangaDex id is required")
     auto_grab = inkdrop_gate_bool(payload, "autoGrab", default=True)
     settings = load_mangadex_settings()
-    detail = mangadex_manga_detail(manga_id)
-    detail.update({key: value for key, value in volume.items() if value not in (None, "", [], {})})
+    detail = merge_mangadex_add_detail(mangadex_manga_detail(manga_id), volume)
     title = detail.get("name") or detail.get("title") or "Untitled manga"
     max_chapters = max(1, min(int(payload.get("maxChapters") or 500), 1000))
     latest_first = (
@@ -42338,6 +43151,12 @@ def run_post_provider_manga_companion_maintenance(reconcile_limit=1, refresh_lim
         "reconcile": reconcile_existing_manga_companions(limit=reconcile_limit, synchronous=True),
         "refresh": refresh_linked_mangadex_companions(limit=refresh_limit),
         "discovery_only_staleness": inkdrop_state.reconcile_discovery_only_companion_staleness(INKDROP_STATE_DB),
+        # Same cadence and the same reason as the line above -- a companion
+        # merged into its own canonical series dies exactly as invisibly as a
+        # discovery_only companion gone monitored=0, and the two passes are
+        # disjoint (that one requires discovery_mode='discovery_only', this
+        # one only ever fires on links carrying the merge marker).
+        "merge_park_staleness": inkdrop_state.reconcile_merge_parked_companion_discovery(INKDROP_STATE_DB),
     }
 
 
@@ -43224,6 +44043,14 @@ def manual_source_resolved_issue_keys():
     if not isinstance(resolved, list):
         resolved = []
     retracted = actions.get("manual_source_retracted_resolved") if isinstance(actions, dict) else []
+    # Defence in depth alongside the loader default. The same read in
+    # inkdrop_state.py and inkdrop_series_autopilot.py already guards this and
+    # this copy did not, so a dict-shaped actions file simply missing the key
+    # returned None here and crashed Search now for every install that had
+    # never been given one -- which is every new install, since nothing writes
+    # it. Callers that build `actions` themselves do not go through the loader.
+    if not isinstance(retracted, list):
+        retracted = []
     retracted_ids = {
         str(row.get("review_id") or "")
         for row in retracted
@@ -47257,8 +48084,56 @@ def prowlarr_api_health(timeout=3.0):
                 "indexer_error": indexer_error,
             }
         detail += f"; {enabled_indexer_count}/{indexer_count} indexers enabled"
+        # "12 indexers enabled" was the whole story InkDrop told, and it stays
+        # true while an indexer is in failure backoff -- enabled and answering
+        # are different things. Prowlarr publishes the difference and we had
+        # never asked for it, so an outage looked exactly like a quiet library.
+        unavailable_names = []
+        indexer_status_error = ""
+        try:
+            status_probe = requests.get(
+                f"{base_url}/indexerstatus",
+                params=query_params,
+                headers=headers,
+                timeout=timeout,
+            )
+            status_probe.raise_for_status()
+            status_rows = status_probe.json() if status_probe.content else []
+            names_by_id = {
+                str(item.get("id")): str(item.get("name") or "")
+                for item in indexers
+                if isinstance(item, dict)
+            }
+            for indexer_id in inkdrop_prowlarr_indexer_health.unavailable_indexer_ids(status_rows):
+                unavailable_names.append(names_by_id.get(indexer_id) or f"#{indexer_id}")
+        except ValueError as exc:
+            indexer_status_error = prowlarr_json_probe_failure_detail("indexerstatus", status_probe, exc)
+        except Exception as exc:
+            # Deliberately broad. This probe is supplementary -- Prowlarr is
+            # already known reachable by this point, and /indexerstatus is a
+            # newer endpoint that a proxy, an older build, or a partial mock can
+            # answer in ways requests never raises for. Losing availability
+            # detail is a footnote; letting it turn a healthy instance into
+            # "health check failed" would be a far worse answer than the one it
+            # replaces.
+            indexer_status_error = f"{type(exc).__name__}: {redact_secret_url_params(exc)}"
+
         state = "healthy" if enabled_indexer_count > 0 else "watch"
         label = "healthy" if enabled_indexer_count > 0 else "no enabled indexers"
+        if unavailable_names and enabled_indexer_count > 0:
+            # Deliberately "watch", not "unavailable": Prowlarr is fine and the
+            # remaining indexers still answer. What the operator needs to know
+            # is that searches running right now are covering less than they
+            # look like they are.
+            state = "watch"
+            label = "indexers backing off"
+            joined = ", ".join(unavailable_names)
+            detail += (
+                f"; {len(unavailable_names)} unavailable right now ({joined})"
+                " -- searches are running with reduced coverage"
+            )
+        elif indexer_status_error:
+            detail += f"; availability check failed: {indexer_status_error}"
         return {
             "state": state,
             "label": label,
@@ -47270,6 +48145,9 @@ def prowlarr_api_health(timeout=3.0):
             "app_name": app_name,
             "indexer_count": indexer_count,
             "enabled_indexer_count": enabled_indexer_count,
+            "unavailable_indexer_names": unavailable_names,
+            "unavailable_indexer_count": len(unavailable_names),
+            "indexer_status_error": indexer_status_error,
             "discovered_children": public_children,
             "settings_source": settings.get("source"),
             **torrentleech_coverage,
@@ -47680,7 +48558,7 @@ def fetch_download_client_status(client_id):
         health = {
             "state": "configured" if effective.get("configured") else "configuration_needed",
             "api_reachable": False,
-            "detail": "Live status polling is not implemented for this beta client.",
+            "detail": "This client's queue history is tracked, but InkDrop doesn't run a live connectivity check for it here -- use Test Connection on its card in Download Clients for that.",
         }
     if snapshot_result:
         snapshots = snapshot_result.get("snapshots") or []
@@ -48693,6 +49571,139 @@ def start_managed_library_audit_scan(params=None):
     return {"ok": True, "started": True, "already_running": False, "running": True, "started_at": started_at}
 
 
+def library_reconciliation_public(max_files=25000, sample_limit=20):
+    if inkdrop_state is None or not INKDROP_STATE_DB.exists():
+        return {
+            "ok": False,
+            "reason": "inkdrop_state_unavailable",
+            "db_path": str(INKDROP_STATE_DB),
+        }
+    try:
+        max_files = max(1, min(int(max_files or 25000), 100000))
+    except (TypeError, ValueError):
+        max_files = 25000
+    try:
+        sample_limit = max(0, min(int(sample_limit or 20), 100))
+    except (TypeError, ValueError):
+        sample_limit = 20
+    try:
+        return inkdrop_library_reconcile.build_reconciliation_report(
+            INKDROP_STATE_DB,
+            max_files=max_files,
+            sample_limit=sample_limit,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "library_reconciliation_failed",
+            "error": str(exc),
+            "db_path": str(INKDROP_STATE_DB),
+            "max_files": max_files,
+            "sample_limit": sample_limit,
+        }
+
+
+LIBRARY_RECONCILIATION_RUN_LOCK = threading.Lock()
+LIBRARY_RECONCILIATION_RUN_STATE = {"running": False, "started_at": None}
+
+
+def library_reconciliation_status():
+    """Cached result plus in-progress flag. Reading this never scans the library."""
+    with LIBRARY_RECONCILIATION_RUN_LOCK:
+        running = bool(LIBRARY_RECONCILIATION_RUN_STATE["running"])
+        started_at = LIBRARY_RECONCILIATION_RUN_STATE["started_at"]
+    last = read_json_file(LIBRARY_RECONCILIATION_LAST_FILE, None)
+    last = last if isinstance(last, dict) else {}
+    report = last.get("report")
+    return {
+        "running": running,
+        "started_at": started_at,
+        "completed_at": last.get("completed_at"),
+        "completed_at_iso": last.get("completed_at_iso"),
+        "report": report if isinstance(report, dict) else None,
+    }
+
+
+def _library_reconciliation_worker(params):
+    try:
+        report = library_reconciliation_public(**params)
+    except Exception as exc:
+        report = {"ok": False, "reason": "library_reconciliation_failed", "error": str(exc)}
+    completed = time.time()
+    try:
+        write_json_file(
+            LIBRARY_RECONCILIATION_LAST_FILE,
+            {
+                "completed_at": completed,
+                "completed_at_iso": series_queue_now_iso(completed),
+                "params": params,
+                "report": report,
+            },
+        )
+    except Exception as exc:
+        print(f"Warning: could not persist library reconciliation result: {exc}", flush=True)
+    finally:
+        with LIBRARY_RECONCILIATION_RUN_LOCK:
+            LIBRARY_RECONCILIATION_RUN_STATE["running"] = False
+
+
+def start_library_reconciliation_scan(params=None):
+    """Kick off one background reconciliation report; report back if one is already going."""
+    params = params if isinstance(params, dict) else {}
+    with LIBRARY_RECONCILIATION_RUN_LOCK:
+        if LIBRARY_RECONCILIATION_RUN_STATE["running"]:
+            return {
+                "ok": True,
+                "started": False,
+                "already_running": True,
+                "running": True,
+                "started_at": LIBRARY_RECONCILIATION_RUN_STATE["started_at"],
+            }
+        LIBRARY_RECONCILIATION_RUN_STATE["running"] = True
+        LIBRARY_RECONCILIATION_RUN_STATE["started_at"] = time.time()
+        started_at = LIBRARY_RECONCILIATION_RUN_STATE["started_at"]
+    try:
+        thread = threading.Thread(
+            target=_library_reconciliation_worker,
+            args=(params,),
+            name="library-reconciliation-scan",
+            daemon=True,
+        )
+        thread.start()
+    except Exception as exc:
+        with LIBRARY_RECONCILIATION_RUN_LOCK:
+            LIBRARY_RECONCILIATION_RUN_STATE["running"] = False
+        return {"ok": False, "started": False, "error": str(exc)}
+    return {"ok": True, "started": True, "already_running": False, "running": True, "started_at": started_at}
+
+
+def library_reconciliation_repair_public(payload):
+    """Guarded repair: only ever refreshes the media_files present/missing ledger.
+
+    Everything else the reconciliation report finds (untracked files, on-disk
+    duplicates, multi-file issue conflicts, naming-scheme drift, duplicate issue
+    rows, legacy settings) needs a human to pick the keeper and is never touched
+    here, regardless of what's in payload.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    if inkdrop_state is None or not INKDROP_STATE_DB.exists():
+        return {
+            "ok": False,
+            "reason": "inkdrop_state_unavailable",
+            "db_path": str(INKDROP_STATE_DB),
+        }
+    apply_flag = inkdrop_bool_value(payload.get("apply"), False)
+    try:
+        return inkdrop_library_reconcile.run_repair(INKDROP_STATE_DB, apply=apply_flag)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "library_reconciliation_repair_failed",
+            "error": str(exc),
+            "db_path": str(INKDROP_STATE_DB),
+        }
+
+
 def managed_library_import_plan_public(max_files=25000, sample_limit=20):
     try:
         max_files = max(1, min(int(max_files or 25000), 100000))
@@ -49024,6 +50035,111 @@ def inkdrop_series_compact_view_public(limit=80, series_filter=None, focus=None,
     return backfill_missing_series_description(payload)
 
 
+# The decision panel can only render what the row carries, and the row-mode
+# projection keeps a fixed key set. append_manual_review() writes its actual
+# finding under reason-specific keys -- `note` is the human sentence, and the
+# gate that rejected the file leaves a dict behind (`archive_check`,
+# `artifact_acceptance`, `identity_guard`, ...). None of that survived the
+# projection, so every reason that does not happen to set `detail` reached the
+# panel as a title-cased code with no explanation under it.
+#
+# This is a mapping from legacy-record key to display label, not a template
+# per reason: a new reason that reuses any of these keys is covered without
+# further work, and one that invents a key simply adds nothing rather than
+# breaking. Values are flattened to short strings here so the panel stays a
+# renderer.
+MANUAL_REVIEW_EVIDENCE_KEYS = (
+    ("ambiguous_alias", "Ambiguous title"),
+    ("ambiguous_targets", "Possible series"),
+    ("archive_check", "Archive check"),
+    ("artifact_acceptance", "Artifact check"),
+    ("identity_guard", "Identity check"),
+    ("bad_content_identity", "Content identity"),
+    ("canonical_filename", "Canonical name"),
+    ("source_unit", "Detected unit"),
+    ("normalized_number", "Detected number"),
+    ("manga_unit_policy_label", "Manga unit policy"),
+    ("language", "Archive language"),
+    ("collection_title", "Collected edition"),
+    ("range", "Covers issues"),
+    ("matched_series_folder", "Library folder"),
+    ("dest", "Destination"),
+    ("failures", "Verification failures"),
+)
+
+# Keys inside a nested evidence dict that carry the finding, best first.
+MANUAL_REVIEW_EVIDENCE_DETAIL_KEYS = ("detail", "reason", "note", "message", "status")
+
+
+def manual_review_evidence_value(value):
+    """Flatten one evidence value to a short display string, or "" to skip."""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, dict):
+        for key in MANUAL_REVIEW_EVIDENCE_DETAIL_KEYS:
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return humanize_review_evidence_text(inner)
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for entry in value:
+            if isinstance(entry, dict):
+                flattened = manual_review_evidence_value(entry)
+                if not flattened:
+                    # A failure record often names the thing that failed
+                    # rather than carrying a reason key.
+                    flattened = " ".join(
+                        str(entry.get(key)).strip()
+                        for key in ("series", "title", "issue", "unit", "path")
+                        if str(entry.get(key) or "").strip()
+                    ).strip()
+                if flattened:
+                    parts.append(flattened)
+            elif str(entry or "").strip():
+                parts.append(str(entry).strip())
+            if len(parts) >= 4:
+                break
+        if not parts:
+            return ""
+        extra = len(value) - len(parts)
+        return ", ".join(parts) + (f", +{extra} more" if extra > 0 else "")
+    text = str(value).strip()
+    return humanize_review_evidence_text(text) if text else ""
+
+
+def humanize_review_evidence_text(text):
+    """Turn a bare snake_case code (`zero_or_empty_header`) into a sentence
+    fragment, and leave anything already written for a person alone.
+
+    Only `_` counts as a code separator. Hyphens are left alone deliberately:
+    real values pass through here too, and a range like "1-7" or a date like
+    "02-2005" is not a code -- treating hyphens as separators rewrote them to
+    "1 7" and "02 2005".
+    """
+    text = str(text or "").strip()
+    if not text or " " in text or "_" not in text:
+        return text
+    return text.replace("_", " ").strip().capitalize()
+
+
+def manual_review_decision_evidence(legacy):
+    """Display-ready [{label, value}] for the decision panel's evidence list."""
+    if not isinstance(legacy, dict):
+        return []
+    out = []
+    for key, label in MANUAL_REVIEW_EVIDENCE_KEYS:
+        if key not in legacy:
+            continue
+        value = manual_review_evidence_value(legacy.get(key))
+        if not value:
+            continue
+        if len(value) > 220:
+            value = value[:217].rstrip() + "..."
+        out.append({"label": label, "value": value})
+    return out
+
+
 def inkdrop_manual_review_compact_view_public(limit=80, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None):
     limit = max(1, min(int(limit or 80), 300))
     manual_review_filter = manual_review_compact_filter_key(manual_review_filter)
@@ -49078,6 +50194,16 @@ def inkdrop_manual_review_compact_view_public(limit=80, manual_review_filter=Non
                 row["detail"] = sanitized["detail"]
             if sanitized.get("filename") and not row.get("local_file_name"):
                 row["local_file_name"] = sanitized["filename"]
+            # `note` is the sentence the import path already wrote for a
+            # person; the evidence list is whatever the rejecting gate left
+            # behind. Only `detail` used to survive, so the reasons that set
+            # neither reached the panel with nothing to show.
+            if sanitized.get("note") and not row.get("note"):
+                row["note"] = sanitized["note"]
+            if not row.get("review_evidence"):
+                evidence = manual_review_decision_evidence(sanitized or legacy)
+                if evidence:
+                    row["review_evidence"] = evidence
         if row.get("can_approve_local_file") is None and not (row.get("can_approve") or row.get("can_approve_pack")):
             local_source_path = manual_review_local_source_path(row.get("source"))
             if local_source_path is not None:
@@ -49169,13 +50295,126 @@ def refresh_inkdrop_series_cover_metadata(payload):
                 "updated": False,
                 "reason": f"{type(exc).__name__}: {exc}",
             })
+    manga = repair_mangadex_series_front_covers(
+        payload, rows=rows, requested_ids=requested_ids, limit=limit
+    )
+    results.extend(manga.get("results") or [])
+    refreshed += int(manga.get("repaired") or 0)
+    skipped += int(manga.get("skipped") or 0)
+    errors += int(manga.get("errors") or 0)
     return {
         "ok": errors == 0 or refreshed > 0 or skipped > 0,
         "requested": len(requested_ids),
-        "candidates": len(candidates),
+        "candidates": len(candidates) + int(manga.get("candidates") or 0),
         "refreshed": refreshed,
         "skipped": skipped,
         "errors": errors,
+        "results": results,
+    }
+
+
+def inkdrop_series_mangadex_metadata_id(row):
+    row = row if isinstance(row, dict) else {}
+    provider = str(row.get("metadata_provider") or row.get("metadataProvider") or row.get("source") or "").strip().lower()
+    metadata_id = str(row.get("metadata_id") or row.get("metadataId") or row.get("mangadexId") or "").strip()
+    if provider == "mangadex" and metadata_id:
+        return metadata_id
+    match = re.match(r"^mangadex:(.+)$", str(row.get("series_id") or row.get("id") or "").strip(), re.I)
+    return match.group(1).strip() if match else ""
+
+
+def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, limit=8):
+    """Re-point MangaDex series at the first volume's cover art.
+
+    Fixing the selection only helps series added afterwards, because the cover
+    writer is fill-only -- a series that already latched onto volume 18's art
+    would keep it forever. This is the repair for the library that already
+    exists.
+
+    Each series costs one /cover request, so a sweep with no explicit ids stays
+    opt-in behind ``repairFrontCovers``: the automatic missing-cover sweeps the
+    UI runs must not turn into a MangaDex crawl. ``dryRun`` reports what would
+    change without writing.
+    """
+
+    payload = payload if isinstance(payload, dict) else {}
+    requested_ids = set(requested_ids or set())
+    sweep = inkdrop_bool_value(payload.get("repairFrontCovers") or payload.get("repair_front_covers"), False)
+    dry_run = inkdrop_bool_value(payload.get("dryRun") or payload.get("dry_run"), False)
+    if not requested_ids and not sweep:
+        return {"candidates": 0, "repaired": 0, "skipped": 0, "errors": 0, "results": []}
+    if rows is None:
+        rows = inkdrop_state.series_rows(INKDROP_STATE_DB, 5000, series_filter="all")
+    try:
+        settings = load_mangadex_settings()
+    except Exception:
+        settings = {}
+    preferred_locales = settings.get("translated_languages") if isinstance(settings, dict) else None
+
+    candidates = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        manga_id = inkdrop_series_mangadex_metadata_id(row)
+        if not manga_id:
+            continue
+        row_id = str(row.get("id") or row.get("series_id") or "").strip()
+        if requested_ids and row_id not in requested_ids and manga_id not in requested_ids and f"mangadex:{manga_id}" not in requested_ids:
+            continue
+        candidates.append((row, manga_id))
+        if len(candidates) >= limit:
+            break
+
+    results = []
+    repaired = 0
+    skipped = 0
+    errors = 0
+    for row, manga_id in candidates:
+        row_id = str(row.get("id") or row.get("series_id") or "").strip()
+        title = row.get("title") or row_id
+        current = str(row.get("image") or "").strip()
+        try:
+            covers = mangadex_cover_records(manga_id)
+            filename = mangadex_select_front_cover(covers, preferred_locales=preferred_locales)
+            if not filename:
+                skipped += 1
+                results.append({"series_id": row_id, "title": title, "mangadex_id": manga_id, "updated": False, "reason": "no_cover_art"})
+                continue
+            image = f"{MANGADEX_COVER_URL}/{manga_id}/{filename}.256.jpg"
+            if image == current:
+                skipped += 1
+                results.append({"series_id": row_id, "title": title, "mangadex_id": manga_id, "updated": False, "reason": "already_current", "image": image})
+                continue
+            if dry_run:
+                results.append({
+                    "series_id": row_id, "title": title, "mangadex_id": manga_id,
+                    "updated": False, "reason": "dry_run", "image": image, "previous_image": current,
+                })
+                continue
+            result = inkdrop_state.update_series_image_metadata(
+                INKDROP_STATE_DB, row_id, image, source="mangadex", replace=True
+            )
+            if result.get("updated"):
+                repaired += 1
+            else:
+                skipped += 1
+            results.append({
+                "series_id": row_id, "title": title, "mangadex_id": manga_id,
+                "updated": bool(result.get("updated")), "reason": result.get("reason"),
+                "image": image, "previous_image": current,
+            })
+        except Exception as exc:
+            errors += 1
+            results.append({
+                "series_id": row_id, "title": title, "mangadex_id": manga_id,
+                "updated": False, "reason": f"{type(exc).__name__}: {exc}",
+            })
+    return {
+        "candidates": len(candidates),
+        "repaired": repaired,
+        "skipped": skipped,
+        "errors": errors,
+        "dry_run": dry_run,
         "results": results,
     }
 
@@ -49406,9 +50645,37 @@ def run_inkdrop_library_frontend_sync(payload):
 # written to the auth audit log. Nothing is removed from the database or from
 # any internal path -- this is the boundary where the payload leaves the
 # process, and every action that acts on these rows posts an id, never a path.
-OPERATIONAL_DETAIL_REDACTED_PATH_FIELDS = ("save_path", "local_path", "source_path", "dest_path")
-OPERATIONAL_DETAIL_REDACTED_IDENTITY_FIELDS = ("external_id", "peer")
-OPERATIONAL_DETAIL_REDACTED_CONTAINERS = ("download_task", "latest_import", "last_attempt")
+OPERATIONAL_DETAIL_REDACTED_PATH_FIELDS = frozenset({
+    "save_path",
+    "local_path",
+    "source_path",
+    "dest_path",
+    # Everything below was measured leaking out of /api/inkdrop-state/queue
+    # with the original list in place. The import planner's preview carries a
+    # second, parallel set of path names that the first four never covered.
+    "planned_path",
+    "planned_dir",
+    "existing_dest_path",
+    "selected_import_dest_path",
+    "legacy_import_dest_path",
+    "current_import_dest_path",
+    "detected_path",
+    "staged_path",
+    "series_folder",
+    # Not the media's location -- InkDrop's own. The queue payload was
+    # reporting where the state database and the free-space probe live, which
+    # is server topology and no part of what a queue row is for.
+    "db_path",
+    "free_space_probe_path",
+})
+OPERATIONAL_DETAIL_REDACTED_IDENTITY_FIELDS = frozenset({
+    "external_id",
+    "peer",
+    # The same download-client job id as external_id, under the name the
+    # transfer contract uses. Redacting one spelling and serving the other in
+    # the same response is not a contract.
+    "client_item_id",
+})
 
 
 def path_leaf_only(value):
@@ -49434,30 +50701,48 @@ def redact_operational_detail(payload):
     """
     if not isinstance(payload, dict):
         return False
-    withheld = False
-    for row in payload.get("rows") or []:
-        if not isinstance(row, dict):
-            continue
-        containers = [row]
-        for key in OPERATIONAL_DETAIL_REDACTED_CONTAINERS:
-            container = row.get(key)
-            if isinstance(container, dict):
-                containers.append(container)
-        for container in containers:
-            for key in OPERATIONAL_DETAIL_REDACTED_PATH_FIELDS:
-                original = container.get(key)
-                if not str(original or "").strip():
+
+    # Walk the whole payload rather than a hand-listed set of container names
+    # at one fixed depth. The list version read row, row["download_task"],
+    # row["latest_import"] and row["last_attempt"] -- and measurably missed
+    # row["transfer"], row["download_task"]["transfer"] (one level deeper than
+    # it looked) and row["media_management_preview"], all of which serve the
+    # same fields out of the same tables. A names-and-depth list is a snapshot
+    # of the payload shape on the day it was written; the payload keeps
+    # growing, so the list goes stale silently and the contract turns back
+    # into a bypass. Matching on the field name at any depth cannot.
+    state = {"withheld": False}
+
+    def scrub(node):
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                if key in OPERATIONAL_DETAIL_REDACTED_IDENTITY_FIELDS:
+                    if str(value or "").strip():
+                        node.pop(key, None)
+                        state["withheld"] = True
                     continue
-                leaf = path_leaf_only(original)
-                if leaf != original:
-                    withheld = True
-                container[key] = leaf
-            for key in OPERATIONAL_DETAIL_REDACTED_IDENTITY_FIELDS:
-                if str(container.get(key) or "").strip():
-                    container.pop(key, None)
-                    withheld = True
-    payload["operational_detail_redacted"] = withheld
-    return withheld
+                if key in OPERATIONAL_DETAIL_REDACTED_PATH_FIELDS:
+                    # Strings only. apply_planned_path is a boolean toggle
+                    # whose name ends the same way; stringifying it would turn
+                    # a flag the UI reads into the text "True".
+                    if isinstance(value, str) and value.strip():
+                        leaf = path_leaf_only(value)
+                        if leaf != value:
+                            state["withheld"] = True
+                        node[key] = leaf
+                    continue
+                scrub(value)
+        elif isinstance(node, list):
+            for value in node:
+                scrub(value)
+
+    # The whole payload, not payload["rows"]: the state views key their rows
+    # on "rows" and the activity views key theirs on "activity", and a helper
+    # that only knows one of those names is the same staleness trap one level
+    # up. Nothing outside the two field sets is touched either way.
+    scrub(payload)
+    payload["operational_detail_redacted"] = state["withheld"]
+    return state["withheld"]
 
 
 def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None):
@@ -50711,7 +51996,12 @@ def library_adoption_search_fn(media_type):
     return search
 
 
-def run_library_adoption_plan(payload):
+def library_adoption_scope_key(root, media_type):
+    """A scan of /comics as manga is not the answer for /comics as comics."""
+    return f"{str(root or '').strip()}|{str(media_type or '').strip().lower()}"
+
+
+def _library_adoption_plan_arguments(payload):
     payload = payload or {}
     root = safe_optional_text(payload.get("root"), 1000)
     if not root:
@@ -50719,6 +52009,12 @@ def run_library_adoption_plan(payload):
     media_type = str(payload.get("mediaType") or payload.get("media_type") or "comic").strip().lower()
     if media_type not in ("comic", "manga"):
         raise ValueError("media_type must be comic or manga")
+    return root, media_type
+
+
+def run_library_adoption_plan(payload):
+    """Synchronous scan. Kept for callers that can wait; the UI uses the task below."""
+    root, media_type = _library_adoption_plan_arguments(payload)
     plan = inkdrop_library_adoption.build_adoption_plan(
         INKDROP_STATE_DB,
         root,
@@ -50738,6 +52034,178 @@ def run_library_adoption_plan(payload):
         },
     )
     return plan
+
+
+def _run_library_adoption_plan_task(task_id, *, root, media_type):
+    def touch(**fields):
+        with LIBRARY_ADOPTION_TASKS_LOCK:
+            task = LIBRARY_ADOPTION_TASKS.get(task_id)
+            if not task:
+                return
+            task.update(fields)
+            task["updated_at"] = time.time()
+        _persist_scan_run_progress(task_id, registry=LIBRARY_ADOPTION_TASKS, lock=LIBRARY_ADOPTION_TASKS_LOCK)
+
+    def scan_progress(scanned, matched, current_path):
+        touch(phase="scanning", scanned=scanned, matched=matched, current_path=current_path)
+
+    def folder_progress(done, total, folder_name):
+        touch(phase="identifying", folders_done=done, folders_total=total, current_path=folder_name)
+
+    try:
+        plan = inkdrop_library_adoption.build_adoption_plan(
+            INKDROP_STATE_DB,
+            root,
+            media_type,
+            search_fn=library_adoption_search_fn(media_type),
+            max_files=20000,
+            max_metadata_lookups=25,
+            scan_progress=scan_progress,
+            folder_progress=folder_progress,
+        )
+        with LIBRARY_ADOPTION_TASKS_LOCK:
+            task = LIBRARY_ADOPTION_TASKS.get(task_id)
+            if task:
+                task["state"] = "completed" if plan.get("ok") else "failed"
+                task["phase"] = "done"
+                task["plan"] = plan
+                task["current_path"] = None
+                task["finished_at"] = time.time()
+        _finish_scan_run(
+            task_id,
+            state=inkdrop_scan_runs.STATE_COMPLETED if plan.get("ok") else inkdrop_scan_runs.STATE_FAILED,
+            result=plan,
+            error=None if plan.get("ok") else ", ".join(str(item) for item in (plan.get("errors") or [])) or None,
+            roots=[root],
+            registry=LIBRARY_ADOPTION_TASKS,
+            lock=LIBRARY_ADOPTION_TASKS_LOCK,
+        )
+        watch_log(
+            "library_adoption_plan",
+            {
+                "root": root,
+                "mediaType": media_type,
+                "ok": plan.get("ok"),
+                "summary": plan.get("summary"),
+                "errors": plan.get("errors"),
+            },
+        )
+    except Exception as exc:
+        message = inkdrop_manual_search.redacted_text(exc, 240)
+        with LIBRARY_ADOPTION_TASKS_LOCK:
+            task = LIBRARY_ADOPTION_TASKS.get(task_id)
+            if task:
+                task["state"] = "failed"
+                task["error"] = message
+                task["finished_at"] = time.time()
+        _finish_scan_run(
+            task_id,
+            state=inkdrop_scan_runs.STATE_FAILED,
+            error=message,
+            roots=[root],
+            registry=LIBRARY_ADOPTION_TASKS,
+            lock=LIBRARY_ADOPTION_TASKS_LOCK,
+        )
+        print(f"library adoption plan task failed task_id={task_id} error={exc}", file=sys.stderr)
+
+
+def run_library_adoption_plan_start(payload):
+    root, media_type = _library_adoption_plan_arguments(payload)
+    with LIBRARY_ADOPTION_TASKS_LOCK:
+        for existing_id, existing_task in LIBRARY_ADOPTION_TASKS.items():
+            if existing_task.get("state") == "running":
+                return {"started": False, "already_running": True, "taskId": existing_id}
+        task_id = uuid.uuid4().hex
+        LIBRARY_ADOPTION_TASKS[task_id] = {
+            "task_id": task_id,
+            "kind": "library_adoption_plan",
+            "state": "running",
+            "phase": "scanning",
+            "root": root,
+            "media_type": media_type,
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "finished_at": None,
+            "scanned": 0,
+            "matched": 0,
+            "folders_done": 0,
+            "folders_total": 0,
+            "current_path": None,
+            "plan": None,
+            "error": None,
+            "run_id": task_id,
+        }
+    _start_scan_run_row(
+        task_id,
+        inkdrop_scan_runs.KIND_LIBRARY_ADOPTION_PLAN,
+        scope_key=library_adoption_scope_key(root, media_type),
+        options={"root": root, "media_type": media_type},
+        registry=LIBRARY_ADOPTION_TASKS,
+        lock=LIBRARY_ADOPTION_TASKS_LOCK,
+    )
+    thread = threading.Thread(
+        target=_run_library_adoption_plan_task,
+        args=(task_id,),
+        kwargs={"root": root, "media_type": media_type},
+        name=f"library-adoption-plan-{task_id[-8:]}",
+        daemon=True,
+    )
+    thread.start()
+    return {"started": True, "already_running": False, "taskId": task_id}
+
+
+def _library_adoption_run_to_task(run):
+    if not run:
+        return None
+    task = dict(run.get("progress") or {})
+    task["task_id"] = run.get("id")
+    task["kind"] = "library_adoption_plan"
+    task["state"] = run.get("state")
+    task["started_at"] = run.get("started_at")
+    task["updated_at"] = run.get("updated_at")
+    task["finished_at"] = run.get("finished_at")
+    task["error"] = run.get("error") or task.get("error")
+    task["plan"] = run.get("result")
+    task["restored"] = True
+    task["age_seconds"] = run.get("age_seconds")
+    task["staleness"] = run.get("staleness")
+    options = run.get("options") or {}
+    task.setdefault("root", options.get("root"))
+    task.setdefault("media_type", options.get("media_type"))
+    return task
+
+
+def library_adoption_task_status(task_id):
+    if not task_id:
+        return None
+    with LIBRARY_ADOPTION_TASKS_LOCK:
+        task = LIBRARY_ADOPTION_TASKS.get(task_id)
+        if task:
+            return dict(task)
+    run = inkdrop_scan_runs.get_run(INKDROP_STATE_DB, task_id)
+    if not run:
+        return None
+    return _library_adoption_run_to_task(
+        inkdrop_scan_runs.public_run(run, db_path=INKDROP_STATE_DB, roots=[(run.get("options") or {}).get("root")])
+    )
+
+
+def library_adoption_latest_run(payload=None):
+    """The last folder scan, so a reopened Settings page is not a blank slate."""
+    payload = payload or {}
+    root = safe_optional_text(payload.get("root"), 1000)
+    media_type = str(payload.get("mediaType") or payload.get("media_type") or "").strip().lower()
+    scope_key = library_adoption_scope_key(root, media_type) if root and media_type else None
+    run = inkdrop_scan_runs.latest_run(INKDROP_STATE_DB, inkdrop_scan_runs.KIND_LIBRARY_ADOPTION_PLAN, scope_key=scope_key)
+    if not run:
+        return None
+    with LIBRARY_ADOPTION_TASKS_LOCK:
+        live = LIBRARY_ADOPTION_TASKS.get(run.get("id"))
+        if live:
+            return dict(live)
+    return _library_adoption_run_to_task(
+        inkdrop_scan_runs.public_run(run, db_path=INKDROP_STATE_DB, roots=[(run.get("options") or {}).get("root")])
+    )
 
 
 def run_library_adoption_apply(payload):
@@ -50782,6 +52250,62 @@ def run_library_adoption_apply(payload):
     return result
 
 
+def archive_conversion_scan_roots():
+    """The roots the conversion scan will actually walk, for the staleness check."""
+    try:
+        return [str(root) for root in inkdrop_archive_conversion.default_library_roots()]
+    except Exception:
+        return []
+
+
+def _scan_run_snapshot(task):
+    """The progress half of a task dict -- everything except the heavy result."""
+    return {key: value for key, value in task.items() if key not in ("plan", "summary")}
+
+
+def _scan_task_registry(registry=None, lock=None):
+    return (
+        ARCHIVE_CONVERSION_TASKS if registry is None else registry,
+        ARCHIVE_CONVERSION_TASKS_LOCK if lock is None else lock,
+    )
+
+
+def _persist_scan_run_progress(task_id, *, force=False, registry=None, lock=None):
+    """Mirror an in-memory task's progress into its durable row."""
+    registry, lock = _scan_task_registry(registry, lock)
+    with lock:
+        task = registry.get(task_id)
+        if not task or not task.get("run_id"):
+            return
+        run_id = task["run_id"]
+        snapshot = _scan_run_snapshot(task)
+    inkdrop_scan_runs.record_progress(INKDROP_STATE_DB, run_id, snapshot, phase=snapshot.get("phase"), force=force)
+
+
+def _finish_scan_run(task_id, *, state, result=None, error=None, roots=None, registry=None, lock=None):
+    registry, lock = _scan_task_registry(registry, lock)
+    with lock:
+        task = registry.get(task_id)
+        if not task or not task.get("run_id"):
+            return
+        run_id = task["run_id"]
+        snapshot = _scan_run_snapshot(task)
+    try:
+        inkdrop_scan_runs.finish_run(
+            INKDROP_STATE_DB,
+            run_id,
+            state=state,
+            result=result,
+            error=error,
+            progress=snapshot,
+            fingerprint=inkdrop_scan_runs.library_fingerprint(
+                INKDROP_STATE_DB, roots=roots if roots is not None else archive_conversion_scan_roots()
+            ),
+        )
+    except Exception as exc:
+        print(f"could not persist scan run task_id={task_id} error={exc}", file=sys.stderr)
+
+
 def _run_archive_conversion_plan_task(task_id, *, include_mislabeled_cbz):
     def scan_progress(scanned, total, candidates_found, current_path):
         with ARCHIVE_CONVERSION_TASKS_LOCK:
@@ -50793,6 +52317,8 @@ def _run_archive_conversion_plan_task(task_id, *, include_mislabeled_cbz):
             task["candidates_found"] = candidates_found
             task["current_path"] = current_path
             task["updated_at"] = time.time()
+        # Rate-limited inside record_progress -- this fires once per file.
+        _persist_scan_run_progress(task_id)
 
     try:
         plan = inkdrop_archive_conversion.convert_library(
@@ -50804,6 +52330,7 @@ def _run_archive_conversion_plan_task(task_id, *, include_mislabeled_cbz):
                 task["state"] = "completed"
                 task["plan"] = plan
                 task["finished_at"] = time.time()
+        _finish_scan_run(task_id, state=inkdrop_scan_runs.STATE_COMPLETED, result=plan, roots=plan.get("roots"))
         watch_log(
             "archive_conversion_plan",
             {
@@ -50814,12 +52341,14 @@ def _run_archive_conversion_plan_task(task_id, *, include_mislabeled_cbz):
             },
         )
     except Exception as exc:
+        message = inkdrop_manual_search.redacted_text(exc, 240)
         with ARCHIVE_CONVERSION_TASKS_LOCK:
             task = ARCHIVE_CONVERSION_TASKS.get(task_id)
             if task:
                 task["state"] = "failed"
-                task["error"] = inkdrop_manual_search.redacted_text(exc, 240)
+                task["error"] = message
                 task["finished_at"] = time.time()
+        _finish_scan_run(task_id, state=inkdrop_scan_runs.STATE_FAILED, error=message)
         print(f"archive conversion plan task failed task_id={task_id} error={exc}", file=sys.stderr)
 
 
@@ -50844,7 +52373,13 @@ def run_archive_conversion_plan_start(payload=None):
             "current_path": None,
             "plan": None,
             "error": None,
+            "run_id": task_id,
         }
+    _start_scan_run_row(
+        task_id,
+        inkdrop_scan_runs.KIND_ARCHIVE_CONVERSION_PLAN,
+        options={"include_mislabeled_cbz": bool(include_mislabeled_cbz)},
+    )
     thread = threading.Thread(
         target=_run_archive_conversion_plan_task,
         args=(task_id,),
@@ -50854,6 +52389,31 @@ def run_archive_conversion_plan_start(payload=None):
     )
     thread.start()
     return {"started": True, "already_running": False, "taskId": task_id}
+
+
+def _start_scan_run_row(task_id, kind, *, scope_key=None, options=None, registry=None, lock=None):
+    """Open the durable row for an already-registered in-memory task.
+
+    A failure here must not stop the scan -- the worst case is that this one run
+    is only recoverable while the process lives, which is exactly where we were
+    before -- so the row id is dropped rather than raised.
+    """
+    registry, lock = _scan_task_registry(registry, lock)
+    with lock:
+        task = registry.get(task_id)
+        snapshot = _scan_run_snapshot(task) if task else {}
+    if scope_key is None:
+        scope_key = "|".join(archive_conversion_scan_roots())
+    try:
+        inkdrop_scan_runs.start_run(
+            INKDROP_STATE_DB, kind, scope_key=scope_key, options=options or {}, progress=snapshot, run_id=task_id
+        )
+    except Exception as exc:
+        with lock:
+            task = registry.get(task_id)
+            if task:
+                task["run_id"] = None
+        print(f"could not open scan run row task_id={task_id} kind={kind} error={exc}", file=sys.stderr)
 
 
 def _run_archive_conversion_task(task_id, *, limit, keep_original, include_mislabeled_cbz):
@@ -50868,6 +52428,7 @@ def _run_archive_conversion_task(task_id, *, limit, keep_original, include_misla
             task["candidates_found"] = candidates_found
             task["current_path"] = current_path
             task["updated_at"] = time.time()
+        _persist_scan_run_progress(task_id)
 
     def progress(event):
         with ARCHIVE_CONVERSION_TASKS_LOCK:
@@ -50885,6 +52446,7 @@ def _run_archive_conversion_task(task_id, *, limit, keep_original, include_misla
                 elif not event.get("ok"):
                     task["failed"] += 1
                 task["last_result"] = {"source": event.get("source"), "converted": bool(event.get("converted")), "reason": event.get("reason")}
+        _persist_scan_run_progress(task_id)
 
     try:
         summary = inkdrop_archive_conversion.convert_library(
@@ -50901,6 +52463,12 @@ def _run_archive_conversion_task(task_id, *, limit, keep_original, include_misla
                 task["state"] = "completed" if summary.get("ok") else "failed"
                 task["summary"] = summary
                 task["finished_at"] = time.time()
+        _finish_scan_run(
+            task_id,
+            state=inkdrop_scan_runs.STATE_COMPLETED if summary.get("ok") else inkdrop_scan_runs.STATE_FAILED,
+            result=summary,
+            roots=summary.get("roots"),
+        )
         watch_log(
             "archive_conversion_apply",
             {
@@ -50912,12 +52480,14 @@ def _run_archive_conversion_task(task_id, *, limit, keep_original, include_misla
             },
         )
     except Exception as exc:
+        message = inkdrop_manual_search.redacted_text(exc, 240)
         with ARCHIVE_CONVERSION_TASKS_LOCK:
             task = ARCHIVE_CONVERSION_TASKS.get(task_id)
             if task:
                 task["state"] = "failed"
-                task["error"] = inkdrop_manual_search.redacted_text(exc, 240)
+                task["error"] = message
                 task["finished_at"] = time.time()
+        _finish_scan_run(task_id, state=inkdrop_scan_runs.STATE_FAILED, error=message)
         print(f"archive conversion task failed task_id={task_id} error={exc}", file=sys.stderr)
 
 
@@ -50947,10 +52517,16 @@ def run_archive_conversion_apply_start(payload):
             "last_result": None,
             "summary": None,
             "error": None,
+            "run_id": task_id,
         }
     limit = payload.get("limit")
     keep_original = not inkdrop_bool_value(payload.get("discardOriginals") or payload.get("discard_originals"), False)
     include_mislabeled_cbz = inkdrop_bool_value(payload.get("includeMislabeledCbz") or payload.get("include_mislabeled_cbz"), False)
+    _start_scan_run_row(
+        task_id,
+        inkdrop_scan_runs.KIND_ARCHIVE_CONVERSION_APPLY,
+        options={"keep_original": bool(keep_original), "include_mislabeled_cbz": bool(include_mislabeled_cbz)},
+    )
     thread = threading.Thread(
         target=_run_archive_conversion_task,
         args=(task_id,),
@@ -50962,12 +52538,69 @@ def run_archive_conversion_apply_start(payload):
     return {"started": True, "already_running": False, "taskId": task_id}
 
 
+def _scan_run_to_task(run):
+    """Rebuild the task shape the poller expects from a durable row.
+
+    A run that outlived its process comes back with the same keys the in-memory
+    dict had, plus the three things only the row knows: that it was interrupted,
+    how old it is, and whether the library has moved since.
+    """
+    if not run:
+        return None
+    task = dict(run.get("progress") or {})
+    task["task_id"] = run.get("id")
+    task["state"] = run.get("state")
+    task["kind"] = task.get("kind") or ("plan" if run.get("kind") == inkdrop_scan_runs.KIND_ARCHIVE_CONVERSION_PLAN else "apply")
+    task["started_at"] = run.get("started_at")
+    task["updated_at"] = run.get("updated_at")
+    task["finished_at"] = run.get("finished_at")
+    task["error"] = run.get("error") or task.get("error")
+    task["restored"] = True
+    task["age_seconds"] = run.get("age_seconds")
+    task["staleness"] = run.get("staleness")
+    result = run.get("result")
+    if run.get("kind") == inkdrop_scan_runs.KIND_ARCHIVE_CONVERSION_PLAN:
+        task["plan"] = result
+    else:
+        task["summary"] = result
+    return task
+
+
 def archive_conversion_task_status(task_id):
     if not task_id:
         return None
     with ARCHIVE_CONVERSION_TASKS_LOCK:
         task = ARCHIVE_CONVERSION_TASKS.get(task_id)
-        return dict(task) if task else None
+        if task:
+            return dict(task)
+    # Not in this process. Before durable rows that meant the poller got nothing
+    # back and rendered it as "0 comics to convert" -- a completed scan and a
+    # restarted container looked identical, and the wrong one was believable.
+    run = inkdrop_scan_runs.get_run(INKDROP_STATE_DB, task_id)
+    if not run:
+        return None
+    return _scan_run_to_task(
+        inkdrop_scan_runs.public_run(run, db_path=INKDROP_STATE_DB, roots=archive_conversion_scan_roots())
+    )
+
+
+def archive_conversion_latest_run(kind="plan"):
+    """The last check (or conversion) this install ran, whoever started it."""
+    run_kind = (
+        inkdrop_scan_runs.KIND_ARCHIVE_CONVERSION_PLAN
+        if str(kind or "plan") == "plan"
+        else inkdrop_scan_runs.KIND_ARCHIVE_CONVERSION_APPLY
+    )
+    run = inkdrop_scan_runs.latest_run(INKDROP_STATE_DB, run_kind)
+    if not run:
+        return None
+    with ARCHIVE_CONVERSION_TASKS_LOCK:
+        live = ARCHIVE_CONVERSION_TASKS.get(run.get("id"))
+        if live:
+            return dict(live)
+    return _scan_run_to_task(
+        inkdrop_scan_runs.public_run(run, db_path=INKDROP_STATE_DB, roots=archive_conversion_scan_roots())
+    )
 
 
 def inkdrop_series_file_removal_requested(payload):
@@ -51902,9 +53535,78 @@ def run_inkdrop_series_merge_apply(payload):
     return {"merge": result}
 
 
+def stored_provider_ids(provider_ids):
+    """Which of these provider ids already have a row in provider_configs."""
+    stored = set()
+    try:
+        if not Path(INKDROP_STATE_DB).exists():
+            return stored
+        with inkdrop_state.connect_read(INKDROP_STATE_DB) as con:
+            table = con.execute(
+                "select 1 from sqlite_master where type='table' and name='provider_configs' limit 1"
+            ).fetchone()
+            if not table:
+                return stored
+            for provider_id in provider_ids:
+                row = con.execute("select 1 from provider_configs where id=? limit 1", (provider_id,)).fetchone()
+                if row is not None:
+                    stored.add(provider_id)
+    except (sqlite3.Error, OSError):
+        # Fall back to "already stored" so a read failure can never silently
+        # retire a card an install is really using.
+        return set(provider_ids)
+    return stored
+
+
+def legacy_slskd_card_configured():
+    """Whether SLSKD is configured enough for its legacy card to claim it works.
+
+    The same test `inkdrop_download_client_config._legacy_payload()` applies
+    before it will carry a legacy card across into a real download-client
+    instance: somewhere to connect, and something to authenticate with. That
+    function's own comment names this trap -- but it bails on never-configured
+    cards before reaching the check, so it never fired on the one card that
+    needed it.
+
+    A probe script shipped inside InkDrop's own image is not configuration.
+    """
+    config = {}
+    try:
+        if INKDROP_STATE_DB.exists():
+            config = inkdrop_state.provider_config(INKDROP_STATE_DB, "slskd") or {}
+    except Exception:
+        config = {}
+    settings = flatten_legacy_nested_settings(config.get("settings"))
+    base_url = str(
+        config.get("base_url")
+        or settings.get("base_url")
+        or os.environ.get("INKDROP_SLSKD_API_BASE_URL")
+        or SLSKD_API_BASE_URL
+        or ""
+    ).strip()
+    # slskd_api_key_for_health() already owns "the provider setting, else the
+    # key in the operator's mounted slskd.yml" -- that file is the user's own
+    # config, unlike our probe script, so a key found there is real.
+    api_key = str(
+        slskd_api_key_for_health(settings)
+        or os.environ.get("INKDROP_SLSKD_API_KEY")
+        or ""
+    ).strip()
+    return bool(base_url and api_key)
+
+
 def runtime_provider_settings():
     providers = []
     settings = []
+    # Download clients are things the user runs elsewhere and connects InkDrop
+    # to, so InkDrop has no business asserting one exists. These three used to be
+    # seeded onto every install regardless -- SLSKD's card was even marked
+    # enabled just because a probe script shipped inside the image -- which made
+    # "a client is set up" and "a card is on the page" impossible to tell apart.
+    # New installs now get an empty Download Clients page and add what they run;
+    # installs that already have one of these rows keep it (and its card) until
+    # the legacy-card migration turns it into a real instance.
+    legacy_client_cards = stored_provider_ids(("qbittorrent", "sabnzbd", "slskd"))
 
     def provider(
         provider_id,
@@ -51914,8 +53616,11 @@ def runtime_provider_settings():
         base_url=None,
         secret_ref=None,
         settings_payload=None,
+        only_when_stored=False,
     ):
         provider_key = str(provider_id or "").strip().lower()
+        if only_when_stored and provider_key not in legacy_client_cards:
+            return
         meta = PROVIDER_SETTINGS_META.get(provider_key, {}) if isinstance(globals().get("PROVIDER_SETTINGS_META"), dict) else {}
         capabilities = []
         if inkdrop_state is not None:
@@ -52280,7 +53985,14 @@ def runtime_provider_settings():
         "slskd",
         "download_source",
         "SLSKD",
-        enabled=SLSKD_SOURCE_PROBE_SCRIPT.exists(),
+        only_when_stored=True,
+        # A probe script existing inside InkDrop's own image never meant the
+        # user runs SLSKD -- not for seeding the card, and not for its enabled
+        # state either. #637 fixed the first half (only_when_stored above) and
+        # left this reading SLSKD_SOURCE_PROBE_SCRIPT.exists(), which is True on
+        # every install because we ship that file. So every install that already
+        # had the row kept showing "Enabled" with no client behind it.
+        enabled=legacy_slskd_card_configured(),
         base_url=SLSKD_API_BASE_URL,
         secret_ref=f"InkDrop provider setting: api_key; fallback {SLSKD_SOURCE_PROBE_SCRIPT.name}/slskd.yml",
         settings_payload={
@@ -52343,8 +54055,15 @@ def runtime_provider_settings():
         "qbittorrent",
         "download_client",
         "qBittorrent",
+        only_when_stored=True,
         enabled=bool(qbit_host),
-        base_url=qbit_host,
+        # "" rather than None: qBittorrent HAS a URL, we just don't know it yet.
+        # None is how a provider says it has no endpoint at all, and the panel
+        # honours that by drawing no Base URL input -- which left the field that
+        # sets the URL visible only once the URL was already set.
+        # load_qbit_settings() raises whenever the client is unconfigured, so
+        # that was every install still being set up.
+        base_url=qbit_host or "",
         secret_ref="InkDrop provider settings: username/password; fallback qbit_manage config.yml",
         settings_payload={
             "username": "",
@@ -52362,6 +54081,7 @@ def runtime_provider_settings():
         "sabnzbd",
         "download_client",
         "SABnzbd",
+        only_when_stored=True,
         enabled=bool(sab_host),
         base_url=sab_host,
         secret_ref="InkDrop provider setting: api_key. Falls back to your Mylar config.ini (sab_apikey) if no key is set here.",
@@ -52401,7 +54121,6 @@ def runtime_provider_settings():
             "comic_root": str(runtime_paths["comic_root"]),
             "manga_root": str(runtime_paths["manga_root"]),
             "use_series_folders": True,
-            "create_empty_series_folders": True,
             "rename_imported_files": True,
             "hardlink_imports": False,
             "delete_empty_folders": False,
@@ -52418,6 +54137,7 @@ def runtime_provider_settings():
             "frontend_sync_after_import": True,
             "library_visibility_provider_order": ["komga", "kavita"],
             "manga_companion_folder_convergence": True,
+            "cover_injection_enabled": False,
             "import_conflict_policy": "skip_existing",
             "minimum_free_space_gb": 10,
             "editable_fields": [
@@ -52425,7 +54145,6 @@ def runtime_provider_settings():
                 "comic_root",
                 "manga_root",
                 "use_series_folders",
-                "create_empty_series_folders",
                 "rename_imported_files",
                 "hardlink_imports",
                 "delete_empty_folders",
@@ -52442,6 +54161,7 @@ def runtime_provider_settings():
                 "frontend_sync_after_import",
                 "library_visibility_provider_order",
                 "manga_companion_folder_convergence",
+                "cover_injection_enabled",
                 "import_conflict_policy",
                 "minimum_free_space_gb",
             ],
@@ -52842,6 +54562,14 @@ def runtime_provider_settings():
                 "label": "Merge Companion Chapters Into the Series Folder",
                 "value": True,
                 "description": "Kavita and Komga both group by physical folder, not by a matching Series name across folders -- verified live against a real Kavita instance. A MangaDex companion tracking chapters ahead of a volume release will place them in the same folder as the canonical series, so the reader shows one series instead of a second, incomplete tile.",
+                "source": "runtime",
+            },
+            {
+                "key": "media_management.cover_injection_enabled",
+                "scope": "media_management",
+                "label": "Write the Series Cover Into Book One",
+                "value": False,
+                "description": "Kavita and Komga build a series' cover from the first page of its lowest-numbered book and ignore the cover InkDrop stores -- verified live against both. With this on, the series cover is written into that book as a new first page, and it moves automatically when an earlier volume arrives. This edits archive files in your library; originals are kept in quarantine and can be restored. Off by default.",
                 "source": "runtime",
             },
             {
@@ -53395,7 +55123,6 @@ COMMON_PROVIDER_FIELD_SCHEMA = {
     },
     "root_folder_strategy": {"label": "Root Folder Strategy"},
     "use_series_folders": {"label": "Use Series Folders", "kind": "boolean"},
-    "create_empty_series_folders": {"label": "Create Empty Series Folders", "kind": "boolean"},
     "rename_imported_files": {"label": "Rename Imported Files", "kind": "boolean"},
     "hardlink_imports": {"label": "Hardlink Instead of Copy", "kind": "boolean"},
     "delete_empty_folders": {"label": "Delete empty folders", "kind": "boolean"},
@@ -53412,6 +55139,7 @@ COMMON_PROVIDER_FIELD_SCHEMA = {
     "frontend_sync_after_import": {"label": "Sync Frontends After Import", "kind": "boolean"},
     "library_visibility_provider_order": {"label": "Library Visibility Provider Order", "kind": "array"},
     "manga_companion_folder_convergence": {"label": "Merge Companion Chapters Into the Series Folder", "kind": "boolean"},
+    "cover_injection_enabled": {"label": "Write the Series Cover Into Book One", "kind": "boolean"},
     "import_conflict_policy": {"label": "Import Conflict Policy"},
     "minimum_free_space_gb": {"label": "Minimum Free Space GB", "kind": "number", "min": 0},
     "kavita_comic_root": {"label": "Kavita Comic Root"},
@@ -53598,6 +55326,10 @@ PROVIDER_FIELD_HELP = {
     },
     "media_management": {
         "root_folder_strategy": "Use media type by default: comics land under the comic root and manga lands under the manga root.",
+        "use_series_folders": "Keep each managed series in its own folder under the library root, named by the series folder format below. Off drops imported files straight into the root -- Kavita and Komga both group by physical folder, so they would then read the whole root as a single series.",
+        "rename_imported_files": "Rename each imported file to the comic or manga filename format below. Off keeps whatever the release was called, which is fine for a library you browse by folder and bad for one you browse by issue number.",
+        "replace_illegal_characters": "Characters Windows and SMB shares reject in a name -- \\ / * ? \" < > | -- are never left in place. On swaps each one for a hyphen, so \"Who? What!\" becomes \"Who- What!\"; off deletes them, giving \"Who What!\". Colons are handled separately by the setting below.",
+        "colon_replacement": "How a colon in a series or issue title is rewritten, since no Windows or SMB path may contain one. \"smart\" and \"space\" both turn it into \" - \", so \"Batman: Year One\" becomes \"Batman - Year One\". \"delete\" drops the colon and keeps the space after it (\"Batman Year One\"). Any other value swaps in a bare hyphen (\"Batman- Year One\").",
         "hardlink_imports": "When a file is placed in your library unchanged (no CBR repack, PDF-to-CBZ conversion, collection rebuild, or ComicInfo.xml injection -- those always write a fresh file), link it into place instead of copying it. The original stays put for your torrent client to keep seeding, at zero extra disk. Falls back to a plain copy with no error whenever staging and your library sit on different filesystems or Docker bind mounts -- hardlinks can't cross that boundary. Off by default; turn it on only if your download client's staging path and your library share one filesystem/mount.",
         "delete_empty_folders": "When a move or removal leaves a folder holding nothing, remove the folder too. The library root itself is never touched.",
         "unmonitor_deleted_issues": "If an issue's file disappears from the library, stop monitoring that issue instead of hunting for a replacement. Turn this on if deleting a file is how you say \"I don't want this one.\"",
@@ -53611,6 +55343,7 @@ PROVIDER_FIELD_HELP = {
         "frontend_sync_after_import": "Tell Kavita and Komga to rescan once the file is in place. InkDrop does not wait for them.",
         "library_visibility_provider_order": "Preferred library adapters to ask for visibility after folder completion.",
         "manga_companion_folder_convergence": "Kavita and Komga group by physical folder, not by matching metadata across folders -- a companion tracking chapters ahead of a volume release will otherwise show as a second, incomplete series tile. On by default; turn off only if you deliberately want companion chapters kept separate.",
+        "cover_injection_enabled": "Both readers take a series' cover from the first page of its lowest-numbered book, so a volume that opens on a title page or a scanlator's banner becomes the series' face no matter what cover InkDrop stores. Turning this on writes the real cover into that book as a new first page, and moves it when an earlier volume shows up. It edits archive files in your library: nothing is replaced, the original goes to quarantine so it can be restored, and any file whose chapter/volume classification would change is skipped. Off by default -- use the Library sweep first if you want to review a run before it touches anything.",
         "import_conflict_policy": "skip_existing avoids replacing files until replacement/upgrade quality profiles exist.",
         "minimum_free_space_gb": "Managed imports will refuse the planned path if the comic or manga root would fall below this floor.",
     },
@@ -53705,7 +55438,6 @@ def merge_runtime_settings_snapshot(snapshot, runtime):
         item = dict(provider)
         if runtime_provider and provider_settings_need_sync(provider, runtime_provider):
             sync_needed = True
-            item = dict(provider)
             runtime_settings = (
                 runtime_provider.get("settings")
                 if isinstance(runtime_provider.get("settings"), dict)
@@ -53719,6 +55451,34 @@ def merge_runtime_settings_snapshot(snapshot, runtime):
                 )
             except Exception:
                 item["settings"] = current_settings
+        # A stored row with no base_url at all cannot be given one, because the
+        # panel draws no Base URL input for it -- so the card that most needs
+        # the field is the only card that never gets it. Adopt the endpoint slot
+        # the runtime provider declares, and only the slot: a real stored value
+        # still wins, and a runtime provider that declares None (no endpoint
+        # concept, e.g. notifications) still suppresses the input. Without this
+        # the field appears only after an explicit settings sync, which is not
+        # something a user knows to run while trying to enter a URL.
+        if (
+            runtime_provider
+            and item.get("base_url") is None
+            and runtime_provider.get("base_url") is not None
+        ):
+            item["base_url"] = runtime_provider.get("base_url")
+        # `enabled` on a row no operator has claimed is a code-level default,
+        # not stored state: upsert_provider_config() re-derives it from the
+        # runtime provider on every settings sync and freezes it only once
+        # source == "user". Reading the stored column here instead meant the
+        # page could show a value the next sync would immediately overwrite --
+        # SLSKD's read "Enabled" that way, from a file in our own image, until
+        # someone happened to run a sync. Display now follows the same rule the
+        # store already applies, so the two cannot disagree.
+        if (
+            runtime_provider
+            and str(provider.get("source") or "") != "user"
+            and runtime_provider.get("enabled") is not None
+        ):
+            item["enabled"] = bool(runtime_provider.get("enabled"))
         merged_providers.append(item)
     missing_runtime_provider_ids = []
     for provider_id, runtime_provider in runtime_providers.items():
@@ -55000,6 +56760,262 @@ def indexer_provider_health(provider, *, http_get=None, timeout_seconds=8.0, max
     )
 
 
+# RSS sources had no Test implementation at all: indexer_provider_health()
+# returns None for these kinds and there is no entry in test_inkdrop_provider's
+# active_health_checks, so Test fell through to the *stored* health blob and
+# never fetched the feed. That is wrong in both directions -- an instance with
+# an empty health blob reported a confident "configured" pass without checking
+# anything, and an instance carrying stale error/unavailable activity state
+# reported a failure that correcting the feed URL could never clear (reported
+# externally 2026-08-14: "rss test fails with getcomics" against a feed URL
+# that was live and returning HTTP 200 the whole time).
+RSS_PROVIDER_TEST_KINDS = {
+    "rss_feed",
+    "rss_direct_feed",
+    "rss_detail_direct_feed",
+    "rss_detail_probe_feed",
+    "rss_reader_page_pack_feed",
+}
+
+
+def _is_rss_feed_provider(provider):
+    provider = provider if isinstance(provider, dict) else {}
+    if _provider_test_source_kind(provider) in RSS_PROVIDER_TEST_KINDS:
+        return True
+    provider_id = str(provider.get("id") or "").strip().lower()
+    return provider_id == "rss" or provider_id.startswith("rss_")
+
+
+def _rss_provider_default_feed_url(provider):
+    """Built-in feed URL for providers that ship one instead of storing it.
+
+    rss_getcomics carries an empty base_url and relies on the adapter's
+    GETCOMICS_FEED_URL constant, so read it from there rather than restating
+    the URL here and letting the two drift apart.
+    """
+
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    if provider_id != "rss_getcomics":
+        return ""
+    try:
+        from core import inkdrop_source_worker_adapters
+
+        return str(getattr(inkdrop_source_worker_adapters, "GETCOMICS_FEED_URL", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _rss_feed_item_count(text):
+    """(item_count, looks_like_feed) for an RSS/Atom body.
+
+    Prefers the same parser the acquisition path uses so Test agrees with what
+    a real search would see; falls back to a tag scan only to tell "not a feed
+    at all" apart from "a feed the parser found nothing in".
+    """
+
+    text = str(text or "").strip()
+    if not text:
+        return 0, False
+    rows = []
+    try:
+        from core import inkdrop_source_providers
+
+        rows = inkdrop_source_providers._rss_rows_from_xml(text) or []
+    except Exception:
+        rows = []
+    if rows:
+        return len(rows), True
+    lowered = text.lower()
+    looks_like_feed = any(
+        marker in lowered for marker in ("<rss", "<feed", "<rdf:rdf", "<channel")
+    )
+    fallback_count = lowered.count("<item") + lowered.count("<entry")
+    return fallback_count, looks_like_feed or bool(fallback_count)
+
+
+def _rss_cloudflare_blocked(status_code, headers):
+    headers = headers if isinstance(headers, dict) else {}
+    lowered = {str(key or "").strip().lower(): str(value or "") for key, value in headers.items()}
+    if any(key in lowered for key in ("cf-ray", "cf-mitigated")):
+        return int(status_code or 0) in {403, 429, 503}
+    server = lowered.get("server", "").lower()
+    return "cloudflare" in server and int(status_code or 0) in {403, 429, 503}
+
+
+def _rss_fetch_failure_detail(exc, host, timeout_seconds):
+    """Say what went wrong in words the person reading the Test dialog can act on.
+
+    The raw exception text still travels in the health payload's `error` field
+    for diagnosis; it just isn't what the operator is asked to read.
+    """
+
+    host_label = host or "the feed host"
+    reason = str(getattr(exc, "reason", "") or "").strip().lower()
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if reason == "disallowed_host":
+        return f"Requests to {host_label} are not allowed for this source."
+    if reason == "disallowed_scheme":
+        return "The feed URL must start with http:// or https://."
+    if "name or service not known" in text or "nodename nor servname" in text or "getaddrinfo" in text:
+        return f"Could not resolve {host_label}. Check the feed URL for typos."
+    if "timed out" in text or "timeout" in text:
+        return f"{host_label} did not respond within {int(timeout_seconds)}s."
+    if "certificate" in text or "ssl" in text:
+        return f"The TLS certificate for {host_label} could not be verified."
+    if "connection refused" in text or "connectionrefused" in text:
+        return f"Could not connect to {host_label}; the connection was refused."
+    return f"Could not fetch the feed from {host_label}."
+
+
+def rss_feed_provider_health(provider, *, http_get=None, timeout_seconds=8.0, max_bytes=512 * 1024):
+    """Really fetch and parse the configured feed, the way the indexer Test does."""
+
+    provider = provider if isinstance(provider, dict) else {}
+    if not _is_rss_feed_provider(provider):
+        return None
+    label = "RSS feed"
+    if inkdrop_source_worker_http is None and http_get is None:
+        return _indexer_provider_test_health(
+            "configuration_required",
+            f"{label} test unavailable",
+            "Source HTTP client is unavailable in this runtime.",
+            ok=False,
+            provider=provider,
+        )
+    base_url = _provider_test_base_url(provider) or _rss_provider_default_feed_url(provider)
+    if not base_url:
+        return _indexer_provider_test_health(
+            "configuration_required",
+            f"{label} URL required",
+            "Add the feed URL before testing this source.",
+            ok=False,
+            provider=provider,
+        )
+    if _provider_test_url_has_visible_secret(base_url):
+        return _indexer_provider_test_health(
+            "configuration_required",
+            f"{label} secret must be stored separately",
+            "Move API keys or tokens out of the feed URL and into the provider secret-ref field.",
+            ok=False,
+            provider=provider,
+            extra={"base_url_host": _provider_test_request_host(base_url)},
+        )
+    host = _provider_test_request_host(base_url)
+    if not host:
+        return _indexer_provider_test_health(
+            "configuration_required",
+            f"{label} host required",
+            "The feed URL must include a hostname.",
+            ok=False,
+            provider=provider,
+        )
+    request_payload = {
+        "request_id": "rss_feed_test",
+        "method": "GET",
+        "url": base_url,
+        "headers": {"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.1"},
+        "purpose": "test_rss_feed",
+        "max_bytes": int(max_bytes),
+    }
+    try:
+        client = http_get or inkdrop_source_worker_http.source_http_get
+        response = client(
+            request_payload,
+            allowed_hosts=[host],
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+        )
+    except Exception as exc:
+        reason = getattr(exc, "reason", "")
+        state = (
+            "configuration_required"
+            if reason in {"disallowed_host", "missing_host", "disallowed_scheme", "secret_ref_in_url", "secret_ref_in_query"}
+            else "provider_wait"
+        )
+        return _indexer_provider_test_health(
+            state,
+            f"{label} test failed",
+            _rss_fetch_failure_detail(exc, host, timeout_seconds),
+            ok=False,
+            provider=provider,
+            request_payload=request_payload,
+            extra={
+                "reason": reason or type(exc).__name__,
+                "error": str(exc),
+                "base_url_host": host,
+                "request": getattr(exc, "safe_request", None),
+                "test_kind": "rss_feed",
+            },
+        )
+    status_code = int((response or {}).get("status_code") or 0)
+    headers = (response or {}).get("headers") or {}
+    text = str((response or {}).get("text") or "")
+    content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+    elapsed_ms = (response or {}).get("elapsed_ms")
+    timing = f" in {int(elapsed_ms)}ms" if elapsed_ms not in (None, "") else ""
+    item_count, looks_like_feed = _rss_feed_item_count(text)
+    extra = {
+        "base_url_host": host,
+        "status_code": status_code,
+        "elapsed_ms": elapsed_ms,
+        "content_type": content_type,
+        "item_count": item_count,
+        "test_kind": "rss_feed",
+    }
+    if not 200 <= status_code < 300:
+        if _rss_cloudflare_blocked(status_code, headers):
+            return _indexer_provider_test_health(
+                "provider_wait",
+                f"{label} blocked by Cloudflare",
+                f"The feed host returned HTTP {status_code}{timing} behind Cloudflare. "
+                "Route this source through FlareSolverr or a proxy before enabling it.",
+                ok=False,
+                provider=provider,
+                request_payload=request_payload,
+                extra={**extra, "cloudflare_blocked": True},
+            )
+        return _indexer_provider_test_health(
+            "provider_wait",
+            f"{label} returned HTTP {status_code}",
+            f"The feed URL returned HTTP {status_code}{timing}. Check the URL and that the host is reachable.",
+            ok=False,
+            provider=provider,
+            request_payload=request_payload,
+            extra=extra,
+        )
+    if not looks_like_feed:
+        shape = f" ({content_type})" if content_type else ""
+        return _indexer_provider_test_health(
+            "watch",
+            f"{label} response is not a feed",
+            f"HTTP {status_code}{timing} but the body{shape} is not RSS or Atom XML. "
+            "This URL usually points at a web page rather than the feed itself.",
+            ok=False,
+            provider=provider,
+            request_payload=request_payload,
+            extra=extra,
+        )
+    if item_count <= 0:
+        return _indexer_provider_test_health(
+            "watch",
+            f"{label} has no items",
+            f"HTTP {status_code}{timing} and the feed parsed, but it currently lists no items.",
+            ok=False,
+            provider=provider,
+            request_payload=request_payload,
+            extra=extra,
+        )
+    return _indexer_provider_test_health(
+        "healthy",
+        f"{label} reachable",
+        f"Feed reachable{timing}; parsed {item_count} item{'' if item_count == 1 else 's'}.",
+        ok=True,
+        provider=provider,
+        request_payload=request_payload,
+        extra=extra,
+    )
+
+
 def _provider_test_bool(value, default=False):
     if isinstance(value, bool):
         return value
@@ -55348,8 +57364,11 @@ def test_inkdrop_provider(payload):
             "channels": channel_results,
         }
     indexer_health = indexer_provider_health(provider)
+    rss_health = None if indexer_health else rss_feed_provider_health(provider)
     if indexer_health:
         health = indexer_health
+    elif rss_health:
+        health = rss_health
     elif provider_id == "suwayomi":
         health = suwayomi_provider_health(provider)
     elif provider_id == "mangadex":
@@ -55358,11 +57377,15 @@ def test_inkdrop_provider(payload):
         health = active_health_checks[provider_id]() if provider_id in active_health_checks else (provider.get("health") or {})
     activity = provider.get("activity") or {}
     state = str(health.get("state") or activity.get("operational_state") or ("disabled" if not provider.get("enabled", True) else "configured")).lower()
-    if indexer_health or provider_id == "suwayomi":
+    if indexer_health or rss_health or provider_id == "suwayomi":
         ok = bool(health.get("ok"))
     else:
         ok = bool(provider.get("enabled", True)) and state not in {"disabled", "unavailable", "error"}
-    if not indexer_health and state in {"watch", "backoff"}:
+    # RSS joins the probe-backed sources here so a reachable-but-unusable feed
+    # (HTML page, Cloudflare block, zero items) cannot be rescued into a pass by
+    # this leniency, which exists for sources whose only signal is stored
+    # activity state. Suwayomi's existing behaviour is deliberately unchanged.
+    if not indexer_health and not rss_health and state in {"watch", "backoff"}:
         ok = True
     return {
         "ok": ok,
@@ -55394,6 +57417,7 @@ def notifications_config_public():
     return {
         "connectors": inkdrop_notifications.public_channel_status(INKDROP_STATE_DB),
         "connector_types": inkdrop_notifications.connector_types_catalog(),
+        "notifications_enabled": inkdrop_notifications.master_switch_enabled(INKDROP_STATE_DB),
         "settings": inkdrop_notification_store.get_settings(INKDROP_STATE_DB),
         "event_types": [
             {"id": event_id, "label": inkdrop_notifications.EVENT_LABELS.get(event_id, event_id)}
@@ -55408,6 +57432,12 @@ def create_notification_connector(payload):
     connector_type = str(payload.get("type") or "").strip().lower()
     if not connector_type:
         raise ValueError("connector type is required")
+    # A type with no provider class behind it renders as a real, enabled
+    # connector card that can never send: every event it subscribes to
+    # records a "disabled -- channel is not configured" delivery row instead.
+    # Reject it at creation rather than letting it look configured forever.
+    if connector_type not in inkdrop_notifications.PROVIDER_CLASSES:
+        raise ValueError(f"unknown connector type: {connector_type}")
     name = payload.get("name")
     settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
     events = payload.get("events") if isinstance(payload.get("events"), list) else []
@@ -55448,10 +57478,15 @@ def delete_notification_connector(payload):
 
 
 def test_notification_connector(payload):
-    connector_id = str((payload or {}).get("id") or "").strip()
+    payload = payload or {}
+    connector_id = str(payload.get("id") or "").strip()
     if not connector_id:
         raise ValueError("connector id is required")
-    return inkdrop_notifications.test_connector(INKDROP_STATE_DB, connector_id)
+    # Credentials the operator has typed but not saved. Passed straight
+    # through to the send attempt and never written back -- test is a
+    # read-only action, so this must not become a second save path.
+    settings_override = payload.get("settings") if isinstance(payload.get("settings"), dict) else None
+    return inkdrop_notifications.test_connector(INKDROP_STATE_DB, connector_id, settings_override)
 
 
 def save_notification_settings(payload):
@@ -56138,6 +58173,14 @@ def load_manual_review_actions():
         data["manual_source_waiting"] = {}
     if not isinstance(data.get("manual_source_resolved"), list):
         data["manual_source_resolved"] = []
+    # This key has NO writer anywhere in the codebase -- three modules read it
+    # and nothing has ever written it since the root commit. The default exists
+    # to stop a missing key crashing a reader, NOT because the field is
+    # supported: retraction's write half is gone, so this list cannot grow. Do
+    # not read this default as a contract to build on. See the dead-retraction
+    # row in the tracker before adding anything that depends on it.
+    if not isinstance(data.get("manual_source_retracted_resolved"), list):
+        data["manual_source_retracted_resolved"] = []
     return data
 
 
@@ -60374,6 +62417,32 @@ def add_alias_from_review(payload):
         raise ValueError(
             f"alias looks like a release filename, not a title -- try {cleaned_alias!r} instead"
         )
+    # Second gap in the same guard. clean_alias_title() recognises release-tag
+    # noise -- ranges, years, formats, groups -- but a bare trailing unit
+    # number is not noise by that test, so `Die!Die!Die! 5` is a no-op for it
+    # and passed this check. It was then stored per-SERIES and trusted verbatim
+    # as a title variant for every issue: measured live, the wanted row for
+    # issue 14 took `Die!Die!Die! 5` as its rung-0 query, asking for issue 5
+    # while wanting 14.
+    #
+    # The number has to be judged, not just detected. alias_declares_issue()
+    # already draws that line for the anchor selector: a number is DECLARED
+    # when a range or a unit word introduces it, and INTRINSIC when the
+    # series' own title carries it. So `Blade Runner 2049` saved against
+    # "Blade Runner 2049" is intrinsic and allowed, while the same string
+    # saved against "Blade Runner" names a different work and is refused.
+    # Reusing that predicate rather than writing a second one is what keeps
+    # the two answers from drifting.
+    trailing_number = re.search(r"(?<![a-z0-9])(\d{1,4})\s*$", alias.strip(), flags=re.I)
+    if trailing_number and slskd_probe.alias_declares_issue(
+        alias, trailing_number.group(1), series
+    ):
+        raise ValueError(
+            "alias ends in a unit number, so it would be used as the title for "
+            "every issue of this series -- save the title alone here, and put "
+            f"{alias!r} in the operator query field if you meant to correct the "
+            "search for one issue"
+        )
     aliases = read_json_file(RSS_ALIASES_FILE, {}) or {}
     values = aliases.setdefault(series, [])
     if alias not in values:
@@ -61065,6 +63134,14 @@ def automatic_search_runtime_state(*, monitored_series=0, in_progress=False, act
         (row for row in maintenance_failed_jobs if _scheduler_job_rc(row) == 124 or str(row.get("last_outcome") or "").lower() == "timeout"),
         None,
     )
+    # container_scheduler.scheduler_status_payload() flips state to "degraded" for
+    # either an actual job failure OR a job simply running behind its schedule
+    # (e.g. waiting its turn behind INKDROP_SCHEDULER_MAX_CONCURRENCY, or behind
+    # the state-database write lock -- see build_jobs()'s lock-budget comments).
+    # A late job with zero consecutive_failures hasn't failed at anything; it
+    # self-heals on its own next tick. Only a real failure should read as
+    # "needs attention" -- lateness alone gets a calmer, separate signal below.
+    late_jobs = [row for row in scheduler_jobs if not row.get("active") and float(row.get("late_by_seconds") or 0) > 0]
     failure_code = ""
     failure_reason = ""
     if not scheduler:
@@ -61084,19 +63161,51 @@ def automatic_search_runtime_state(*, monitored_series=0, in_progress=False, act
         failure_code = "maintenance_timed_out"
         job_label = str(timed_out_job.get("name") or "Queue maintenance").replace("_", " ").strip().title()
         failure_reason = f"{job_label} ran out of time and will try again on the next cycle."
+    elif maintenance_failed_jobs:
+        failed_job = maintenance_failed_jobs[0]
+        failure_code = "maintenance_job_failed"
+        job_label = str(failed_job.get("name") or "A maintenance task").replace("_", " ").strip().title()
+        attempts = _scheduler_int(failed_job.get("consecutive_failures"))
+        rc = _scheduler_job_rc(failed_job)
+        rc_detail = f" (exit code {rc})" if rc is not None else ""
+        failure_reason = (
+            f"{job_label} has failed {attempts} time{'s' if attempts != 1 else ''} in a row{rc_detail} "
+            "and will keep retrying automatically. It will not block searches or imports."
+        )
+    elif late_jobs:
+        failure_code = "maintenance_catching_up"
+        late_job = max(late_jobs, key=lambda row: float(row.get("late_by_seconds") or 0))
+        job_label = str(late_job.get("name") or "A maintenance task").replace("_", " ").strip().title()
+        delay_seconds = int(float(late_job.get("late_by_seconds") or 0))
+        failure_reason = f"{job_label} is running about {max(1, delay_seconds)}s behind schedule and will catch up on its own; nothing has failed."
     elif _scheduler_int(scheduler.get("failure_count")) > 0 or scheduler_state == "degraded":
         failure_code = "worker_degraded"
-        failure_reason = "A maintenance task needs attention. No reason was reported."
+        failure_reason = "The worker reported a degraded scheduler state without a specific failing task. Check System > Advanced Diagnostics > Background Maintenance for the raw job list, or download a support bundle."
     scheduler_active = bool(
         scheduler
         and heartbeat_age <= 90
         and scheduler_state not in {"stopping", "paused", "unavailable"}
     )
+    # Lateness alone is the only thing excused here. The scheduler reports
+    # "degraded" for a late job *and* for a real failure, so requiring
+    # scheduler_state == "healthy" made a job that had failed at nothing read as
+    # needing attention. Dropping the state check on its own also discarded
+    # `failure_count`, which is a failure signal we do have -- reporting healthy
+    # because no job-level detail accompanied it downgrades a real signal on the
+    # grounds that a different one is missing. So both conditions stay, and only
+    # a degraded state that is *fully explained by lateness* is forgiven.
+    degraded_only_from_lateness = bool(
+        scheduler_state != "healthy"
+        and late_jobs
+        and not failed_jobs
+        and _scheduler_int(scheduler.get("failure_count")) == 0
+    )
     worker_healthy = bool(
         scheduler_active
         and scheduler.get("ok") is True
-        and scheduler_state == "healthy"
+        and not failed_jobs
         and _scheduler_int(scheduler.get("failure_count")) == 0
+        and (scheduler_state == "healthy" or degraded_only_from_lateness)
     )
     acquisition_worker_healthy = bool(
         scheduler_active
@@ -61134,9 +63243,9 @@ def automatic_search_runtime_state(*, monitored_series=0, in_progress=False, act
     elif maintenance_degraded:
         state = "maintenance_degraded"
         next_action = (
-            "Retry the timed-out maintenance task from System > Advanced Diagnostics."
+            "Retry the timed-out maintenance task from System > Advanced Diagnostics > Background Maintenance."
             if failure_code == "maintenance_timed_out"
-            else "Review the maintenance task in System > Advanced Diagnostics."
+            else "Open System > Advanced Diagnostics > Background Maintenance to see which task failed and why."
         )
     elif in_progress or int(active_work or 0) > 0:
         state = "running"
@@ -61144,6 +63253,23 @@ def automatic_search_runtime_state(*, monitored_series=0, in_progress=False, act
     else:
         state = "idle"
         next_action = ""
+    scheduler_job_rows = sorted(
+        (
+            {
+                "name": row.get("name"),
+                "critical": bool(row.get("critical")),
+                "active": bool(row.get("active")),
+                "consecutive_failures": _scheduler_int(row.get("consecutive_failures")),
+                "last_rc": _scheduler_job_rc(row),
+                "last_outcome": row.get("last_outcome"),
+                "last_completed_at": row.get("last_completed_at"),
+                "late_by_seconds": float(row.get("late_by_seconds") or 0),
+                "next_run_at": row.get("next_run_at"),
+            }
+            for row in scheduler_jobs
+        ),
+        key=lambda row: (row["consecutive_failures"] == 0, -row["late_by_seconds"], row["name"] or ""),
+    )
     return {
         "state": state,
         "series_monitored": max(0, int(monitored_series or 0)),
@@ -61166,6 +63292,7 @@ def automatic_search_runtime_state(*, monitored_series=0, in_progress=False, act
         "last_worked_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_worked_at)) if last_worked_at else None,
         "core_library_usable": True,
         "next_action": next_action,
+        "scheduler_jobs": scheduler_job_rows,
     }
 
 
@@ -62217,18 +64344,42 @@ def bounded_status_state_summary(autopilot_summary=None):
     source_wait = int(summary.get("source_wait") or 0)
     active = int(summary.get("active") or searching + downloading + importing + source_wait + needs_you)
     count_snapshot = fast_state_count_snapshot()
+    # The per-state buckets used to come only from the autopilot rollup while
+    # active_queue_items came from the database, so a missing or not-yet-run
+    # rollup published "7 active items, 0 in every state" -- the same payload
+    # disagreeing with itself. A 2026-08-16 field bundle shipped exactly that,
+    # which is what made the System page read 0 Source Wait while the queue
+    # page listed seven rows in it. The database is the authority; the rollup
+    # is the fallback for when we cannot read it.
+    db_state_counts = count_snapshot.get("queue_by_state")
+    db_state_counts = dict(db_state_counts) if isinstance(db_state_counts, dict) else {}
+    db_display_counts = {}
     import_ledger_cleanup = {}
     try:
         if inkdrop_state is not None and INKDROP_STATE_DB.exists():
             with inkdrop_state.connect_read(INKDROP_STATE_DB, timeout_seconds=1.0, busy_timeout_ms=500) as con:
                 import_ledger_cleanup = inkdrop_state.import_ledger_cleanup_rollup(con, limit=1)
+                # Splits the raw 'downloading' bucket into the rows with a
+                # confirmed live transfer and the rows without one, which is
+                # the only place "source_wait" exists -- it is a display state
+                # derived from download_tasks, never a queue_items.state value.
+                db_display_counts = inkdrop_state.queue_display_active_state_counts(
+                    con, db_state_counts or None
+                )
     except Exception as exc:
         import_ledger_cleanup = {
             "import_ledger_cleanup_error": f"{type(exc).__name__}: {exc}",
         }
+    db_display_counts = dict(db_display_counts) if isinstance(db_display_counts, dict) else {}
     if count_snapshot.get("active_queue_items"):
         active = max(active, int(count_snapshot.get("active_queue_items") or 0))
     count_snapshot_ok = bool(count_snapshot.get("count_snapshot"))
+
+    def _bucket(counts, name, fallback):
+        if not counts:
+            return int(fallback or 0)
+        return int(counts.get(name) or 0)
+
     payload = {
         "ok": count_snapshot_ok,
         "status_snapshot": True,
@@ -62236,19 +64387,19 @@ def bounded_status_state_summary(autopilot_summary=None):
         "series_by_ownership": {},
         "wanted_by_status": count_snapshot.get("wanted_by_status") or {},
         "queue_by_state": {
-            "queued": queued,
-            "searching": searching,
-            "downloading": downloading,
-            "importing": importing,
-            "needs_you": needs_you,
+            "queued": _bucket(db_state_counts, "queued", queued),
+            "searching": _bucket(db_state_counts, "searching", searching),
+            "downloading": _bucket(db_state_counts, "downloading", downloading),
+            "importing": _bucket(db_state_counts, "importing", importing),
+            "needs_you": _bucket(db_state_counts, "needs_you", needs_you),
         },
         "queue_by_display_active_state": {
-            "queued": queued,
-            "searching": searching,
-            "downloading": downloading,
-            "importing": importing,
-            "needs_you": needs_you,
-            "source_wait": source_wait,
+            "queued": _bucket(db_display_counts, "queued", queued),
+            "searching": _bucket(db_display_counts, "searching", searching),
+            "downloading": _bucket(db_display_counts, "downloading", downloading),
+            "importing": _bucket(db_display_counts, "importing", importing),
+            "needs_you": _bucket(db_display_counts, "needs_you", needs_you),
+            "source_wait": _bucket(db_display_counts, "source_wait", source_wait),
         },
         "active_queue_items": active,
         "queue_retry_due_items": int(summary.get("retry_due") or 0),
@@ -64510,6 +66661,68 @@ def manual_search_grab_runner(public_candidate, raw_candidate):
     }
 
 
+# A well-formed Range that asks for bytes the file does not have. Distinct
+# from None (no range / ignore it and send the whole thing) because RFC 7233
+# wants 416 for this and 200 for that, and collapsing the two is how a client
+# ends up retrying forever against a 416 it reads as fatal.
+RANGE_UNSATISFIABLE = object()
+
+_BYTE_RANGE_PATTERN = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def parse_single_byte_range(range_header, size, *, strict_syntax=False):
+    """Resolve one RFC 7233 byte range against a known size.
+
+    Returns None to serve the whole entity, ``RANGE_UNSATISFIABLE`` to answer
+    416, or an inclusive ``(start, end)`` to answer 206.
+
+    Multi-range requests ("bytes=0-9,20-29") are deliberately answered with the
+    whole entity rather than a multipart/byteranges body: every client that
+    matters sends single ranges, and a resumed download only ever needs one.
+
+    ``strict_syntax`` makes a syntactically broken Range unsatisfiable instead
+    of ignored. The spec says to ignore it and send 200; the OPDS endpoint has
+    always answered 416, and this keeps that behaviour byte-for-byte rather
+    than changing a shipped contract while extracting the helper.
+    """
+    text = str(range_header or "").strip()
+    if not text:
+        return None
+    size = int(size)
+    match = _BYTE_RANGE_PATTERN.fullmatch(text)
+    if (
+        not match
+        or (not match.group(1) and not match.group(2))
+        # A digit run long enough to be an attack rather than an offset.
+        or any(len(value) > 20 for value in match.groups() if value)
+    ):
+        return RANGE_UNSATISFIABLE if strict_syntax else None
+    if size <= 0:
+        return RANGE_UNSATISFIABLE
+    if match.group(1):
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else size - 1
+    else:
+        # "bytes=-500": the last 500 bytes, clamped to the whole file.
+        start = max(0, size - int(match.group(2)))
+        end = size - 1
+    if start >= size or start > end:
+        return RANGE_UNSATISFIABLE
+    return start, min(end, size - 1)
+
+
+def file_entity_validators(stat_result):
+    """A stable ETag and Last-Modified for a file served off disk.
+
+    Derived from size and mtime, never from the body: a backup archive is a
+    copy of the whole state database -- tens of GB on a real install -- and
+    hashing it on every request would cost more than sending it.
+    """
+    etag = '"{:x}-{:x}"'.format(int(stat_result.st_size), int(stat_result.st_mtime_ns))
+    last_modified = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(stat_result.st_mtime))
+    return etag, last_modified
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = inkdrop_version.server_version()
 
@@ -64736,7 +66949,7 @@ class Handler(BaseHTTPRequestHandler):
             self.release_state_endpoint_slot()
             self.finish_request_trace()
 
-    def send_file_stream(self, path, content_type, filename):
+    def send_file_stream(self, path, content_type, filename, *, head_only=False):
         """Stream a file straight from disk, never materializing it in RAM.
 
         send_bytes() takes a bytes object and reads len(body) -- fine for
@@ -64746,29 +66959,82 @@ class Handler(BaseHTTPRequestHandler):
         container's own memory limit is a few GB. Loading one into a bytes
         object before sending it would OOM the container on the exact
         install that most needs a working backup download.
+
+        Resumable, for the same reason. A tens-of-GB download over a phone
+        connection does not reliably finish in one go, and without Range the
+        only recovery was starting the whole thing again -- on the install
+        least able to afford it. Ranges are resolved by the same
+        parse_single_byte_range() the OPDS reader endpoint uses.
+
+        The validators are size+mtime, never a body hash: hashing tens of GB
+        per request would cost more than sending it. Cache-Control stays
+        no-store -- a backup archive is the whole database and has no business
+        in a shared cache -- which does not affect resuming, since If-Range is
+        matched against the ETag we hand out either way.
         """
         path = Path(path)
         try:
-            size = path.stat().st_size
+            descriptor_stat = path.stat()
             handle = path.open("rb")
         except OSError as exc:
             self.send_json({"ok": False, "error": f"could not open file: {exc}"}, status=404)
             return
+        size = int(descriptor_stat.st_size)
+        etag, last_modified = file_entity_validators(descriptor_stat)
         try:
-            self.send_response(200)
+            # If-Range: resume only when the file is provably the one the
+            # client already holds bytes of. On any mismatch it gets the whole
+            # file, which is what stops a rotated archive being stitched
+            # together out of two different backups.
+            if_range = str(self.headers.get("If-Range") or "").strip()
+            resume_allowed = (not if_range) or if_range in (etag, last_modified)
+            window = parse_single_byte_range(self.headers.get("Range"), size) if resume_allowed else None
+
+            if window is RANGE_UNSATISFIABLE:
+                self.send_bytes(
+                    b"",
+                    content_type,
+                    status=416,
+                    headers={
+                        "Content-Range": f"bytes */{size}",
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-store, max-age=0",
+                    },
+                )
+                return
+
+            if window is None:
+                start, end, status = 0, size - 1, 200
+            else:
+                start, end = window
+                status = 206
+            length = max(0, end - start + 1)
+
+            self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Length", str(length))
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Connection", "close")
             self.end_headers()
+            if head_only:
+                self.close_connection = True
+                return
+            handle.seek(start)
+            remaining = length
             chunk_size = 1024 * 1024
-            while True:
-                chunk = handle.read(chunk_size)
+            while remaining > 0:
+                chunk = handle.read(min(chunk_size, remaining))
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+                remaining -= len(chunk)
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
@@ -64827,7 +67093,33 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.send_bytes(b"", "image/png", status=404)
             return
-        self.send_bytes(body, "image/png")
+        # Same immutable+ETag contract as the mobile CSS/JS above. This is a
+        # 590KB image that was being retransmitted in full on every load
+        # because it carried no validator at all; send_bytes turns the ETag
+        # into a 304 on the next request.
+        self.send_bytes(
+            body,
+            "image/png",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "ETag": f'"{INKDROP_LOGO_MARK_VERSION}"',
+            },
+        )
+
+    def send_mobile_logo_mark(self):
+        try:
+            body = INKDROP_LOGO_MARK_MOBILE_FILE.read_bytes()
+        except OSError:
+            self.send_bytes(b"", "image/png", status=404)
+            return
+        self.send_bytes(
+            body,
+            "image/png",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "ETag": f'"{INKDROP_LOGO_MARK_MOBILE_VERSION}"',
+            },
+        )
 
     def send_ui_stylesheet(self):
         try:
@@ -65075,27 +67367,16 @@ class Handler(BaseHTTPRequestHandler):
             with handle:
                 size = int(descriptor_stat.st_size)
                 start, end, status = 0, size - 1, 200
-                range_header = str(self.headers.get("Range") or "").strip()
-                if range_header:
-                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
-                    if (
-                        not match
-                        or (not match.group(1) and not match.group(2))
-                        or any(len(value) > 20 for value in match.groups() if value)
-                    ):
-                        self.send_bytes(b"", "application/octet-stream", status=416, headers={"Content-Range": f"bytes */{size}", "Cache-Control": "private, no-store"})
-                        return
-                    if match.group(1):
-                        start = int(match.group(1))
-                        end = int(match.group(2)) if match.group(2) else size - 1
-                    else:
-                        suffix = int(match.group(2))
-                        start = max(0, size - suffix)
-                        end = size - 1
-                    if start >= size or start > end:
-                        self.send_bytes(b"", "application/octet-stream", status=416, headers={"Content-Range": f"bytes */{size}", "Cache-Control": "private, no-store"})
-                        return
-                    end = min(end, size - 1)
+                # Same resolver the backup download uses. strict_syntax keeps
+                # this endpoint's long-standing "malformed Range -> 416"
+                # answer rather than the spec's "ignore it and send 200",
+                # so extracting the helper changed nothing observable here.
+                window = parse_single_byte_range(self.headers.get("Range"), size, strict_syntax=True)
+                if window is RANGE_UNSATISFIABLE:
+                    self.send_bytes(b"", "application/octet-stream", status=416, headers={"Content-Range": f"bytes */{size}", "Cache-Control": "private, no-store"})
+                    return
+                if window is not None:
+                    start, end = window
                     status = 206
                 length = end - start + 1
                 self.send_response(status)
@@ -65134,10 +67415,20 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query or "")
         self.begin_request_trace(path)
-        if not path.startswith("/opds/v1.2/"):
+        if path != "/api/inkdrop-settings/backup/archives/download" and not path.startswith("/opds/v1.2/"):
             self.send_bytes(b"", "text/plain; charset=utf-8", status=405, headers={"Allow": "GET"})
             return
         if not self.ensure_authorized(path, "GET"):
+            return
+        if path == "/api/inkdrop-settings/backup/archives/download":
+            # HEAD is how a resuming client checks size and validator before
+            # asking for a window, so it has to answer with the same headers
+            # GET would -- minus the body.
+            archive_path = backup_archive_path_by_name(str((query.get("name") or [""])[0]))
+            if archive_path is None:
+                self.send_bytes(b"", "text/plain", status=404)
+            else:
+                self.send_file_stream(archive_path, "application/zip", archive_path.name, head_only=True)
             return
         if path == "/opds/v1.2/catalog.xml":
             body = inkdrop_opds.root_catalog(INKDROP_STATE_DB, after=(query.get("after") or [""])[0], limit=(query.get("limit") or [inkdrop_opds.DEFAULT_PAGE_SIZE])[0])
@@ -65249,6 +67540,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "requests": requests, "count": len(requests)})
         elif path == "/inkdrop-logo-mark.png":
             self.send_logo_mark()
+        elif path == "/inkdrop-logo-mark-mobile.png":
+            self.send_mobile_logo_mark()
         elif path == "/api/inkdrop-cover":
             self.send_inkdrop_cover(query)
         elif path == "/opds/v1.2/catalog.xml":
@@ -65345,25 +67638,36 @@ class Handler(BaseHTTPRequestHandler):
                 for key in inkdrop_activity.SUPPORTED_FACETS
                 if (query.get(key) or [None])[0] not in (None, "")
             }
-            self.send_json(
-                inkdrop_activity.activity_current(
-                    INKDROP_STATE_DB,
-                    limit=limit,
-                    offset=offset,
-                    sort=(query.get("sort") or ["last_updated"])[0],
-                    direction=(query.get("direction") or ["desc"])[0],
-                    filters=filters,
-                )
+            # Activity serves the same download-client job id out of the same
+            # download_tasks rows the Queue view does, and was doing it with no
+            # policy at all -- measured leaking client_item_id. Same gate, same
+            # admin reveal, same audit record.
+            activity_payload = inkdrop_activity.activity_current(
+                INKDROP_STATE_DB,
+                limit=limit,
+                offset=offset,
+                sort=(query.get("sort") or ["last_updated"])[0],
+                direction=(query.get("direction") or ["desc"])[0],
+                filters=filters,
             )
+            if not self._apply_operational_detail_privacy("activity", query, activity_payload):
+                return
+            self.send_json(activity_payload)
         elif path == "/api/inkdrop-activity/summary":
-            self.send_json(inkdrop_activity.activity_summary(INKDROP_STATE_DB))
+            summary_payload = inkdrop_activity.activity_summary(INKDROP_STATE_DB)
+            if not self._apply_operational_detail_privacy("activity_summary", query, summary_payload):
+                return
+            self.send_json(summary_payload)
         elif path.startswith("/api/inkdrop-activity/"):
             activity_id = path.removeprefix("/api/inkdrop-activity/").strip("/")
             detail = inkdrop_activity.activity_detail(INKDROP_STATE_DB, activity_id)
             if detail is None:
                 self.send_json({"ok": False, "error": "activity_not_found", "activity_id": activity_id}, status=404)
             else:
-                self.send_json({"ok": True, "schema": "inkdrop.activity_detail.v2", "activity": detail})
+                envelope = {"ok": True, "schema": "inkdrop.activity_detail.v2", "activity": detail}
+                if not self._apply_operational_detail_privacy("activity_detail", query, envelope):
+                    return
+                self.send_json(envelope)
         elif path == "/api/inkdrop-maintenance/deferred-queue-sync":
             payload = inkdrop_deferred_sync.classify_deferred_syncs(INKDROP_STATE_DB, limit=1000)
             self.send_json(payload)
@@ -65479,6 +67783,11 @@ class Handler(BaseHTTPRequestHandler):
             # System > Advanced no longer walks and hashes the whole library.
             status = managed_library_audit_scan_status()
             self.send_json({"ok": True, **status})
+        elif path in {"/api/inkdrop-diagnostics/library-reconciliation", "/api/inkdrop-diagnostics/library_reconciliation"}:
+            # Read-only: report the cached last reconciliation report. The scan
+            # itself only runs when someone posts to .../library-reconciliation/run.
+            status = library_reconciliation_status()
+            self.send_json({"ok": True, **status})
         elif path in {"/api/inkdrop-state/library-import/plan", "/api/inkdrop-diagnostics/library-import-plan", "/api/inkdrop-diagnostics/library_import_plan"}:
             query = parse_qs(parsed.query or "")
             try:
@@ -65578,6 +67887,13 @@ class Handler(BaseHTTPRequestHandler):
                 end=(query.get("end") or [""])[0],
                 series_id=(query.get("series_id") or query.get("seriesId") or [""])[0],
                 include_unmonitored=inkdrop_bool_value((query.get("include_unmonitored") or ["0"])[0], False),
+                # The operator's own calendar date, sent by the browser that
+                # actually knows it. Release dates are bare wall-clock dates
+                # and there is no server-side timezone setting, so without
+                # this the server dates the calendar by its own UTC clock.
+                # Sanitized by _iso_day, which fails closed to the old UTC
+                # behavior on anything that is not a plain YYYY-MM-DD.
+                today=(query.get("today") or [""])[0],
             )
             self.send_json({"ok": True, "calendar": document})
         elif path == "/api/inkdrop-state/series/library":
@@ -65607,6 +67923,24 @@ class Handler(BaseHTTPRequestHandler):
             )
             status = 200 if plan.get("ok") else 404 if plan.get("reason") == "series_not_found" else 409
             self.send_json({"ok": bool(plan.get("ok")), "preview": plan}, status=status)
+        elif path == "/api/inkdrop-state/reliability/signals":
+            # Split out of the list payload on purpose: the freshness numbers
+            # need a real provider timestamp for every row in the backlog,
+            # which measured ~1.2s however it was fetched. The list must not
+            # wait for that, so the strip loads alongside it.
+            signals = inkdrop_state.reliability_health_signals_view(INKDROP_STATE_DB)
+            self.send_json({"ok": bool(signals.get("ok")), "signals": signals}, status=200 if signals.get("ok") else 400)
+        elif path == "/api/inkdrop-state/reliability/item":
+            # Read-only, and deliberately per-item: the same joins run across
+            # the whole Wanted universe measure 3.2s, while keyed on one
+            # wanted_id they ride idx_source_attempts_wanted_recent. This is
+            # why the Reliability list never carries evidence inline.
+            wanted_id = str(
+                (query.get("wanted_id") or query.get("wantedId") or query.get("id") or [""])[0] or ""
+            ).strip()
+            evidence = inkdrop_state.reliability_item_evidence(INKDROP_STATE_DB, wanted_id)
+            status = 200 if evidence.get("ok") else 404 if evidence.get("reason") == "wanted_item_not_found" else 400
+            self.send_json({"ok": bool(evidence.get("ok")), "evidence": evidence}, status=status)
         elif path == "/api/inkdrop-state/history/raw":
             query = parse_qs(parsed.query or "")
             payload = inkdrop_history_event_raw((query.get("id") or [None])[0])
@@ -65886,10 +68220,21 @@ class Handler(BaseHTTPRequestHandler):
                     include_rejected=bool(data.get("include_rejected", True)),
                     pack_allowed=data.get("pack_allowed") if "pack_allowed" in data else None,
                     timeout_seconds=data.get("timeout_seconds"),
+                    # Client-generated, one per logical search. A retry after a
+                    # lost response carries the same one and gets the original
+                    # run back instead of starting a second fanout. Bounded
+                    # because it is attacker-influenced text that ends up in a
+                    # hash and an index.
+                    request_id=str(data.get("request_id") or "").strip()[:200],
                 )
-                if result.get("ok"):
+                if result.get("ok") and not result.get("idempotent_replay"):
                     result["worker"] = run_manual_search_background(result["run_id"])
-                status = 202 if result.get("ok") else 429 if result.get("reason") == "manual_search_rate_limited" else 400
+                status = (
+                    200 if result.get("idempotent_replay")
+                    else 202 if result.get("ok")
+                    else 429 if result.get("reason") == "manual_search_rate_limited"
+                    else 400
+                )
                 self.send_json(result, status=status)
             elif path.startswith("/api/manual-search/runs/") and path.endswith("/cancel"):
                 run_id = unquote(path.removeprefix("/api/manual-search/runs/").removesuffix("/cancel").strip("/"))
@@ -66110,6 +68455,33 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": bool(result.get("ok")), "result": result},
                     status=200 if result.get("ok") else mutation_conflict_status(result),
                 )
+            elif path == "/api/inkdrop-state/reliability/search-query":
+                principal = manual_search_principal_label(getattr(self, "inkdrop_principal", None))
+                payload = data if isinstance(data, dict) else {}
+                result = inkdrop_state.set_operator_search_query(
+                    INKDROP_STATE_DB,
+                    str(payload.get("wanted_id") or payload.get("id") or "").strip(),
+                    payload.get("query"),
+                    set_by=principal,
+                )
+                self.send_json(
+                    {"ok": bool(result.get("ok")), "result": result},
+                    status=200 if result.get("ok") else 404 if result.get("reason") == "wanted_item_not_found" else 400,
+                )
+            elif path == "/api/inkdrop-state/reliability/pursuit":
+                principal = manual_search_principal_label(getattr(self, "inkdrop_principal", None))
+                payload = data if isinstance(data, dict) else {}
+                result = inkdrop_state.set_wanted_pursuit(
+                    INKDROP_STATE_DB,
+                    str(payload.get("wanted_id") or payload.get("id") or "").strip(),
+                    inkdrop_gate_bool(payload, "paused"),
+                    set_by=principal,
+                    reason=payload.get("reason") or "",
+                )
+                self.send_json(
+                    {"ok": bool(result.get("ok")), "result": result},
+                    status=200 if result.get("ok") else 404 if result.get("reason") == "wanted_item_not_found" else 400,
+                )
             elif path == "/api/inkdrop-state/source-memory/allow":
                 principal = manual_search_principal_label(getattr(self, "inkdrop_principal", None))
                 result = allow_inkdrop_blocklist_candidate(
@@ -66200,6 +68572,24 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": bool(started.get("ok")), **started},
                     status=202 if started.get("ok") else 500,
                 )
+            elif path in {"/api/inkdrop-diagnostics/library-reconciliation/run", "/api/inkdrop-diagnostics/library_reconciliation/run"}:
+                data = data if isinstance(data, dict) else {}
+                try:
+                    max_files = max(1, min(int(data.get("maxFiles") or data.get("max_files") or 25000), 100000))
+                except (TypeError, ValueError):
+                    max_files = 25000
+                try:
+                    sample_limit = max(0, min(int(data.get("sampleLimit") or data.get("sample_limit") or 20), 100))
+                except (TypeError, ValueError):
+                    sample_limit = 20
+                started = start_library_reconciliation_scan({"max_files": max_files, "sample_limit": sample_limit})
+                self.send_json(
+                    {"ok": bool(started.get("ok")), **started},
+                    status=202 if started.get("ok") else 500,
+                )
+            elif path in {"/api/inkdrop-diagnostics/library-reconciliation/repair", "/api/inkdrop-diagnostics/library_reconciliation/repair"}:
+                result = library_reconciliation_repair_public(data)
+                self.send_json({"ok": bool(result.get("ok")), "result": result}, status=200 if result.get("ok") else 400)
             elif path in {"/api/inkdrop-diagnostics/managed-library-duplicates/quarantine", "/api/inkdrop-diagnostics/managed_library_duplicates/quarantine"}:
                 result = managed_library_duplicate_quarantine_public(data)
                 self.send_json({"ok": bool(result.get("ok")), "result": result}, status=200 if result.get("ok") else 400)
@@ -66389,6 +68779,16 @@ class Handler(BaseHTTPRequestHandler):
                 }, headers={"Cache-Control": "no-store", "Content-Disposition": f'attachment; filename="{filename}"'})
             elif path == "/api/library-adoption/plan":
                 self.send_json({"ok": True, "plan": run_library_adoption_plan(data)}, headers={"Cache-Control": "no-store"})
+            elif path == "/api/library-adoption/plan/start":
+                self.send_json({"ok": True, **run_library_adoption_plan_start(data)}, headers={"Cache-Control": "no-store"})
+            elif path == "/api/library-adoption/plan/status":
+                status_result = library_adoption_task_status((data or {}).get("taskId") or (data or {}).get("task_id"))
+                if status_result is None:
+                    self.send_json({"ok": False, "error": "unknown task_id"}, status=404, headers={"Cache-Control": "no-store"})
+                else:
+                    self.send_json({"ok": True, "task": status_result}, headers={"Cache-Control": "no-store"})
+            elif path == "/api/library-adoption/plan/latest":
+                self.send_json({"ok": True, "task": library_adoption_latest_run(data)}, headers={"Cache-Control": "no-store"})
             elif path == "/api/library-adoption/apply":
                 try:
                     self.send_json({"ok": True, "result": run_library_adoption_apply(data)}, headers={"Cache-Control": "no-store"})
@@ -66404,6 +68804,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "unknown task_id"}, status=404, headers={"Cache-Control": "no-store"})
                 else:
                     self.send_json({"ok": True, "task": status_result}, headers={"Cache-Control": "no-store"})
+            elif path == "/api/inkdrop-library/convert-archives/latest":
+                kind = (data or {}).get("kind") or "plan"
+                self.send_json({"ok": True, "task": archive_conversion_latest_run(kind)}, headers={"Cache-Control": "no-store"})
             elif path in {"/api/inkdrop-settings/backup/preview", "/api/inkdrop-settings/backup/restore"}:
                 raw_document = (data or {}).get("document_text")
                 if not isinstance(raw_document, str):
@@ -66686,6 +69089,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             is_client_api = str(locals().get("path") or "").startswith("/api/" + "download-clients")
             status = download_client_error_status(exc) if is_client_api else 400
+            # The response deliberately carries only str(exc) and that does not
+            # change here -- it is operator-facing and must not grow internals.
+            # But stringifying was also the only record this guard kept, and it
+            # spans ~911 lines and ~112 /api/ routes, so a TypeError deep inside
+            # any handler arrived as {"error": "'NoneType' object is not
+            # iterable"} with no file, line or call path behind it. That is what
+            # a 90-minute CI run reported for the mobile Search now failure on
+            # 2026-08-20: a symptom and no location. Mirrors the print +
+            # print_exc the outer request guard already does at the same layer.
+            failed_path = str(locals().get("path") or self.path or "")
+            print(f"InkDrop API handler failed: {self.command} {failed_path}: {exc}", flush=True)
+            traceback.print_exc()
             self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
 
     def _apply_operational_detail_privacy(self, view, query, payload):
@@ -66858,6 +69273,18 @@ def _web_background_bootstrap():
             )
     except Exception as exc:
         print(f"Warning: failed to initialize InkDrop state DB: {exc}", flush=True)
+    try:
+        # Threads do not survive a restart, so any scan row still claiming to be
+        # running belongs to a process that is gone. Say so, rather than leaving
+        # the panel on a progress bar that will never move again.
+        interrupted = inkdrop_scan_runs.interrupt_orphaned_runs(INKDROP_STATE_DB)
+        if interrupted:
+            print(
+                f"Marked {interrupted} library scan{'' if interrupted == 1 else 's'} as interrupted by restart",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"Warning: failed to close out interrupted library scans: {exc}", flush=True)
     try:
         launch_pending_manga_companion_jobs(limit=2)
     except Exception as exc:
