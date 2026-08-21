@@ -64,6 +64,20 @@ UNIT_PREFERENCES = (
 
 SETTING_UNIT_PREFERENCE = "media_management.unit_preference"
 SETTING_COLLECTED_EDITION = "media_management.collected_edition_policy"
+# The same setting as stored in the media-management settings dict, which is
+# keyed by short name. resolve() must bind either shape: a caller passing the
+# settings context (short keys) and a caller passing flat dotted keys are both
+# legitimate, and accepting only one is how this setting stayed unreachable.
+SETTING_COLLECTED_EDITION_SHORT = "collected_edition_policy"
+
+# Where a producer that HAS a db_path leaves the instance settings for a
+# producer that does not. The matching path is a chain of pure
+# ``(candidate, item)`` functions with no database in scope, so the snapshot
+# rides the wanted row -- but it is read at the SETTINGS precedence position,
+# never as a wanted-row value. Stamping these keys onto the row directly would
+# put an instance-wide setting ahead of a per-row and per-series override and
+# silently invert the documented precedence.
+SETTINGS_SNAPSHOT_KEY = "acquisition_settings_snapshot"
 
 # A collected edition that contains the wanted unit is content, and content
 # comes first. It is `review` rather than `admit` only because an operator has
@@ -159,7 +173,16 @@ def resolve(wanted_item=None, settings=None, series=None):
     Precedence is narrowest-first: an explicit per-wanted-row override beats a
     per-series one, which beats the instance setting, which beats the shipped
     default. Every key is populated, always.
+
+    An explicit ``settings=`` always wins over the carried snapshot: a caller
+    that knows its settings is more specific than a producer's projection.
     """
+    if settings is None and isinstance(wanted_item, dict):
+        carried = wanted_item.get(SETTINGS_SNAPSHOT_KEY)
+        if isinstance(carried, dict) and carried:
+            # Third position: instance settings. Not first -- see the note on
+            # SETTINGS_SNAPSHOT_KEY.
+            settings = carried
     sources = [wanted_item, series, settings]
     policy = {
         "acquisition_policy_version": ACQUISITION_POLICY_VERSION,
@@ -172,6 +195,7 @@ def resolve(wanted_item=None, settings=None, series=None):
                 sources,
                 "collected_edition",
                 SETTING_COLLECTED_EDITION,
+                SETTING_COLLECTED_EDITION_SHORT,
                 # The dead flags, still honoured where something does set them
                 # so this is a strict widening rather than a behaviour swap.
                 "allow_collected_edition",

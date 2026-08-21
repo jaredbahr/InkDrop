@@ -235,6 +235,7 @@
     body[data-inkdrop-view="sources"] .arr-page-masthead,
     body[data-inkdrop-view="source_attempts"] .arr-page-masthead,
     body[data-inkdrop-view="source_memory"] .arr-page-masthead,
+    body[data-inkdrop-view="settings"] .arr-page-masthead,
     body[data-inkdrop-view="imports"] .arr-page-masthead {
       align-items: center;
       margin-bottom: 10px;
@@ -286,7 +287,6 @@
     body[data-inkdrop-view="queue"] .arr-page-masthead,
     body[data-inkdrop-view="wanted"] .arr-page-masthead,
     body[data-inkdrop-view="manual_review"] .arr-page-masthead,
-    body[data-inkdrop-view="settings"] .arr-page-masthead,
     body[data-inkdrop-view="system"] .arr-page-masthead {
       display: none;
     }

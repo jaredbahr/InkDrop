@@ -712,10 +712,27 @@
     body[data-inkdrop-view="settings"] .settings-form-note {
       color: var(--settings-arr-muted);
     }
+    /* This rule, not 05-settings-providers.css's equal-specificity
+       `.settings-actions`, is what actually paints the Settings toolbar row
+       -- it is view-scoped, so it outranks 05's copy no matter which file
+       lands later in the bundle. Toolbar styling otherwise belongs in 05;
+       the background lives here because this is the selector that wins.
+
+       Until 2026-08-20 the row was the only chrome on the Settings page
+       (tracker row 546: the masthead and `#inkdropSettings > summary` were
+       both display:none), and the #242424 fill inherited from the shared
+       .workflow-actions card made it read as a raised slab with its left
+       half empty -- the "detached floating toolbar" in the report. Settings
+       now has a real masthead header above it (15-redesign-shell.css), so
+       this row is that header's command row and matches what Queue and
+       Wanted do with .section-commandbar: transparent, no card box, bottom
+       rule only. */
     body[data-inkdrop-view="settings"] .settings-actions {
       min-height: 50px;
+      border: 0;
       border-bottom: 1px solid rgba(255, 255, 255, .12);
-      background: #242424;
+      border-radius: 0;
+      background: transparent;
     }
     body[data-inkdrop-view="settings"] .settings-actions button {
       min-width: 76px;

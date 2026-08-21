@@ -3324,18 +3324,24 @@ def import_status_queue_backed_source_file_child():
     argv = list(sys.argv[1:])
     # inkdrop_slskd_staging_sweep.py's per-file child (process_one_file) is
     # the actual queue-backed invocation this exists to detect, and it never
-    # sends --trusted-series-id -- only --trusted-issue, extracted from the
-    # staged filename (see its cmd list). That mismatch meant this always
-    # returned False for the sweep, so every one of its per-file children ran
-    # the full sync_inkdrop_import_results() (43 stages, itself the write-lock
-    # holder PR 129 fixed for the bulk pass) instead of deferring to the
-    # separate periodic completed-import-comics job that already reconciles
-    # everything in far fewer passes. --trusted-issue is an equally trusted,
-    # queue-tracked target identity, just under a different flag name.
+    # sends --trusted-series-id (see its cmd list). If this misses it, every
+    # one of its per-file children runs the full sync_inkdrop_import_results()
+    # (43 stages, itself the write-lock holder PR 129 fixed for the bulk pass)
+    # instead of deferring to the separate periodic completed-import-comics job
+    # that already reconciles everything in far fewer passes.
+    #
+    # The sweep used to be recognised here by --trusted-issue, on the stated
+    # basis that it was "an equally trusted, queue-tracked target identity,
+    # just under a different flag name". That was wrong: the sweep parses that
+    # number out of the staged basename. It now sends --source-issue-hint
+    # instead, which is the honest name, so this detects that too. What makes
+    # a child queue-backed is that it was handed one explicit file to import,
+    # which either flag equally attests.
     trusted_target_flag_present = any(
-        arg in ("--trusted-series-id", "--trusted-issue")
+        arg in ("--trusted-series-id", "--trusted-issue", "--source-issue-hint")
         or arg.startswith("--trusted-series-id=")
         or arg.startswith("--trusted-issue=")
+        or arg.startswith("--source-issue-hint=")
         for arg in argv
     )
     return (
@@ -8519,8 +8525,22 @@ def native_manga_explicit_chapter_import_is_safe(path, target, number, trusted_i
 
 
 def classify_import_filename_safety(
-    path, target=None, kind="comics", trusted_issue=None, comicinfo=None, collection_range_proof=None
+    path, target=None, kind="comics", trusted_issue=None, comicinfo=None, collection_range_proof=None,
+    trusted_issue_is_queue_derived=True,
 ):
+    # trusted_issue_is_queue_derived says whether `trusted_issue` actually came
+    # from a queue/issue row or is only a filename guess. It defaults True
+    # because every caller that predates it (inkdrop_reconcile_imports, the
+    # e2e fixture) reads the number off an issues/queue row and is entitled to
+    # reject on it. inkdrop_slskd_staging_sweep is not: it parses the staged
+    # basename, so trusted_issue_mismatch_reason() below would be comparing two
+    # InkDrop parses of one string and can only ever detect InkDrop disagreeing
+    # with itself -- never a real identity conflict. Measured over the live
+    # 2,393-file staging tree: barring that comparison for filename-derived
+    # values changes the import-eligible set from 1,539 to 1,578 and newly
+    # blocks nothing, i.e. it had zero true positives and 39 false negatives.
+    # The value is still passed in and still earns filename-confidence evidence
+    # below; only its power to veto is withdrawn.
     if str(kind or "").lower() not in {"comics", "manga"} or not target:
         return {"ok": True, "score": 99, "evidence": ["not_comic_target"]}
     path = Path(path)
@@ -8564,7 +8584,11 @@ def classify_import_filename_safety(
             "wrong_unit_type_chapter_for_comic_issue",
             "A chapter-marked artifact cannot satisfy a western comic issue.",
         )
-    issue_mismatch = trusted_issue_mismatch_reason(path, trusted_issue, target=target, comicinfo=info)
+    issue_mismatch = (
+        trusted_issue_mismatch_reason(path, trusted_issue, target=target, comicinfo=info)
+        if trusted_issue_is_queue_derived
+        else None
+    )
     if issue_mismatch:
         return reject(issue_mismatch, "Trusted queue issue does not match the filename number.")
     # collection_range_proof is set only by direct_import_destination_unit_gate(),
@@ -8671,8 +8695,14 @@ def classify_import_filename_safety(
     return allow()
 
 
-def weak_filename_import_guard(path, target, kind, trusted_issue=None):
-    return classify_import_filename_safety(path, target=target, kind=kind, trusted_issue=trusted_issue)
+def weak_filename_import_guard(path, target, kind, trusted_issue=None, trusted_issue_is_queue_derived=True):
+    return classify_import_filename_safety(
+        path,
+        target=target,
+        kind=kind,
+        trusted_issue=trusted_issue,
+        trusted_issue_is_queue_derived=trusted_issue_is_queue_derived,
+    )
 
 
 def artifact_acceptance_decision(path, target=None, event=None, archive_check=None, collection=None, source_unit=None):
@@ -9131,7 +9161,18 @@ def _flush_pending_write_before_slow_verification(conn):
         conn.commit()
 
 
-def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, matched_only=False, series_filter=None, all_series=False, pending_only=False, manual_inbox=False, suwayomi_staging=False, max_files=None, source_files=None, trusted_volume_id=None, trusted_issue=None, trusted_series_id=None, trusted_issue_title=None, trusted_issue_id=None, wait_for_kavita_scan=True, apply_planned_path=None, wait_for_library_scan=None, slskd_staging=False, human_approved=False):
+def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, matched_only=False, series_filter=None, all_series=False, pending_only=False, manual_inbox=False, suwayomi_staging=False, max_files=None, source_files=None, trusted_volume_id=None, trusted_issue=None, trusted_series_id=None, trusted_issue_title=None, trusted_issue_id=None, wait_for_kavita_scan=True, apply_planned_path=None, wait_for_library_scan=None, slskd_staging=False, human_approved=False, source_issue_hint=None):
+    # source_issue_hint is the same shape of number as trusted_issue but with
+    # none of the authority: it is parsed off the staged filename by
+    # inkdrop_slskd_staging_sweep, not read from a queue/issue row. It still
+    # earns filename-confidence evidence and still names the destination --
+    # withholding it entirely costs 830 files that fall under the confidence
+    # bar -- but it must never veto an import, because the only thing it can
+    # contradict is another parse of the same string. Keeping the two under
+    # separate names is what makes that unreachable rather than remembered.
+    trusted_issue_is_queue_derived = trusted_issue not in (None, "")
+    if not trusted_issue_is_queue_derived and source_issue_hint not in (None, ""):
+        trusted_issue = source_issue_hint
     if wait_for_library_scan is None:
         wait_for_library_scan = bool(wait_for_kavita_scan)
     path_settings = apply_path_provider_settings()
@@ -9333,7 +9374,11 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 elif collection_candidate and collection_candidate.get("error"):
                     collection_error = collection_candidate
             if kind == "comics" and trusted_target:
-                issue_mismatch = trusted_issue_mismatch_reason(path, trusted_issue, target=trusted_target)
+                issue_mismatch = (
+                    trusted_issue_mismatch_reason(path, trusted_issue, target=trusted_target)
+                    if trusted_issue_is_queue_derived
+                    else None
+                )
                 if issue_mismatch:
                     event = {
                         "event": "skip_trusted_issue_mismatch",
@@ -9476,7 +9521,13 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 skipped.append(event)
                 continue
             weak_filename_gate = (
-                weak_filename_import_guard(path, target, kind, trusted_issue=trusted_issue)
+                weak_filename_import_guard(
+                    path,
+                    target,
+                    kind,
+                    trusted_issue=trusted_issue,
+                    trusted_issue_is_queue_derived=trusted_issue_is_queue_derived,
+                )
                 if kind == "comics" and target and not collection
                 else {"ok": True}
             )
@@ -10426,6 +10477,7 @@ def main():
     parser.add_argument("--trusted-volume-id", help="For an explicit source file, trust this InkDrop series target id as the import target")
     parser.add_argument("--trusted-series-id", help="For an explicit source file, trust this InkDrop/native series id as the import target")
     parser.add_argument("--trusted-issue", help="For an explicit source file, require this watched issue number when present")
+    parser.add_argument("--source-issue-hint", help="For an explicit source file, a filename-derived issue number: names and scores the import but can never reject it")
     parser.add_argument("--trusted-issue-title", help="For an explicit source file, carry the native watched issue title as import evidence")
     parser.add_argument("--trusted-issue-id", help="For an explicit source file, bind trusted issue metadata to this exact InkDrop issue row")
     parser.add_argument(
@@ -10525,6 +10577,7 @@ def main():
         apply_planned_path=True if args.apply_planned_path else None,
         slskd_staging=args.slskd_staging,
         human_approved=bool(args.human_approved),
+        source_issue_hint=args.source_issue_hint,
     )
 
 

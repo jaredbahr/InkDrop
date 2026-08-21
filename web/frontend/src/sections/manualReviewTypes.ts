@@ -27,6 +27,14 @@ export type ManualReviewRow = {
   origin?: string;
   reason?: string;
   review_reason?: string;
+  // Supplied by core/inkdrop_review_reasons.py so every Manual Review
+  // surface renders one vocabulary instead of deriving its own.
+  reason_label?: string;
+  reason_tone?: string;
+  reason_detail?: string;
+  reason_label_source?: string;
+  state_label?: string;
+  source_label?: string;
   manual_source_stage?: string;
   manual_review_actionable?: boolean;
   manual_review_parked?: boolean;

@@ -1741,6 +1741,7 @@
     body[data-inkdrop-view="sources"] .arr-page-masthead,
     body[data-inkdrop-view="source_attempts"] .arr-page-masthead,
     body[data-inkdrop-view="source_memory"] .arr-page-masthead,
+    body[data-inkdrop-view="settings"] .arr-page-masthead,
     body[data-inkdrop-view="imports"] .arr-page-masthead {
       align-items: center;
       margin-bottom: 10px;
@@ -1792,7 +1793,6 @@
     body[data-inkdrop-view="queue"] .arr-page-masthead,
     body[data-inkdrop-view="wanted"] .arr-page-masthead,
     body[data-inkdrop-view="manual_review"] .arr-page-masthead,
-    body[data-inkdrop-view="settings"] .arr-page-masthead,
     body[data-inkdrop-view="system"] .arr-page-masthead {
       display: none;
     }
@@ -8339,10 +8339,27 @@
     body[data-inkdrop-view="settings"] .settings-form-note {
       color: var(--settings-arr-muted);
     }
+    /* This rule, not 05-settings-providers.css's equal-specificity
+       `.settings-actions`, is what actually paints the Settings toolbar row
+       -- it is view-scoped, so it outranks 05's copy no matter which file
+       lands later in the bundle. Toolbar styling otherwise belongs in 05;
+       the background lives here because this is the selector that wins.
+
+       Until 2026-08-20 the row was the only chrome on the Settings page
+       (tracker row 546: the masthead and `#inkdropSettings > summary` were
+       both display:none), and the #242424 fill inherited from the shared
+       .workflow-actions card made it read as a raised slab with its left
+       half empty -- the "detached floating toolbar" in the report. Settings
+       now has a real masthead header above it (15-redesign-shell.css), so
+       this row is that header's command row and matches what Queue and
+       Wanted do with .section-commandbar: transparent, no card box, bottom
+       rule only. */
     body[data-inkdrop-view="settings"] .settings-actions {
       min-height: 50px;
+      border: 0;
       border-bottom: 1px solid rgba(255, 255, 255, .12);
-      background: #242424;
+      border-radius: 0;
+      background: transparent;
     }
     body[data-inkdrop-view="settings"] .settings-actions button {
       min-width: 76px;
@@ -21246,18 +21263,32 @@ button.missing-recovery-metric:focus-visible {
      display:contents so its two children (stats/actions) can each land in a
      different grid area without changing the existing JS/DOM.
 
-     Scoped to the five redesigned pages only -- Series/Settings/System/
-     Sources/Imports/etc keep whatever masthead treatment they already have.
+     Scoped to the redesigned pages only -- Series/System/Sources/Imports/etc
+     keep whatever masthead treatment they already have.
      Queue, Wanted, and Manual Review previously hid .arr-page-masthead
      entirely (relying on a bespoke "operator now" bar instead); History hid
      it with !important. The mockups put all five on this same masthead +
      stat-card pattern, so visibility is forced back on here rather than
      patched at each of those scattered legacy rules (own layer, `!important`
-     needed to beat the pre-existing `!important` hide on History). */
+     needed to beat the pre-existing `!important` hide on History).
+
+     Settings joined this list on 2026-08-20. It was the one view in the app
+     with no page title at any width: its .arr-page-masthead was hidden by
+     02-series-library.css and its own in-page heading -- the
+     `#inkdropSettings > summary` that holds <h2>Settings</h2> -- is hidden
+     too (06-settings-forms.css). Every other hidden-masthead view keeps a
+     visible heading of its own (Series/System their own <h2>, Queue/Wanted
+     their .section-heading below 1100px), so the shared Show Advanced /
+     No Changes / Test All / Refresh toolbar was the only chrome on ten
+     Settings areas and read as a floating strip. Settings carries no stat
+     cards, so the "stats stats" row simply collapses. The toolbar is NOT
+     reparented into the masthead: it stays where it is in the DOM, below
+     the header, exactly as Queue's and Wanted's command rows do. */
   body[data-inkdrop-view="queue"] .arr-page-masthead,
   body[data-inkdrop-view="wanted"] .arr-page-masthead,
   body[data-inkdrop-view="history"] .arr-page-masthead,
   body[data-inkdrop-view="source_memory"] .arr-page-masthead,
+  body[data-inkdrop-view="settings"] .arr-page-masthead,
   body[data-inkdrop-view="manual_review"] .arr-page-masthead {
     display: grid !important;
     grid-template-columns: minmax(0, 1fr) auto;

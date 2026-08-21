@@ -22,11 +22,24 @@ if str(_ROOT) not in _sys.path:
 
 import argparse
 import json
+import os
+import sys
+import tempfile
 import time
 from pathlib import Path
 
 from core import inkdrop_runtime_config
 from core import inkdrop_state
+
+# Each category already caps how many GROUPS it reports (limit=2000) and records
+# `truncated` when it hits that. Nothing capped the members *inside* a group: a
+# single multi-file conflict returned every media_files row for that issue, and a
+# duplicate-number group every issues row, each carrying a full path or title. So
+# the document's worst-case size was set by the data rather than by us -- 2,000
+# groups times an unbounded member list. The two bounds are independent, and so
+# are their truncation flags: a run can be complete in groups and truncated in
+# members, and the report has to be able to say that.
+MEMBER_DETAIL_LIMIT = 50
 
 LEGACY_QBIT_EBOOKS_CATEGORY = "readarr"
 LEGACY_QBIT_EBOOKS_SAVE_PATH = "/downloads/readarr"
@@ -49,7 +62,7 @@ def _capped(con, count_sql, count_params, group_sql, group_params, limit, build_
     return {"items": items, "total": int(total or 0), "truncated": int(total or 0) > len(items)}
 
 
-def multi_file_issue_conflicts(con, limit=2000):
+def multi_file_issue_conflicts(con, limit=2000, member_limit=MEMBER_DETAIL_LIMIT):
     """Active media_files rows that disagree about which file satisfies one issue.
 
     media_files.normalized_path is unique, so two present files for the same
@@ -67,9 +80,13 @@ def multi_file_issue_conflicts(con, limit=2000):
             from media_files
             where issue_id = ? and active = 1
             order by last_seen_at desc
+            limit ?
             """,
-            (group["issue_id"],),
+            (group["issue_id"], member_limit),
         )
+        # file_count comes from the unbounded group query, so the true total
+        # survives even when the member list below is cut.
+        total_files = int(group.get("file_count") or len(files))
         return {
             "category": "multi_file_issue_conflict",
             "requires_human_review": True,
@@ -78,8 +95,9 @@ def multi_file_issue_conflicts(con, limit=2000):
             "media_type": group.get("series_media_type"),
             "issue_id": group.get("issue_id"),
             "issue_number": group.get("issue_number"),
-            "file_count": group.get("file_count"),
+            "file_count": total_files,
             "files": files,
+            "files_truncated": total_files > len(files),
         }
 
     return _capped(
@@ -170,7 +188,7 @@ def naming_scheme_drift(con, limit=2000):
     }
 
 
-def duplicate_issue_number_rows(con, limit=2000):
+def duplicate_issue_number_rows(con, limit=2000, member_limit=MEMBER_DETAIL_LIMIT):
     """Same series + same normalized issue number recorded as two distinct issue rows.
 
     There is no unique index on issues(series_id, normalized_number), so this can
@@ -190,17 +208,20 @@ def duplicate_issue_number_rows(con, limit=2000):
             from issues
             where series_id = ? and normalized_number = ?
             order by created_at
+            limit ?
             """,
-            (group["series_id"], group["normalized_number"]),
+            (group["series_id"], group["normalized_number"], member_limit),
         )
+        total_rows = int(group.get("row_count") or len(issue_rows))
         return {
             "category": "duplicate_issue_number_row",
             "requires_human_review": True,
             "series_id": group.get("series_id"),
             "series_title": group.get("series_title"),
             "normalized_number": group.get("normalized_number"),
-            "row_count": group.get("row_count"),
+            "row_count": total_rows,
             "issues": issue_rows,
+            "issues_truncated": total_rows > len(issue_rows),
         }
 
     return _capped(
@@ -322,6 +343,27 @@ def build_reconciliation_report(db_path, *, max_files=50000, sample_limit=50, in
                 f"truncated at their per-run limit, true totals are higher: {', '.join(truncated)} "
                 "(see each section's own total/truncated fields)."
             )
+        # Group truncation and member truncation are separate facts. A run can
+        # report every group it found and still have cut the file list inside
+        # one of them, so this is counted independently rather than folded into
+        # the flag above -- a reader must not take a complete group list as a
+        # complete document.
+        member_truncated = {
+            key: sum(
+                1
+                for item in report[key]["items"]
+                if item.get("files_truncated") or item.get("issues_truncated")
+            )
+            for key in ("multi_file_issue_conflicts", "duplicate_issue_number_rows")
+        }
+        member_truncated = {key: count for key, count in member_truncated.items() if count}
+        report["summary"]["groups_with_truncated_members"] = sum(member_truncated.values())
+        if member_truncated:
+            detail = ", ".join(f"{key}: {count} group(s)" for key, count in sorted(member_truncated.items()))
+            report["known_gaps"].append(
+                f"per-group member lists capped at {MEMBER_DETAIL_LIMIT}; the full member list was cut "
+                f"for {detail}. Each affected item carries its true count and a *_truncated flag."
+            )
         return report
 
 
@@ -379,6 +421,14 @@ def _print_human_summary(payload):
     summary = payload.get("summary") or payload.get("report", {}).get("summary") or {}
     print("InkDrop library reconciliation")
     print("-" * 40)
+    if not payload.get("ok"):
+        # A failure has to stay visible in the logs -- the fix for the leak is
+        # not to go quiet when the job breaks. `reason` is a fixed vocabulary
+        # ("state_db_missing"), never interpolated user data, so it says what
+        # happened without reprinting the absolute path that `payload["db_path"]`
+        # carries for the cache file's benefit.
+        print(f"status: FAILED ({payload.get('reason') or 'unknown_error'})", file=sys.stderr)
+        return
     for key, value in summary.items():
         print(f"{key}: {value}")
     if payload.get("mode") == "repair":
@@ -404,9 +454,25 @@ def write_cache_file(cache_path, payload, params):
     }
     cache_path = Path(cache_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = cache_path.with_name(f".{cache_path.name}.tmp")
-    temp_path.write_text(json.dumps(envelope, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    temp_path.replace(cache_path)
+    # This file is the only place the path-bearing detail is allowed to live,
+    # so it is created 0600 by its owner rather than written at the umask's
+    # discretion and fixed up afterwards -- there is no window where it is
+    # readable and then narrowed. mkstemp also gives a unique name: the old
+    # fixed ".{name}.tmp" meant two runs (the scheduled job and a human
+    # clicking "run" in System > Advanced, which share this writer) could
+    # interleave on one temp path.
+    fd, temp_name = tempfile.mkstemp(dir=str(cache_path.parent), prefix=f".{cache_path.name}.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(envelope, indent=2, sort_keys=True, default=str) + "\n")
+        os.replace(temp_name, cache_path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def main() -> int:
@@ -416,8 +482,8 @@ def main() -> int:
     parser.add_argument("--max-files", type=int, default=50000)
     parser.add_argument("--sample-limit", type=int, default=50)
     parser.add_argument("--apply", action="store_true", help="repair mode only: actually refresh the media_files ledger from disk")
-    parser.add_argument("--json", action="store_true", help="print the full JSON report instead of a human-readable summary")
-    parser.add_argument("--cache-file", default=None, help="report mode only: also write the result to this path in the System > Advanced cache-file shape")
+    parser.add_argument("--json", action="store_true", help="print the full JSON report to stdout; ignored when --cache-file is given, because the detail then belongs to the cache file only")
+    parser.add_argument("--cache-file", default=None, help="report mode only: write the result to this path in the System > Advanced cache-file shape. Supplying it makes stdout counts-only.")
     args = parser.parse_args()
 
     db_path = Path(args.state_db) if args.state_db else inkdrop_runtime_config.state_db_path()
@@ -429,7 +495,26 @@ def main() -> int:
     else:
         payload = run_repair(db_path, apply=args.apply, max_files=args.max_files, sample_limit=args.sample_limit)
 
-    if args.json:
+    # The scheduled run is a container process: whatever this prints lands in
+    # ordinary Docker log retention, which is a different audience and a
+    # different lifetime from the authenticated cache file. The report carries
+    # series titles, filenames, source and expected library paths and the
+    # absolute state-DB path, so when a cache file is being written the detail
+    # goes there and stdout gets counts only.
+    #
+    # This is a property of the CLI rather than of one scheduler entry on
+    # purpose. Removing --json from the scheduled command fixes today; making
+    # --cache-file authoritative means re-adding it later cannot re-open this,
+    # which is the failure this shape is guarding against.
+    detail_to_stdout = bool(args.json) and not args.cache_file
+    if args.json and args.cache_file:
+        print(
+            "library reconciliation: full detail written to the cache file; "
+            "stdout is counts-only (--json ignored alongside --cache-file)",
+            file=sys.stderr,
+        )
+
+    if detail_to_stdout:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:
         _print_human_summary(payload)

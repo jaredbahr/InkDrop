@@ -43,6 +43,46 @@ MANGA_STYLE_CHAPTER_RE = re.compile(
     re.I,
 )
 
+def _sampled_image_members(image_entries):
+    """A bounded, deterministic, END-INCLUSIVE sample of an oversized archive.
+
+    Sorted by filename so the choice does not depend on zip member order, then
+    spread evenly with the first and last members always taken. Both matter:
+    a truncated download and a padded fake both go wrong at the tail, so a
+    front-loaded probe would pass precisely the archives this exists to catch.
+
+    A second byte ceiling stops a sample of very large pages from costing as
+    much as the full read the ceilings were meant to avoid; it can only shrink
+    the sample, never skip it, so an oversized archive is always looked at.
+    """
+    ordered = sorted(image_entries, key=lambda info: info.filename.lower())
+    count = len(ordered)
+    if count <= SAMPLED_IMAGE_MEMBERS:
+        picked = list(range(count))
+    else:
+        step = (count - 1) / float(SAMPLED_IMAGE_MEMBERS - 1)
+        picked = sorted({int(round(index * step)) for index in range(SAMPLED_IMAGE_MEMBERS)})
+    # First and last are reserved before the byte ceiling is applied to
+    # anything else. Filling in picked order instead would spend the whole
+    # ceiling on the front of a large-page archive and never reach the tail --
+    # which is the one place a truncated or padded file is guaranteed to be
+    # wrong, and so the one member the sample cannot afford to miss.
+    required = [picked[0]] if picked else []
+    if len(picked) > 1:
+        required.append(picked[-1])
+    chosen = list(required)
+    budget = sum(max(0, int(ordered[index].file_size or 0)) for index in required)
+    for index in picked:
+        if index in chosen:
+            continue
+        size = max(0, int(ordered[index].file_size or 0))
+        if budget + size > SAMPLED_ARCHIVE_IMAGE_BYTES:
+            continue
+        budget += size
+        chosen.append(index)
+    return [ordered[index] for index in sorted(chosen)]
+
+
 ARCHIVE_MEMBER_SEMANTICS_CACHE = OrderedDict()
 ARCHIVE_MEMBER_SEMANTICS_CACHE_MAX = 4096
 MAX_VERIFIED_IMAGE_BYTES = 16 * 1024 * 1024
@@ -51,6 +91,21 @@ MAX_VERIFIED_IMAGE_BYTES = 16 * 1024 * 1024
 # and member-count limits; this only raises the bounded aggregate ceiling.
 MAX_VERIFIED_ARCHIVE_IMAGE_BYTES = 512 * 1024 * 1024
 MAX_VERIFIED_IMAGE_MEMBERS = 2000
+# Over those ceilings the verifier used to check NOTHING and report
+# credible_image_count 0, which decide_acceptance read as
+# "rejected_invalid_image_payload" -- a verdict about the content. Measured on
+# the live staging tree, every single archive ever refused that way (8 of 8,
+# across three unrelated series) was a valid archive the verifier had simply
+# declined to open: testzip() clean, 423-463 real PNG members. Zero true
+# positives. "We did not look" was being recorded as "we looked and it is bad".
+#
+# So an over-budget archive is now sampled instead of skipped. The sample is
+# bounded (work stays bounded, which is what the ceilings were for) and
+# deterministic, and it is spread across the whole member list rather than
+# taken from the front, because a truncated or padded archive goes bad at the
+# END -- a first-N probe would pass exactly the archives worth catching.
+SAMPLED_IMAGE_MEMBERS = 24
+SAMPLED_ARCHIVE_IMAGE_BYTES = 96 * 1024 * 1024
 MAX_VERIFIED_IMAGE_PIXELS = 40_000_000
 # ComicInfo.xml is metadata: a handful of short tags. A megabyte is already
 # absurdly generous for that and still small enough that a hostile archive
@@ -661,32 +716,45 @@ def archive_member_semantics(path, *, fresh=False):
             fully_read = 0
             verified_pages = []
             declared_payload = sum(max(0, int(info.file_size or 0)) for info in image_entries)
-            budget_error = len(image_entries) > MAX_VERIFIED_IMAGE_MEMBERS or declared_payload > MAX_VERIFIED_ARCHIVE_IMAGE_BYTES
-            if budget_error:
-                result["image_validation_errors"].append("archive_image_validation_budget_exceeded")
-            else:
-                for info in image_entries:
-                    try:
-                        if info.file_size > MAX_VERIFIED_IMAGE_BYTES:
-                            raise ValueError("image_exceeds_bounded_verifier_limit")
-                        with archive.open(info) as member:
-                            data = member.read(MAX_VERIFIED_IMAGE_BYTES + 1)
-                        if len(data) != info.file_size:
-                            raise ValueError("image_member_size_mismatch")
-                        fully_read += 1
-                        width, height = _credible_image_dimensions(data, Path(info.filename).suffix) or (0, 0)
-                        if info.file_size < 32 or not (8 <= width <= 20000 and 8 <= height <= 20000) or max(width, height) / min(width, height) > 100:
-                            raise ValueError("implausible_image")
-                        credible_payload += int(info.file_size)
-                        verified_pages.append((info.filename, hashlib.sha256(data).hexdigest()))
-                    except Exception as exc:
-                        result["image_validation_errors"].append(f"unreadable_image:{info.filename}:{type(exc).__name__}")
-            all_valid = bool(image_entries) and not result["image_validation_errors"] and fully_read == len(image_entries)
+            over_budget = len(image_entries) > MAX_VERIFIED_IMAGE_MEMBERS or declared_payload > MAX_VERIFIED_ARCHIVE_IMAGE_BYTES
+            entries_to_check = _sampled_image_members(image_entries) if over_budget else list(image_entries)
+            sampled_bytes = 0
+            for info in entries_to_check:
+                try:
+                    if info.file_size > MAX_VERIFIED_IMAGE_BYTES:
+                        raise ValueError("image_exceeds_bounded_verifier_limit")
+                    with archive.open(info) as member:
+                        data = member.read(MAX_VERIFIED_IMAGE_BYTES + 1)
+                    if len(data) != info.file_size:
+                        raise ValueError("image_member_size_mismatch")
+                    fully_read += 1
+                    sampled_bytes += len(data)
+                    width, height = _credible_image_dimensions(data, Path(info.filename).suffix) or (0, 0)
+                    if info.file_size < 32 or not (8 <= width <= 20000 and 8 <= height <= 20000) or max(width, height) / min(width, height) > 100:
+                        raise ValueError("implausible_image")
+                    credible_payload += int(info.file_size)
+                    verified_pages.append((info.filename, hashlib.sha256(data).hexdigest()))
+                except Exception as exc:
+                    result["image_validation_errors"].append(f"unreadable_image:{info.filename}:{type(exc).__name__}")
+            all_valid = bool(entries_to_check) and not result["image_validation_errors"] and fully_read == len(entries_to_check)
+            # A clean sample earns the archive its credibility, but not a claim
+            # that every page was read: archive_integrity says "sampled_ok"
+            # rather than "fully_checked", image_validation_checked_count stays
+            # the number actually opened, and the page-manifest hashes below --
+            # which are a whole-archive proof used for duplicate identity -- are
+            # withheld. A dirty sample is a real content verdict and keeps the
+            # existing "failed", so decide_acceptance still refuses it.
             result["credible_image_count"] = len(image_entries) if all_valid else 0
             result["credible_image_payload_bytes"] = credible_payload if all_valid else 0
             result["image_validation_checked_count"] = fully_read
-            result["archive_integrity"] = "fully_checked" if all_valid else ("budget_exceeded" if budget_error else "failed")
+            result["image_validation_sampled"] = bool(over_budget)
+            result["image_validation_sample_size"] = len(entries_to_check) if over_budget else 0
+            result["image_validation_sampled_bytes"] = sampled_bytes if over_budget else 0
             if all_valid:
+                result["archive_integrity"] = "sampled_ok" if over_budget else "fully_checked"
+            else:
+                result["archive_integrity"] = "failed"
+            if all_valid and not over_budget:
                 page_digest = hashlib.sha256()
                 member_digest = hashlib.sha256()
                 for filename, page_hash in sorted(verified_pages, key=lambda item: item[0].lower()):
@@ -949,7 +1017,14 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
     cbz_verified = bool(
         comic_archive_suffix(path) != ".cbz"
         or (
-            member_semantics.get("archive_integrity") == "fully_checked"
+            # "sampled_ok" counts as verified here. It means every image the
+            # bounded sampler opened was a real, plausible image; the archive is
+            # simply too large to read whole. Refusing it instead was recorded
+            # as rejected_invalid_image_payload -- a content verdict the
+            # verifier had no evidence for, and one that never once caught a
+            # real problem on this library. A dirty sample lands on "failed"
+            # and is still refused below.
+            member_semantics.get("archive_integrity") in {"fully_checked", "sampled_ok"}
             and int(member_semantics.get("credible_image_count") or 0) == int(member_semantics.get("image_count") or 0) > 0
             and not member_semantics.get("image_validation_errors")
         )

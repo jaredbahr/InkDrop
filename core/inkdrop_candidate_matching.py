@@ -680,7 +680,7 @@ def collection_target_conflicts_with_candidate(candidate, wanted_item):
         return ""
 
 
-def target_context(wanted_item=None):
+def target_context(wanted_item=None, *, settings):
     wanted = wanted_item if isinstance(wanted_item, dict) else {}
     explicit_unit_type = str(_first(wanted.get("unit_type"), wanted.get("unitType"), wanted.get("unit"))).strip().lower()
     unit_type = explicit_unit_type
@@ -811,7 +811,7 @@ def target_context(wanted_item=None):
         # wrote, so it was always falsy and the edition gate was permanently
         # on -- 127 items refused in silence. The resolver always returns a
         # complete policy, so "nobody set it" can no longer mean "refuse".
-        "acquisition_policy": inkdrop_acquisition_policy.resolve(wanted),
+        "acquisition_policy": inkdrop_acquisition_policy.resolve(wanted, settings=settings),
         "unit_type_explicit": bool(explicit_unit_type),
         "media_type": media_type,
         "canonical_issue_count": canonical_issue_count,
@@ -1605,11 +1605,11 @@ def _relaunch_run_year_conflict(target, wanted_item, evidence, identity_values):
     return int(declared_year) > int(wanted_year) + 1
 
 
-def collected_singleton_alias_exact_title_match(candidate, wanted_item=None):
+def collected_singleton_alias_exact_title_match(candidate, wanted_item=None, *, settings=None):
     """Return whether a raw result is an exact alias for a proven collected singleton."""
 
     normalized = normalize_candidate(candidate, wanted_item)
-    target = target_context(wanted_item)
+    target = target_context(wanted_item, settings=settings)
     return _collected_singleton_alias_exact_title_match(
         normalized,
         wanted_item,
@@ -1618,9 +1618,9 @@ def collected_singleton_alias_exact_title_match(candidate, wanted_item=None):
     )
 
 
-def candidate_compatibility(candidate, wanted_item=None):
+def candidate_compatibility(candidate, wanted_item=None, settings=None):
     candidate = normalize_candidate(candidate, wanted_item)
-    target = target_context(wanted_item)
+    target = target_context(wanted_item, settings=settings)
     evidence = candidate["source_unit_evidence"]
     provider = str(candidate.get("provider_id") or candidate.get("source") or "").strip().lower()
     if (
@@ -2050,9 +2050,9 @@ def _explanation(reason, target, source):
     return messages.get(reason, "Candidate unit identity is compatible with the target.")
 
 
-def apply_compatibility(verdict, wanted_item=None):
+def apply_compatibility(verdict, wanted_item=None, *, settings=None):
     out = normalize_candidate(verdict, wanted_item)
-    compatibility = candidate_compatibility(out, wanted_item)
+    compatibility = candidate_compatibility(out, wanted_item, settings=settings)
     out["target_compatibility"] = compatibility
     blocks = list(dict.fromkeys([*(out.get("block_reasons") or []), *compatibility["rejection_codes"]]))
     reviews = list(dict.fromkeys([*(out.get("review_reasons") or []), *compatibility["review_codes"]]))

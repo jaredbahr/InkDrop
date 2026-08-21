@@ -43,18 +43,41 @@ except Exception:
 
 
 def extract_issue_number(filename):
-    """Best-effort volume/issue number extraction from a release filename.
+    """Best-effort issue number extraction from a release filename.
 
-    Mirrors the pattern used during the backlog audit tonight -- explicit
-    '#032' style markers first, then a bare number with a plausible
-    boundary. Not perfect, but --trusted-issue only helps precision; if this
-    comes back empty the file is still processed, just without that extra
-    signal, matching what a human operator would do without it.
+    The ordering is the point. An explicit `issue` marker outranks a volume
+    marker, because a release like "Spawn (1992) Volume 01 Issue 169.cbz"
+    states both and only one of them is the issue. Without that rule this
+    returned the volume, and that value went out as --trusted-issue to a
+    child that parses the same string with
+    inkdrop_completed_import.extract_issue_number() -- which does read the
+    `Issue` token. The two disagreed and trusted_issue_mismatch_reason()
+    refused the file as "trusted_issue_mismatch:169!=001", on a Manual Review
+    card that simultaneously showed the row's issue as not recorded. Both
+    were true: nothing here ever came from the queue, despite the flag name.
+    Measured over the live 2,393-file staging tree, 39 correct files were
+    refused that way, across three unrelated series.
+
+    The volume branch also refuses a year, mirroring the negative lookahead
+    inkdrop_completed_import.extract_issue_number() already applies on its
+    own volume pattern, so "... V2015 001 [09-2015].cbz" stops sending 2015
+    as an issue number -- 16 such year-shaped values in the same tree.
+
+    Only the singular `issue` is matched: "Issues 001-050" is a pack marker,
+    not a unit, and still falls through to the branches below exactly as
+    before.
+
+    Not perfect, but --trusted-issue only helps precision; if this comes back
+    empty the file is still processed, just without that extra signal,
+    matching what a human operator would do without it.
     """
+    m = re.search(r"\bissue[\s._#-]*0*(\d{1,4})\b", filename, re.I)
+    if m:
+        return m.group(1)
     m = re.search(r"#\s*0*(\d{1,4})", filename)
     if m:
         return m.group(1)
-    m = re.search(r"\bv(?:ol(?:ume)?)?\.?\s*0*(\d{1,4})\b", filename, re.I)
+    m = re.search(r"\bv(?:ol(?:ume)?)?\.?\s*0*(?!(?:19|20)\d{2}\b)(\d{1,4})\b", filename, re.I)
     if m:
         return m.group(1)
     m = re.search(r"\b0*(\d{2,4})\b(?=\s*\(|\.\w+$|\s)", filename)
@@ -410,9 +433,18 @@ def process_one_file(path):
         # child to be invoked.
         "--no-wait-for-library-scan",
     ]
+    # --source-issue-hint, not --trusted-issue. This number is parsed off the
+    # staged basename above; nothing here has consulted a queue or issue row.
+    # Sent as --trusted-issue it reached trusted_issue_mismatch_reason(), which
+    # compares it against inkdrop_completed_import's own parse of the same
+    # string -- so the only disagreement it could ever report was InkDrop with
+    # itself, on a Manual Review card that told the operator the issue was "not
+    # recorded on this row". Under the honest name it still names the
+    # destination and still earns filename-confidence evidence; it just cannot
+    # veto an import.
     issue_number = extract_issue_number(os.path.basename(path))
     if issue_number:
-        cmd.extend(["--trusted-issue", issue_number])
+        cmd.extend(["--source-issue-hint", issue_number])
     if DRY_RUN:
         cmd.append("--dry-run")
 

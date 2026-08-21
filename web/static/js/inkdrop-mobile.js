@@ -62,6 +62,11 @@
   let seriesTotal = 0;
   let seriesLoading = false;
   let homeSeriesRows = [];
+  // Whether the last Home load's series request FAILED, as distinct from
+  // returning nothing. loadHome() swallows that failure on purpose so one bad
+  // request cannot blank the screen; without this flag the swallow also
+  // erases the distinction, and "no answer" renders as "no series".
+  let homeSeriesFailed = false;
   let homeSeriesTotal = 0;
   // review_id / series id -> the outcome sentence for an action already taken
   // this session, so it survives the re-render that follows the action.
@@ -195,13 +200,80 @@
   // --- Confirm sheet ----------------------------------------------------
 
   let sheetResolve = null;
+  // The element focus returns to when the sheet closes. Without it a keyboard
+  // user who confirms a destructive action is returned nowhere -- focus falls
+  // back to <body> and there is no way to tell where you are.
+  let sheetOpener = null;
+
+  const FOCUSABLE = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled]):not([type=hidden])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    "[tabindex]:not([tabindex='-1'])",
+  ].join(",");
+
+  function sheetFocusable() {
+    if (!els.sheet) return [];
+    return Array.from(els.sheet.querySelectorAll(FOCUSABLE)).filter(
+      (node) => node.offsetParent !== null || node === document.activeElement,
+    );
+  }
+
+  // `aria-modal="true"` is a promise to assistive technology that the rest of
+  // the page is unavailable. Marking the siblings inert is what keeps it: it
+  // removes them from the tab order AND from the accessibility tree, which
+  // aria-hidden alone does not do for focus.
+  function setBackgroundInert(inert) {
+    const root = els.sheet && els.sheet.parentElement;
+    if (!root) return;
+    for (const child of Array.from(root.children)) {
+      if (child === els.sheet) continue;
+      if (inert) {
+        child.setAttribute("inert", "");
+        child.setAttribute("aria-hidden", "true");
+      } else {
+        child.removeAttribute("inert");
+        child.removeAttribute("aria-hidden");
+      }
+    }
+  }
+
+  function trapSheetTab(event) {
+    if (event.key !== "Tab" || els.sheet.hidden) return;
+    const nodes = sheetFocusable();
+    if (!nodes.length) return;
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    // Reverse-Tab is the arm a naive trap fails: without this branch, Shift+Tab
+    // from the first control escapes backwards into the inert page.
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+      return;
+    }
+    if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   function closeSheet(result) {
     if (!els.sheet) return;
     els.sheet.hidden = true;
     els.sheet.classList.remove("m-sheet-open");
+    els.sheet.removeEventListener("keydown", trapSheetTab);
+    setBackgroundInert(false);
+    const opener = sheetOpener;
+    sheetOpener = null;
     const resolve = sheetResolve;
     sheetResolve = null;
+    // Restore before resolving: the caller may re-render the list the opener
+    // lived in, and focus has to land somewhere real first.
+    if (opener && typeof opener.focus === "function" && document.contains(opener)) {
+      opener.focus();
+    }
     if (resolve) resolve(!!result);
   }
 
@@ -216,8 +288,11 @@
     els.sheetCopy.textContent = config.copy || "";
     els.sheetConfirm.textContent = config.confirmLabel || "Confirm";
     els.sheetConfirm.classList.toggle("m-btn-danger", config.tone === "bad");
+    sheetOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     els.sheet.hidden = false;
     els.sheet.classList.add("m-sheet-open");
+    setBackgroundInert(true);
+    els.sheet.addEventListener("keydown", trapSheetTab);
     els.sheetConfirm.focus();
     return new Promise((resolve) => { sheetResolve = resolve; });
   }
@@ -387,6 +462,10 @@
         ).catch(() => null),
       ]);
       if (token !== loadToken) return;
+      // `series` is null only because the .catch above swallowed a failure --
+      // a different fact from an empty library, and renderHomeSeries() needs
+      // to be able to tell them apart.
+      homeSeriesFailed = series === null;
       const seriesView = (series && series.view) || {};
       homeSeriesRows = Array.isArray(seriesView.rows) ? seriesView.rows : [];
       homeSeriesTotal = Number(seriesView.total_count ?? homeSeriesRows.length) || homeSeriesRows.length;
@@ -477,9 +556,24 @@
 
   function renderHomeSeries() {
     if (!homeSeriesRows.length) {
-      // A real empty library, not a failed read -- loadHome() leaves the rows
-      // empty for both, and pushing someone toward Add is the right answer
-      // either way.
+      // The original comment here read: "A real empty library, not a failed
+      // read -- loadHome() leaves the rows empty for both, and pushing someone
+      // toward Add is the right answer either way." The first half of that
+      // intent is right and is preserved: a failed series read must not blank
+      // the screen someone opened to check on things, so Home still paints
+      // status and tiles and loadHome() keeps its .catch(() => null).
+      //
+      // The second half is what this changes. It is not the right answer
+      // either way. "Nothing tracked yet" plus an Add affordance, shown after
+      // a request that failed, invites the operator to re-add series they
+      // already own -- a wrong render with a call to action is a route to
+      // duplicate data. Absence of an answer is not zero.
+      if (homeSeriesFailed) {
+        return `<div class="m-section-head"><div class="m-section-title">Your series</div></div>
+          <div class="m-empty"><strong>Couldn't load your series</strong>
+          <span class="m-empty-body">This list is unavailable right now, so it is not a sign that anything is missing. Everything above still loaded.</span>
+          <button type="button" class="m-btn-quiet" data-home-retry="1">Try again</button></div>`;
+      }
       return `<div class="m-section-head"><div class="m-section-title">Your series</div></div>
         <div class="m-empty">Nothing tracked yet. Tap <strong>Add a series</strong> to start one.</div>`;
     }
@@ -808,18 +902,16 @@
       }));
       if (token !== searchToken) return;
       searchResults = mergeSeriesResults(groups).slice(0, SEARCH_LIMIT);
-      renderSearchResults();
-      const failures = groups.filter((g) => g.status === "failed");
-      const contributing = groups.filter((g) => g.status !== "unconfigured");
-      const suffix = failures.length ? ` ${failures.map((g) => `${g.label}: ${g.error}`).join("; ")}` : "";
-      if (!searchResults.length && failures.length === contributing.length) {
-        setAddStatus(`No metadata source could answer.${suffix}`, "bad");
-      } else {
-        setAddStatus(
-          `${searchResults.length} match${searchResults.length === 1 ? "" : "es"} across metadata sources.${suffix}`,
-          failures.length ? "warn" : "",
-        );
-      }
+      // Decide WHY the result set is the size it is before anything renders.
+      // Previously renderSearchResults() ran first and, seeing zero results,
+      // printed "No matches. Try a shorter title." -- then the status line
+      // below printed "No metadata source could answer." Those are different
+      // DOM regions, so both were on screen at once, and the one giving the
+      // operator advice was blaming their query for an outage in which zero
+      // searches had completed.
+      const outcome = searchOutcome(groups, searchResults);
+      renderSearchResults(outcome);
+      setAddStatus(outcome.statusText, outcome.statusTone);
     } catch (err) {
       if (token !== searchToken) return;
       if (err.unauthenticated) { showLogin(); return; }
@@ -830,9 +922,83 @@
     }
   }
 
-  function renderSearchResults() {
+  // Mutually exclusive by construction: exactly one of all_failed /
+  // partial_failure / no_sources / completed_empty / completed_results
+  // describes any search. Sources reporting "unconfigured" (Metron, off by
+  // default) contributed nothing on purpose and are excluded from the
+  // denominator, so an install that never enabled one does not read as a
+  // permanent partial outage.
+  function searchOutcome(groups, results) {
+    const failures = groups.filter((g) => g.status === "failed");
+    const contributing = groups.filter((g) => g.status !== "unconfigured");
+    const answered = contributing.filter((g) => g.status === "ok");
+    const failureDetail = failures.map((g) => `${g.label}: ${g.error}`).join("; ");
+    const count = results.length;
+
+    if (!contributing.length) {
+      return {
+        kind: "no_sources",
+        retryable: false,
+        statusText: "No metadata source is configured.",
+        statusTone: "bad",
+        emptyTitle: "No metadata source is configured",
+        emptyBody: "Add a metadata provider in Settings before searching.",
+      };
+    }
+
+    // Nothing answered. The query is not implicated and must not be blamed:
+    // zero searches completed, so nothing was learned about this title.
+    if (failures.length === contributing.length) {
+      return {
+        kind: "all_failed",
+        retryable: true,
+        statusText: `No metadata source could answer. ${failureDetail}`,
+        statusTone: "bad",
+        emptyTitle: "Couldn't reach any metadata source",
+        // No query advice here. That is the whole defect.
+        emptyBody: "Nothing was searched, so this says nothing about the title. Tap Try again in a moment.",
+      };
+    }
+
+    if (failures.length) {
+      const answeredLabels = answered.map((g) => g.label).join(", ");
+      const failedLabels = failures.map((g) => g.label).join(", ");
+      return {
+        kind: "partial_failure",
+        retryable: true,
+        statusText: `${count} match${count === 1 ? "" : "es"} from ${answeredLabels}. ${failedLabels} didn't answer: ${failureDetail}`,
+        statusTone: "warn",
+        emptyTitle: `${failedLabels} didn't answer`,
+        // Results are incomplete, so a shorter title is not the likely fix.
+        emptyBody: `${answeredLabels} returned nothing for this title, but some sources are still unavailable, so this is not the full picture.`,
+      };
+    }
+
+    // Every contributing source answered. Only here is the query the most
+    // likely explanation for an empty result, so only here may we say so.
+    return {
+      kind: count ? "completed_results" : "completed_empty",
+      retryable: false,
+      statusText: `${count} match${count === 1 ? "" : "es"} across metadata sources.`,
+      statusTone: "",
+      emptyTitle: "No matches",
+      emptyBody: "Every metadata source answered and none had this series. Try a shorter title.",
+    };
+  }
+
+  function renderSearchResults(outcome) {
     if (!searchResults.length) {
-      els.addResults.innerHTML = '<div class="m-empty">No matches. Try a shorter title.</div>';
+      const state = outcome || {
+        emptyTitle: "No matches",
+        emptyBody: "Every metadata source answered and none had this series. Try a shorter title.",
+        retryable: false,
+      };
+      const retry = state.retryable
+        ? '<button type="button" class="m-btn-quiet" data-add-retry="1">Try again</button>'
+        : "";
+      els.addResults.innerHTML =
+        `<div class="m-empty"><strong>${escapeHtml(state.emptyTitle)}</strong>`
+        + `<span class="m-empty-body">${escapeHtml(state.emptyBody)}</span>${retry}</div>`;
       return;
     }
     els.addResults.innerHTML = searchResults
@@ -924,11 +1090,24 @@
   }
 
   function reviewRowState(row) {
-    return row.display_state_label || row.display_state || row.state || row.status || "";
+    // state_label is server-supplied alongside reason_label. The remaining
+    // fallbacks are for payloads that predate it; none of them is title-cased.
+    return row.state_label || row.display_state_label || row.display_state || row.state || row.status || "";
   }
 
-  function reviewRowReason(row) {
-    return row.review_reason || row.reason || row.why_not_grabbed || row.activity_summary || "";
+  // Only reached when the server did not supply reason_label -- an older
+  // payload, or a row from a path that skips manual_review_rows(). It returns
+  // prose or nothing: an identifier is refused rather than title-cased into
+  // something that reads like a sentence InkDrop wrote on purpose.
+  function reviewRowReasonFallback(row) {
+    const candidates = [row.review_reason, row.reason, row.why_not_grabbed, row.activity_summary];
+    for (const value of candidates) {
+      const text = String(value || "").trim();
+      if (!text) continue;
+      if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(text.toLowerCase())) continue;
+      return text;
+    }
+    return "";
   }
 
   // Which write endpoint an approval on this row goes to. Same precedence the
@@ -1040,8 +1219,16 @@
     }
     const cards = rows
       .map((row, index) => {
-        const reason = reviewRowReason(row);
+        // Server-supplied, from core/inkdrop_review_reasons.py. Mobile used to
+        // run the raw reason through humanizeToken(), which title-cases every
+        // word -- so `slskd_transfer_missing_staged_file_repeat` reached the
+        // operator as "Slskd Transfer Missing Staged File Repeat", a machine
+        // identifier dressed as an English sentence. Deriving a label here at
+        // all is the defect; there is one vocabulary and it lives on the row.
+        const reasonLabel = String(row.reason_label || "").trim() || reviewRowReasonFallback(row);
+        const reasonDetail = String(row.reason_detail || "").trim();
         const state = reviewRowState(row);
+        const sourceLabel = String(row.source_label || row.current_source || row.source || "").trim();
         const approveEndpoint = approveEndpointFor(row);
         const rejectable = canReject(row);
         const ignorable = Boolean(row.review_id);
@@ -1060,10 +1247,11 @@
         const done = reviewNotes.get(row.review_id) || "";
         return `<div class="m-item-card" data-review-card="${index}">
           <div class="m-item-title">${escapeHtml(reviewRowTitle(row))}</div>
-          ${reason ? `<div class="m-item-reason">${escapeHtml(humanizeToken(reason))}</div>` : ""}
+          ${reasonLabel ? `<div class="m-item-reason m-tone-${escapeHtml(row.reason_tone || "warn")}">${escapeHtml(reasonLabel)}</div>` : ""}
+          ${reasonDetail ? `<div class="m-item-reason-detail">${escapeHtml(reasonDetail)}</div>` : ""}
           <div class="m-item-row">
-            ${state ? `<span class="m-pill">${escapeHtml(humanizeToken(state))}</span>` : ""}
-            ${row.current_source || row.source ? `<span class="m-item-source">${escapeHtml(humanizeToken(row.current_source || row.source))}</span>` : ""}
+            ${state ? `<span class="m-pill">${escapeHtml(state)}</span>` : ""}
+            ${sourceLabel ? `<span class="m-item-source">${escapeHtml(sourceLabel)}</span>` : ""}
           </div>
           <div class="m-actions">${approveBtn}${secondary}</div>
           ${approveNote}
@@ -1197,6 +1385,12 @@
     // The result and review cards are re-rendered wholesale on every load, so
     // they are delegated rather than re-bound per render.
     els.addResults.addEventListener("click", (event) => {
+      // A source outage is retryable and the empty state offers it; re-running
+      // the same query is the correct action there, unlike changing the title.
+      if (event.target.closest("[data-add-retry]")) {
+        handleSearch();
+        return;
+      }
       const btn = event.target.closest("[data-add-index]");
       if (!btn) return;
       addSeriesAt(Number(btn.dataset.addIndex), btn);
@@ -1207,6 +1401,10 @@
       runReviewAction(btn.dataset.reviewAction, Number(btn.dataset.reviewIndex), btn);
     });
     els.homeContent.addEventListener("click", (event) => {
+      if (event.target.closest("[data-home-retry]")) {
+        loadHome();
+        return;
+      }
       const card = event.target.closest("[data-home-series]");
       if (card) {
         // Hand the title to the Series screen's own filter rather than

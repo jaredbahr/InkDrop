@@ -992,7 +992,7 @@ def _confidence(candidate: dict[str, Any], rejected: bool) -> str:
     return value if value in CONFIDENCE_TIERS else "unknown"
 
 
-def _canonical_pack_target_safe(candidate: dict[str, Any], context: dict[str, Any]) -> bool:
+def _canonical_pack_target_safe(candidate: dict[str, Any], context: dict[str, Any], *, settings=None) -> bool:
     canonical = _text(context.get("canonical_work_title"))
     unit_type = _text(context.get("unit_type")).lower()
     unit_number = _text(context.get("unit_number"))
@@ -1086,12 +1086,12 @@ def _canonical_pack_target_safe(candidate: dict[str, Any], context: dict[str, An
     bound_candidate = dict(candidate)
     bound_candidate["pack_contents_match"] = manifest
     bound_candidate["filename"] = manifest.get("entry")
-    compatibility = inkdrop_candidate_matching.candidate_compatibility(bound_candidate, current_target)
+    compatibility = inkdrop_candidate_matching.candidate_compatibility(bound_candidate, current_target, settings=settings)
     member_candidate = dict(bound_candidate)
     member_candidate["title"] = member_entry
     member_candidate["original_result_title"] = member_entry
     member_candidate["filename"] = member_entry
-    member_compatibility = inkdrop_candidate_matching.candidate_compatibility(member_candidate, current_target)
+    member_compatibility = inkdrop_candidate_matching.candidate_compatibility(member_candidate, current_target, settings=settings)
     original_compatibility = candidate.get("target_compatibility") if isinstance(candidate.get("target_compatibility"), dict) else {}
     exact_manifest_evidence = "exact_pack_manifest_member" in _list(
         original_compatibility.get("positive_evidence")

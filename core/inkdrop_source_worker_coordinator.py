@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
+from core import inkdrop_acquisition_policy
 from core import inkdrop_candidate_matching
 from core import inkdrop_direct_downloader as direct_downloader
 from core import inkdrop_manga_unit_policy
@@ -666,6 +667,24 @@ def wanted_item_from_queue(queue, db_path=None, *, con=None, singleton_context=N
         wanted.update(_dict(singleton_context))
     else:
         wanted.update(_singleton_issue_context(db_path, wanted.get("series_id"), con=con))
+    # Tracker #296. This is the one producer on the acquisition path that holds
+    # a db_path; everything downstream is pure (candidate, item) functions with
+    # no database in scope. Read the stored settings here and carry them, so an
+    # operator's choice reaches the matcher instead of dying at the first
+    # function that cannot look it up.
+    #
+    # Read at projection time, from the live settings row, for a queue item
+    # that is being worked NOW. It re-evaluates nothing: no stored decision is
+    # revisited and nothing is written back -- this dict is an in-memory
+    # projection, never persisted. #296's never-retroactive rule holds.
+    if db_path is not None:
+        try:
+            wanted[inkdrop_acquisition_policy.SETTINGS_SNAPSHOT_KEY] = inkdrop_state.acquisition_policy_settings(db_path)
+        except Exception:
+            # A settings read must never take down a search. Absent snapshot
+            # means resolve() falls to the shipped defaults, which is exactly
+            # the pre-#296 behaviour -- degraded, not wrong.
+            pass
     return {key: value for key, value in wanted.items() if value not in (None, "", [], {})}
 
 

@@ -49,6 +49,23 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.13",
+      slug: "v0-1-13",
+      released_at: "2026-08-21",
+      title: "Books we had already found, and then refused",
+      summary: "Three checks were turning down files for reasons that were not about the file: an archive too big to validate was called damaged, a folder name was read as an issue number, and a failed transfer condemned a candidate forever. All three now say only what they know.",
+      highlights: [
+        "Large archives are sampled instead of being refused unread",
+        "A folder's volume number is no longer compared against a file's issue number",
+        "A stalled or failed transfer no longer condemns a candidate permanently",
+        "The daily reconciliation report no longer prints library paths into the container log",
+        "InkDrop can state which version it is running, and fails closed if it cannot",
+        "A second Manual Review decision is refused while the first runs, not sent alongside it",
+        "The System page reports real backup status, and the cadence is a setting",
+        "The collected-edition preference reaches the matcher on the main paths — set a value to use it"
+      ]
+    }),
+    publicRelease({
       version: "v0.1.12",
       slug: "v0-1-12",
       released_at: "2026-08-19",
@@ -199,18 +216,6 @@
         "Manual Review no longer hides legacy decisions, and supports bulk-ignore.",
         "Fixed several qBittorrent and download-client bugs, including one that could wrongly blacklist a release.",
         "Smaller fixes: faster status indicator, a clearer Queue wait panel, and automatic search on by default for new installs."
-      ]
-    }),
-    publicRelease({
-      version: "v0.1.03",
-      slug: "v0-1-03",
-      released_at: "2026-08-02",
-      title: "Search tries the right title, and the System page stops hanging",
-      summary: "Search now tries the title people actually share files under instead of burning its budget on one nobody uses, and a real print-run marker on the exact issue you wanted no longer gets rejected. The System page also stops hanging if a request stalls.",
-      highlights: [
-        "Searches for licensed creator-credit titles (like \"Naoki Urasawa's Monster\") now try the title people actually share files under, instead of spending the whole budget on one nobody uses.",
-        "A volume/print-run marker like \"v1 #19\" no longer gets treated as a mismatch when it's exactly the issue you wanted — that was silently blocking real grabs.",
-        "The System page no longer hangs on a silent \"Loading...\" if a request stalls; you'll see what failed instead."
       ]
     })
   ]);

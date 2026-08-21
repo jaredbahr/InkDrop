@@ -84,6 +84,21 @@ BACKUP_RETENTION_COUNT_ENV_KEY = "INKDROP_BACKUP_RETENTION_COUNT"
 BACKUP_RETENTION_DAYS_ENV_KEY = "INKDROP_BACKUP_RETENTION_DAYS"
 DEFAULT_BACKUP_RETENTION_COUNT = 6
 DEFAULT_BACKUP_RETENTION_DAYS = 28
+# How often a scheduled archive is created. Same shape as the retention pair
+# above, and here for the same reason: it is operator policy, so it belongs in
+# app_settings where a person can see and change it, with the environment
+# variable still honoured underneath for installs that set it in .env.
+#
+# It is resolved per run by run_scheduled_backup(), never baked into the
+# scheduler's argv. Baking it in would freeze whatever value existed at
+# container start, so a change made in Settings would appear to save and then
+# do nothing until the next restart -- the exact trap the retention pair is
+# already written to avoid. The bounds match the ones the scheduler previously
+# applied to INKDROP_BACKUP_INTERVAL_DAYS, so no install loses a value it could
+# already configure.
+BACKUP_INTERVAL_DAYS_SETTING_KEY = "backup.interval_days"
+BACKUP_INTERVAL_DAYS_ENV_KEY = "INKDROP_BACKUP_INTERVAL_DAYS"
+DEFAULT_BACKUP_INTERVAL_DAYS = 7
 SECRET_KEY_MARKERS = ("API_KEY", "PASSWORD", "TOKEN", "SECRET", "USERNAME")
 CREDENTIAL_PASSPHRASE_MIN_LENGTH = 8
 CREDENTIAL_KDF_ITERATIONS = 480_000
@@ -1217,8 +1232,8 @@ def list_backup_archives(backup_dir=None):
     return archives
 
 
-def _stored_retention_setting(state_db_path, key):
-    """The saved value for a retention setting, but only once a person set it.
+def _stored_policy_setting(state_db_path, key):
+    """The saved value for a backup policy setting, but only once a person set it.
 
     ``source`` is what separates "the operator chose this" from "the runtime
     seeded the default row on first sync". Only the former may override the
@@ -1246,7 +1261,7 @@ def _stored_retention_setting(state_db_path, key):
         return None
 
 
-def _environment_retention(environ, key, minimum, maximum):
+def _environment_policy_value(environ, key, minimum, maximum):
     raw = str((environ if environ is not None else os.environ).get(key) or "").strip()
     if not raw:
         return None
@@ -1255,6 +1270,55 @@ def _environment_retention(environ, key, minimum, maximum):
     except (TypeError, ValueError):
         return None
     return max(minimum, min(maximum, parsed))
+
+
+def _policy_state_db_path(state_db_path, environ):
+    if state_db_path is not None:
+        return state_db_path
+    try:
+        return inkdrop_runtime_config.state_db_path(environ if environ is not None else os.environ)
+    except Exception:
+        return None
+
+
+def _resolve_policy_value(explicit, setting_key, env_key, fallback, state_db_path, environ):
+    """One backup policy number, and where it came from.
+
+    Shared by retention and interval so the three of them can never drift into
+    disagreeing about precedence. Highest first: an explicit argument (a human
+    running the CLI by hand, or a test), then the saved Settings value, then
+    the environment variable, then the shipped default.
+    """
+    schema = inkdrop_settings_registry.field_schema(setting_key)
+    if explicit is not None:
+        return int(explicit), "explicit"
+    stored = _stored_policy_setting(state_db_path, setting_key) if state_db_path else None
+    if stored is not None:
+        return stored, "settings"
+    from_env = _environment_policy_value(environ, env_key, int(schema["min"]), int(schema["max"]))
+    if from_env is not None:
+        return from_env, "environment"
+    return int(fallback), "default"
+
+
+def resolve_backup_interval(*, state_db_path=None, environ=None, interval_days=None):
+    """How many days between scheduled archives, and where that number came from.
+
+    Resolved on every scheduled pass rather than when the scheduler builds its
+    job list, for the same reason retention is: a cadence change made in
+    Settings has to take effect on the next pass, not on the next container
+    restart.
+    """
+    state_db_path = _policy_state_db_path(state_db_path, environ)
+    value, source = _resolve_policy_value(
+        interval_days,
+        BACKUP_INTERVAL_DAYS_SETTING_KEY,
+        BACKUP_INTERVAL_DAYS_ENV_KEY,
+        DEFAULT_BACKUP_INTERVAL_DAYS,
+        state_db_path,
+        environ,
+    )
+    return {"interval_days": value, "interval_days_source": source}
 
 
 def resolve_backup_retention(*, state_db_path=None, environ=None, retention_days=None, retention_count=None):
@@ -1270,11 +1334,7 @@ def resolve_backup_retention(*, state_db_path=None, environ=None, retention_days
     .env pins the value can see why the box they are looking at is not the one
     in charge.
     """
-    if state_db_path is None:
-        try:
-            state_db_path = inkdrop_runtime_config.state_db_path(environ if environ is not None else os.environ)
-        except Exception:
-            state_db_path = None
+    state_db_path = _policy_state_db_path(state_db_path, environ)
     resolved = {}
     for name, explicit, setting_key, env_key, fallback in (
         (
@@ -1292,31 +1352,28 @@ def resolve_backup_retention(*, state_db_path=None, environ=None, retention_days
             DEFAULT_BACKUP_RETENTION_DAYS,
         ),
     ):
-        schema = inkdrop_settings_registry.field_schema(setting_key)
-        if explicit is not None:
-            resolved[name] = int(explicit)
-            resolved[f"{name}_source"] = "explicit"
-            continue
-        stored = _stored_retention_setting(state_db_path, setting_key) if state_db_path else None
-        if stored is not None:
-            resolved[name] = stored
-            resolved[f"{name}_source"] = "settings"
-            continue
-        from_env = _environment_retention(environ, env_key, int(schema["min"]), int(schema["max"]))
-        if from_env is not None:
-            resolved[name] = from_env
-            resolved[f"{name}_source"] = "environment"
-            continue
-        resolved[name] = int(fallback)
-        resolved[f"{name}_source"] = "default"
+        value, source = _resolve_policy_value(
+            explicit, setting_key, env_key, fallback, state_db_path, environ
+        )
+        resolved[name] = value
+        resolved[f"{name}_source"] = source
     return resolved
 
 
 def backup_retention_contract(*, state_db_path=None, environ=None):
-    """Effective retention plus the schema the Settings panel renders from."""
-    resolved = resolve_backup_retention(state_db_path=state_db_path, environ=environ)
+    """Effective backup policy plus the schema the Settings panel renders from.
+
+    Carries the cadence alongside the two retention limits because all three
+    are one operator decision -- how often, how many, how old -- and because
+    the cadence had no surface at all before: no settings row, no field, and
+    nothing on the Backups panel that stated it. An operator could only ever
+    recall what the interval was, never read it.
+    """
+    resolved = dict(resolve_backup_retention(state_db_path=state_db_path, environ=environ))
+    resolved.update(resolve_backup_interval(state_db_path=state_db_path, environ=environ))
     contract = {"ok": True}
     for name, setting_key, fallback in (
+        ("interval_days", BACKUP_INTERVAL_DAYS_SETTING_KEY, DEFAULT_BACKUP_INTERVAL_DAYS),
         ("retention_count", BACKUP_RETENTION_COUNT_SETTING_KEY, DEFAULT_BACKUP_RETENTION_COUNT),
         ("retention_days", BACKUP_RETENTION_DAYS_SETTING_KEY, DEFAULT_BACKUP_RETENTION_DAYS),
     ):
@@ -1331,6 +1388,108 @@ def backup_retention_contract(*, state_db_path=None, environ=None):
             "units": schema.get("units"),
         }
     return contract
+
+
+# A scheduled backup is late once it is this far past due. The scheduler checks
+# in every four hours, so anything beyond a day means the pass is not running
+# rather than merely not having had its turn. Sized to flag rather than to stay
+# quiet: a backup that silently stopped is the failure worth catching, and a
+# card that says "healthy" while nothing has been written is the one that costs
+# something.
+BACKUP_OVERDUE_GRACE_SECONDS = 86400
+
+
+def backup_health_summary(*, backup_dir=None, state_db_path=None, environ=None, now=None):
+    """What InkDrop actually knows about its own backups.
+
+    This exists because the System page had no producer behind its Backups
+    card at all. It read `status.backup_status || systemHealth.backup`, neither
+    of which was ever written by anything, so the card could only ever fall
+    through to a hardcoded "Backups are handled outside InkDrop, and nothing
+    has reported in yet." That sentence was false on every install that had the
+    scheduler running -- InkDrop creates the archives, prunes them, and owns
+    the cadence -- and it is what sent an operator looking for a retention bug
+    that did not exist.
+
+    Everything here is read from the backups directory and the resolved policy,
+    so the card reports measured state rather than an assumption about who is
+    in charge. Raises nothing an ordinary read would not; the caller decides
+    what a failed read should look like on the page.
+    """
+    now = float(now if now is not None else time.time())
+    backup_dir = Path(backup_dir or inkdrop_runtime_config.backup_dir(environ if environ is not None else os.environ))
+    archives = list_backup_archives(backup_dir)
+    scheduled = [item for item in archives if item["label"] == "scheduled"]
+    manual = [item for item in archives if item["label"] != "scheduled"]
+
+    retention = resolve_backup_retention(state_db_path=state_db_path, environ=environ)
+    interval = resolve_backup_interval(state_db_path=state_db_path, environ=environ)
+    interval_days = interval["interval_days"]
+
+    last = scheduled[0] if scheduled else None
+    next_due_at = (last["created_at"] + interval_days * 86400) if last else None
+    overdue_by = max(0.0, now - next_due_at) if next_due_at is not None else 0.0
+
+    # Age-eligibility of what is on disk right now, under the retention in
+    # force. Deliberately not a projection of when the count cap will first
+    # bite -- that depends on backups not yet taken, and a status card must not
+    # state a guess as a date.
+    oldest = scheduled[-1] if scheduled else None
+    oldest_expires_at = (oldest["created_at"] + retention["retention_days"] * 86400) if oldest else None
+
+    if not scheduled:
+        state = "watch"
+        label = "No scheduled backup yet"
+        detail = (
+            f"InkDrop runs a full backup every {interval_days} day{'s' if interval_days != 1 else ''}, "
+            "but has not written one yet. The first runs on the next scheduled pass."
+        )
+    elif overdue_by > BACKUP_OVERDUE_GRACE_SECONDS:
+        state = "warning"
+        label = "Overdue"
+        detail = (
+            f"The last full backup was {utc_stamp(last['created_at'])} and the next was due "
+            f"{utc_stamp(next_due_at)}. Nothing has been written since, so the scheduled pass "
+            "is probably not running."
+        )
+    else:
+        state = "healthy"
+        label = "Healthy"
+        detail = (
+            f"Last full backup {utc_stamp(last['created_at'])}, next due {utc_stamp(next_due_at)}. "
+            f"Keeping the {retention['retention_count']} most recent and deleting anything over "
+            f"{retention['retention_days']} days."
+        )
+
+    return {
+        "ok": state == "healthy",
+        "state": state,
+        "status": state,
+        "label": label,
+        "detail": detail,
+        # InkDrop schedules, writes and prunes these itself. Stated as a fact
+        # in the payload so no consumer has to infer it -- inferring it wrong
+        # is the whole reason this function exists.
+        "managed_by_inkdrop": True,
+        "backup_dir": str(backup_dir),
+        "archive_count": len(archives),
+        "scheduled_count": len(scheduled),
+        "manual_count": len(manual),
+        "total_bytes": sum(int(item.get("bytes") or 0) for item in archives),
+        "last_scheduled_name": last["name"] if last else None,
+        "last_scheduled_at": last["created_at"] if last else None,
+        "last_scheduled_at_iso": utc_stamp(last["created_at"]) if last else None,
+        "next_scheduled_due_at": next_due_at,
+        "next_scheduled_due_at_iso": utc_stamp(next_due_at) if next_due_at is not None else None,
+        "overdue_seconds": overdue_by,
+        "oldest_scheduled_expires_at_iso": utc_stamp(oldest_expires_at) if oldest_expires_at is not None else None,
+        "interval_days": interval_days,
+        "interval_days_source": interval["interval_days_source"],
+        "retention_count": retention["retention_count"],
+        "retention_count_source": retention["retention_count_source"],
+        "retention_days": retention["retention_days"],
+        "retention_days_source": retention["retention_days_source"],
+    }
 
 
 def prune_backup_archives(backup_dir=None, *, retention_days=28, retention_count=0, label=None, now=None):
@@ -1388,14 +1547,14 @@ def prune_backup_archives(backup_dir=None, *, retention_days=28, retention_count
     }
 
 
-def run_scheduled_backup(*, config_dir=None, state_db_path=None, backup_dir=None, environ=None, interval_days=7, retention_days=None, retention_count=None, now=None):
+def run_scheduled_backup(*, config_dir=None, state_db_path=None, backup_dir=None, environ=None, interval_days=None, retention_days=None, retention_count=None, now=None):
     """Create a new "scheduled" backup only once interval_days have passed
     since the last one, then prune -- the interval check only ever looks at
     prior "scheduled" archives, so a manual backup an operator triggers from
     the UI never delays or resets the automatic cadence.
 
-    Leaving either retention limit as None resolves it from Settings, then the
-    environment, then the shipped default (resolve_backup_retention). That
+    Leaving interval_days or either retention limit as None resolves it from
+    Settings, then the environment, then the shipped default. That
     lookup happens here, on every pass, which is what lets an operator change
     retention in Settings and have the next scheduled backup honour it without
     restarting anything.
@@ -1409,6 +1568,12 @@ def run_scheduled_backup(*, config_dir=None, state_db_path=None, backup_dir=None
     )
     retention_days = retention["retention_days"]
     retention_count = retention["retention_count"]
+    interval = resolve_backup_interval(
+        state_db_path=state_db_path,
+        environ=environ,
+        interval_days=interval_days,
+    )
+    interval_days = interval["interval_days"]
     backup_dir = Path(backup_dir or inkdrop_runtime_config.backup_dir(environ if environ is not None else os.environ))
     existing = [item for item in list_backup_archives(backup_dir) if item["label"] == "scheduled"]
     due = not existing or (now - existing[0]["created_at"]) >= max(1, int(interval_days)) * 86400
@@ -1428,7 +1593,14 @@ def run_scheduled_backup(*, config_dir=None, state_db_path=None, backup_dir=None
         label="scheduled",
         now=now,
     )
-    return {"ok": True, "due": due, "created": created, "prune": prune_result, "retention": retention}
+    return {
+        "ok": True,
+        "due": due,
+        "created": created,
+        "prune": prune_result,
+        "retention": retention,
+        "interval": interval,
+    }
 
 
 # A backup archive InkDrop itself writes only ever has 3-5 members (manifest,
@@ -2543,7 +2715,15 @@ def main(argv=None):
     scheduled.add_argument("--config-dir")
     scheduled.add_argument("--state-db")
     scheduled.add_argument("--backup-dir")
-    scheduled.add_argument("--interval-days", type=int, default=7)
+    # Defaults to unset so a hand-run honours the configured cadence, exactly
+    # as the two retention flags below do. The scheduler passes none of the
+    # three; see run_scheduled_backup().
+    scheduled.add_argument(
+        "--interval-days",
+        type=int,
+        default=None,
+        help="Create a scheduled archive once this many days have passed. Omit to use the configured Backups setting.",
+    )
     # Both retention limits default to unset so the run resolves them from
     # Settings first. Passing one here is the override an operator running the
     # command by hand gets; the scheduler deliberately passes neither.

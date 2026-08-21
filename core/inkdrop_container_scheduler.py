@@ -541,8 +541,8 @@ def build_jobs() -> list[ScheduledJob]:
         ScheduledJob(
             "scheduled-backup",
             # This is a check-in cadence, not the backup interval itself --
-            # run_scheduled_backup() only actually creates an archive once
-            # INKDROP_BACKUP_INTERVAL_DAYS has elapsed since the last
+            # run_scheduled_backup() only actually creates an archive once the
+            # configured interval has elapsed since the last
             # "scheduled"-labeled one (real archive timestamps on disk, no
             # separate state file to lose track of across a container
             # restart). Checking every few hours costs nothing when nothing
@@ -554,17 +554,22 @@ def build_jobs() -> list[ScheduledJob]:
                 "-B",
                 _script("inkdrop_backup_restore.py"),
                 "scheduled-backup",
-                "--interval-days",
-                str(bounded_int_env("INKDROP_BACKUP_INTERVAL_DAYS", 7, 1, 90)),
-                # Neither retention limit is passed here on purpose. Both are
-                # operator policy editable from Settings > General > Full
-                # backups, and run_scheduled_backup() resolves them on every
-                # pass (Settings, then INKDROP_BACKUP_RETENTION_DAYS /
-                # INKDROP_BACKUP_RETENTION_COUNT, then the shipped default of
-                # 28 days / newest 6). Baking the value into argv here instead
-                # would freeze it at container start, so a retention change
-                # made in the UI would not take effect until a restart -- and
-                # would override the saved setting when it finally did.
+                # None of the three policy numbers is passed here on purpose:
+                # not the interval, and not either retention limit. All three
+                # are operator policy editable from Settings > General > Full
+                # backups, and run_scheduled_backup() resolves each of them on
+                # every pass (Settings, then INKDROP_BACKUP_INTERVAL_DAYS /
+                # INKDROP_BACKUP_RETENTION_DAYS / INKDROP_BACKUP_RETENTION_COUNT,
+                # then the shipped defaults of 7 days / 28 days / newest 6).
+                # Baking a value into argv here instead would freeze it at
+                # container start, so a change made in the UI would not take
+                # effect until a restart -- and would override the saved
+                # setting when it finally did.
+                #
+                # --interval-days used to be baked in here, which is exactly
+                # that trap: the cadence had no settings row and no field, so
+                # nothing surfaced the contradiction. It is resolved per run
+                # now, the same way the retention pair below always was.
                 #
                 # Age alone does not bound disk usage: an archive of the
                 # production database is ~2.25GB, so a shorter interval under
@@ -739,7 +744,17 @@ def build_jobs() -> list[ScheduledJob]:
                 _script("inkdrop_library_reconcile.py"),
                 "--mode",
                 "report",
-                "--json",
+                # No --json. run_job() does not redirect the child's streams
+                # (inkdrop_process_lifecycle.run_tracked is called with no
+                # stdout/stderr/capture_output), so the child inherits this
+                # process's stdout and anything it prints lands in ordinary
+                # container log retention -- five 10MB files, a different
+                # audience and a different lifetime from the authenticated
+                # cache file. The full report carries series titles, filenames,
+                # source and expected library paths and the absolute state-DB
+                # path, so it belongs in --cache-file only. The CLI enforces
+                # this too: supplying --cache-file makes stdout counts-only, so
+                # re-adding --json here cannot re-open it.
                 "--cache-file",
                 f"{state_dir}/library-reconciliation-last.json",
             ),

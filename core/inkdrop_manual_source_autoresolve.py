@@ -2810,6 +2810,9 @@ IDENTITY_VERDICT_REDERIVE_EXCLUDED_REASONS = frozenset({
     "slskd_transfer_missing_staged_file",
     "slskd_transfer_stalled",
 })
+IDENTITY_VERDICT_REDERIVE_WANTED_STATUSES = frozenset({
+    "wanted", "missing", "queued", "searching", "in_progress",
+})
 
 
 CONTENT_DIGEST_RE = re.compile(r"^(?:sha256|sha1|md5|blake2b|blake2s):[0-9a-f]{16,}$", re.I)
@@ -2893,12 +2896,14 @@ def stored_identity_verdict_is_stale(probe, record, detected, known_bad):
             con.row_factory = sqlite3.Row
             queue_row = con.execute(
                 """
-                select q.*, s.title as series, s.media_type as media_type,
+                select q.*, wi.status as wanted_status,
+                       s.title as series, s.media_type as media_type,
                        i.title as issue_title, i.issue_number as issue_number,
                        i.release_date as issue_release_date,
                        i.metadata_provider as issue_metadata_provider,
                        s.metadata_provider as metadata_provider
                 from queue_items q
+                left join wanted_items wi on wi.id=q.wanted_id
                 left join series s on s.id=q.series_id
                 left join issues i on i.id=q.issue_id
                 where q.id=? limit 1
@@ -2907,7 +2912,17 @@ def stored_identity_verdict_is_stale(probe, record, detected, known_bad):
             ).fetchone()
             if not queue_row:
                 return False
-            wanted = inkdrop_source_worker_coordinator.wanted_item_from_queue(dict(queue_row), con=con)
+            # Re-derivation may return a staged file to the ordinary acceptance
+            # path, so only current work may reach it. Settled or ownerless rows
+            # retain their durable refusal regardless of later policy changes.
+            if not inkdrop_state.queue_item_is_activeish(dict(queue_row)):
+                return False
+            wanted_status = str(queue_row["wanted_status"] or "").strip().lower()
+            if wanted_status not in IDENTITY_VERDICT_REDERIVE_WANTED_STATUSES:
+                return False
+            wanted = inkdrop_source_worker_coordinator.wanted_item_from_queue(
+                dict(queue_row), db_path=INKDROP_STATE_DB, con=con
+            )
     except Exception:
         return False
     if not wanted:

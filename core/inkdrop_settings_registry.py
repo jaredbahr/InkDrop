@@ -71,6 +71,12 @@ NUMBER_SPECS = {
     # container scheduler already applied to the equivalent environment
     # variables, so nothing an install could previously configure becomes
     # unreachable through the setting.
+    # Bounds match the ones the container scheduler used to apply to
+    # INKDROP_BACKUP_INTERVAL_DAYS, so nothing an install could already
+    # configure in .env becomes unreachable through the setting.
+    "backup.interval_days": {
+        "min": 1, "max": 90, "integer": True, "units": "days", "default": 7, "recommended": 7,
+    },
     "backup.retention_count": {
         "min": 1, "max": 100, "integer": True, "units": "backups", "default": 6, "recommended": 6,
     },

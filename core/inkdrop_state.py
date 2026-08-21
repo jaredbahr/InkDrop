@@ -20,6 +20,7 @@ import unicodedata
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+from core import inkdrop_review_reasons
 from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
 from core import inkdrop_db
@@ -207,7 +208,12 @@ HISTORY_ACTIVITY_VIEW_TTL_SECONDS = 8
 HISTORY_ACTIVITY_VIEW_CACHE = {}
 SETTINGS_SNAPSHOT_TTL_SECONDS = 60
 SOURCE_PROVIDER_VIEW_TTL_SECONDS = 45
-# Both caches below are rebuilt outside this lock (a DB read can take a while
+# The two acquisition-policy settings are read once per projected wanted row.
+# A planning pass projects every due row, so an uncached read is per-row work
+# on a path whose whole point is to be flat in row count. Same bound as the
+# settings snapshot every other reader already tolerates.
+ACQUISITION_POLICY_SETTINGS_TTL_SECONDS = SETTINGS_SNAPSHOT_TTL_SECONDS
+# The caches below are rebuilt outside this lock (a DB read can take a while
 # under load), so a plain lock around the read/write of each cache's fields
 # only stops a torn read -- it does not stop a rebuild that started *before*
 # a settings write from publishing its now-stale result *after*
@@ -221,6 +227,7 @@ SETTINGS_SNAPSHOT_CACHE = {
     "record": None,  # {"db_path": ..., "ts": ..., "snapshot": ...} or None
 }
 SOURCE_PROVIDER_VIEW_CACHE = {}
+ACQUISITION_POLICY_SETTINGS_CACHE = {}
 # The Blocklist page's impact rollup has to check whether each source_attempts
 # row was ever flagged by source memory, including rows a later pass
 # reclassified under a different status/failure_reason. That check is a
@@ -490,6 +497,7 @@ def clear_settings_caches():
         SETTINGS_CACHE_GENERATION += 1
         SETTINGS_SNAPSHOT_CACHE["record"] = None
         SOURCE_PROVIDER_VIEW_CACHE.clear()
+        ACQUISITION_POLICY_SETTINGS_CACHE.clear()
 
 
 def clear_state_view_summary_cache():
@@ -24935,6 +24943,56 @@ def media_management_root_for_media_type(db_path, media_type):
     ).strip()
 
 
+def acquisition_policy_settings(db_path):
+    """Just the two settings the acquisition policy reads.
+
+    Deliberately narrow: this runs once per projected wanted row, and the full
+    media-management context is ~30 separate setting reads. Defaults are
+    MEDIA_MANAGEMENT_SETTING_DEFAULTS verbatim -- this reports the stored
+    value, it does not choose one.
+
+    Narrow was not enough. Two reads still means two connections for every row
+    a planning pass projects, which put per-row database work back on the
+    batched planner -- measured at +2 connections and ~+4 SELECTs per extra
+    queue row, against a planner whose contract is to stay flat in row count.
+    These are instance-wide values, identical for every row in a pass, so they
+    get the same treatment as the settings snapshot and the provider view.
+
+    What actually invalidates is clear_settings_caches() emptying this dict, so
+    an in-process settings write is visible on the next call. The generation
+    counter does a narrower job: it stops a read that began BEFORE a write from
+    publishing its now-stale result afterwards with a fresh timestamp. The TTL
+    is the only bound on a write made by a DIFFERENT process, and it is the
+    same bound every other settings reader here already lives with -- so this
+    adds no staleness that was not already accepted.
+    """
+    cache_key = str(db_path)
+    now = time.time()
+    with SETTINGS_CACHE_LOCK:
+        cached = ACQUISITION_POLICY_SETTINGS_CACHE.get(cache_key)
+        generation = SETTINGS_CACHE_GENERATION
+    if (
+        isinstance(cached, dict)
+        and isinstance(cached.get("settings"), dict)
+        and now - float(cached.get("ts") or 0) <= ACQUISITION_POLICY_SETTINGS_TTL_SECONDS
+    ):
+        return dict(cached["settings"])
+    settings = {
+        "unit_preference": media_management_text_setting(
+            db_path, "unit_preference", MEDIA_MANAGEMENT_SETTING_DEFAULTS["unit_preference"]
+        ) or MEDIA_MANAGEMENT_SETTING_DEFAULTS["unit_preference"],
+        "collected_edition_policy": media_management_text_setting(
+            db_path, "collected_edition_policy", MEDIA_MANAGEMENT_SETTING_DEFAULTS["collected_edition_policy"]
+        ) or MEDIA_MANAGEMENT_SETTING_DEFAULTS["collected_edition_policy"],
+    }
+    with SETTINGS_CACHE_LOCK:
+        # A write that landed while this was reading wins: publishing now would
+        # stamp a stale value with a fresh timestamp.
+        if SETTINGS_CACHE_GENERATION == generation:
+            ACQUISITION_POLICY_SETTINGS_CACHE[cache_key] = {"ts": time.time(), "settings": dict(settings)}
+    return dict(settings)
+
+
 def media_management_settings_context(db_path):
     return {
         "root_folder_strategy": media_management_text_setting(db_path, "root_folder_strategy", "media_type") or "media_type",
@@ -24974,6 +25032,14 @@ def media_management_settings_context(db_path):
         "library_visibility_provider_order": app_setting_value(db_path, "media_management.library_visibility_provider_order", ["komga", "kavita"]) or ["komga", "kavita"],
         "manga_companion_folder_convergence": media_management_bool_setting(db_path, "manga_companion_folder_convergence", True),
         "cover_injection_enabled": media_management_bool_setting(db_path, "cover_injection_enabled", False),
+        # Acquisition policy inputs. Defaults are MEDIA_MANAGEMENT_SETTING_DEFAULTS
+        # verbatim -- this exposes the stored value, it does not choose one.
+        "unit_preference": media_management_text_setting(
+            db_path, "unit_preference", MEDIA_MANAGEMENT_SETTING_DEFAULTS["unit_preference"]
+        ) or MEDIA_MANAGEMENT_SETTING_DEFAULTS["unit_preference"],
+        "collected_edition_policy": media_management_text_setting(
+            db_path, "collected_edition_policy", MEDIA_MANAGEMENT_SETTING_DEFAULTS["collected_edition_policy"]
+        ) or MEDIA_MANAGEMENT_SETTING_DEFAULTS["collected_edition_policy"],
     }
 
 
@@ -56334,6 +56400,34 @@ def manual_review_canonical_snapshot(db_path, limit=5000):
         row for row in review_candidates
         if str(row.get("state") or "").strip().lower() == "provider_wait"
     ]
+
+    # Presentation for the reason, the state pill and the source pill, attached
+    # once here rather than derived per surface. Mobile ran all three through a
+    # generic title-caser, so `slskd_transfer_missing_staged_file_repeat`
+    # reached the operator as "Slskd Transfer Missing Staged File Repeat" -- a
+    # machine identifier dressed as an English sentence, which reads as
+    # InkDrop's considered explanation rather than as the leaked token it is.
+    #
+    # In place, on the shared row objects, before rows_by_filter slices them
+    # into overlapping lists -- a row appears in several filters and must not
+    # be labelled differently in each.
+    # Over BOTH candidate lists: decisions is built from queue_candidates +
+    # review_candidates, so iterating review_candidates alone would leave
+    # every queue-origin row unlabelled and silently fall back in the UI.
+    for row in [*queue_candidates, *review_candidates]:
+        inkdrop_review_reasons.annotate_row(row)
+        raw_source = str(row.get("current_source") or row.get("source") or "").strip()
+        # source_display_label() is this repo's one source-naming function;
+        # a second copy in JavaScript is how the two would drift.
+        row["source_label"] = source_display_label(raw_source) if raw_source else ""
+        state_label = str(row.get("display_state_label") or "").strip()
+        if not state_label:
+            raw_state = str(row.get("display_state") or row.get("state") or row.get("status") or "").strip()
+            # Sentence case, not title case. An unmapped state should still
+            # look like the token it is rather than considered copy.
+            text = raw_state.replace("_", " ").strip()
+            state_label = (text[:1].upper() + text[1:]) if text else ""
+        row["state_label"] = state_label
 
     def ordered(rows):
         rows = list(rows or [])

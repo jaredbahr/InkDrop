@@ -2571,7 +2571,10 @@ def queue_source_explicit_unit_context(item):
     item = item if isinstance(item, dict) else {}
     if not inkdrop_candidate_matching:
         return {}
-    target = inkdrop_candidate_matching.target_context(item)
+    # Explicit: this path reads only unit_type from the target and never
+    # touches acquisition_policy, so instance settings deliberately do not
+    # apply here. Recorded rather than omitted -- see tracker #296.
+    target = inkdrop_candidate_matching.target_context(item, settings=None)
     unit_type = str(target.get("unit_type") or "").strip().lower()
     aliases = {
         "vol": "volume", "book_volume": "volume", "manga_volume": "volume",
@@ -5323,6 +5326,25 @@ def durable_bad_source_candidate_match(candidate):
     out["detected_filename"] = out.get("detected_filename") or source_path or out.get("source_path") or title
     out["source_memory"] = True
     out["source_memory_id"] = out.get("id")
+    # A transfer that did not finish is not a statement that the file is the
+    # wrong file. TRANSIENT_BAD_CANDIDATE_REASONS already says so -- peer and
+    # network outcomes plus our own resolver_error -- and the per-review rows
+    # above have honored a TRANSIENT_BAD_CANDIDATE_RETRY_SECONDS cooldown on
+    # exactly those reasons since it shipped. The durable table never did, so
+    # both callers (bad_candidate_match, and the staged-candidate check that
+    # appends this row directly) treated the same reason as permanent here
+    # while treating it as retryable there. Measured live: 709 durable rows
+    # carried one of those four reasons past the window, 170 of them on issues
+    # still wanted, some on rows whose queue phase now reads
+    # searched_no_candidates -- InkDrop reporting nothing was found while
+    # suppressing a candidate it had already found because a peer stalled.
+    #
+    # The cooldown lives here rather than in the two call sites so a third
+    # caller cannot reintroduce the asymmetry. Every other reason -- the
+    # judgements that are actually about the file -- is absent from that set
+    # and is returned exactly as before, as is a row with no usable timestamp.
+    if transient_bad_candidate_retry_ready(out):
+        return None
     return out
 
 
@@ -7251,7 +7273,7 @@ def authoritative_candidate_identity_text(candidate, filename):
     return filename_leaf(filename)
 
 
-def candidate_identity_compatibility(candidate, filename, item):
+def candidate_identity_compatibility(candidate, filename, item, *, settings=None):
     identity_text = authoritative_candidate_identity_text(candidate, filename)
     candidate = candidate if isinstance(candidate, dict) else {}
     identity_candidate = {
@@ -7264,7 +7286,7 @@ def candidate_identity_compatibility(candidate, filename, item):
     manifest_match = candidate.get("pack_contents_match")
     if isinstance(manifest_match, dict):
         identity_candidate["pack_contents_match"] = dict(manifest_match)
-    compatibility = inkdrop_candidate_matching.candidate_compatibility(identity_candidate, item)
+    compatibility = inkdrop_candidate_matching.candidate_compatibility(identity_candidate, item, settings=settings)
 
     # Alternate result fields may veto a leaf, but must never donate positive
     # title or unit evidence to it. Keep these provider/durable safety signals
@@ -7289,7 +7311,7 @@ def candidate_identity_compatibility(candidate, filename, item):
         if inkdrop_candidate_matching.parse_release_title(value).get("preview_or_sample"):
             veto_codes.append("preview_or_sample")
             break
-    alternate_compatibility = inkdrop_candidate_matching.candidate_compatibility(candidate, item)
+    alternate_compatibility = inkdrop_candidate_matching.candidate_compatibility(candidate, item, settings=settings)
     if "creator_identity_conflict" in (alternate_compatibility.get("rejection_codes") or []):
         veto_codes.append("creator_identity_conflict")
 
@@ -8510,7 +8532,7 @@ def leaf_identity_authority(leaf, item):
     return "exact" if prefix_match else "foreign"
 
 
-def auto_grab_candidate_verdict(candidate, item):
+def auto_grab_candidate_verdict(candidate, item, *, settings=None):
     filename = candidate.get("filename") or candidate.get("path") or ""
     policy_filename = filename_without_exact_issue_titles(filename, item=item)
     directory_identity_filename = ""
@@ -8549,7 +8571,7 @@ def auto_grab_candidate_verdict(candidate, item):
             unit_candidate = dict(candidate or {})
             unit_candidate.setdefault("provider_id", "slskd")
             unit_candidate["title"] = compatibility_title
-            unit_compatibility = inkdrop_candidate_matching.candidate_compatibility(unit_candidate, item)
+            unit_compatibility = inkdrop_candidate_matching.candidate_compatibility(unit_candidate, item, settings=settings)
         blockers.extend(unit_compatibility.get("rejection_codes") or [])
         review_reasons.extend(unit_compatibility.get("review_codes") or [])
         reasons.extend(unit_compatibility.get("positive_evidence") or [])
@@ -13057,7 +13079,7 @@ def explicit_leaf_publisher_conflict(leaf, item):
     )
 
 
-def series_run_leaf_identity_filename(file_row, item):
+def series_run_leaf_identity_filename(file_row, item, *, settings=None):
     """Build bounded identity text only after the leaf proves its exact unit.
 
     Returns (identity_filename, reason, parent_dependent). parent_dependent
@@ -13088,6 +13110,7 @@ def series_run_leaf_identity_filename(file_row, item):
         compatibility = inkdrop_candidate_matching.candidate_compatibility(
             {"title": compatibility_leaf, "provider_id": "slskd"},
             item,
+            settings=settings,
         )
         rejection_codes = list(compatibility.get("rejection_codes") or [])
         review_codes = list(compatibility.get("review_codes") or [])
@@ -14696,7 +14719,10 @@ def canonical_retarget_unit(entry):
             return (unit_type, unit_number) if unit_number else ("", "")
         return "", ""
     if inkdrop_candidate_matching:
-        target = inkdrop_candidate_matching.target_context(entry)
+        # Explicit: this path reads only unit_type from the target and never
+        # touches acquisition_policy, so instance settings deliberately do not
+        # apply here. Recorded rather than omitted -- see tracker #296.
+        target = inkdrop_candidate_matching.target_context(entry, settings=None)
         unit_type = str(target.get("unit_type") or "").strip().lower()
         if unit_type in {"volume", "vol", "book_volume", "manga_volume"}:
             return "volume", str(target.get("volume_number") or "")

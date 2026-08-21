@@ -22,6 +22,7 @@ from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
 from core import inkdrop_state
 from core import inkdrop_operator_contracts
+from core import inkdrop_release_identity
 from core import inkdrop_version
 from core import inkdrop_web_state_views
 from core import inkdrop_acquisition_funnel
@@ -1435,9 +1436,18 @@ HTML = r"""<!doctype html>
           title: "Settings",
           description: "Indexers, download clients, paths, language rules, and automation defaults grouped by area.",
           stats: [],
-          actions: [
-            mastheadAction("Provider Settings", {target: "inkdropSettings"}),
-          ],
+          // No masthead action. This model was built with a "Provider
+          // Settings" button targeting #inkdropSettings -- the settings
+          // drawer on the page it is already rendered on, so it scrolled
+          // to itself. It was never seen: the Settings masthead was
+          // display:none until 2026-08-20, when Settings was given the
+          // redesign-shell header (15-redesign-shell.css). Showing the
+          // header would have made this self-link visible for the first
+          // time, so it goes rather than shipping a new no-op control to
+          // ten Settings areas. The real per-area actions (Show Advanced,
+          // No Changes, Test All, Refresh) live in .settings-toolbar-cluster
+          // below the header and are untouched.
+          actions: [],
         },
         system: {
           tone: systemProblemCount ? "warn" : "good",
@@ -6226,6 +6236,18 @@ HTML = r"""<!doctype html>
       if (next === inkdropSeriesSearchQuery) return;
       inkdropSeriesSearchQuery = next;
       setSeriesAddPanelOpen(false);
+      // The nav search box stays mounted on the single-series detail page,
+      // but it searches the library ("Search existing series"). Re-rendering a
+      // detail payload in place filters its one focused row out and lands on
+      // the focused empty state; leave the detail route -- and drop the
+      // #series?series_id= hash that would re-focus it on reload -- so the
+      // search runs against the library the box claims to search.
+      if (seriesDetailPayloadIsFocused(activeInkdropSectionPayload || {})) {
+        focusedSeriesRow = null;
+        clearInkdropRouteHash("series");
+        loadInkdropSection("series", null, {scroll: "top"});
+        return;
+      }
       if ((activeInkdropViewSection || activeInkdropPrimarySection) === "series" && activeInkdropSectionPayload?.view === "series") {
         renderInkdropSection(activeInkdropSectionPayload);
       } else {
@@ -6242,6 +6264,11 @@ HTML = r"""<!doctype html>
         if (event.key === "Enter") {
           event.preventDefault();
           setSeriesAddPanelOpen(false);
+          // Same reasoning as applyInkdropSeriesNavSearch: this reload drops
+          // focus, so the hash that still names the focused series has to go
+          // with it or a refresh silently re-focuses the library.
+          focusedSeriesRow = null;
+          clearInkdropRouteHash("series");
           loadInkdropSection("series", null, {scroll: "top"});
         } else if (event.key === "Escape") {
           event.preventDefault();
@@ -7670,7 +7697,14 @@ HTML = r"""<!doctype html>
         const activeImports = Number(status.ready_import_count || stateCounts.importing || state.imports_active || 0);
         const disks = Array.isArray(systemHealth.disks) ? systemHealth.disks : [];
         const storageWarnings = disks.filter(item => systemToneFromState(item?.state || item?.status) !== "good").length;
-        const backup = status.backup_status || systemHealth.backup || {};
+        // systemHealth.backup is the only source. There was previously a
+        // second operand ahead of it -- a `backup_status` key on the status
+        // payload that no code anywhere ever wrote -- so the whole expression
+        // fell through to a hardcoded string claiming backups were handled
+        // outside InkDrop. They are not: InkDrop schedules them, writes them
+        // and prunes them. Reading one key that is actually produced is what
+        // keeps that sentence from being reachable again.
+        const backup = systemHealth.backup || {};
         const acquisitionWorkerHealthy = automatic.acquisition_worker_healthy !== undefined
           ? automatic.acquisition_worker_healthy === true
           : automatic.worker_healthy === true;
@@ -7691,7 +7725,7 @@ HTML = r"""<!doctype html>
           ["Maintenance", maintenanceLabel, maintenanceDetail, ""],
           ["Active work", `${activeDownloads} download${activeDownloads === 1 ? "" : "s"} · ${activeImports} import${activeImports === 1 ? "" : "s"}`, "Current transfer and import activity.", ""],
           ["Storage", storageWarnings ? `${storageWarnings} warning${storageWarnings === 1 ? "" : "s"}` : "No warnings", storageWarnings ? "See which paths are low." : "Configured storage has no reported warning.", storageWarnings ? "disk-space" : ""],
-          ["Backups", backup.state || backup.status || "Not reported", backup.detail || backup.last_success_at_iso || "Backups are handled outside InkDrop, and nothing has reported in yet.", ""],
+          ["Backups", backup.label || "Not measured yet", backup.detail || "InkDrop has not read the backups folder yet.", ""],
         ];
         for (const [label, value, detail, target] of rows) {
           // A card that names a problem should be the way to go look at it.
@@ -18016,11 +18050,13 @@ HTML = r"""<!doctype html>
       status.textContent = text;
       status.className = `manual-review-decision-status ${tone}`;
       status.hidden = !text;
+      delete status.dataset.reviewActionToken;
     }
 
     function manualReviewActionButton(action={}) {
       const btn = document.createElement("button");
       btn.type = "button";
+      btn.dataset.manualReviewDecisionControl = "true";
       const label = document.createElement("span");
       label.className = "manual-review-action-label";
       label.textContent = action.label || "Action";
@@ -18044,10 +18080,25 @@ HTML = r"""<!doctype html>
           if (btn.disabled) return;
           btn.disabled = true;
           const original = label.textContent;
+          const startedAt = Date.now();
           label.textContent = "Working…";
+          const elapsed = document.createElement("span");
+          elapsed.className = "manual-review-action-elapsed";
+          elapsed.setAttribute("aria-hidden", "true");
+          label.after(elapsed);
+          // Keep visual motion without changing the button's accessible name
+          // every second. The live region announces one neutral explanation
+          // after the short-wait threshold instead of reading a stopwatch.
+          const ticker = window.setInterval(() => {
+            if (!btn.isConnected) return;
+            const seconds = Math.round((Date.now() - startedAt) / 1000);
+            if (seconds >= 3) elapsed.textContent = ` ${seconds}s`;
+          }, 1000);
           try {
             await action.onClick();
           } finally {
+            window.clearInterval(ticker);
+            elapsed.remove();
             if (btn.isConnected) {
               btn.disabled = false;
               label.textContent = original;
@@ -18152,6 +18203,10 @@ HTML = r"""<!doctype html>
     }
 
     function stepManualReviewDecision(direction) {
+      if (manualReviewDecisionActionPending()) {
+        setManualReviewDecisionStatus("Another Manual Review decision is still running. Wait for its result before choosing another.", "warn");
+        return;
+      }
       const rows = manualReviewDecisionRows();
       const index = manualReviewDecisionIndex(selectedManualReviewRow || {});
       if (index === -1 || !rows.length) return;
@@ -18162,10 +18217,35 @@ HTML = r"""<!doctype html>
     }
 
     let selectedManualReviewRow = null;
+    let manualReviewDecisionModalRevision = 0;
+
+    function manualReviewDecisionActionPending() {
+      return Boolean(inkdropReviewActionInFlight);
+    }
+
+    function setManualReviewDecisionControlsPending(pending) {
+      const controls = [
+        ...document.querySelectorAll('[data-manual-review-decision-control="true"]'),
+        $("manualReviewDecisionPrev"),
+        $("manualReviewDecisionNext"),
+      ].filter(Boolean);
+      for (const control of controls) {
+        if (pending) {
+          if (!Object.prototype.hasOwnProperty.call(control.dataset, "reviewActionWasDisabled")) {
+            control.dataset.reviewActionWasDisabled = control.disabled ? "true" : "false";
+          }
+          control.disabled = true;
+        } else if (Object.prototype.hasOwnProperty.call(control.dataset, "reviewActionWasDisabled")) {
+          control.disabled = control.dataset.reviewActionWasDisabled === "true";
+          delete control.dataset.reviewActionWasDisabled;
+        }
+      }
+    }
 
     function openManualReviewDecisionModal(row={}) {
       const item = manualReviewActionRow(row) || row || {};
       selectedManualReviewRow = item;
+      manualReviewDecisionModalRevision += 1;
       const modal = $("manualReviewDecisionModal");
       if (!modal) return;
       const title = $("manualReviewDecisionTitle");
@@ -18239,8 +18319,16 @@ HTML = r"""<!doctype html>
         }
       }
       if (safety) safety.textContent = "Approve only if this file is the correct issue/chapter. Reject keeps InkDrop searching. Ignore hides this wanted item from Manual Review without deleting files.";
-      // A previous row's failure must not read as this one's.
-      setManualReviewDecisionStatus("");
+      // A previous row's failure must not read as this one's. If another row
+      // owns an active request, this row is viewable but cannot start a second
+      // decision until that request settles.
+      if (manualReviewDecisionActionPending()) {
+        setManualReviewDecisionStatus("Another Manual Review decision is still running. Wait for its result before choosing another.", "warn");
+        const status = $("manualReviewDecisionStatus");
+        if (status && inkdropReviewActionInFlight) status.dataset.reviewActionToken = inkdropReviewActionInFlight.token;
+      } else {
+        setManualReviewDecisionStatus("");
+      }
       const {primary, advanced} = manualReviewDecisionActions(item);
       if (actions) {
         actions.innerHTML = "";
@@ -18261,6 +18349,7 @@ HTML = r"""<!doctype html>
       if (navPosition) navPosition.textContent = rows.length && index !== -1 ? `${index + 1} of ${rows.length}` : "";
       if (navPrev) navPrev.disabled = index <= 0;
       if (navNext) navNext.disabled = index === -1 || index >= rows.length - 1;
+      setManualReviewDecisionControlsPending(manualReviewDecisionActionPending());
       modal.hidden = false;
       modal.onclick = event => {
         if (event.target === modal) closeManualReviewDecisionModal();
@@ -21260,7 +21349,9 @@ HTML = r"""<!doctype html>
         if (!searching && (!seriesFilter || seriesFilter === "all")) {
           return "No series yet. Add one with Add Series and InkDrop starts tracking its issues.";
         }
-        if (searching) return "No series match that search.";
+        // Name the query. "No series match that search" made the user re-read
+        // the box to find out what the app thought they had typed.
+        if (searching) return `No series match "${String(inkdropSeriesSearchQuery || "").trim()}".`;
         return "No series match this filter.";
       }
       return "Nothing here yet.";
@@ -22291,8 +22382,23 @@ HTML = r"""<!doctype html>
         : viewPayload;
       if (!rows.length) {
         renderTransferImportDrainStrip(rowsBox, view, rows, viewPayload);
-        if (!renderFocusedEmptyState(rowsBox, view, viewPayload)) {
-          if (!renderOperationalEmptyState(rowsBox, view, viewPayload)) {
+        // `rows` is post-client-filter; `sourceRows` is what the endpoint
+        // actually returned. Both renderFocusedEmptyState and
+        // renderOperationalEmptyState assert server-side facts -- "the row
+        // this view is focused on is not in this payload", "N rows match this
+        // view elsewhere" -- so they may only speak when the server itself
+        // returned nothing. When the server returned rows and a client-side
+        // filter emptied the list, the rows and the focus are both still
+        // there, and the focused state's wording ("Series not found -- this
+        // series may have been removed") tells the user something was deleted
+        // because they typed in a search box. Report the filter that actually
+        // emptied the list instead. Today the Series nav search is the only
+        // client-side row filter (every other view passes sourceRows through
+        // sort-only), but gating on the payload rather than on `view` keeps
+        // that true for the next one.
+        const clientFilterEmptiedRows = sourceRows.length > 0;
+        if (clientFilterEmptiedRows || !renderFocusedEmptyState(rowsBox, view, viewPayload)) {
+          if (clientFilterEmptiedRows || !renderOperationalEmptyState(rowsBox, view, viewPayload)) {
             const empty = document.createElement("div");
             empty.className = "section-empty";
             empty.textContent = emptyInkdropSectionMessage(view, viewPayload);
@@ -28972,7 +29078,7 @@ HTML = r"""<!doctype html>
       panel.className = "settings-backup-restore";
       panel.dataset.settingsFullBackups = "true";
       const intro = document.createElement("p");
-      intro.textContent = "A full backup copies the entire state database (not just settings) plus your logins and API keys. A scheduled backup runs automatically in the background, and older ones are deleted once either limit below is passed. You can also create one manually here at any time -- backups you make yourself are never deleted automatically -- or import a backup file from another install or an older InkDrop version.";
+      intro.textContent = "A full backup copies the entire state database (not just settings) plus your logins and API keys. A scheduled backup runs automatically on the schedule below, and older ones are deleted once either retention limit below is passed. You can also create one manually here at any time -- backups you make yourself are never deleted automatically -- or import a backup file from another install or an older InkDrop version.";
       const mergePreviewIntro = document.createElement("p");
       mergePreviewIntro.textContent = "Bringing in a backup from a different InkDrop instance? \"Preview merge\" on any backup below compares its series and issues against your library and shows what's new, what you already have, and anything that needs a human to look at it -- by exact metadata ID only, never by title. This is a preview only: nothing is added, changed, or removed. Actually importing is not available yet.";
       const restoreDisabledNotice = document.createElement("p");
@@ -29194,25 +29300,44 @@ HTML = r"""<!doctype html>
     // than editing a box that quietly loses to it on the next run.
     const BACKUP_RETENTION_FIELDS = [
       {
+        name: "interval_days",
+        label: "Back up every",
+        suffix: "days",
+        help: "How often InkDrop creates a full backup. It checks a few times a day and writes one as soon as this many days have passed since the last, so a backup missed while InkDrop was off is picked up shortly after it starts again.",
+        floorNote: "The shortest schedule is one day.",
+      },
+      {
         name: "retention_count",
         label: "Backups to keep",
         suffix: "most recent",
         help: "Once there are more scheduled backups than this, the oldest are deleted. Each one is a full copy of the state database, so this is what decides how much disk the backups folder uses.",
+        floorNote: "InkDrop always keeps at least one backup, so 1 is the lowest this goes.",
       },
       {
         name: "retention_days",
         label: "Delete backups older than",
         suffix: "days",
         help: "A scheduled backup this old is deleted even if the number kept has not been reached. The newest backup is always kept, whatever both limits say.",
+        floorNote: "InkDrop always keeps at least one backup, so 1 is the lowest this goes.",
       },
     ];
 
+    // Keyed rather than a ternary. This was `key === "backup.retention_count"
+    // ? COUNT : DAYS`, which silently labelled anything that was not the count
+    // as the days variable -- so adding a third field would have told an
+    // operator their cadence was pinned by INKDROP_BACKUP_RETENTION_DAYS.
+    const BACKUP_SETTING_ENV_NAMES = {
+      "backup.interval_days": "INKDROP_BACKUP_INTERVAL_DAYS",
+      "backup.retention_count": "INKDROP_BACKUP_RETENTION_COUNT",
+      "backup.retention_days": "INKDROP_BACKUP_RETENTION_DAYS",
+    };
+
     function backupRetentionSourceNote(field) {
       if (field.source === "environment") {
-        const variable = field.key === "backup.retention_count"
-          ? "INKDROP_BACKUP_RETENTION_COUNT"
-          : "INKDROP_BACKUP_RETENTION_DAYS";
-        return `Currently set by ${variable} in your .env file. Saving here takes over from it.`;
+        const variable = BACKUP_SETTING_ENV_NAMES[field.key];
+        return variable
+          ? `Currently set by ${variable} in your .env file. Saving here takes over from it.`
+          : "Currently set in your .env file. Saving here takes over from it.";
       }
       if (field.source === "settings") return "";
       return `Using the default of ${field.default}.`;
@@ -29228,7 +29353,7 @@ HTML = r"""<!doctype html>
         row.className = "settings-form-row";
         row.dataset.settingKey = field.key;
         row.dataset.backupRetentionField = spec.name;
-        row.dataset.settingsSearchText = [spec.label, field.key, "backup retention", spec.help].join(" ");
+        row.dataset.settingsSearchText = [spec.label, field.key, "backup retention schedule", spec.help].join(" ");
 
         const label = document.createElement("div");
         label.className = "settings-form-label";
@@ -29285,7 +29410,7 @@ HTML = r"""<!doctype html>
           if (!raw || !Number.isInteger(parsed) || parsed < field.minimum || parsed > field.maximum) {
             toast(
               `${spec.label} must be a whole number from ${field.minimum} to ${field.maximum}. `
-              + `InkDrop always keeps at least one backup, so ${field.minimum} is the lowest this goes.`,
+              + (spec.floorNote || ""),
               false,
               "inkdropSettings",
             );
@@ -29298,9 +29423,9 @@ HTML = r"""<!doctype html>
             field.source = "settings";
             note.textContent = backupRetentionSourceNote(field);
             note.hidden = !note.textContent;
-            toast("Backup retention saved.", true, "inkdropSettings");
+            toast("Backup settings saved.", true, "inkdropSettings");
           } catch (err) {
-            toast(err?.message || "Could not save backup retention.", false, "inkdropSettings");
+            toast(err?.message || "Could not save backup settings.", false, "inkdropSettings");
           } finally {
             save.disabled = false;
           }
@@ -37530,37 +37655,127 @@ HTML = r"""<!doctype html>
       }
     }
 
-    const inkdropReviewActionsInFlight = new Set();
+    let inkdropReviewActionInFlight = null;
+    let inkdropReviewActionSequence = 0;
+    // A local-file decision runs the whole flock wrapper under one 600s
+    // subprocess timeout; up to 60s of lock waiting consumes that same budget.
+    // This browser deadline is longer than the server bound. If it fires, the
+    // result is unknown rather than safe to retry. Other decision types use
+    // the same client path but must not be described as imports or assigned a
+    // lock holder the server never named.
+    const INKDROP_REVIEW_ACTION_TIMEOUT_MS = 690000;
+    const INKDROP_REVIEW_ACTION_EXPLAIN_AFTER_MS = 6000;
+
+    function manualReviewDecisionIdentity(row={}) {
+      return String(row?.review_id || row?.id || "").trim();
+    }
+
+    function reviewActionOwnsCurrentPanel(operation) {
+      return Boolean(
+        operation
+        && operation.modalRevision === manualReviewDecisionModalRevision
+        && operation.reviewId
+        && operation.reviewId === manualReviewDecisionIdentity(selectedManualReviewRow || {}),
+      );
+    }
+
+    function setReviewActionOwnedStatus(operation, message, tone="warn") {
+      if (!reviewActionOwnsCurrentPanel(operation)) return false;
+      setManualReviewDecisionStatus(message, tone);
+      const status = $("manualReviewDecisionStatus");
+      if (status && operation) status.dataset.reviewActionToken = operation.token;
+      return true;
+    }
+
+    function reviewActionWaitingMessage() {
+      return "Still working. InkDrop is finishing this Manual Review decision. Wait for its result before choosing another.";
+    }
+
+    function reviewActionOutcomeUnknown(err) {
+      const reason = [
+        String(err?.message || err || ""),
+        String(err?.detail || ""),
+        String(err?.code || ""),
+        String(err?.name || ""),
+      ].join(" | ");
+      return /did not respond within|import timed out|network_unavailable|aborterror|network request failed|failed to fetch|connection/i.test(reason);
+    }
+
+    function reviewActionFailureMessage(err) {
+      const raw = String(err?.message || err || "").trim();
+      const reason = [raw, String(err?.detail || ""), String(err?.payload?.error || "")].join(" | ");
+      if (reviewActionOutcomeUnknown(err)) {
+        return "InkDrop lost contact before it could confirm the result. The outcome is unknown. Refresh Manual Review and check History before retrying.";
+      }
+      if (/another import is running/i.test(reason)) {
+        return "Another import was already running, so this decision did not start. Nothing was imported or changed. Wait for that import to finish, then retry.";
+      }
+      return raw || "That decision did not go through. Check History before deciding again.";
+    }
+
+    function reviewActionNonSuccessResult(data={}) {
+      const result = data?.result && typeof data.result === "object" ? data.result : {};
+      const state = String(result.state || result.status || "").trim().toLowerCase();
+      if (result.manual_source_import_busy || state === "import_busy") {
+        return result.note || "Another import is already running. This decision did not complete; wait for the current import to finish before retrying.";
+      }
+      return "";
+    }
 
     async function reviewAction(path, payload) {
-      // Every Approve, Approve pack and Bad match button lands here, and none
-      // of them disabled themselves for the round trip. A double-click sent
-      // the decision twice; a fast click on Approve then Bad match sent both,
-      // and whichever reply landed last decided the outcome. This is the
-      // human-approval gate, so it is the last place that should accept a
-      // decision the person only made once.
-      const key = `${path}:${JSON.stringify(payload || {})}`;
-      if (inkdropReviewActionsInFlight.has(key)) return;
-      inkdropReviewActionsInFlight.add(key);
-      setManualReviewDecisionStatus("");
+      // One browser tab may have only one Manual Review decision in flight.
+      // This blocks identical, conflicting and different-row choices alike;
+      // describing a second request as queued while sending it immediately
+      // only deepened contention and let two human decisions race.
+      if (inkdropReviewActionInFlight) {
+        setManualReviewDecisionStatus("Another Manual Review decision is still running. Wait for its result before choosing another.", "warn");
+        const status = $("manualReviewDecisionStatus");
+        if (status) status.dataset.reviewActionToken = inkdropReviewActionInFlight.token;
+        return {ok: false, blocked: true};
+      }
+      const operation = {
+        token: `manual-review-${++inkdropReviewActionSequence}`,
+        path: String(path || ""),
+        reviewId: String(payload?.review_id || "").trim(),
+        modalRevision: manualReviewDecisionModalRevision,
+      };
+      inkdropReviewActionInFlight = operation;
+      setManualReviewDecisionControlsPending(true);
+      setReviewActionOwnedStatus(operation, "");
+      const waitNotice = window.setTimeout(() => {
+        setReviewActionOwnedStatus(operation, reviewActionWaitingMessage(), "warn");
+      }, INKDROP_REVIEW_ACTION_EXPLAIN_AFTER_MS);
       try {
-        const data = await api(path, payload);
+        const data = await api(path, payload, {timeoutMs: INKDROP_REVIEW_ACTION_TIMEOUT_MS});
         $("output").textContent = JSON.stringify(data.result, null, 2);
+        const nonSuccess = reviewActionNonSuccessResult(data);
+        if (nonSuccess) {
+          setReviewActionOwnedStatus(operation, nonSuccess, "warn");
+          toast(nonSuccess, false);
+          return {ok: false, deferred: true, data};
+        }
         toast("Manual Review updated.");
-        closeManualReviewDecisionModal();
+        if (reviewActionOwnsCurrentPanel(operation)) closeManualReviewDecisionModal();
         loadManualReview();
         if ((activeInkdropViewSection || activeInkdropPrimarySection) === "manual_review") {
           loadInkdropSection("manual_review", null, {keepExisting: true});
         }
         refreshStatus();
+        return {ok: true, data};
       } catch (err) {
         $("output").textContent = err?.message || String(err);
-        // The panel stays open on failure, so the person is still looking at
-        // it -- say so there, not only in a toast this overlay can cover.
-        setManualReviewDecisionStatus(err?.message || "That decision did not go through. Nothing was changed.");
-        toast(err.message, false);
+        const message = reviewActionFailureMessage(err);
+        setReviewActionOwnedStatus(operation, message);
+        toast(message, false);
+        return {ok: false, unknown: reviewActionOutcomeUnknown(err), error: err};
       } finally {
-        inkdropReviewActionsInFlight.delete(key);
+        window.clearTimeout(waitNotice);
+        if (inkdropReviewActionInFlight?.token === operation.token) inkdropReviewActionInFlight = null;
+        setManualReviewDecisionControlsPending(false);
+        const status = $("manualReviewDecisionStatus");
+        if (!reviewActionOwnsCurrentPanel(operation) && status?.dataset.reviewActionToken === operation.token) {
+          setManualReviewDecisionStatus("");
+        }
       }
     }
 
@@ -46831,6 +47046,26 @@ def database_health_item(status=None, *, now=None, stale_after_seconds=None):
     return item
 
 
+def backup_health_item():
+    """The Backups card's data, or a truthful "could not read" if that fails.
+
+    Wrapped rather than inlined so a backups directory that cannot be read
+    degrades one card instead of the whole System page. The failure text says
+    what went wrong; it never says backups are somebody else's job.
+    """
+    try:
+        return inkdrop_backup_restore.backup_health_summary()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "state": "unknown",
+            "status": "unknown",
+            "label": "Could not read",
+            "detail": f"InkDrop could not read its backups folder: {type(exc).__name__}.",
+            "managed_by_inkdrop": True,
+        }
+
+
 def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=None):
     runtime_paths = inkdrop_runtime_paths()
     slskd_settings = slskd_provider_runtime_settings()
@@ -46854,6 +47089,7 @@ def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=No
     )
     path_checks = slskd_paths["roots"]
     database = database_health_item()
+    backup = backup_health_item()
     database_problem_count = 1 if system_health_severity(database.get("state")) >= 2 else 0
     disk_missing_count = sum(1 for item in disks if item.get("problem") == "missing")
     disk_low_count = sum(1 for item in disks if item.get("problem") == "low")
@@ -47000,6 +47236,12 @@ def system_health_summary(disk_targets=None, log_dir=None, explicit_log_paths=No
         "path_problem_count": path_problem_count,
         "database_problem_count": database_problem_count,
         "database": database,
+        # Reported, not scored. A late or missing backup is worth showing on
+        # its own card, but rolling it into the Web tile's severity would put
+        # the whole System page into "Needs attention" for something that is
+        # not a web problem, which is the alert-fatigue complaint the log
+        # thresholds above are already written against.
+        "backup": backup,
         "path_checks": path_checks,
         "disks": disks,
         "logs": visible_logs,
@@ -54771,6 +55013,19 @@ def runtime_provider_settings():
                 "label": "Log Level",
                 "value": "info",
                 "description": "Default runtime log verbosity shown for settings completeness. Service-level logging remains deployment-managed.",
+                "source": "runtime",
+            },
+            {
+                "key": "backup.interval_days",
+                "scope": "general",
+                "label": "Full Backup Schedule",
+                "value": inkdrop_backup_restore.DEFAULT_BACKUP_INTERVAL_DAYS,
+                "description": (
+                    "How often InkDrop creates a scheduled full backup, in days. The default is every "
+                    "7 days. InkDrop checks a few times a day and writes one as soon as this many days "
+                    "have passed since the last, so a backup missed while the container was down is "
+                    "picked up shortly after it comes back."
+                ),
                 "source": "runtime",
             },
             {
@@ -67586,6 +67841,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(
                 inkdrop_version.update_status(allow_remote=refresh_remote),
                 headers={"Cache-Control": "private, max-age=30, stale-while-revalidate=120"},
+            )
+        elif path == "/api/system/release-readiness":
+            # Deliberately its own surface rather than a block on
+            # /api/system/version. That endpoint is descriptive -- About renders
+            # it and update-awareness consumes it -- and putting a pass/fail
+            # verdict inside a descriptive payload invites someone to wire it
+            # into a probe. Keeping the verdict here means that mistake has to
+            # be a deliberate act rather than a plausible one.
+            #
+            # NOT public (unlike /api/system/version): this reports image
+            # digests, repository names and the candidate manifest, which is
+            # operational detail. It stays behind the normal session/API-key
+            # gate.
+            #
+            # RepoDigests are not passed: the web process has no Docker socket
+            # and should not have one, so that check reports "unverified" and
+            # the state can never read "matched" from in here. That is the
+            # honest answer, not a degraded one -- the deploy tool supplies the
+            # RepoDigests and is the thing that can reach "matched".
+            self.send_json(
+                inkdrop_release_identity.readiness_payload(),
+                headers={"Cache-Control": "no-store"},
             )
         elif path == "/api/system/health":
             self.send_json({"ok": True, "health": operator_system_health_summary()})

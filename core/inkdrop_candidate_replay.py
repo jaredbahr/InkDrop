@@ -271,7 +271,7 @@ def _slskd_filename(candidate):
     return ""
 
 
-def replay_compatibility(candidate, wanted_item, *, source=""):
+def replay_compatibility(candidate, wanted_item, *, source="", settings=None):
     """Call the deployed authority for this row. No local matcher."""
     authority = replay_authority(source)
     if authority == AUTHORITY_SLSKD_IDENTITY:
@@ -285,7 +285,7 @@ def replay_compatibility(candidate, wanted_item, *, source=""):
             candidate, _slskd_filename(candidate), wanted_item
         )
     else:
-        verdict = inkdrop_candidate_matching.candidate_compatibility(candidate, wanted_item)
+        verdict = inkdrop_candidate_matching.candidate_compatibility(candidate, wanted_item, settings=settings)
     if not isinstance(verdict, dict) or "rejection_codes" not in verdict:
         raise TypeError(f"{authority} did not return a compatibility verdict: {type(verdict).__name__}")
     return authority, verdict

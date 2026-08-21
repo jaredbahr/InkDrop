@@ -71,7 +71,13 @@ function stageLabel(row: ManualReviewRow): string {
 // nothing else -- deliberately narrow, so a sentence that merely contains an
 // underscored token ("it's stopped auto_retrying and needs a decision from
 // you.") is still treated as prose and shown.
+// Whole-string, and that anchor is a hole: `trusted_issue_mismatch:174!=001`
+// does not match it, so the raw token was printed under a badge derived from
+// the same string -- the same fact twice, once in machine form. The server's
+// vocabulary (core/inkdrop_review_reasons.py) now recognises both shapes and
+// supplies reason_detail; this pair stays only for payloads that predate it.
 const REASON_CODE_RE = /^[a-z0-9]+(?:_[a-z0-9]+)+$/;
+const REASON_CODE_WITH_PAYLOAD_RE = /^[a-z0-9]+(?:_[a-z0-9]+)+:[^!]*!=.*$/;
 
 // The detail line under the badge. It must never print the gate's own key.
 //
@@ -93,11 +99,16 @@ const REASON_CODE_RE = /^[a-z0-9]+(?:_[a-z0-9]+)+$/;
 // it has other prose available, so this loses information on zero rows today.
 // It is a forward-looking guard, not a fix for something widespread.
 function reasonText(row: ManualReviewRow): string {
+  // reason_detail is the server's answer to this same question, computed by
+  // the same rule; prefer it so the two cannot drift.
+  const supplied = String(row.reason_detail || "").trim();
+  if (supplied) return supplied;
   const candidates = [row.review_reason, row.reason, row.why_not_grabbed, row.activity_summary];
   for (const value of candidates) {
     const text = String(value || "").trim();
     if (!text) continue;
-    if (REASON_CODE_RE.test(text.toLowerCase())) continue;
+    const lowered = text.toLowerCase();
+    if (REASON_CODE_RE.test(lowered) || REASON_CODE_WITH_PAYLOAD_RE.test(lowered)) continue;
     return text;
   }
   return "";
@@ -125,29 +136,23 @@ function queueIdFor(row: ManualReviewRow): string {
   return row.id || "";
 }
 
-// Human copy + tone for the raw review-reason strings ("weak_filename_
-// unit_evidence" read as leaked internals in the list). Known reasons get
-// deliberate phrasing; the fallback title-cases whatever arrives, since
-// review_reason is not a closed enum.
-const REASON_META: Record<string, { label: string; tone: string }> = {
-  weak_filename_unit_evidence: { label: "Weak filename evidence", tone: "warn" },
-  ambiguous_results: { label: "Two possible matches", tone: "warn" },
-  pack_requires_review: { label: "Pack needs review", tone: "warn" },
-  wrong_unit_type: { label: "Wrong unit type", tone: "warn" },
-  conflicting_manga_identity: { label: "Conflicting manga identity", tone: "warn" },
-  filename_confidence_too_low: { label: "Filename confidence too low", tone: "warn" },
-  destination_conflict: { label: "Destination conflict", tone: "bad" },
-  policy_block: { label: "Blocked by policy", tone: "bad" },
-  language_blocked: { label: "Blocked by language rule", tone: "bad" },
-  staged_file_low_confidence: { label: "Staged file mismatch", tone: "warn" },
-  qbit_torrent_completed_outside_expected_save_path: { label: "Torrent finished in the wrong folder", tone: "bad" },
-};
-
+// The reason VOCABULARY now lives in core/inkdrop_review_reasons.py and
+// arrives on the row as reason_label/reason_tone. It moved because Manual
+// Review is rendered three times -- this island, the vanilla desktop shell and
+// /m -- and the table only ever existed here. Mobile derived its own labels by
+// title-casing the raw token, so `slskd_transfer_missing_staged_file_repeat`
+// reached the operator as "Slskd Transfer Missing Staged File Repeat" while
+// this surface showed real phrasing for the codes it happened to know.
+//
+// What stays here is a mechanical fallback for a payload that predates the
+// server field -- no phrasing, no mapping, nothing that can disagree with the
+// server's vocabulary. Sentence case rather than title case, deliberately: an
+// unmapped identifier should still read as an identifier.
 function reasonBadge(row: ManualReviewRow): { label: string; tone: string } | null {
+  const supplied = String(row.reason_label || "").trim();
+  if (supplied) return { label: supplied, tone: String(row.reason_tone || "warn") };
   const raw = String(row.review_reason || row.reason || "").trim().toLowerCase().replace(/-/g, "_");
   if (!raw) return null;
-  const known = REASON_META[raw];
-  if (known) return known;
   const isBad = /fail|error|blocked/.test(raw);
   return { label: raw.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase()), tone: isBad ? "bad" : "warn" };
 }
