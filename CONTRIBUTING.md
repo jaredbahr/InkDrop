@@ -35,7 +35,7 @@ codebase, not against this mirror. That check answers three questions:
 1. **Is it real?** The mirror can lag the development tree by a release or
    more, so something broken here is sometimes already fixed there. That is
    worth knowing either way, and it is not a wasted report — it confirms the
-   fix and tells us the export is behind.
+   fix and flags that the export is behind.
 2. **Is the diagnosis complete?** Reports are often right about the symptom and
    land one layer above the cause. When that happens, the report is still what
    made the bug findable.

@@ -20,6 +20,7 @@ import unicodedata
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+from core import inkdrop_import_evidence
 from core import inkdrop_review_reasons
 from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
@@ -857,7 +858,67 @@ def init_schema(con):
     init_schema_uncached(con)
 
 
+def _stored_schema_version(con):
+    """The schema_version schema_meta already carries, or None if it cannot say.
+
+    A brand-new database has no schema_meta table yet -- that is not evidence
+    of anything, it is the ordinary first-run case, and reads through as None
+    so migrations proceed. A present-but-unparseable value is treated the same
+    way, on the same reasoning restore_backup_archive() uses for its manifest
+    read: a future format would carry a higher number, not a broken one, so a
+    value that cannot be read as an int is not evidence of a future database.
+    """
+    try:
+        table = con.execute(
+            "select 1 from sqlite_master where type='table' and name='schema_meta'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not table:
+        return None
+    try:
+        row = con.execute(
+            "select value from schema_meta where key='schema_version'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def init_schema_uncached(con):
+    # Same judgement _portable_settings_plan() and restore_backup_archive()
+    # already make about their own artifacts -- "is this from a newer InkDrop
+    # than I understand?" -- asked here for the live state database, which
+    # until now never asked it at all. This has to run before the
+    # executescript() below touches anything: that block is what used to
+    # migrate a future database down to this build's shape and overwrite
+    # schema_version in the same breath, so the marker read 19 afterward no
+    # matter what it had read going in, and nothing on disk recorded that it
+    # had ever been higher. Checking first, before any statement runs, is what
+    # keeps that evidence intact when this refuses.
+    #
+    # Forward-only, matching restore_backup_archive()'s manifest check rather
+    # than _portable_settings_plan()'s strict equality: an *older* database is
+    # the ordinary upgrade case this function exists to handle, and must keep
+    # migrating forward.
+    stored_schema_version = _stored_schema_version(con)
+    if stored_schema_version is not None and stored_schema_version > SCHEMA_VERSION:
+        raise ValueError(
+            f"state database was written by a newer InkDrop (schema "
+            f"v{stored_schema_version}; this build understands up to "
+            f"v{SCHEMA_VERSION}). Refusing to open it -- migrating it with an "
+            f"older build's schema would rewrite its version marker downward "
+            f"and leave no record that it was ever newer. Upgrade InkDrop to a "
+            f"build that understands v{stored_schema_version} or higher before "
+            f"opening this database, or restore from a backup taken by this "
+            f"build instead."
+        )
     con.executescript(
         """
         create table if not exists schema_meta (
@@ -1974,6 +2035,17 @@ def init_schema_uncached(con):
         reconcile_all_duplicate_wanted_items(con, time.time())
         con.execute(
             "insert into schema_meta(key, value) values('wanted_duplicate_reconcile_v1', '1') "
+            "on conflict(key) do update set value=excluded.value"
+        )
+    # Tracker #537. Same durable-marker shape as the sweep above, and for the
+    # same reason: background jobs run as fresh subprocesses, so an in-process
+    # cache key would re-run this on every invocation.
+    if not con.execute(
+        "select 1 from schema_meta where key='manual_source_retracted_resolved_retired_v1' limit 1"
+    ).fetchone():
+        archive_and_retire_manual_source_retracted_resolved(con, time.time())
+        con.execute(
+            "insert into schema_meta(key, value) values('manual_source_retracted_resolved_retired_v1', '1') "
             "on conflict(key) do update set value=excluded.value"
         )
     con.execute("create index if not exists idx_queue_series_state_active_updated on queue_items(series_id, state, active, updated_at desc)")
@@ -24824,21 +24896,11 @@ def manual_source_resolved_rows(state_dir, *, require_existing_destination=True)
     resolved = actions.get("manual_source_resolved") if isinstance(actions, dict) else []
     if not isinstance(resolved, list):
         return []
-    retracted = actions.get("manual_source_retracted_resolved") if isinstance(actions, dict) else []
-    if not isinstance(retracted, list):
-        retracted = []
-    retracted_ids = {
-        str(row.get("review_id") or "")
-        for row in retracted
-        if isinstance(row, dict) and row.get("review_id")
-    }
     rows = []
     for row in resolved:
         if not isinstance(row, dict):
             continue
         review_id = str(row.get("review_id") or "")
-        if review_id and review_id in retracted_ids:
-            continue
         if require_existing_destination and not manual_source_resolved_has_existing_destination(row, db_path=db_path):
             continue
         if not manual_source_resolved_matches_issue(row):
@@ -28320,6 +28382,88 @@ def dedupe_series_wanted_issue_id_collisions(con, series_id, now):
         ).fetchall()
         changed += merge_wanted_items_group(con, series_id, issue_id, wanted_rows, now, default_reason="wanted_issue_id_dedupe")
     return changed
+
+
+def archive_and_retire_manual_source_retracted_resolved(con, now):
+    """Preserve the frozen retraction entries, then take the key out of use.
+
+    Tracker #537. `manual_source_retracted_resolved` has no writer anywhere in
+    the tree and has not had one since the root commit. Three modules read it
+    to build a set of review ids to skip, and a loader default keeps
+    re-creating it as an empty list, so it reads as a live filter to anyone
+    who finds it. On this install it holds six entries, all written by a
+    one-off session on 2026-06-26 with retracted_reason=identity_mismatch.
+
+    WHY PRESERVE RATHER THAN DELETE.
+        Nobody can reconstruct what those six decisions meant -- the history is
+        squashed at root, so there is no commit to read. Copying the contents
+        into history_events costs almost nothing and keeps the call reversible;
+        deleting outright would not be.
+
+    WHAT IS ACTUALLY HARMFUL IS THE MECHANISM.
+        A dead filter that looks live will mislead whoever reads it next, and
+        the loader default is what cements that impression. The readers and the
+        default go; the contents survive as a record.
+
+    THE WRITER IS NOT COMING BACK HERE.
+        If retraction becomes a feature it gets scoped as one. Half-building a
+        write path to justify six relics is the failure mode this avoids.
+
+    Idempotent: the history id is derived from the entry, so a second run
+    inserts nothing. Never raises into init_schema -- an unreadable or absent
+    actions file simply means there is nothing to archive.
+    """
+    try:
+        actions_path = Path(inkdrop_runtime_config.state_dir()) / "manual-review-actions.json"
+    except Exception:
+        return 0
+    actions = read_json(actions_path, None)
+    if not isinstance(actions, dict) or "manual_source_retracted_resolved" not in actions:
+        return 0
+    entries = actions.get("manual_source_retracted_resolved")
+    entries = entries if isinstance(entries, list) else []
+
+    archived = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        review_id = str(entry.get("review_id") or "")
+        con.execute(
+            """
+            insert or ignore into history_events(
+                id, entity_type, entity_id, series_id, issue_id, event_type,
+                source, message, outcome, display_phase, created_at, raw_json
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                stable_id("manual_source_retraction_archived", review_id,
+                          str(entry.get("retracted_at") or ""), str(entry.get("source_path") or "")),
+                "manual_review",
+                review_id,
+                None,
+                None,
+                "manual_source_retraction_archived",
+                "state_migration",
+                (
+                    "Archived a frozen manual-source retraction record before retiring the key: "
+                    f"{entry.get('series') or 'unknown series'} "
+                    f"issue {entry.get('issue') if entry.get('issue') is not None else '?'}, "
+                    f"reason {entry.get('retracted_reason') or 'unrecorded'}"
+                ),
+                "informational",
+                "archived",
+                now,
+                json_dumps(entry),
+            ),
+        )
+        archived += 1
+
+    # Remove the key whether or not any entry was archivable -- a non-list or
+    # empty value is exactly as dead as a populated one, and leaving it behind
+    # would leave the misleading shape in place.
+    actions.pop("manual_source_retracted_resolved", None)
+    write_json(actions_path, actions)
+    return archived
 
 
 def dedupe_series_issue_numbers(con, series_id, now):
@@ -34389,6 +34533,141 @@ def download_tasks_matching_missing_folder_proof(con, import_row):
     return [row for row in rows if download_task_matches_missing_folder_proof(row, import_row)]
 
 
+def release_falsely_satisfied_unit(con, row, now, *, dry_run=False):
+    """Return a unit to `wanted` when its file is gone and nothing else holds it.
+
+    THE DEFECT THIS EXISTS FOR.
+        cleanup_missing_folder_verified_import_proofs() does its job in two
+        halves: it marks the media row missing, and it releases the unit so the
+        search resumes. Between them sits `if already_retracted: continue`.
+
+        The release therefore only ever happened on the single pass that FIRST
+        retracted a proof. If that pass did not reach it -- the queue row
+        carried no wanted_id at that moment, or its state was on the no-reopen
+        list -- every later pass short-circuits before the release and the unit
+        stays `satisfied` forever. The sweep runs, marks the file missing again,
+        and gives up in the same place. Measured against the live library
+        2026-08-21 by running this build over it dry: 1,624 rows reach that
+        branch and 27 units are in exactly this stranded state. They sit inside
+        a wider population of 171 satisfied units with no active media row --
+        69 of which do have the file on disk (a ledger gap, not this defect)
+        and 58 of which never recorded a dest_path at all.
+
+        The recovery mechanism was not missing and was not wrong. It had a
+        one-shot property nobody declared.
+
+    WHY THIS KEYS ON CURRENT EVIDENCE, NEVER ON RETRACTION HISTORY.
+        "Release everything already retracted" looks like the same fix and is
+        not. 1,434 retracted proofs sit under a satisfied unit, and 1,405 of
+        them were legitimately re-satisfied by a LATER import -- they have a
+        live file right now. Releasing on history would return those 1,405
+        correctly-held units to wanted: the same defect inverted, and far more
+        disruptive than the one being fixed. The dry run confirms the shape:
+        of the 1,597 rows this function declines, 1,243 are declined on exactly
+        that test.
+
+        So the question asked here is only ever "is this unit satisfied by
+        something that is not there any more", answered from today's rows.
+
+    THE UNMOUNTED-ROOT GUARD IS INHERITED, NOT REIMPLEMENTED.
+        Every caller reaches this function having already passed
+        path_under_any_root(dest, managed_roots) -- where managed_roots has had
+        unmounted roots removed by media_root_is_mounted() -- and having read
+        the path without an OSError and found it absent. That ordering is the
+        guard, and it is why this function takes no root argument and performs
+        no existence check of its own: a second copy of that reasoning is
+        exactly how a temporarily unmounted volume turns 30 recoveries into 30
+        false releases. See media_root_is_mounted()'s own docstring for the
+        2026-08-11 Akira incident that rule was written after.
+
+    Returns 1 when a unit was released, 0 otherwise.
+    """
+    wanted_id = str((row["wanted_id"] if "wanted_id" in row.keys() else "") or "").strip()
+    if not wanted_id:
+        return 0
+
+    wanted_row = con.execute(
+        "select id, status, series_id, issue_id, raw_json from wanted_items where id=?",
+        (wanted_id,),
+    ).fetchone()
+    if not wanted_row:
+        return 0
+
+    # Only a FALSE satisfaction is in scope. A unit already wanted, blocked or
+    # inactive is somebody else's state and must not be overwritten.
+    if str(wanted_row["status"] or "").strip().lower() != "satisfied":
+        return 0
+
+    # Something else may hold this unit legitimately -- a second import that
+    # succeeded after the one being retracted. That is the 1,403 case.
+    if con.execute(
+        "select 1 from media_files where issue_id=? and active=1 limit 1",
+        (wanted_row["issue_id"],),
+    ).fetchone():
+        return 0
+
+    # A queue row in one of these states is not waiting to be searched, it has
+    # been disposed of. Reopening its unit would undo an operator's decision.
+    queue_state = str((row["queue_state"] if "queue_state" in row.keys() else "") or "").strip().lower()
+    if queue_state in MISSING_FOLDER_PROOF_NO_REOPEN_QUEUE_STATES:
+        return 0
+
+    # A series the operator removed must never reappear in their wanted list.
+    # That would be this same defect run backwards at them.
+    if wanted_row["series_id"] and series_id_user_removed(con, wanted_row["series_id"]):
+        return 0
+
+    wanted_raw = json_loads(wanted_row["raw_json"] or "{}", {})
+    wanted_raw = wanted_raw if isinstance(wanted_raw, dict) else {}
+    if wanted_raw.get("ignored") or wanted_raw.get("ignored_at"):
+        return 0
+
+    if dry_run:
+        return 1
+
+    wanted_raw.update({
+        "released_from_false_satisfaction_at": now,
+        "released_from_false_satisfaction_at_iso": utc_stamp(now),
+        "released_from_false_satisfaction_reason": "managed_destination_missing",
+        "released_from_false_satisfaction_import_result_id": row["id"],
+    })
+    con.execute(
+        "update wanted_items set status='wanted', updated_at=?, raw_json=? where id=? and status='satisfied'",
+        (now, json_dumps(wanted_raw), wanted_id),
+    )
+    released = int(con.execute("select changes()").fetchone()[0] or 0)
+    if not released:
+        return 0
+
+    # The queue row is deliberately left alone. On the pass that first
+    # retracted this proof the queue was already reopened immediately above the
+    # release that was skipped, so it is the wanted row -- the one the search
+    # population is drawn from -- that is out of step, not the queue.
+    con.execute(
+        """
+        insert or ignore into history_events(
+            id, entity_type, entity_id, series_id, issue_id, event_type,
+            source, message, outcome, display_phase, created_at, raw_json
+        ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            stable_id("false_satisfaction_released", wanted_id, row["id"]),
+            "wanted_item",
+            wanted_id,
+            wanted_row["series_id"],
+            wanted_row["issue_id"],
+            "false_satisfaction_released",
+            "state_maintenance",
+            "Returned to wanted: the file that satisfied this unit is no longer on disk.",
+            "corrective",
+            "queued",
+            now,
+            json_dumps({"import_result_id": row["id"], "dest_path": row["dest_path"]}),
+        ),
+    )
+    return 1
+
+
 def cleanup_missing_folder_verified_import_proofs(
     con, now, limit=5000, *, series_id=None, issue_number=None, dry_run=False, cursor=None
 ):
@@ -34402,7 +34681,7 @@ def cleanup_missing_folder_verified_import_proofs(
     """
     managed_roots = media_management_roots_from_connection(con)
     if not managed_roots:
-        return {"import_results": 0, "queue_items": 0, "download_tasks": 0, "media_files": 0}
+        return {"import_results": 0, "queue_items": 0, "download_tasks": 0, "media_files": 0, "released_units": 0, "relocations": 0, "relocation_conflicts": 0}
     # Only sweep roots that are actually mounted. A root that is missing or
     # empty cannot tell the difference between "these files were deleted" and
     # "this volume is not here right now", and this sweep's answer to that
@@ -34418,6 +34697,12 @@ def cleanup_missing_folder_verified_import_proofs(
             "queue_items": 0,
             "download_tasks": 0,
             "media_files": 0,
+            # Zero, and that is the guard working rather than nothing to do:
+            # with every managed root unmounted, "the file is gone" cannot be
+            # told from "the volume is not here", so nothing is released.
+            "released_units": 0,
+            "relocations": 0,
+            "relocation_conflicts": 0,
             "skipped_unmounted_roots": list(unmounted_roots),
         }
     try:
@@ -34472,6 +34757,9 @@ def cleanup_missing_folder_verified_import_proofs(
     queue_items = 0
     download_tasks = 0
     media_files = 0
+    released_units = 0
+    relocations = 0
+    relocation_conflicts = 0
     handled_media_ids = set()
     handled_task_ids = set()
     handled_queue_ids = set()
@@ -34496,10 +34784,92 @@ def cleanup_missing_folder_verified_import_proofs(
         if not already_retracted:
             relocated_path = relocated_series_folder_import_proof_path(con, row, managed_roots)
         if relocated_path:
-            if dry_run:
-                continue
             normalized_dest = media_file_normalized_path(dest_path)
             normalized_relocated = media_file_normalized_path(relocated_path)
+            # TWO ROWS CANNOT CLAIM ONE FILE.
+            #
+            # media_files.normalized_path is UNIQUE. When a series folder is
+            # flattened -- "Absolute Power (2024)/Volume 01 (2024)/x.cbz"
+            # becoming "Absolute Power (2024)/x.cbz" -- the destination can
+            # already be owned by a DIFFERENT import_result's media row. The
+            # relocation UPDATE below then raises IntegrityError, and because
+            # run_stage() writes its cursor only after the callback returns,
+            # the sweep re-reads the same row forever: missing_folder is the
+            # first stage, so wrong_unit_page_pack and
+            # contradictory_provenance stop running too.
+            #
+            # Measured on the live library 2026-08-21: of 8,358 rows the sweep
+            # walks, 24 are a fresh proof whose file is absent from a mounted
+            # root, 16 of those have a relocated copy, and 11 of those land on
+            # a path another row already owns.
+            #
+            # This REFUSES rather than resolves. Merging the two rows, or
+            # quietly preferring one, decides an ownership question on the
+            # operator's behalf from inside a maintenance sweep. Skipping in
+            # silence is what let these sit unnoticed since June. So the row is
+            # left exactly as it is, the conflict is counted, and a history
+            # event names both sides.
+            #
+            # ANY existing row at the destination is a conflict, whoever owns
+            # it. An earlier cut exempted rows belonging to this same
+            # import_result, and that was wrong in the direction that keeps the
+            # crash: the UPDATE moves the row sitting at normalized_dest, so a
+            # row already at normalized_relocated is by definition a different
+            # row and the move still collides. The exemption cannot be correct
+            # for the idempotent case either -- once a proof has been
+            # relocated, dest_path points at the new file, the file exists, and
+            # the loop skips long before reaching here.
+            relocation_owner_conflict = None
+            if table_exists(con, "media_files"):
+                relocation_owner_conflict = con.execute(
+                    """
+                    select id, import_result_id from media_files
+                     where normalized_path=?
+                     limit 1
+                    """,
+                    (normalized_relocated,),
+                ).fetchone()
+            if relocation_owner_conflict:
+                relocation_conflicts += 1
+                if not dry_run:
+                    con.execute(
+                        """
+                        insert or ignore into history_events(
+                            id, entity_type, entity_id, series_id, issue_id, event_type,
+                            source, message, outcome, display_phase, created_at, raw_json
+                        ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            stable_id("missing_folder_import_proof_relocation_conflict", row["id"], relocated_path),
+                            "import_result",
+                            row["id"],
+                            row["series_id"],
+                            row["issue_id"],
+                            "missing_folder_import_proof_relocation_conflict",
+                            "inkdrop_state",
+                            (
+                                "Import proof looks relocated, but another library record already "
+                                f"claims that file, so nothing was changed: {dest_path} -> {relocated_path}"
+                            ),
+                            "needs_attention",
+                            row["display_phase"],
+                            now,
+                            json_dumps({
+                                "previous_dest_path": dest_path,
+                                "relocated_dest_path": relocated_path,
+                                "conflicting_media_file_id": relocation_owner_conflict["id"],
+                                "conflicting_import_result_id": relocation_owner_conflict["import_result_id"],
+                            }),
+                        ),
+                    )
+                continue
+            # Counted, not silent. Every other dry-run branch in this sweep
+            # reports what it would do; this one returned `continue` and so a
+            # dry run could never reach -- or report -- the riskiest statement
+            # in the function. That is why the conflict above went unmeasured.
+            if dry_run:
+                relocations += 1
+                continue
             con.execute(
                 "update import_results set dest_path=? where id=?",
                 (relocated_path, row["id"]),
@@ -34609,6 +34979,12 @@ def cleanup_missing_folder_verified_import_proofs(
                     )
                     media_files += int(con.execute("select changes()").fetchone()[0] or 0)
         if already_retracted:
+            # Reaching here means the proof was retracted on an earlier pass and
+            # the file is STILL absent from a mounted root. Everything above
+            # re-ran and found nothing left to do; the one thing the original
+            # pass may never have done is release the unit, and until now no
+            # later pass could. Keyed on today's evidence, not on the retraction.
+            released_units += release_falsely_satisfied_unit(con, row, now, dry_run=dry_run)
             continue
         if dry_run:
             import_results += 1
@@ -34795,6 +35171,16 @@ def cleanup_missing_folder_verified_import_proofs(
         "queue_items": queue_items,
         "download_tasks": download_tasks,
         "media_files": media_files,
+        # Units returned to `wanted` because the file that satisfied them is
+        # gone. Reported separately because it is the only counter here an
+        # operator can act on: it means the search resumed.
+        "released_units": released_units,
+        # Import proofs whose file was found at a new path and repointed.
+        "relocations": relocations,
+        # Proofs that look relocated but whose destination another library
+        # record already claims. Refused, never resolved here -- two rows
+        # claiming one file is an ownership question for an operator.
+        "relocation_conflicts": relocation_conflicts,
     }
     if cursor is not None:
         result["_progress"] = {
@@ -56428,6 +56814,15 @@ def manual_review_canonical_snapshot(db_path, limit=5000):
             text = raw_state.replace("_", " ").strip()
             state_label = (text[:1].upper() + text[1:]) if text else ""
         row["state_label"] = state_label
+        # Tracker #820. The source pill also needs to know whether `source` is
+        # a filesystem path, because source_display_label() above title-cases
+        # whatever it is given, so a staged-file path comes back with every
+        # segment title-cased -- a mutated path presented as InkDrop's own
+        # label, and on Linux no longer a path that resolves.
+        # decision_evidence carries source_is_path so the renderer can show the
+        # path verbatim instead. Read from the raw `source`/`current_source`
+        # fields, which nothing above rewrites, so order here does not matter.
+        inkdrop_import_evidence.annotate_row(row)
 
     def ordered(rows):
         rows = list(rows or [])
@@ -70478,6 +70873,25 @@ ISSUE_COMPACT_ROW_KEYS = {
 
 
 MANUAL_REVIEW_COMPACT_ROW_KEYS = QUEUE_COMPACT_ROW_KEYS | {
+    # Tracker #572, the operator's own words: "we need to ensure that it says what
+    # series and expected item was. then what we found so a user can decide
+    # the correct action." decision_evidence() already builds exactly that
+    # (core/inkdrop_import_evidence.py) and this allowlist was throwing it
+    # away -- both shipped clients ask for a compacting row mode, so the
+    # structure never reached either surface and both their fallback paths
+    # ran 100% of the time.
+    #
+    # Deliberately ONLY this key. reason_detail, reason_tone,
+    # reason_label_source, source_label and state_label are dropped here too,
+    # and restoring them belongs with #580: under #814 alone a composite
+    # reason returns label_source='prose' and both lines render raw, so
+    # delivering them now would replace a working fallback with a visible
+    # regression.
+    #
+    # Costs 430 bytes/row measured. Mobile fetches 30 rows and desktop 10,
+    # so +12.6 KB and +4.2 KB per request -- which is why this is a fatter
+    # row and not a detail endpoint.
+    "decision_evidence",
     "revision",
     "review_id",
     "origin",

@@ -116,6 +116,52 @@ function reasonText(row: ManualReviewRow): string {
 
 // Distinguishes a stuck IMPORT (file downloaded, verification/import failed)
 // from a stuck SEARCH -- Reopen Import only makes sense for the former.
+// #572, the operator's request: say what series and unit were expected, and what we
+// actually found, so the operator can decide. The server already builds this
+// (decision_evidence(), core/inkdrop_import_evidence.py); it reaches the row
+// because MANUAL_REVIEW_COMPACT_ROW_KEYS now carries it.
+//
+// Three outcomes kept distinct, matching the mobile renderer exactly -- this
+// judgement existing in two places with two answers is the most recurrent
+// defect on this project, so both surfaces read the same fields and use the
+// server's own sentence:
+//   no evidence      -> render nothing (payload predates #572)
+//   incomplete       -> say we do not know, never an empty Expected/Found pair
+//   otherwise        -> expected / found / why
+function evidenceBlock(row: ManualReviewRow) {
+  const evidence = row.decision_evidence;
+  if (!evidence) return null;
+  if (evidence.incomplete) {
+    return <span className="mini mr-evidence-unknown">InkDrop did not record what it expected for this item.</span>;
+  }
+  const expected = evidence.expected || {};
+  const found = evidence.found || {};
+  const expectedText = [expected.series, expected.unit ? `#${expected.unit}` : ""].filter(Boolean).join(" ");
+  const foundText = found.file_name || found.path || (found.unit ? `#${found.unit}` : "");
+  if (!expectedText && !foundText) return null;
+  // The producer's own sentence, verbatim. In `198!=001` the left number is
+  // what was FOUND and the right is what was EXPECTED -- backwards from
+  // intuition, and re-composing the copy here is how that ships inverted.
+  const why = String(evidence.disagreement || "").trim();
+  return (
+    <span className="mr-evidence">
+      {expectedText && (
+        <span className="mr-evidence-line">
+          <span className="mr-evidence-key">Expected</span>
+          <span>{expectedText}</span>
+        </span>
+      )}
+      {foundText && (
+        <span className="mr-evidence-line">
+          <span className="mr-evidence-key">Found</span>
+          <span className="mr-evidence-val">{foundText}</span>
+        </span>
+      )}
+      {why && <span className="mini mr-evidence-why">{why}</span>}
+    </span>
+  );
+}
+
 function isImportStuck(row: ManualReviewRow): boolean {
   const state = String(row.state || "").toLowerCase();
   if (state === "importing" || state === "verified") return true;
@@ -441,6 +487,7 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
                         {detail && badge?.label.toLowerCase() !== detail.toLowerCase() && (
                           <span className="mini">{detail}</span>
                         )}
+                        {evidenceBlock(row)}
                       </div>
                     );
                   })()}

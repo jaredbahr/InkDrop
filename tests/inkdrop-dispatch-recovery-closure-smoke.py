@@ -183,7 +183,7 @@ def main():
             series_id="comicvine:169497", issue_number="1", expected_sha256="1" * 64,
             apply=True,
         )
-        require(pre_applied["reconciliation"] == {"import_results":0,"queue_items":0,"download_tasks":0,"media_files":2}, pre_applied)
+        require(pre_applied["reconciliation"] == {"import_results":0,"queue_items":0,"download_tasks":0,"media_files":2,"released_units":0,"relocations":0,"relocation_conflicts":0}, pre_applied)
         with sqlite3.connect(retracted_db) as con:
             require(con.execute("select status,active,completion_truth,folder_imported,size_bytes,mtime from media_files where id='media:dispatch'").fetchone() == ("missing",0,None,0,None,None), "pre-retracted direct media was not fully repaired")
             require(con.execute("select status,active from media_files where id='media:legacy-dispatch'").fetchone() == ("missing",0), "pre-retracted legacy media was not repaired")
@@ -201,7 +201,7 @@ def main():
             state_db=duplicate_db, completion_db=root / "duplicate-proof-completion.sqlite3",
             series_id="comicvine:169497", issue_number="1", expected_sha256="2" * 64,
         )
-        expected_duplicate = {"import_results":2,"queue_items":1,"download_tasks":1,"media_files":2}
+        expected_duplicate = {"import_results":2,"queue_items":1,"download_tasks":1,"media_files":2,"released_units":0,"relocations":0,"relocation_conflicts":0}
         require(duplicate_dry["reconciliation"] == expected_duplicate, duplicate_dry)
         duplicate_applied = recovery.recover_exact_artifact(
             state_db=duplicate_db, completion_db=root / "duplicate-proof-completion.sqlite3",
@@ -242,7 +242,7 @@ def main():
         applied = recovery.recover_exact_artifact(state_db=state_db,completion_db=completion,series_id="comicvine:169497",issue_number="1",expected_sha256=digest,staged_path=staged,allowed_roots=[staged_root],quarantine_root=quarantine,apply=True)
         require(applied["quarantined"] and not staged.exists(), applied)
         require(len(list((quarantine / operation_id).glob("candidate*.cbz"))) == 2, "equal-hash quarantine destination left staged source in place")
-        expected_ordinary = {"import_results":1,"queue_items":1,"download_tasks":1,"media_files":2}
+        expected_ordinary = {"import_results":1,"queue_items":1,"download_tasks":1,"media_files":2,"released_units":0,"relocations":0,"relocation_conflicts":0}
         require(dry["reconciliation"] == expected_ordinary, dry)
         require(applied["reconciliation"] == expected_ordinary, applied)
         journal = quarantine / ".operations" / f"{applied['operation_id']}.json"

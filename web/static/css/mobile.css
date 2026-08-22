@@ -425,6 +425,54 @@ body {
   color: var(--m-text-dim);
 }
 
+/* #572 expected-versus-found. A quiet block, not a callout: it is reference
+   the operator reads while deciding, not an alarm. The file name can be long
+   and must stay a readable path, so it wraps on any character rather than
+   overflowing the card. */
+.m-item-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--m-surface-2, rgba(127, 127, 127, 0.10));
+  font-size: 13px;
+}
+
+.m-evidence-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.m-evidence-key {
+  flex: 0 0 auto;
+  min-width: 62px;
+  color: var(--m-text-dim);
+  font-weight: 600;
+}
+
+.m-evidence-val {
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+.m-evidence-why {
+  margin: 4px 0 0;
+  color: var(--m-text-dim);
+}
+
+/* "We could not tell" -- deliberately worded and styled as an absence of
+   knowledge, never as an empty Expected/Found pair, which reads as a
+   confident "nothing was expected". */
+.m-item-evidence-unknown {
+  margin: 4px 0 0;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--m-text-dim);
+}
+
 .m-item-row {
   display: flex;
   align-items: center;

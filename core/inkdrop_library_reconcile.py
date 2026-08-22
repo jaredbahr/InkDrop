@@ -463,7 +463,15 @@ def write_cache_file(cache_path, payload, params):
     # interleave on one temp path.
     fd, temp_name = tempfile.mkstemp(dir=str(cache_path.parent), prefix=f".{cache_path.name}.", suffix=".tmp")
     try:
-        os.fchmod(fd, 0o600)
+        # Guarded the same way as the other two mkstemp sites in this tree
+        # (inkdrop_backup_restore.create_backup_archive and the backup-upload
+        # handler in inkdrop_web): os.fchmod does not exist on Windows, and
+        # calling it unguarded makes this writer -- and the smoke that covers
+        # it -- impossible to run on a developer machine. Every InkDrop
+        # deployment is a Linux container, so the 0600 below is what production
+        # always gets; nothing about the shipped behaviour changes.
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(envelope, indent=2, sort_keys=True, default=str) + "\n")
         os.replace(temp_name, cache_path)

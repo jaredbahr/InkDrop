@@ -445,6 +445,37 @@ def move_internal_dirs(repair, run_id):
     return {"candidates": [str(path) for path in candidates], "moved": moved}
 
 
+def _apply_repair(stats, applied_key, record, detail, repair_call):
+    """Run one repair and record what it did, not what it was asked to do.
+
+    Every repair in this module answers True when it changed the archive and
+    False when it looked and declined: remove_number_from_volume_comicinfo()
+    returns False when the ComicInfo member it was going to rewrite is not
+    there, add_volume_comicinfo() returns False when one is already there.
+    Both of those are reachable -- archive_info() reads the archive at one
+    moment and the repair reopens it at another -- and two of the three call
+    sites appended to the "repaired" list without looking at the answer, while
+    one ran outside a try at all.
+
+    So a repair that declined and a repair that raised were both published as a
+    completed repair: they counted in repaired_volume_number_count and
+    added_comicinfo_count in the status JSON, and they satisfied the "something
+    changed, so trigger a library scan" test in main(). A declined repair is
+    not a repair, and neither is a failed one. Only a True answer goes in the
+    applied list; the other two are recorded as themselves.
+    """
+    try:
+        changed = bool(repair_call())
+    except Exception as exc:
+        stats["archive_errors"].append({**detail, "repair_error": f"{type(exc).__name__}: {exc}"})
+        return False
+    if changed:
+        stats[applied_key].append(record)
+        return True
+    stats["declined_repairs"].append({**detail, "declined_repair": applied_key})
+    return False
+
+
 def inspect_and_repair_archives(repair, *, max_archives=None):
     stats = {
         "scanned": 0,
@@ -455,6 +486,10 @@ def inspect_and_repair_archives(repair, *, max_archives=None):
         "missing_comicinfo_ambiguous": [],
         "archive_errors": [],
         "repaired_malformed_comicinfo": [],
+        # A repair that looked at the archive and declined to change it. Not an
+        # error, and not a repair -- it needs its own bucket, because folding it
+        # into either one states something that did not happen.
+        "declined_repairs": [],
         "skipped_internal": 0,
         "skipped_recent": 0,
         "scan_limited": False,
@@ -480,12 +515,15 @@ def inspect_and_repair_archives(repair, *, max_archives=None):
             if context:
                 item = {"path": str(path), "error": info.get("error"), **context}
                 if repair:
-                    try:
-                        replace_volume_comicinfo(path, context["series"], context["number"], context.get("year", ""))
-                        stats["repaired_malformed_comicinfo"].append(item)
-                    except Exception as exc:
-                        item["repair_error"] = f"{type(exc).__name__}: {exc}"
-                        stats["archive_errors"].append(item)
+                    _apply_repair(
+                        stats,
+                        "repaired_malformed_comicinfo",
+                        item,
+                        item,
+                        lambda: replace_volume_comicinfo(
+                            path, context["series"], context["number"], context.get("year", "")
+                        ),
+                    )
                 else:
                     stats["archive_errors"].append(info)
                 continue
@@ -495,8 +533,13 @@ def inspect_and_repair_archives(repair, *, max_archives=None):
         if info.get("comicinfo") and fmt == "manga" and info.get("number") and info.get("volume"):
             stats["bad_volume_number_nodes"].append(info)
             if repair:
-                remove_number_from_volume_comicinfo(path, info)
-                stats["repaired_volume_number_nodes"].append(str(path))
+                _apply_repair(
+                    stats,
+                    "repaired_volume_number_nodes",
+                    str(path),
+                    {"path": str(path)},
+                    lambda: remove_number_from_volume_comicinfo(path, info),
+                )
             continue
         if not info.get("comicinfo"):
             context = obvious_volume_context(path)
@@ -504,8 +547,15 @@ def inspect_and_repair_archives(repair, *, max_archives=None):
                 item = {"path": str(path), **context}
                 stats["missing_comicinfo_obvious"].append(item)
                 if repair:
-                    add_volume_comicinfo(path, context["series"], context["number"], context.get("year", ""))
-                    stats["added_comicinfo"].append(item)
+                    _apply_repair(
+                        stats,
+                        "added_comicinfo",
+                        item,
+                        item,
+                        lambda: add_volume_comicinfo(
+                            path, context["series"], context["number"], context.get("year", "")
+                        ),
+                    )
             else:
                 stats["missing_comicinfo_ambiguous"].append({"path": str(path), "number": volume_number_from_name(path)})
     return stats
@@ -635,6 +685,12 @@ def main() -> int:
         "archive_error_samples": archive_stats["archive_errors"][:10],
         "repaired_malformed_comicinfo_count": len(archive_stats["repaired_malformed_comicinfo"]),
         "repaired_malformed_comicinfo": archive_stats["repaired_malformed_comicinfo"][:10],
+        # Repairs that looked and declined. Every count above this line is now
+        # only what was actually written, so the operator can see the
+        # difference between "the guard fixed 40 archives" and "the guard
+        # opened 40 archives and found nothing left to fix in them".
+        "declined_repair_count": len(archive_stats["declined_repairs"]),
+        "declined_repairs": archive_stats["declined_repairs"][:20],
         "stale_duplicate_chapter_row_count": len(stale_rows),
         "stale_duplicate_chapter_rows_deleted": stale_deleted,
         "stale_duplicate_chapter_samples": stale_rows[:20],

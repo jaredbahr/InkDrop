@@ -99,9 +99,11 @@ concurrency:
   group: inkdrop-public-release-${{ github.ref }}
   # Safe to cancel a superseded pull_request run: qa_image/validate_qa_image/
   # github_release below are all gated on `github.event_name != 'pull_request'`,
-  # so a PR-triggered run only ever contains the two test jobs (public_release,
-  # full_smoke_suite) -- never a publish/deploy step. A push run (to qa/main),
-  # which *can* reach those publish jobs, still never auto-cancels.
+  # so a PR-triggered run only executes public_release; full_smoke_suite is
+  # deliberately skipped by its job condition below, and no publish/deploy
+  # step can run. A workflow_dispatch run on qa can reach the private QA
+  # publish jobs; a push to main can reach only the main/public jobs. Neither
+  # kind of publishing run ever auto-cancels.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -153,6 +155,17 @@ jobs:
           mkdir -p "$INKDROP_CONFIG_DIR" "$INKDROP_LOCK_DIR" "$INKDROP_LOG_DIR" "$INKDROP_CACHE_DIR" "$INKDROP_BACKUP_DIR" "$INKDROP_STAGING_DIR" "$INKDROP_MANUAL_INBOX_DIR" "$INKDROP_QUARANTINE_DIR"
           python -B tools/inkdrop_public_http_smoke.py --json > inkdrop-public-http-smoke.json
           python -B tools/inkdrop_public_release_check.py --strict-host-dependencies
+
+      # This workflow is exported to jaredbahr/InkDrop, but the nightly
+      # workflow and private runbooks inspected by this test deliberately are
+      # not. Keep the contract gate on the private PR path where all four
+      # inputs exist; the public workflow retains its existing smoke behavior.
+      - name: Verify Full-smoke trigger and runbook truth
+        if: github.repository == 'jaredbahr/inkdrop-dev'
+        timeout-minutes: 1
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -B tests/inkdrop-full-smoke-trigger-and-runbook-contract-smoke.py
 
       - name: Verify the staged public export actually runs
         timeout-minutes: 10

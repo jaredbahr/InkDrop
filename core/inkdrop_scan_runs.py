@@ -265,36 +265,71 @@ def interrupt_orphaned_runs(db_path, *, now=None):
 
 
 def compare_fingerprints(stored, current):
-    """Returns {"stale": bool, "reasons": [str]} in words a human would use."""
+    """Returns {"stale": bool, "reasons": [str], "comparable": bool, "unknown": [str]}.
+
+    "Nothing moved" and "we could not tell whether anything moved" are
+    different answers, and every caller has to be able to tell them apart. This
+    used to return only `stale`, so a fingerprint it could not read -- a stored
+    row from before a field existed, or a `library_fingerprint()` whose database
+    read failed and came back with counts missing -- produced exactly the same
+    `stale: False` as a fingerprint it had compared field by field and found
+    unchanged. A check that declined to run was being written down as a verdict
+    about the library.
+
+    So each fact reports whether it could be compared at all. `unknown` names
+    the facts that could not be; `comparable` is False when nothing could be.
+    `stale`/`reasons` keep their old meaning -- something is known to have
+    moved -- and are never set by an absent fact in either direction.
+    """
     stored = stored if isinstance(stored, dict) else {}
     current = current if isinstance(current, dict) else {}
     reasons = []
+    unknown = []
 
     # Each reason is a bare clause: the caller puts "Since then, " in front of
     # the joined list, so nothing here repeats "since" or "your library".
     stored_roots = [str(item) for item in (stored.get("roots") or [])]
     current_roots = [str(item) for item in (current.get("roots") or [])]
-    if stored_roots and current_roots and stored_roots != current_roots:
+    if not stored_roots or not current_roots:
+        unknown.append("roots")
+    elif stored_roots != current_roots:
         reasons.append("your library folders changed in Settings")
 
-    stored_count = stored.get("media_file_count")
-    current_count = current.get("media_file_count")
-    if isinstance(stored_count, (int, float)) and isinstance(current_count, (int, float)):
+    # One table, both directions. Counting only the increases -- which is what
+    # series_count used to do while media_file_count counted both -- means a
+    # library that lost rows reads as unchanged, and two facts of the same kind
+    # answer the same question differently depending on which one moved.
+    counted_facts = (
+        ("media_file_count",
+         lambda n: f"{n:,} file{'' if n == 1 else 's'} landed",
+         lambda n: f"{n:,} file{'' if n == 1 else 's'} went away"),
+        ("series_count",
+         lambda n: f"{n:,} series {'was' if n == 1 else 'were'} added",
+         lambda n: f"{n:,} series went away"),
+    )
+    for key, added_phrase, removed_phrase in counted_facts:
+        stored_count = stored.get(key)
+        current_count = current.get(key)
+        if not isinstance(stored_count, (int, float)) or not isinstance(current_count, (int, float)):
+            unknown.append(key)
+            continue
         delta = int(current_count) - int(stored_count)
         if delta > 0:
-            reasons.append(f"{delta:,} file{'' if delta == 1 else 's'} landed")
+            reasons.append(added_phrase(delta))
         elif delta < 0:
-            gone = abs(delta)
-            reasons.append(f"{gone:,} file{'' if gone == 1 else 's'} went away")
+            reasons.append(removed_phrase(abs(delta)))
 
-    stored_series = stored.get("series_count")
-    current_series = current.get("series_count")
-    if isinstance(stored_series, (int, float)) and isinstance(current_series, (int, float)):
-        delta = int(current_series) - int(stored_series)
-        if delta > 0:
-            reasons.append(f"{delta:,} series {'was' if delta == 1 else 'were'} added")
-
-    return {"stale": bool(reasons), "reasons": reasons}
+    return {
+        "stale": bool(reasons),
+        "reasons": reasons,
+        # True only when every fact was actually compared. A partial comparison
+        # is not a clean bill of health: `stale: False` with a non-empty
+        # `unknown` means "none of what we could check had moved", which is a
+        # weaker claim than "nothing moved". A caller that wants to act on
+        # freshness should require `comparable and not stale`.
+        "comparable": not unknown,
+        "unknown": unknown,
+    }
 
 
 def library_fingerprint(db_path, *, roots=None):
@@ -307,9 +342,13 @@ def library_fingerprint(db_path, *, roots=None):
             row = con.execute("select count(*) as c from series").fetchone()
             fingerprint["series_count"] = int(row["c"] if row else 0)
     except Exception:
-        # No fingerprint is better than a wrong one: compare_fingerprints only
-        # reports on keys present on both sides, so this degrades to "we can
-        # only tell you how old it is", never to a false "still fresh".
+        # No fingerprint is better than a wrong one. compare_fingerprints()
+        # only reports on keys present on both sides, and names the keys it
+        # could not read in `unknown` -- so this degrades to "we can only tell
+        # you how old it is", never to a false "still fresh". That second half
+        # is the part that has to be checked: while `stale` was the only thing
+        # returned, an absent key here and a compared-and-unchanged key were
+        # the same value to every caller.
         pass
     return fingerprint
 
@@ -327,5 +366,9 @@ def public_run(run, *, db_path=None, roots=None, now=None, current_fingerprint=N
             current_fingerprint = library_fingerprint(db_path, roots=roots)
         payload["staleness"] = compare_fingerprints(run.get("fingerprint"), current_fingerprint or {})
     else:
-        payload["staleness"] = {"stale": False, "reasons": []}
+        # A run that did not finish has no stored fingerprint to compare, so
+        # staleness is not "False" here either -- it is simply not a question
+        # this row can answer. Same shape as compare_fingerprints() so callers
+        # never have to test which branch produced it.
+        payload["staleness"] = {"stale": False, "reasons": [], "comparable": False, "unknown": ["run_not_completed"]}
     return payload

@@ -49,10 +49,26 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.14",
+      slug: "v0-1-14",
+      released_at: "2026-08-22",
+      title: "Corrections to things InkDrop had told you",
+      summary: "A book whose file was gone still counted as owned. A check that failed to run reported the file as bad. A repair that was attempted was counted as made. None of these were wrong about the library; they were wrong about themselves.",
+      highlights: [
+        "A book whose file was deleted is released on every pass, not just the first",
+        "One folder layout could stall the daily integrity check and the two behind it",
+        "Manual Review says what it expected, what arrived, and why they disagree",
+        "A check that could not run no longer records a verdict about the file",
+        "Repairs are counted when made, not when attempted",
+        "A scan whose freshness could not be checked says so instead of claiming fresh",
+        "InkDrop refuses to open a state database written by a newer version of itself",
+      ],
+    }),
+    publicRelease({
       version: "v0.1.13",
       slug: "v0-1-13",
       released_at: "2026-08-21",
-      title: "Books we had already found, and then refused",
+      title: "Books already found, and then refused",
       summary: "Three checks were turning down files for reasons that were not about the file: an archive too big to validate was called damaged, a folder name was read as an issue number, and a failed transfer condemned a candidate forever. All three now say only what they know.",
       highlights: [
         "Large archives are sampled instead of being refused unread",
@@ -199,23 +215,6 @@
         "SLSKD can now recognize and convert raw page-image folders into a CBZ during import.",
         "The History page supports searching by series title and no longer repeats duplicate entries.",
         "Recover Missing, Attempts, and the SLSKD/download-client Settings cards all got clarity and usability fixes this build."
-      ]
-    }),
-    publicRelease({
-      version: "v0.1.04",
-      slug: "v0-1-04",
-      released_at: "2026-08-02",
-      title: "SLSKD stops crying wolf, and a wrong print-run stops auto-grabbing",
-      summary: "Fixed a bug where finished SLSKD searches could be wrongly logged and retried as timed out, likely the cause of \"SLSKD isn't working\" reports. Also fixes a wrong-volume auto-grab bug and a queue bug that excluded some series from search.",
-      highlights: [
-        "Fixed finished SLSKD searches sometimes being wrongly logged and retried as timed out.",
-        "Fixed candidates with the wrong volume or print run getting auto-grabbed as a safe match; unclear cases now go to Manual Review.",
-        "Fixed a queue bug that could permanently exclude some series from SLSKD search, and a stalled RSS discovery check.",
-        "Fixed a wrong-series match retrying endlessly instead of stopping after the first rejection.",
-        "SLSKD, Prowlarr, Torznab, and Newznab now try more results on a genuine zero-result search instead of waiting for the next pass.",
-        "Manual Review no longer hides legacy decisions, and supports bulk-ignore.",
-        "Fixed several qBittorrent and download-client bugs, including one that could wrongly blacklist a release.",
-        "Smaller fixes: faster status indicator, a clearer Queue wait panel, and automatic search on by default for new installs."
       ]
     })
   ]);

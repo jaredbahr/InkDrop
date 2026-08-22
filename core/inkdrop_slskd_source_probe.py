@@ -4654,6 +4654,21 @@ def token_number(value):
     return None
 
 
+def slskd_config_api_key():
+    """Best-effort read of slskd's own mounted config file for its API key.
+
+    Returns "" rather than raising when the file is missing or has no key
+    line -- slskd_api_key() below decides whether that is fatal, and the
+    legacy-card-to-instance migration reuses this to resolve a credential
+    the same way this loader does (PASS522).
+    """
+    text = read_slskd_config_text()
+    if not text:
+        return ""
+    match = re.search(r"^\s*key:\s*([^\s#]+)", text, flags=re.M)
+    return match.group(1) if match else ""
+
+
 def slskd_api_key():
     global SLSKD_API_KEY_CACHE
     instance_id = str(SLSKD_PROVIDER_SETTINGS.get("download_client_instance_id") or "").strip()
@@ -4675,13 +4690,10 @@ def slskd_api_key():
         return provider_key
     if SLSKD_API_KEY_CACHE:
         return SLSKD_API_KEY_CACHE
-    text = read_slskd_config_text()
-    if not text:
-        raise RuntimeError("SLSKD API key is not set in InkDrop settings and slskd config could not be read")
-    match = re.search(r"^\s*key:\s*([^\s#]+)", text, flags=re.M)
-    if not match:
+    key = slskd_config_api_key()
+    if not key:
         raise RuntimeError("SLSKD API key is not set in InkDrop settings or slskd config")
-    SLSKD_API_KEY_CACHE = match.group(1)
+    SLSKD_API_KEY_CACHE = key
     return SLSKD_API_KEY_CACHE
 
 

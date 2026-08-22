@@ -13,6 +13,7 @@ import hmac
 import importlib.util
 import ipaddress
 from core import inkdrop_acquire_adapter
+from core.inkdrop_validation import ValidationError
 from core import inkdrop_cloudflare_bypass_proxy
 from core import inkdrop_prowlarr_indexer_health
 from core import inkdrop_qbittorrent_auth
@@ -7984,9 +7985,17 @@ HTML = r"""<!doctype html>
           }
           const archiveIntegrity = managedLibraryAudit.archive_integrity || {};
           if (archiveIntegrity.requested) {
+            const integrityTruncation = !archiveIntegrity.truncated
+              ? ""
+              : (archiveIntegrity.truncated_by === "budget_seconds"
+                  ? ` · stopped at the ${compactNumber(archiveIntegrity.budget_seconds || 0)}s time budget`
+                  : ` · truncated at ${compactNumber(archiveIntegrity.max_files || 0)}`);
+            const integrityUnchecked = Number(archiveIntegrity.undetermined_count || 0) > 0
+              ? ` · ${compactNumber(archiveIntegrity.undetermined_count)} could not be checked`
+              : "";
             const integrityDetail = archiveIntegrity.ok === false
               ? (archiveIntegrity.error || archiveIntegrity.reason || "scan failed")
-              : `${compactNumber(archiveIntegrity.checked_files || 0)} archives opened${archiveIntegrity.truncated ? ` · truncated at ${compactNumber(archiveIntegrity.max_files || 0)}` : ""}`;
+              : `${compactNumber(archiveIntegrity.checked_files || 0)} archives opened${integrityUnchecked}${integrityTruncation}`;
             appendSystemTableRow(table, ["Archive integrity", compactNumber(archiveIntegrity.corrupt_count || 0), integrityDetail], {columns: 3});
           } else {
             appendSystemTableRow(table, ["Archive integrity", "not checked", "Check \"Also check archive integrity\" above and scan again."], {columns: 3});
@@ -29083,7 +29092,7 @@ HTML = r"""<!doctype html>
       mergePreviewIntro.textContent = "Bringing in a backup from a different InkDrop instance? \"Preview merge\" on any backup below compares its series and issues against your library and shows what's new, what you already have, and anything that needs a human to look at it -- by exact metadata ID only, never by title. This is a preview only: nothing is added, changed, or removed. Actually importing is not available yet.";
       const restoreDisabledNotice = document.createElement("p");
       restoreDisabledNotice.className = "settings-backup-restore-disabled-notice";
-      restoreDisabledNotice.textContent = "Restoring a full backup is temporarily disabled while we fix a data-safety issue in the restore path. Creating, downloading, and importing backups still work normally -- the archives below are safe to keep.";
+      restoreDisabledNotice.textContent = "Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed. Creating, downloading, and importing backups still work normally -- the archives below are safe to keep.";
       const retention = document.createElement("div");
       retention.dataset.backupRetention = "true";
       const actions = document.createElement("div");
@@ -44257,27 +44266,11 @@ def manual_source_resolved_issue_keys():
     resolved = actions.get("manual_source_resolved") if isinstance(actions, dict) else []
     if not isinstance(resolved, list):
         resolved = []
-    retracted = actions.get("manual_source_retracted_resolved") if isinstance(actions, dict) else []
-    # Defence in depth alongside the loader default. The same read in
-    # inkdrop_state.py and inkdrop_series_autopilot.py already guards this and
-    # this copy did not, so a dict-shaped actions file simply missing the key
-    # returned None here and crashed Search now for every install that had
-    # never been given one -- which is every new install, since nothing writes
-    # it. Callers that build `actions` themselves do not go through the loader.
-    if not isinstance(retracted, list):
-        retracted = []
-    retracted_ids = {
-        str(row.get("review_id") or "")
-        for row in retracted
-        if isinstance(row, dict) and row.get("review_id")
-    }
     keys = set()
     for row in resolved:
         if not isinstance(row, dict):
             continue
         review_id = str(row.get("review_id") or "")
-        if review_id and review_id in retracted_ids:
-            continue
         if not manual_source_resolved_has_existing_destination(row):
             continue
         if not manual_source_resolved_matches_issue(row):
@@ -49659,23 +49652,37 @@ def managed_library_archive_integrity_scan(max_files=MANAGED_LIBRARY_ARCHIVE_INT
     started = time.time()
     checked = 0
     corrupt = []
+    undetermined = []
     truncated = bool(scan.get("truncated"))
+    # Which limit stopped us, if one did. "truncated" alone made a time-budget
+    # stop indistinguishable from hitting the file cap, and the UI attributed
+    # every truncation to max_files.
+    truncated_by = "max_files" if truncated else None
     for row in scan.get("files") or []:
         if time.time() - started > budget_seconds:
             truncated = True
+            truncated_by = "budget_seconds"
             break
         finding = inkdrop_completed_import.archive_corruption_check(row.get("path"))
         if finding is None:
             if inkdrop_completed_import.comic_archive_suffix(row.get("path") or "") in (".cbz", ".cbr"):
                 checked += 1
             continue
-        checked += 1
-        corrupt.append({
+        entry = {
             "path": row.get("path"),
             "media_type": row.get("media_type"),
             "reason": finding.get("reason"),
             "detail": finding.get("detail") or "",
-        })
+        }
+        if finding.get("outcome") == "undetermined":
+            # Counted, never as corruption: these files were not read to a
+            # conclusion, so the only honest thing to report is that we could
+            # not check them. They are excluded from checked_files for the
+            # same reason -- an archive we failed to open was not "opened".
+            undetermined.append(entry)
+            continue
+        checked += 1
+        corrupt.append(entry)
     return {
         "ok": True,
         "requested": True,
@@ -49683,10 +49690,13 @@ def managed_library_archive_integrity_scan(max_files=MANAGED_LIBRARY_ARCHIVE_INT
         "scanned_total": len(scan.get("files") or []),
         "checked_files": checked,
         "corrupt_count": len(corrupt),
+        "undetermined_count": len(undetermined),
         "truncated": truncated,
+        "truncated_by": truncated_by,
         "max_files": max_files,
         "budget_seconds": budget_seconds,
         "samples": corrupt[:sample_limit],
+        "undetermined_samples": undetermined[:sample_limit],
     }
 
 
@@ -54547,7 +54557,7 @@ def runtime_provider_settings():
                 "scope": "automation",
                 "label": "SLSKD Queued-Transfer Wait Threshold",
                 "value": 48,
-                "description": "Give up on an SLSKD transfer that reached a peer's queue (or our own) but hasn't started moving bytes yet after this many hours. Busy uploaders routinely take a long time to open a slot, so this is intentionally patient -- separate from the Active Stall Threshold above, which only covers a transfer that already started and then stopped. Range: 1–336 hours; default: 48.",
+                "description": "Give up on an SLSKD transfer that reached a peer's queue (or InkDrop's own) but hasn't started moving bytes yet after this many hours. Busy uploaders routinely take a long time to open a slot, so this is intentionally patient -- separate from the Active Stall Threshold above, which only covers a transfer that already started and then stopped. Range: 1–336 hours; default: 48.",
                 "source": "runtime",
             },
             {
@@ -58428,14 +58438,11 @@ def load_manual_review_actions():
         data["manual_source_waiting"] = {}
     if not isinstance(data.get("manual_source_resolved"), list):
         data["manual_source_resolved"] = []
-    # This key has NO writer anywhere in the codebase -- three modules read it
-    # and nothing has ever written it since the root commit. The default exists
-    # to stop a missing key crashing a reader, NOT because the field is
-    # supported: retraction's write half is gone, so this list cannot grow. Do
-    # not read this default as a contract to build on. See the dead-retraction
-    # row in the tracker before adding anything that depends on it.
-    if not isinstance(data.get("manual_source_retracted_resolved"), list):
-        data["manual_source_retracted_resolved"] = []
+    # Tracker #537: manual_source_retracted_resolved is retired. The default
+    # used to be re-created here on every load, which is what made a key with
+    # no writer look like a supported field. Its readers are gone and the six
+    # entries that existed are archived in history_events. Do not add it back;
+    # if retraction becomes a feature it gets scoped as one.
     return data
 
 
@@ -64558,6 +64565,31 @@ def fast_state_count_snapshot(timeout_seconds=0.25):
             snapshot["active_queue_items"] = int(
                 con.execute("select count(*) from queue_items where active = 1").fetchone()[0] or 0
             )
+            # `series` above is a bare table count. On the live library that is
+            # 431, of which 124 carry a removal/merge/retirement marker and 10
+            # are discovery-only records -- so a tile labelled "Series" was
+            # overstating the library by about a third and counting rows the
+            # operator had deliberately removed, four rows above a list header
+            # that said "All 297".
+            #
+            # The predicates come from inkdrop_state rather than being rewritten
+            # here: series_not_removed_sql() is the same clause
+            # series_filter_clause() hands series_rows(), so this count and the
+            # Series list cannot drift apart. They are pure string builders and
+            # need no connection of their own.
+            #
+            # Three extra counts on a table of a few hundred rows; this function
+            # is bounded at 0.25s and they are index-free scans of the same table
+            # already being counted above.
+            snapshot["series_live"] = int(
+                con.execute(f"select count(*) from series s where {inkdrop_state.series_not_removed_sql('s')}").fetchone()[0] or 0
+            )
+            snapshot["series_excluded_removed"] = int(
+                con.execute(f"select count(*) from series s where {inkdrop_state.series_removed_sql('s')}").fetchone()[0] or 0
+            )
+            snapshot["series_excluded_discovery_only"] = int(
+                con.execute(f"select count(*) from series s where {inkdrop_state.series_discovery_only_sql('s')}").fetchone()[0] or 0
+            )
             snapshot["wanted_by_status"] = {
                 str(row["status"] or "unknown"): int(row["count"] or 0)
                 for row in con.execute(
@@ -65922,6 +65954,16 @@ def light_script_status():
         "inkdrop_state": standalone,
         "inkdrop_state_ok": bool(standalone.get("ok")) if isinstance(standalone, dict) else False,
         "inkdrop_state_series_count": series_count,
+        # The live population, and the two reasons the raw count is larger.
+        # Mobile Home renders the live figure: a tile labelled "Series" that
+        # counts merged duplicates and series the operator deliberately
+        # removed is not answering the question its own label asks. The two
+        # exclusion counts are carried so a surface can EXPLAIN the gap
+        # rather than leaving someone to infer it from two disagreeing
+        # numbers on one screen.
+        "inkdrop_state_series_live_count": int(standalone.get("series_live") or 0) if isinstance(standalone, dict) else 0,
+        "inkdrop_state_series_excluded_removed": int(standalone.get("series_excluded_removed") or 0) if isinstance(standalone, dict) else 0,
+        "inkdrop_state_series_excluded_discovery_only": int(standalone.get("series_excluded_discovery_only") or 0) if isinstance(standalone, dict) else 0,
         "inkdrop_state_wanted_count": int(standalone.get("wanted_items") or 0) if isinstance(standalone, dict) else 0,
         "inkdrop_state_queue_count": int(standalone.get("queue_items") or 0) if isinstance(standalone, dict) else 0,
         "source_health": source_health,
@@ -69376,8 +69418,23 @@ class Handler(BaseHTTPRequestHandler):
             # 2026-08-20: a symptom and no location. Mirrors the print +
             # print_exc the outer request guard already does at the same layer.
             failed_path = str(locals().get("path") or self.path or "")
-            print(f"InkDrop API handler failed: {self.command} {failed_path}: {exc}", flush=True)
-            traceback.print_exc()
+            # Tracker #535, phase 1. A ValidationError means the request was
+            # understood and refused -- a bad field, an unknown id, a
+            # disallowed transition. The operator needs the message; nobody
+            # needs the stack. Same reasoning the outer request guard already
+            # applies to a client hang-up: it is not a fault, so it does not
+            # deserve a stack trace.
+            #
+            # Everything else is unchanged, deliberately. This phase converts
+            # no raise sites and alters no status code, so every route behaves
+            # exactly as it does today; the traceback simply stops firing for
+            # the sites that later opt in. Flipping the default for
+            # unconverted faults is phase 3 and ships on its own.
+            if isinstance(exc, ValidationError):
+                print(f"InkDrop API rejected: {self.command} {failed_path}: {exc}", flush=True)
+            else:
+                print(f"InkDrop API handler failed: {self.command} {failed_path}: {exc}", flush=True)
+                traceback.print_exc()
             self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
 
     def _apply_operational_detail_privacy(self, view, query, payload):

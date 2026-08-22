@@ -3466,11 +3466,40 @@ def append_manual_review(reason, payload, db_path=None):
 
 
 def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
+    """Classify an archive as valid, invalid, or not-determinable.
+
+    Three outcomes, not two. `ok` stays a bool so every existing caller keeps
+    gating exactly as it did, but the result now also carries `outcome`:
+
+      * "valid"        -- opened, read, and passed.
+      * "invalid"      -- a verdict about the file itself.
+      * "undetermined" -- we could not finish the check. A missing extractor,
+        an extractor that blew its timeout, or an OS-level read failure says
+        nothing about whether the archive is intact, and must not be recorded
+        as though it did. These still return ok=False so nothing imports on
+        the strength of a check that never ran; what changes is that the
+        reason no longer claims the file is broken.
+
+    Reporting surfaces (archive_corruption_check and the managed-library
+    integrity scan above it) count the third case separately instead of
+    folding it into a corruption total.
+    """
+    path = Path(path)
     ext = comic_archive_suffix(path)
-    with path.open("rb") as handle:
-        head = handle.read(16)
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(16)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "outcome": "undetermined",
+            "reason": "archive_unreadable",
+            "page_count": 0,
+            "payload_size": 0,
+            "error": str(exc),
+        }
     if not head or all(byte == 0 for byte in head):
-        return {"ok": False, "reason": "zero_or_empty_header", "page_count": 0, "payload_size": 0}
+        return {"ok": False, "outcome": "invalid", "reason": "zero_or_empty_header", "page_count": 0, "payload_size": 0}
     if ext == ".cbz":
         try:
             with zipfile.ZipFile(path) as archive:
@@ -3487,37 +3516,84 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
                     bad_member = None
                     bad_member_error = str(exc)
         except zipfile.BadZipFile:
-            return {"ok": False, "reason": "bad_zip_archive", "page_count": 0, "payload_size": 0}
-        if len(images) < min_pages:
-            return {"ok": False, "reason": "too_few_image_pages", "page_count": len(images), "payload_size": payload_size}
-        if payload_size < min_payload_bytes:
-            return {"ok": False, "reason": "too_little_image_payload", "page_count": len(images), "payload_size": payload_size}
+            return {"ok": False, "outcome": "invalid", "reason": "bad_zip_archive", "page_count": 0, "payload_size": 0}
+        except OSError as exc:
+            return {
+                "ok": False,
+                "outcome": "undetermined",
+                "reason": "archive_unreadable",
+                "page_count": 0,
+                "payload_size": 0,
+                "error": str(exc),
+            }
+        # Corruption is decided BEFORE the page-count/payload heuristics.
+        # Those two are policy judgements about whether the content is worth
+        # importing; a failed CRC is a fact about the bytes. Evaluating policy
+        # first meant a genuinely corrupt archive that happened to be short or
+        # small was labelled "too_few_image_pages" -- a reason
+        # ARCHIVE_CORRUPTION_REASONS deliberately excludes -- so the
+        # library-wide integrity scan reported it as healthy.
         if bad_member:
             return {
                 "ok": False,
+                "outcome": "invalid",
                 "reason": "bad_zip_member",
                 "page_count": len(images),
                 "payload_size": payload_size,
                 "bad_member": bad_member,
             }
         if bad_member_error:
+            # testzip() itself raised. That is our read failing part-way, not
+            # a proven CRC mismatch, so it cannot be reported as a bad member.
             return {
                 "ok": False,
-                "reason": "bad_zip_member",
+                "outcome": "undetermined",
+                "reason": "archive_check_incomplete",
                 "page_count": len(images),
                 "payload_size": payload_size,
                 "error": bad_member_error,
             }
-        return {"ok": True, "page_count": len(images), "payload_size": payload_size}
+        if len(images) < min_pages:
+            return {"ok": False, "outcome": "invalid", "reason": "too_few_image_pages", "page_count": len(images), "payload_size": payload_size}
+        if payload_size < min_payload_bytes:
+            return {"ok": False, "outcome": "invalid", "reason": "too_little_image_payload", "page_count": len(images), "payload_size": payload_size}
+        return {"ok": True, "outcome": "valid", "page_count": len(images), "payload_size": payload_size}
     if ext == ".cbr":
         # No workdir passed -- reuses the single-slot extraction cache, so if
         # this same file goes on to repack_cbr_to_cbz() moments later, that
         # call reuses this extraction instead of paying for a second one.
         try:
             images, meta = extract_cbr_images(path)
+        except subprocess.TimeoutExpired as exc:
+            # Our own budget ran out. The archive was never read to the end,
+            # so there is nothing to conclude about it.
+            return {
+                "ok": False,
+                "outcome": "undetermined",
+                "reason": "cbr_extract_timeout",
+                "page_count": 0,
+                "payload_size": 0,
+                "error": str(exc),
+            }
+        except OSError as exc:
+            # Covers the extractor binary being absent (FileNotFoundError from
+            # Popen) and the archive being unreadable. Neither is evidence
+            # about the file's contents. Deployments really do run without a
+            # working 7z/unrar -- inkdrop_preflight.py already warns about
+            # exactly that -- and before this split every .cbr on such a host
+            # was reported to the operator as corrupt.
+            return {
+                "ok": False,
+                "outcome": "undetermined",
+                "reason": "cbr_extract_unavailable",
+                "page_count": 0,
+                "payload_size": 0,
+                "error": str(exc),
+            }
         except Exception as exc:
             return {
                 "ok": False,
+                "outcome": "invalid",
                 "reason": "cbr_extract_failed",
                 "page_count": 0,
                 "payload_size": 0,
@@ -3527,6 +3603,7 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
         if len(images) < min_pages:
             return {
                 "ok": False,
+                "outcome": "invalid",
                 "reason": "too_few_image_pages",
                 "page_count": len(images),
                 "payload_size": payload_size,
@@ -3535,6 +3612,7 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
         if payload_size < min_payload_bytes:
             return {
                 "ok": False,
+                "outcome": "invalid",
                 "reason": "too_little_image_payload",
                 "page_count": len(images),
                 "payload_size": payload_size,
@@ -3542,6 +3620,7 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
             }
         return {
             "ok": True,
+            "outcome": "valid",
             "page_count": len(images),
             "payload_size": payload_size,
             "exit_code": meta.get("unrar_exit_code", meta.get("seven_zip_exit_code")),
@@ -3551,7 +3630,7 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
             "missing_pages": meta.get("missing_pages", 0),
             "extracted_ratio": meta.get("extracted_ratio"),
         }
-    return {"ok": True, "reason": "non_archive_comic_format"}
+    return {"ok": True, "outcome": "valid", "reason": "non_archive_comic_format"}
 
 
 # Corruption reasons validate_comic_archive() can return, as opposed to its
@@ -3566,6 +3645,19 @@ ARCHIVE_CORRUPTION_REASONS = {
     "cbr_extract_failed",
 }
 
+# Reasons that mean the check did not finish. They are not corruption and are
+# not health either -- they are the absence of a result, and they get counted
+# and displayed on their own so an operator can tell "N files are broken"
+# apart from "N files I could not open". Folding these into the corruption
+# total is how a missing 7z binary or an expired extraction timeout used to
+# read as a library full of damaged archives.
+ARCHIVE_UNDETERMINED_REASONS = {
+    "archive_unreadable",
+    "archive_check_incomplete",
+    "cbr_extract_timeout",
+    "cbr_extract_unavailable",
+}
+
 
 def archive_corruption_check(path):
     """Report-only corruption check for a file already sitting in the library.
@@ -3576,6 +3668,12 @@ def archive_corruption_check(path):
     of a pending download. Returns None when the file is fine or isn't a
     format validate_comic_archive() actually checks (only .cbz/.cbr are;
     .cb7/.pdf fall through to "non_archive_comic_format" there too).
+
+    A returned dict carries `outcome`: "corrupt" means the file is damaged,
+    "undetermined" means the check could not be completed and says nothing
+    about the file. Callers must keep those apart -- reporting an
+    undetermined result as corruption is reporting our own failure as the
+    file's.
     """
     path = Path(path)
     if comic_archive_suffix(path) not in (".cbz", ".cbr"):
@@ -3583,14 +3681,19 @@ def archive_corruption_check(path):
     try:
         result = validate_comic_archive(path)
     except OSError as exc:
-        return {"reason": "unreadable", "detail": str(exc)}
+        # Not corruption: we never got to look at the file.
+        return {"outcome": "undetermined", "reason": "archive_unreadable", "detail": str(exc)}
+    except subprocess.TimeoutExpired as exc:
+        return {"outcome": "undetermined", "reason": "cbr_extract_timeout", "detail": str(exc)}
     if result.get("ok"):
         return None
     reason = result.get("reason")
+    detail = str(result.get("error") or result.get("bad_member") or "")
+    if result.get("outcome") == "undetermined" or reason in ARCHIVE_UNDETERMINED_REASONS:
+        return {"outcome": "undetermined", "reason": reason, "detail": detail}
     if reason not in ARCHIVE_CORRUPTION_REASONS:
         return None
-    detail = result.get("error") or result.get("bad_member") or ""
-    return {"reason": reason, "detail": str(detail)}
+    return {"outcome": "corrupt", "reason": reason, "detail": detail}
 
 
 def normalize_archive_member_name(member, root):

@@ -485,11 +485,32 @@
   function renderHome(status, activity) {
     status = status || {};
     const dotClass = statusDotClass(status.status);
-    const detail = status.detail ? `<span class="m-status-detail">${escapeHtml(status.detail)}</span>` : "";
+    // status.detail is NOT rendered here any more. It is the desktop status
+    // bar's diagnostic line: up to four of nine heterogeneous bits joined
+    // with semicolons (core/inkdrop_web.py, `"; ".join(detail_bits[:4])`),
+    // so which four appear depends on which fired first. On a phone it read
+    // as one run-on paragraph splicing one probe's progress into global
+    // queue counters and disk health, naming the series twice, with no
+    // decision attached to any of it.
+    //
+    // Everything in it already has a home on this screen except one thing:
+    // what Series Autopilot is doing right now. That is rendered below from
+    // its own discrete field rather than by picking the joined string apart.
+    const autopilotActivity = String(status.series_autopilot_active_task_detail || "").trim();
+    const activityHtml = autopilotActivity
+      // Reuses .m-meta-row, the row "Last import" already renders in, rather
+      // than introducing an unstyled class -- mobile.css is owned elsewhere
+      // and this change is render logic, not layout.
+      ? `<div class="m-meta-row"><span>Working on ${escapeHtml(autopilotActivity)}</span></div>`
+      : "";
     const lastImport = fmtMinutes(status.last_import_minutes);
 
     const tiles = [
-      tile(status.inkdrop_state_series_count ?? "-", "Series"),
+      // The live count, not the raw table count. inkdrop_state_series_count
+      // is `select count(*) from series` -- on the live library 431, of which
+      // 124 are removed/merged/retired and 10 are discovery-only. The
+      // fallback keeps an older payload rendering a number rather than a dash.
+      tile(status.inkdrop_state_series_live_count ?? status.inkdrop_state_series_count ?? "-", "Series"),
       tile(status.inkdrop_state_wanted_count ?? "-", "Wanted"),
       tile(activity && activity.active_total != null ? activity.active_total : (status.inkdrop_state_queue_count ?? "-"), "Active downloads"),
       tile(status.manual_review_actionable_count ?? status.manual_review_count ?? "-", "Needs attention", (status.manual_review_actionable_count || 0) > 0),
@@ -504,8 +525,9 @@
     els.homeContent.innerHTML = `
       <div class="m-status-banner">
         <span class="m-status-dot ${dotClass}"></span>
-        <span class="m-status-text">${escapeHtml(status.status ? humanizeToken(status.status) : "Status unavailable")}${detail}</span>
+        <span class="m-status-text">${escapeHtml(status.status ? humanizeToken(status.status) : "Status unavailable")}</span>
       </div>
+      ${activityHtml}
       <div class="m-home-actions">
         <button type="button" class="m-btn-primary" data-mobile-goto="add">Add a series</button>
         <button type="button" class="m-btn-quiet" data-mobile-goto="series">Find a series</button>
@@ -514,31 +536,6 @@
       ${renderHomeSeries()}
       ${metaHtml}
     `;
-    setUpStatusDetailToggle();
-  }
-
-  // status.json's `detail` is written for the desktop status bar and can run
-  // to a full paragraph. CSS clamps it to three lines; this adds the control
-  // to see the rest -- but only when there IS a rest, so a one-line status
-  // never grows a pointless "More" button. Measured rather than guessed from
-  // string length: whether it overflows depends on the font and the device's
-  // width, which only layout knows.
-  function setUpStatusDetailToggle() {
-    const banner = els.homeContent.querySelector(".m-status-banner");
-    const detailEl = banner && banner.querySelector(".m-status-detail");
-    if (!detailEl) return;
-    if (detailEl.scrollHeight <= detailEl.clientHeight + 1) return;
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "m-status-more";
-    toggle.setAttribute("aria-expanded", "false");
-    toggle.textContent = "More";
-    toggle.addEventListener("click", () => {
-      const expanded = banner.classList.toggle("is-expanded");
-      toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
-      toggle.textContent = expanded ? "Less" : "More";
-    });
-    detailEl.insertAdjacentElement("afterend", toggle);
   }
 
   // One pill per card, not the Series screen's full set: a rail card is a
@@ -1116,6 +1113,41 @@
   // copy of the allowed-source list -- the server re-checks the source itself
   // in approve_manual_review(), and a second, drifting copy here is exactly
   // how a button ends up enabled for an action the backend will refuse.
+  // #572. The server already knows what was wanted and what actually arrived
+  // (decision_evidence(), core/inkdrop_import_evidence.py). This renders it so
+  // the operator decides from the facts instead of inferring them from a
+  // reason code.
+  //
+  // THREE outcomes, kept distinct on purpose. Collapsing the middle one is how
+  // a blank field starts reading as "nothing was expected" -- the same
+  // false-certainty shape that has cost this library books:
+  //   no decision_evidence at all  -> render nothing (payload predates #572)
+  //   decision_evidence.incomplete -> say in words that we do not know
+  //   otherwise                    -> expected / found / why
+  function reviewEvidenceHtml(evidence) {
+    if (!evidence || typeof evidence !== "object") return "";
+    if (evidence.incomplete) {
+      return `<p class="m-item-evidence-unknown">InkDrop did not record what it expected for this item.</p>`;
+    }
+    const expected = evidence.expected || {};
+    const found = evidence.found || {};
+    const expectedText = [expected.series, expected.unit ? `#${expected.unit}` : ""].filter(Boolean).join(" ");
+    // The file name verbatim, never through a label function -- same rule as
+    // the source pill below, for the same reason.
+    const foundText = found.file_name || found.path || (found.unit ? `#${found.unit}` : "");
+    if (!expectedText && !foundText) return "";
+    // evidence.disagreement is the PRODUCER's sentence, rendered verbatim and
+    // never recomposed here: in `198!=001` the left number is what was FOUND
+    // and the right is what was EXPECTED. That reads backwards from intuition,
+    // and new copy written against the intuition is how it ships inverted.
+    const why = String(evidence.disagreement || "").trim();
+    return `<div class="m-item-evidence">
+              ${expectedText ? `<div class="m-evidence-line"><span class="m-evidence-key">Expected</span><span class="m-evidence-val">${escapeHtml(expectedText)}</span></div>` : ""}
+              ${foundText ? `<div class="m-evidence-line"><span class="m-evidence-key">Found</span><span class="m-evidence-val">${escapeHtml(foundText)}</span></div>` : ""}
+              ${why ? `<p class="m-evidence-why">${escapeHtml(why)}</p>` : ""}
+            </div>`;
+  }
+
   function approveEndpointFor(row) {
     if (row.can_approve_pack) return "/api/manual-review/approve-pack";
     if (row.can_approve_local_file) return "/api/manual-review/approve-local-file";
@@ -1228,7 +1260,38 @@
         const reasonLabel = String(row.reason_label || "").trim() || reviewRowReasonFallback(row);
         const reasonDetail = String(row.reason_detail || "").trim();
         const state = reviewRowState(row);
-        const sourceLabel = String(row.source_label || row.current_source || row.source || "").trim();
+        // `source` carries two different kinds of value: a provider id
+        // (`slskd`) and, on staged-file rows, a filesystem path. Both used to
+        // go through humanizeToken(), which title-cases every word -- so
+        // a staged-file path came back with every segment title-cased, which
+        // on Linux is not a valid path. Uglifying a label is cosmetic; mutating a path
+        // hands the operator a broken string to copy. The server classifies
+        // the value (core/inkdrop_import_evidence.py); a path is shown
+        // verbatim as its file name, never through a label function.
+        const evidence = row.decision_evidence || {};
+        const rawSource = row.current_source || row.source || "";
+        const sourceHtml = evidence.source_is_path
+          ? `<span class="m-item-source" title="${escapeHtml(evidence.found && evidence.found.path || rawSource)}">${escapeHtml((evidence.found && evidence.found.file_name) || rawSource)}</span>`
+          : (rawSource
+              // Not conditional on the server having classified it. A row that
+              // arrives without decision_evidence -- an older payload, or one
+              // from a path that skips the snapshot -- must still never have a
+              // path title-cased: the client can see a separator as well as the
+              // server can, and mutating a path is data loss, not cosmetics.
+              ? `<span class="m-item-source">${escapeHtml(
+                  // Path check FIRST, before any label function. #814 landed
+                  // row.source_label (source_display_label(), this repo's one
+                  // source-naming function) after this branch was cut; it is
+                  // the right name for a PROVIDER id and the wrong thing for a
+                  // path, because source_display_label is itself what mutates
+                  // the path. Consulting it ahead of the separator check would
+                  // hand a mutated path straight back. Ordered this way mobile
+                  // keeps #814's naming without reopening #820's defect.
+                  (/[\/]/.test(rawSource)
+                    ? rawSource
+                    : (row.source_label || evidence.source_name || humanizeToken(rawSource)))
+                )}</span>`
+              : "");
         const approveEndpoint = approveEndpointFor(row);
         const rejectable = canReject(row);
         const ignorable = Boolean(row.review_id);
@@ -1249,9 +1312,10 @@
           <div class="m-item-title">${escapeHtml(reviewRowTitle(row))}</div>
           ${reasonLabel ? `<div class="m-item-reason m-tone-${escapeHtml(row.reason_tone || "warn")}">${escapeHtml(reasonLabel)}</div>` : ""}
           ${reasonDetail ? `<div class="m-item-reason-detail">${escapeHtml(reasonDetail)}</div>` : ""}
+          ${reviewEvidenceHtml(row.decision_evidence)}
           <div class="m-item-row">
             ${state ? `<span class="m-pill">${escapeHtml(state)}</span>` : ""}
-            ${sourceLabel ? `<span class="m-item-source">${escapeHtml(sourceLabel)}</span>` : ""}
+            ${sourceHtml}
           </div>
           <div class="m-actions">${approveBtn}${secondary}</div>
           ${approveNote}

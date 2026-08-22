@@ -1,16 +1,94 @@
 #!/usr/bin/env python3
 import json
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 from core import inkdrop_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
-catalog = (ROOT / "web/static/js/inkdrop-version-about.js").read_text(encoding="utf-8")
+catalog_path = ROOT / "web/static/js/inkdrop-version-about.js"
+catalog = catalog_path.read_text(encoding="utf-8")
 workflow = (ROOT / ".github/workflows/inkdrop-public-release.yml").read_text(encoding="utf-8")
 release_contract = json.loads((ROOT / "docs/inkdrop/releases/current.json").read_text(encoding="utf-8"))
 current_notes = (ROOT / release_contract["notes_path"]).read_text(encoding="utf-8")
+
+summary_limit_match = re.search(r"\bsummary:\s*(\d+),", catalog)
+assert summary_limit_match, "About release summary limit was not found"
+summary_limit = int(summary_limit_match.group(1))
+
+
+def assert_summary_length(summary: str) -> None:
+    javascript_length = len(summary.encode("utf-16-le")) // 2
+    assert javascript_length <= summary_limit, (
+        f"release summary is {javascript_length} UTF-16 code units; "
+        f"loader limit is {summary_limit}"
+    )
+
+
+def run_catalog_loader(path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "node",
+            "-e",
+            (
+                f"require({json.dumps(str(path))});"
+                "process.stdout.write(JSON.stringify(globalThis.InkDropVersionAbout.publicReleases));"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def catalog_with_summary(summary: str) -> str:
+    updated, replacements = re.subn(
+        r'(\bsummary:\s*)"(?:[^"\\]|\\.)*"',
+        lambda match: match.group(1) + json.dumps(summary),
+        catalog,
+        count=1,
+    )
+    assert replacements == 1, "About release summary fixture was not found"
+    return updated
+
+
+loader = run_catalog_loader(catalog_path)
+assert loader.returncode == 0, (
+    "About release catalog failed its production loader: "
+    f"{(loader.stderr or loader.stdout).strip()}"
+)
+loaded_releases = json.loads(loader.stdout)
+for release in loaded_releases:
+    assert_summary_length(str(release["summary"]))
+
+# Exercise the production loader itself at both sides of its exact boundary.
+with tempfile.TemporaryDirectory(prefix="inkdrop-release-summary-") as temp_dir:
+    boundary_path = Path(temp_dir) / "boundary-catalog.js"
+    boundary_path.write_text(catalog_with_summary("x" * summary_limit), encoding="utf-8")
+    boundary_loader = run_catalog_loader(boundary_path)
+    assert boundary_loader.returncode == 0, (
+        "About release loader refused a summary at its exact limit: "
+        f"{(boundary_loader.stderr or boundary_loader.stdout).strip()}"
+    )
+
+    over_limit_path = Path(temp_dir) / "over-limit-catalog.js"
+    over_limit_path.write_text(catalog_with_summary("x" * (summary_limit + 1)), encoding="utf-8")
+    over_limit_loader = run_catalog_loader(over_limit_path)
+    assert over_limit_loader.returncode != 0, "About release loader accepted a summary over its limit"
+    assert "Error: Release summary is too long" in over_limit_loader.stderr, over_limit_loader.stderr
+
+# Pin the Python assertion boundary as a separate reporting guard.
+assert_summary_length("x" * summary_limit)
+try:
+    assert_summary_length("x" * (summary_limit + 1))
+except AssertionError:
+    pass
+else:
+    raise AssertionError("release summary over the loader limit was accepted")
 
 catalog_match = re.search(r'var DETAILED_RELEASES.*?version: "(v[^"]+)"', catalog, re.DOTALL)
 assert catalog_match, "newest About release version was not found"

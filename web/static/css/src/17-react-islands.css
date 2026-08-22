@@ -714,6 +714,41 @@
   overflow-wrap: anywhere;
 }
 
+/* #572 expected-versus-found, inside the Reason cell. Reference the operator
+   reads while deciding, so it sits quiet under the badge rather than
+   competing with it. The found value is a file name and must stay readable
+   and unmangled, so it wraps rather than truncating. */
+.mr-evidence {
+  display: grid;
+  gap: 2px;
+  margin-top: 2px;
+  min-width: 0;
+}
+.mr-evidence-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+.mr-evidence-key {
+  flex: 0 0 auto;
+  min-width: 58px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.mr-evidence-val {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.mr-evidence-why {
+  margin-top: 2px;
+}
+/* An absence of knowledge, styled as one. Never an empty Expected/Found pair,
+   which reads as a confident "nothing was expected". */
+.mr-evidence-unknown {
+  font-style: italic;
+}
+
 /* ---- Island tables: shared width base + mobile card transform ----
    The Blocklist/History/Manual Review/Wanted islands render bare .arr-table
    markup, which has NO responsive treatment of its own -- at phone widths

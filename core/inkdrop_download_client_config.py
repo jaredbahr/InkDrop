@@ -902,6 +902,48 @@ def _record_migration(db_path, client_type, status, detail):
         con.commit()
 
 
+def _external_config_credentials(client_type):
+    """Read the operator's own app config for a credential, for the same
+    three client types whose runtime loader already treats that file as a
+    trusted fallback when InkDrop's stored settings have none:
+    load_qbit_settings() and qbit_manage's config.yml, load_sab_settings()
+    and Mylar's config.ini, slskd_api_key() and the mounted slskd.yml
+    (core/inkdrop_acquire.py, core/inkdrop_slskd_source_probe.py).
+
+    _legacy_payload() below reads only the legacy card's settings_json, so a
+    credential that lives only in one of these files never carried across --
+    the migration under-carried relative to what the client actually runs on
+    (PASS522, tracker #522). Returns (secrets, username), both best-effort
+    empty on any read failure so a missing or malformed file just leaves the
+    migration exactly as unconfigured as it was before this existed.
+
+    Imported locally, not at module level: this module is imported by
+    inkdrop_state, which inkdrop_acquire and inkdrop_slskd_source_probe both
+    import at module level -- a module-level import here would cycle.
+    """
+    try:
+        if client_type == "qbittorrent":
+            from core import inkdrop_acquire
+
+            qbt = inkdrop_acquire._qbit_manage_config_credentials()
+            username = str(qbt.get("user") or "").strip()
+            password = str(qbt.get("pass") or "").strip()
+            return ({"password": password} if password else {}), username
+        if client_type == "sabnzbd":
+            from core import inkdrop_acquire
+
+            api_key = str(inkdrop_acquire._mylar_config_credentials().get("api_key") or "").strip()
+            return ({"api_key": api_key} if api_key else {}), ""
+        if client_type == "slskd":
+            from core import inkdrop_slskd_source_probe as slskd_probe
+
+            api_key = str(slskd_probe.slskd_config_api_key() or "").strip()
+            return ({"api_key": api_key} if api_key else {}), ""
+    except Exception:
+        return {}, ""
+    return {}, ""
+
+
 def _legacy_payload(client_type, row):
     """Build a create_instance() payload from one legacy provider-card row.
 
@@ -917,6 +959,21 @@ def _legacy_payload(client_type, row):
         value = str(settings.get(field) or "").strip()
         if value:
             secrets[field] = value
+    username_field = plan.get("username_field")
+    username = str(settings.get(username_field) or "").strip() if username_field else ""
+    schema = DEFAULT_TYPE_SCHEMAS.get(client_type) or {}
+    required_secret_fields = set(schema.get("required_secret_fields") or ()) | set(schema.get("required_secret_fields_any") or ())
+    if required_secret_fields and not any(secrets.get(field) for field in required_secret_fields):
+        # The legacy card's settings_json plaintext has no credential -- but
+        # that is not the same as "nothing to carry". load_qbit_settings(),
+        # load_sab_settings() and slskd_api_key() would still find one in the
+        # operator's own app config file and run the client live on it, so
+        # resolve the same way before concluding there is nothing here.
+        fallback_secrets, fallback_username = _external_config_credentials(client_type)
+        for field, value in fallback_secrets.items():
+            secrets.setdefault(field, value)
+        if not username and fallback_username:
+            username = fallback_username
     if not base_url and not secrets:
         return None
     payload = {
@@ -930,9 +987,8 @@ def _legacy_payload(client_type, row):
         "base_url": base_url,
         "source": "legacy_provider_config",
     }
-    username_field = plan.get("username_field")
     if username_field:
-        payload["username"] = str(settings.get(username_field) or "").strip()
+        payload["username"] = username
     if secrets:
         payload["secrets"] = secrets
     categories = {}
@@ -969,6 +1025,57 @@ def _legacy_payload(client_type, row):
     return payload
 
 
+def _repair_legacy_instance_secrets(db_path, client_type, row, *, secret_root=None, history_writer=None):
+    """Close a credential gap in an instance this migration created itself.
+
+    materialize_legacy_instances() marks a client type "completed" the first
+    time it runs and never revisits it, specifically so a user's later edit
+    or deletion is never clobbered. That guarantee only covers instances a
+    user could have touched. An instance still at revision 1, still carrying
+    ``source="legacy_provider_config"`` and still disabled has not been
+    touched by anyone -- it is exactly this migration's own incomplete
+    output from before it could resolve a credential from the operator's app
+    config file (PASS522). Only ever updates that specific, narrow case; any
+    instance a user has since edited (revision > 1, or source no longer
+    "legacy_provider_config" once update_instance() below has run on it once)
+    is left alone, same as materialize_legacy_instances() itself would.
+
+    Returns a result dict when it repairs something, else None.
+    """
+    with _connection(db_path) as con:
+        existing = con.execute(
+            "select * from download_client_instances where client_type=? and deleted_at is null "
+            "order by created_at, id limit 1",
+            (client_type,),
+        ).fetchone()
+        existing = dict(existing) if existing else None
+    if existing is None:
+        return None
+    if existing.get("source") != "legacy_provider_config" or int(existing.get("revision") or 0) != 1:
+        return None
+    if bool(existing.get("enabled")):
+        return None
+    payload = _legacy_payload(client_type, row)
+    if not payload or not payload.get("enabled"):
+        # Nothing new resolvable yet -- leave it exactly as it was, still
+        # eligible for a later repair pass once the operator's config file
+        # exists or gains a credential.
+        return None
+    try:
+        updated = update_instance(
+            db_path, existing["id"],
+            {"enabled": True, "username": payload.get("username", ""), "secrets": payload.get("secrets") or {}},
+            expected_revision=1, secret_root=secret_root, history_writer=history_writer,
+        )
+    except ValueError:
+        # The instance model's stricter rules (e.g. qBittorrent password
+        # with no resolvable username) can still refuse enablement even once
+        # a credential is found. Leave the instance exactly as it was rather
+        # than half-apply a change.
+        return None
+    return {"client_type": client_type, "instance_id": existing["id"], "enabled": updated["enabled"]}
+
+
 def materialize_legacy_instances(db_path, *, secret_root=None, history_writer=None, client_types=None):
     """Carry configured legacy provider-card clients into real instances, once.
 
@@ -986,7 +1093,7 @@ def materialize_legacy_instances(db_path, *, secret_root=None, history_writer=No
     way across.
     """
     types = [str(value).lower() for value in (client_types or LEGACY_CLIENT_FIELDS)]
-    result = {"schema": CONTRACT_SCHEMA, "migrated": [], "skipped": []}
+    result = {"schema": CONTRACT_SCHEMA, "migrated": [], "skipped": [], "repaired": []}
     rows = _legacy_rows(db_path, types)
     if not rows:
         return result
@@ -1001,8 +1108,17 @@ def materialize_legacy_instances(db_path, *, secret_root=None, history_writer=No
         if row is None:
             continue
         if states.get(client_type) == "completed":
-            # Already carried across. Never redo it -- the user may since have
-            # deliberately deleted or renamed the instance.
+            # Already carried across. Never redo the migration itself -- the
+            # user may since have deliberately deleted or renamed the
+            # instance. But an instance this migration created and nobody has
+            # touched since may still be missing a credential this function
+            # could not resolve before (PASS522) -- that gap is this
+            # function's own, not a user's, so it is safe to close.
+            repaired = _repair_legacy_instance_secrets(
+                db_path, client_type, row, secret_root=secret_root, history_writer=history_writer,
+            )
+            if repaired:
+                result["repaired"].append(repaired)
             continue
         if client_type in existing_types:
             result["skipped"].append({"client_type": client_type, "reason": "instance_already_exists"})

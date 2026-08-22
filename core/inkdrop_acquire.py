@@ -731,6 +731,22 @@ def effective_prowlarr_search_timeout_seconds(media_type="comics", requested=Non
         return configured
 
 
+def _qbit_manage_config_credentials():
+    """Read qbit_manage's own config file for a username/password.
+
+    This is the fallback load_qbit_settings() already trusts when InkDrop's
+    own settings have no credential -- and the migration that carries a
+    legacy download-client card into the instance model reuses it too, so
+    "enabled" gets computed from the same reality this loader observes
+    (PASS522). Raises whatever yaml/Path.read_text raises; callers decide
+    whether an unreadable file is fatal.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(QBIT_CONFIG.read_text()) or {}
+    return cfg.get("qbt") or {}
+
+
 def load_qbit_settings():
     config = provider_config("qbittorrent") or {}
     if config and not config.get("enabled", True):
@@ -743,10 +759,7 @@ def load_qbit_settings():
     qbt = {}
     if not api_key and not all(str(settings.get(key) or "").strip() for key in ("username", "password")):
         try:
-            import yaml
-
-            cfg = yaml.safe_load(QBIT_CONFIG.read_text()) or {}
-            qbt = cfg.get("qbt") or {}
+            qbt = _qbit_manage_config_credentials()
         except (ImportError, OSError, KeyError, TypeError, ValueError) as exc:
             if not (settings.get("username") and settings.get("password")):
                 raise RuntimeError(
@@ -776,6 +789,23 @@ def load_qbit_settings():
     }
 
 
+def _mylar_config_credentials():
+    """Read Mylar's own config file for the SABnzbd host/api_key it holds.
+
+    Same fallback load_sab_settings() already trusts, reused by the
+    legacy-card-to-instance migration so it resolves a credential the same
+    way this loader does (PASS522).
+    """
+    import configparser
+
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read(MYLAR_CONFIG)
+    return {
+        "host": cp.get("SABnzbd", "sab_host", fallback="").rstrip("/"),
+        "api_key": cp.get("SABnzbd", "sab_apikey", fallback="").strip(),
+    }
+
+
 def load_sab_settings():
     config = provider_config("sabnzbd") or {}
     if config and not config.get("enabled", True):
@@ -785,16 +815,13 @@ def load_sab_settings():
     fallback_api_key = ""
     if not str(settings.get("api_key") or "").strip():
         try:
-            import configparser
-
-            cp = configparser.ConfigParser(interpolation=None)
-            cp.read(MYLAR_CONFIG)
-            fallback_host = cp.get("SABnzbd", "sab_host", fallback="").rstrip("/")
-            fallback_api_key = cp.get("SABnzbd", "sab_apikey", fallback="").strip()
+            mylar = _mylar_config_credentials()
         except (OSError, ValueError) as exc:
             raise RuntimeError(
                 "SABnzbd API key is not set in InkDrop settings and could not be read from Mylar config"
             ) from exc
+        fallback_host = mylar["host"]
+        fallback_api_key = mylar["api_key"]
     host = str(config.get("base_url") or settings.get("host") or os.environ.get("INKDROP_SABNZBD_URL") or fallback_host or "").strip().rstrip("/")
     if not host:
         raise RuntimeError("SABnzbd URL is not configured; set INKDROP_SABNZBD_URL or the SABnzbd provider host setting.")

@@ -168,18 +168,36 @@ def _looks_html(sample):
     return any(marker in lowered for marker in HTML_MARKERS)
 
 
+# A local read that never got off the ground is not evidence about what the
+# provider sent. Reasons in this set are classified as infrastructure, so
+# inkdrop_source_suppression -- which only records failures classed as
+# "source_content" -- stops charging our own disk faults to the provider.
+LOCAL_READ_FAILURE_REASONS = {"archive_unreadable_locally"}
+
+
 def _archive_validation_reason(path, extension):
+    """Cheap post-download shape check on the staged partial.
+
+    Deliberately shallow: this is a pre-filter that runs before staging, not
+    the import gate. inkdrop_completed_import.validate_comic_archive() does
+    the real CRC pass later, so a .cbz whose members are corrupt passes here
+    and is caught there. What this must get right is not mistaking a failure
+    to read the file for a judgement about its contents.
+    """
     path = Path(path)
     extension = providers.normalize_extension(extension)
     if extension in {".cbz", ".epub", ".zip"}:
-        if zipfile.is_zipfile(path):
-            return ""
+        try:
+            if zipfile.is_zipfile(path):
+                return ""
+        except OSError:
+            return "archive_unreadable_locally"
         return "archive_validation_failed"
     try:
         with path.open("rb") as handle:
             head = handle.read(512)
-    except Exception:
-        return "archive_validation_failed"
+    except OSError:
+        return "archive_unreadable_locally"
     if extension == ".pdf":
         return "" if head.startswith(b"%PDF-") else "archive_validation_failed"
     if extension in {".cbr", ".rar"}:
@@ -673,7 +691,8 @@ def download_direct_file(
         return _blocked("archive_validation_failed", provider_id=provider_id, download_task_id=download_task_id, error=f"{type(exc).__name__}: {exc}")
     if archive_reason:
         _cleanup_partial(partial, incomplete_root_path)
-        return _source_content_blocked(
+        blocked = _blocked if archive_reason in LOCAL_READ_FAILURE_REASONS else _source_content_blocked
+        return blocked(
             archive_reason,
             provider_id=provider_id,
             download_task_id=download_task_id,

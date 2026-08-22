@@ -4687,17 +4687,6 @@ def read_manual_source_resolved_records(queue=None, *, target_index=None, deadli
     resolved = actions.get("manual_source_resolved") if isinstance(actions, dict) else []
     if not isinstance(resolved, list):
         return {}, {}
-    retracted = actions.get("manual_source_retracted_resolved") if isinstance(actions, dict) else []
-    # Older action documents and interrupted rehearsal fixtures may contain an
-    # explicit JSON null here.  Treat it like an empty collection; a missing
-    # retraction list must never stop the entire Automatic Search worker.
-    if not isinstance(retracted, list):
-        retracted = []
-    retracted_ids = {
-        str(row.get("review_id") or "")
-        for row in retracted
-        if isinstance(row, dict) and row.get("review_id")
-    }
     by_key = {}
     by_review_id = {}
     for row in resolved:
@@ -4706,8 +4695,6 @@ def read_manual_source_resolved_records(queue=None, *, target_index=None, deadli
         if not isinstance(row, dict):
             continue
         review_id = str(row.get("review_id") or "")
-        if review_id and review_id in retracted_ids:
-            continue
         if not manual_source_resolved_has_existing_destination(row):
             continue
         series = row.get("series")
