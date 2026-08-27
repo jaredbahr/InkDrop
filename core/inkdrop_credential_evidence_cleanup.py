@@ -56,6 +56,28 @@ def _scrub_normalized_credential_text(text):
     return _NORMALIZED_CREDENTIAL_RE.sub(r"\1\2redacted", str(text or ""))
 
 
+# Rows READ per (table, column) per pass, as opposed to batch_size, which caps
+# rows REWRITTEN. These are two different costs and were previously the same
+# number, which is what broke this job.
+#
+# The cursor only advances over rows it has read, so tying the read budget to
+# the write budget made the cursor crawl at batch_size/len(targets) rows per
+# pass -- 5 rows every 180s with the scheduler's batch_size=100. Measured on
+# the 2026-08-15 production database: history_events grows 74,854 rows/day
+# while the cursor advanced 2,400 rows/day, so the sweep lost ground 31:1 and
+# its cursor (1,940,446) was 2.36M rows behind the table head (4,301,087) with
+# no possibility of ever lapping. Roughly 945 rows past that cursor carried a
+# real credential-shaped token.
+#
+# Reading is cheap and takes no write lock: a 50,000-row read of
+# history_events.raw_json plus the regex work measured 2.9s against that same
+# 32GB database. Rewrites are the expensive, lock-taking part, so those stay
+# capped at batch_size exactly as before. 2,000 rows/target/pass is ~1s of
+# read work per pass and clears history_events' backlog in about 2.5 days
+# while staying ~13x ahead of that table's growth.
+DEFAULT_SCAN_WINDOW = 2000
+
+
 def _columns(con, table):
     return {str(row["name"]) for row in con.execute(f"pragma table_info({table})")}
 
@@ -84,9 +106,18 @@ def _save_cursor(con, table, column, rowid):
     )
 
 
-def cleanup_persisted_credentials(db_path, *, batch_size=100):
-    """Scrub at most batch_size rows using short compare-and-swap updates."""
+def cleanup_persisted_credentials(db_path, *, batch_size=100, scan_window=DEFAULT_SCAN_WINDOW):
+    """Rewrite at most batch_size rows using short compare-and-swap updates.
+
+    ``batch_size`` caps rows *rewritten*; ``scan_window`` caps rows *read* per
+    (table, column). Keeping those separate is what lets the cursor outrun the
+    tables it sweeps -- see DEFAULT_SCAN_WINDOW. A pass reads at most
+    ``scan_window`` rows per target and stops rewriting once its share of
+    ``batch_size`` is spent, leaving the cursor on the last row it actually
+    finished so the next pass resumes there rather than skipping the remainder.
+    """
     budget = max(1, int(batch_size or 100))
+    window = max(1, int(scan_window or DEFAULT_SCAN_WINDOW))
     remaining = budget
     result = {"ok": True, "examined": 0, "changed": 0, "malformed": 0, "concurrent_skips": 0}
     with inkdrop_state.connect(Path(db_path)) as con:
@@ -100,11 +131,11 @@ def cleanup_persisted_credentials(db_path, *, batch_size=100):
             cursor = _cursor(con, table, column)
             rows = con.execute(
                 f"select rowid, {column} from {table} where rowid>? order by rowid limit ?",
-                (cursor, quota),
+                (cursor, window),
             ).fetchall()
-            retry_current_row = False
+            written = 0
+            stopped_early = False
             for row in rows:
-                remaining -= 1
                 result["examined"] += 1
                 old = row[column]
                 if not _contains_candidate(old):
@@ -114,8 +145,8 @@ def cleanup_persisted_credentials(db_path, *, batch_size=100):
                     try:
                         value = json.loads(old or "{}")
                     except (TypeError, ValueError):
-                        result["malformed"] += 1
                         new = inkdrop_state.json_dumps({"credential_cleanup": "malformed_evidence_redacted"})
+                        malformed = True
                     else:
                         safe = (
                             inkdrop_state.credential_safe_operational_payload(value)
@@ -123,27 +154,39 @@ def cleanup_persisted_credentials(db_path, *, batch_size=100):
                             else inkdrop_state.privacy_safe_evidence_payload(value)
                         )
                         new = inkdrop_state.json_dumps(safe)
+                        malformed = False
                 else:
                     new = inkdrop_state.scrub_credential_query_params(str(old or ""))
+                    malformed = False
                 new = _scrub_normalized_credential_text(new)
                 if new == old:
                     cursor = row["rowid"]
                     continue
+                if written >= quota:
+                    # Write budget for this target is spent. Leave the cursor
+                    # BEFORE this row so the next pass rewrites it, and do not
+                    # lap -- there is known work left in this window.
+                    stopped_early = True
+                    break
+                result["malformed"] += int(malformed)
                 changed = con.execute(
                     f"update {table} set {column}=? where rowid=? and {column}=?",
                     (new, row["rowid"], old),
                 ).rowcount
                 result["changed"] += int(bool(changed))
                 result["concurrent_skips"] += int(not changed)
+                remaining -= 1
                 if not changed:
-                    retry_current_row = True
+                    stopped_early = True
                     break
                 cursor = row["rowid"]
-            if len(rows) < quota and not retry_current_row:
+                written += 1
+            if len(rows) < window and not stopped_early:
                 cursor = 0
             _save_cursor(con, table, column, cursor)
         con.commit()
     result["batch_size"] = budget
+    result["scan_window"] = window
     result["budget_remaining"] = remaining
     return result
 
@@ -170,14 +213,26 @@ def backfill_all_persisted_credentials(db_path):
         for kind, table, column, operational in targets:
             if not inkdrop_state.table_exists(con, table) or column not in _columns(con, table):
                 continue
+            # Walk forward on rowid rather than re-running a fixed "dirty"
+            # SELECT. The previous query filtered on '%apikey%'/'%api_key%'
+            # only, so a persisted password=, token=, rsskey= or secret= leak
+            # -- every other key in SENSITIVE_EVIDENCE_CREDENTIAL_KEYS, all of
+            # which _contains_candidate() and both scrubbers already handle --
+            # was never selected, never cleaned, and never counted. It also
+            # re-selected from rowid 0 every iteration, which does not
+            # terminate in reasonable time on a multi-million-row table.
+            # _contains_candidate() does the needle test in Python against the
+            # full key set, so the SQL side only has to page through rowids.
+            cursor = 0
             while True:
                 rows = con.execute(
-                    f"select rowid, {column} from {table} where lower({column}) like '%apikey%' or lower({column}) like '%api_key%' order by rowid limit 500"
+                    f"select rowid, {column} from {table} where rowid>? order by rowid limit 500",
+                    (cursor,),
                 ).fetchall()
                 if not rows:
                     break
-                progressed = False
                 for row in rows:
+                    cursor = row["rowid"]
                     result["examined"] += 1
                     old = row[column]
                     if not _contains_candidate(old):
@@ -199,9 +254,9 @@ def backfill_all_persisted_credentials(db_path):
                         new = inkdrop_state.scrub_credential_query_params(str(old or ""))
                     new = _scrub_normalized_credential_text(new)
                     if new == old:
-                        # Matched a NEEDLE substring but neither scrubber changed
-                        # it (e.g. "api_keys" as an unrelated field name) --
-                        # already safe, not an infinite-loop risk.
+                        # Matched a NEEDLE substring but neither scrubber
+                        # changed it (e.g. "api_keys" as an unrelated field
+                        # name) -- already safe.
                         continue
                     changed = con.execute(
                         f"update {table} set {column}=? where rowid=? and {column}=?",
@@ -209,22 +264,41 @@ def backfill_all_persisted_credentials(db_path):
                     ).rowcount
                     result["changed"] += int(bool(changed))
                     result["concurrent_skips"] += int(not changed)
-                    progressed = progressed or bool(changed)
                 con.commit()
-                if not progressed:
-                    # Nothing in this batch actually changed the stored value
-                    # (all remaining matches are safe placeholders/field-name
-                    # false positives) -- stop instead of re-selecting the same
-                    # 500 rows forever.
-                    break
-        for table, column in (
-            ("download_tasks", "raw_json"), ("source_attempts", "raw_json"), ("bad_source_candidates", "raw_json"),
-            ("bad_source_candidates", "source_path"), ("bad_source_candidates", "title"), ("bad_source_candidates", "normalized_title"),
-        ):
+        # Re-check every swept target with the same predicate the sweep used,
+        # instead of the old apikey-only count over a hand-picked subset of
+        # tables. That count reported "0 remaining" while password/token/rsskey
+        # rows were still sitting in the database untouched.
+        for kind, table, column, operational in targets:
             if not inkdrop_state.table_exists(con, table) or column not in _columns(con, table):
                 continue
-            row = con.execute(
-                f"select count(*) as c from {table} where lower({column}) like '%apikey%' or lower({column}) like '%api_key%'"
-            ).fetchone()
-            result["remaining_dirty"] += int(row["c"] or 0)
+            cursor = 0
+            while True:
+                rows = con.execute(
+                    f"select rowid, {column} from {table} where rowid>? order by rowid limit 500",
+                    (cursor,),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    cursor = row["rowid"]
+                    old = row[column]
+                    if not _contains_candidate(old):
+                        continue
+                    if kind == "json":
+                        try:
+                            value = json.loads(old or "{}")
+                        except (TypeError, ValueError):
+                            new = inkdrop_state.json_dumps({"credential_cleanup": "malformed_evidence_redacted"})
+                        else:
+                            safe = (
+                                inkdrop_state.credential_safe_operational_payload(value)
+                                if operational
+                                else inkdrop_state.privacy_safe_evidence_payload(value)
+                            )
+                            new = inkdrop_state.json_dumps(safe)
+                    else:
+                        new = inkdrop_state.scrub_credential_query_params(str(old or ""))
+                    if _scrub_normalized_credential_text(new) != old:
+                        result["remaining_dirty"] += 1
     return result

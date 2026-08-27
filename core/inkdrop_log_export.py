@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Bundle InkDrop's own log files into one downloadable archive.
+"""Bundle InkDrop's own log files into one redacted, downloadable archive.
 
-Backs a "Download logs" button on the System page: collects the ``*.log``
-files (and rotated ``.log.1`` style siblings) under the runtime log
-directory, keeps only the most recent tail of each file so one runaway log
-cannot balloon the archive, and writes a zip with a manifest describing
-exactly what was captured and where truncation happened.
+Backs the "Download logs only" button on the System page: the logs half of
+the support bundle, without the configuration and diagnostics members. It is
+the same archive a support thread would get, narrowed.
+
+Collection and redaction both come from ``inkdrop_support_bundle`` rather
+than being reimplemented here. That module already rejects symlinked,
+hardlinked and out-of-root log paths, builds the secret inventory, redacts
+each tail, and re-verifies the result before anything is written. This module
+previously did its own plain ``glob`` and tail-read with no redaction at all,
+so a button sitting one row below "Download support bundle" shipped API keys,
+basic-auth headers and passwords in cleartext -- and named the host log
+directory in its manifest.
 
 Newest-modified logs are packed first, so if the total budget runs out it is
 the stale files that get dropped, not the ones a support thread needs.
@@ -26,50 +33,41 @@ if str(_ROOT) not in _sys.path:
 import argparse
 import io
 import json
+import re
 import time
 import zipfile
 from pathlib import Path
 
-from core import inkdrop_runtime_config
+from core import inkdrop_support_bundle
 
 
-EXPORT_SCHEMA = "inkdrop.log_export.v1"
-DEFAULT_PER_FILE_CAP_BYTES = 8 * 1024 * 1024
-DEFAULT_TOTAL_CAP_BYTES = 64 * 1024 * 1024
+EXPORT_SCHEMA = "inkdrop.log_export.v2"
+DEFAULT_PER_FILE_CAP_BYTES = inkdrop_support_bundle.DEFAULT_PER_FILE_CAP_BYTES
+DEFAULT_TOTAL_CAP_BYTES = inkdrop_support_bundle.DEFAULT_TOTAL_CAP_BYTES
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def collect_log_files(log_dir=None):
-    """List log files newest-first without reading their contents."""
-    root = Path(log_dir or inkdrop_runtime_config.log_dir())
-    rows = []
-    if not root.is_dir():
-        return rows
-    for path in root.glob("*.log*"):
-        if not path.is_file():
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        rows.append(
-            {
-                "name": path.name,
-                "path": str(path),
-                "size_bytes": int(stat.st_size),
-                "modified_at": int(stat.st_mtime),
-            }
-        )
-    rows.sort(key=lambda row: (row["modified_at"], row["name"]), reverse=True)
-    return rows
+    """List log files newest-first without reading their contents.
+
+    Thin wrapper over the support bundle's collector so both exports agree on
+    which files are logs and which are unsafe to follow.
+    """
+    rows, _skipped = inkdrop_support_bundle.collect_log_files(log_dir)
+    return [
+        {
+            "name": row.get("name") or Path(row["path"]).name,
+            "path": str(row["path"]),
+            "size_bytes": row["size_bytes"],
+            "modified_at": row["modified_at"],
+        }
+        for row in rows
+    ]
 
 
-def _tail_bytes(path, cap_bytes):
-    """Read at most the last ``cap_bytes`` of a file."""
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size > cap_bytes:
-            handle.seek(size - cap_bytes)
-        return handle.read(cap_bytes), size > cap_bytes
+def _member_name(row, index):
+    name = _UNSAFE_NAME.sub("_", str(row.get("name") or "")).strip("._")[:100]
+    return f"logs/{index:03d}-{name or 'log'}"
 
 
 def log_archive_filename(now=None):
@@ -81,42 +79,79 @@ def build_log_archive_bytes(
     log_dir=None,
     per_file_cap_bytes=DEFAULT_PER_FILE_CAP_BYTES,
     total_cap_bytes=DEFAULT_TOTAL_CAP_BYTES,
+    *,
+    state_db=None,
+    environ=None,
+    secret_root=None,
+    deadline_seconds=inkdrop_support_bundle.DEFAULT_DEADLINE_SECONDS,
 ):
-    """Return ``(zip_bytes, manifest)`` for the current log directory.
+    """Return ``(zip_bytes, manifest)`` of redacted logs for the log directory.
 
-    The manifest is also embedded in the zip as ``manifest.json``. Files that
-    would push the archive past ``total_cap_bytes`` are listed in the
-    manifest as skipped rather than silently absent.
+    Every included file is redacted with the support bundle's inventory-backed
+    redactor and then re-checked for the exact secret values before it is
+    written. A file that cannot be proven clean is skipped with a reason in
+    the manifest rather than shipped, and if the inventory itself could not be
+    built no logs are included at all -- the same fail-closed posture the full
+    support bundle takes.
     """
-    per_file_cap_bytes = max(4096, int(per_file_cap_bytes))
-    total_cap_bytes = max(per_file_cap_bytes, int(total_cap_bytes))
+    started = time.monotonic()
+    deadline_seconds = max(1.0, min(float(deadline_seconds or inkdrop_support_bundle.DEFAULT_DEADLINE_SECONDS), 30.0))
+    deadline = started + deadline_seconds
+    per_file_cap_bytes = min(inkdrop_support_bundle.HARD_PER_FILE_CAP_BYTES, max(4096, int(per_file_cap_bytes)))
+    total_cap_bytes = min(inkdrop_support_bundle.HARD_TOTAL_LOG_BYTES, max(per_file_cap_bytes, int(total_cap_bytes)))
+    inventory = inkdrop_support_bundle.collect_secret_inventory(
+        state_db, environ=environ, secret_root=secret_root, deadline=deadline
+    )
+    encoded_variants = tuple(item.encode("utf-8") for item in inventory.variants())
     manifest = {
         "schema": EXPORT_SCHEMA,
         "generated_at": int(time.time()),
-        "log_dir": str(Path(log_dir or inkdrop_runtime_config.log_dir())),
+        # Never the real path: it carries the host account name.
+        "log_dir": "<runtime-log-dir>",
         "per_file_cap_bytes": per_file_cap_bytes,
         "total_cap_bytes": total_cap_bytes,
+        "redacted": True,
         "files": [],
         "skipped": [],
+        "redactions": 0,
+        "decode_replacements": 0,
     }
+    rows, path_skips = inkdrop_support_bundle.collect_log_files(log_dir, deadline=deadline)
+    manifest["skipped"].extend(path_skips)
+    if inventory.errors:
+        manifest["skipped"].extend(
+            {"name": f"log-{index:03d}", "reason": "secret_inventory_unavailable"}
+            for index, _row in enumerate(rows, 1)
+        )
+        rows = []
     budget = total_cap_bytes
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for row in collect_log_files(log_dir):
-            path = Path(row["path"])
+        for index, row in enumerate(rows, 1):
+            member = _member_name(row, index)
             if budget <= 0:
-                manifest["skipped"].append({"name": row["name"], "reason": "total_cap_reached"})
+                manifest["skipped"].append({"name": member, "reason": "total_cap_reached"})
                 continue
+            redactor = inkdrop_support_bundle.SupportRedactor(inventory, deadline=deadline)
             try:
-                payload, truncated = _tail_bytes(path, min(per_file_cap_bytes, budget))
-            except OSError as exc:
-                manifest["skipped"].append({"name": row["name"], "reason": f"read_failed:{type(exc).__name__}"})
+                cap = min(per_file_cap_bytes, budget)
+                raw, truncated = inkdrop_support_bundle.tail_with_context(row, cap)
+                payload = redactor.log_bytes(raw)
+                if len(payload) > cap:
+                    payload = payload[-cap:].decode("utf-8", errors="ignore").encode("utf-8")
+                    truncated = True
+                if inkdrop_support_bundle.contains_secret((payload,), encoded_variants, deadline=deadline):
+                    raise ValueError("post-redaction secret verification failed")
+            except Exception:
+                manifest["skipped"].append({"name": member, "reason": "redaction_failed"})
                 continue
             budget -= len(payload)
-            archive.writestr(f"logs/{row['name']}", payload)
+            archive.writestr(member, payload)
+            manifest["redactions"] += redactor.redactions
+            manifest["decode_replacements"] += redactor.decode_replacements
             manifest["files"].append(
                 {
-                    "name": row["name"],
+                    "name": member,
                     "size_bytes": row["size_bytes"],
                     "included_bytes": len(payload),
                     "truncated": bool(truncated or len(payload) < row["size_bytes"]),
@@ -124,7 +159,17 @@ def build_log_archive_bytes(
                 }
             )
         archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
-    return buffer.getvalue(), manifest
+    payload = buffer.getvalue()
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError("log archive ZIP validation failed")
+        for item in archive.infolist():
+            metadata = item.filename.encode("utf-8") + item.comment + item.extra
+            if inkdrop_support_bundle.contains_secret(
+                (metadata, archive.read(item)), encoded_variants, deadline=deadline
+            ):
+                raise RuntimeError("log archive post-build secret verification failed")
+    return payload, manifest
 
 
 def write_log_archive(out_dir, log_dir=None, **caps):

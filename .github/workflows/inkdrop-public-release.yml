@@ -167,7 +167,14 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: python -B tests/inkdrop-full-smoke-trigger-and-runbook-contract-smoke.py
 
+      # Builds a fresh export and runs tests inside it, so it only has an
+      # answer when it runs from the pre-export tree. Inside the export it was
+      # comparing that export against itself and failing on the manifest's own
+      # entry -- one of the thirteen reds that made the public suite unreadable.
+      # Same repository condition as the runbook check above, for the same
+      # reason: the private repo is where all of this check's inputs exist.
       - name: Verify the staged public export actually runs
+        if: github.repository == 'jaredbahr/inkdrop-dev'
         timeout-minutes: 10
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -871,3 +878,64 @@ jobs:
             --validation release-evidence/validation/qa-image-validation.json \
             --image-repository "ghcr.io/${GITHUB_REPOSITORY_OWNER}/inkdrop-qa" \
             --update-manifest release-evidence/inkdrop-update-manifest.json
+
+  # The consumer of the two gating jobs' verdict, and the reason a skip can no
+  # longer read as a pass.
+  #
+  # Every job below public_release/full_smoke_suite is gated on
+  # `github.ref == 'refs/heads/qa'`. The public repo has only `main`, so on the
+  # public side those three report `skipped` -- and a workflow whose remaining
+  # jobs all succeed concludes `success`. A run that validated nothing and a run
+  # that validated everything were therefore indistinguishable from the outside,
+  # which is how a release could be, and was, published against a red run.
+  #
+  # This job runs on `always()` precisely so it cannot be skipped out of
+  # existence along with the thing it is checking: a job that only runs when its
+  # dependencies succeeded can never report that they did not. It reads
+  # `needs.<job>.result` -- which is `success`, `failure`, `cancelled` or
+  # `skipped` -- and requires `success` explicitly. Anything else, absence
+  # included, fails the run.
+  release_gate:
+    name: Release gate
+    if: always() && github.event_name != 'pull_request'
+    needs: [public_release, full_smoke_suite]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require that both gating jobs actually executed and passed
+        env:
+          PUBLIC_RELEASE_RESULT: ${{ needs.public_release.result }}
+          FULL_SMOKE_RESULT: ${{ needs.full_smoke_suite.result }}
+        run: |
+          status=0
+          for pair in "Public release smoke:$PUBLIC_RELEASE_RESULT" "Full smoke suite:$FULL_SMOKE_RESULT"; do
+            name="${pair%%:*}"
+            result="${pair##*:}"
+            case "$result" in
+              success)
+                echo "ok: $name executed and passed"
+                ;;
+              skipped)
+                echo "BLOCKED: $name was skipped, so its checks never ran. Skipping is not passing."
+                status=1
+                ;;
+              *)
+                echo "BLOCKED: $name concluded '${result:-nothing}', not success."
+                status=1
+                ;;
+            esac
+          done
+          {
+            echo "## Release gate"
+            echo
+            echo "- Public release smoke: \`${PUBLIC_RELEASE_RESULT:-absent}\`"
+            echo "- Full smoke suite: \`${FULL_SMOKE_RESULT:-absent}\`"
+            if [ "$status" -eq 0 ]; then
+              echo "- Verdict: both gating jobs executed and passed."
+            else
+              echo "- Verdict: **blocked** -- this commit is not releasable."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

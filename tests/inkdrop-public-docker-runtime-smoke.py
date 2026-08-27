@@ -1189,7 +1189,7 @@ def assert_state_schema_audit_contract():
         "REQUIRED_STATE_SUMMARY_FIELDS",
         "REQUIRED_STATE_SECTIONS_FIELDS",
         "STATE_DB_NAME = \"inkdrop-state.sqlite3\"",
-        "SCHEMA_VERSION = 19",
+        "SCHEMA_VERSION = 20",
         "runtime_schema_version",
         "runtime_integrity",
         "runtime_foreign_key_violations",

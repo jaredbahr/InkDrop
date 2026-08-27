@@ -68,6 +68,28 @@ PROVENANCE_BRANDING_PREFIX = "branding_prefix"
 # predicate emitted mismatch against every genuine copy.
 BRANDING_PREFIXES = ("nickelodeon",)
 
+# The publication formats whose OWN numbering convention is chapter/volume
+# (`v01`, `ch001`, `c001`) rather than the issue/part convention Western
+# comics use. Two query builders each independently decide whether a numbered
+# item should get that notation -- `core/inkdrop_missing_acquire.py`'s
+# `row_is_manga()` (Prowlarr) and `core/inkdrop_slskd_source_probe.py`'s
+# `slskd_media_query_qualifier()` (slskd) -- and they had drifted: Prowlarr's
+# set included `webtoon`, slskd's did not. This is the one place the
+# AUTHORITATIVE `media_type` field is read for that question, so the two
+# query builders cannot silently disagree on it again. Each keeps its own
+# SECONDARY fallback heuristic for when `media_type` is absent or disputed
+# (Prowlarr's title/publisher list, slskd's publisher-phrase list) --
+# reconciling those is a data-correctness question (#578) this does not
+# attempt, on purpose: #578 already found one of the two measurably less
+# reliable than the other, and "do not bulk-correct" is its own ruling.
+MANGA_SHAPED_MEDIA_TYPES = frozenset({"manga", "manhwa", "manhua", "webtoon"})
+
+
+def media_type_is_manga_shaped(media_type):
+    """Whether a stored `media_type` value names a chapter/volume-numbered format."""
+    return str(media_type or "").strip().lower() in MANGA_SHAPED_MEDIA_TYPES
+
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _APOSTROPHES = "'’ʼ՚＇"
 # An apostrophe that follows a word character is punctuation inside a word --

@@ -5,10 +5,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# inkdrop_web_config.py holds the static-asset registration constants that
-# used to live directly in inkdrop_web.py; the mount/asset contract below
-# spans both files.
-WEB = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8") + (ROOT / "core" / "inkdrop_web_config.py").read_text(encoding="utf-8")
+# inkdrop_web_config.py holds the static-asset registration constants and
+# web/templates/inkdrop-shell.html holds the <script src> mount tag, both of
+# which used to live directly in inkdrop_web.py; the mount/asset contract
+# below spans all three files.
+WEB = (
+    (ROOT / "web/templates/inkdrop-shell.html").read_text(encoding="utf-8")
+    + (ROOT / "core/inkdrop_web.py").read_text(encoding="utf-8")
+    + (ROOT / "core/inkdrop_web_config.py").read_text(encoding="utf-8")
+)
 JS = (ROOT / "web/static/js/inkdrop-download-clients-ui.js").read_text(encoding="utf-8")
 CSS = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")
 FIXTURE = (ROOT / "web/tests/fixtures/download-clients-settings.html").read_text(encoding="utf-8")

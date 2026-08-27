@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="en" class="inkdrop-auth-pending">
+<head>
+  <meta charset="utf-8">
+  <!-- Must precede the view-switch script below: without it the browser
+       has not yet adopted the real device width, so matchMedia reads
+       against the ~980px desktop-page default instead of the phone's
+       actual width -- see the redirect script's own comment. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    // Server-computed at request time (see send_html()) so the redirect
+    // decision below never needs a network round trip. While true, nobody
+    // has claimed this install yet and /m has no bootstrap form of its
+    // own -- see INKDROP_AUTH_SETUP_SAFE_PATHS -- so every viewport stays
+    // on this shell until inkdrop-auth-ui.js renders the setup flow.
+    window.__INKDROP_SETUP_REQUIRED__ = __INKDROP_SETUP_REQUIRED_JSON__;
+    // The one source-naming vocabulary, rendered from
+    // core/inkdrop_state.SOURCE_DISPLAY_LABELS. Constant for the life of
+    // the process, so it is substituted once at import rather than per
+    // request. web/static/js/inkdrop-api.js turns it into a name.
+    window.__INKDROP_SOURCE_DISPLAY__ = __INKDROP_SOURCE_DISPLAY_JSON__;
+  </script>
+  <script>
+    // Auto-switch to the lightweight mobile view (/m) on a narrow viewport,
+    // before any of this page's CSS/JS below is requested. Runs again on
+    // every crossing of the breakpoint (matchMedia's change event) so
+    // resizing or rotating an already-open window switches live too, not
+    // just on initial load -- not a one-time user-agent sniff. A visitor
+    // who explicitly asked to stay on desktop (the mobile page's "Desktop
+    // site" link, or ?view=desktop) is remembered for this browser tab via
+    // sessionStorage so it doesn't bounce them back.
+    //
+    // The auto-detect branch (no explicit preference) is guarded by a
+    // shared sessionStorage cooldown: dragging a window edge through 768px
+    // fires matchMedia's change event on every transient crossing, and each
+    // one used to trigger an immediate location.replace -- a full document
+    // reload takes long enough that the width can drift back across the
+    // breakpoint again before the new page's own gate script runs, so /
+    // and /m kept bouncing each other back and forth (visible as constant
+    // flashing). A redirect this script fires now stamps the time; neither
+    // side's auto-detect branch will fire again for a short window after,
+    // so the loop can't sustain itself. Explicit preferences (query param
+    // or the "Desktop site" link) bypass the cooldown entirely -- they're a
+    // single deliberate decision, not a repeatable auto-trigger, so nothing
+    // about them can loop.
+    (function () {
+      var BREAKPOINT = "(max-width: 768px)";
+      var SWITCH_COOLDOWN_MS = 1500;
+      var CHANGE_SETTLE_MS = 250;
+      function preference() {
+        try { return sessionStorage.getItem("inkdropViewPreference"); } catch (e) { return null; }
+      }
+      function recentlyAutoSwitched() {
+        try {
+          var at = Number(sessionStorage.getItem("inkdropViewSwitchedAt") || 0);
+          return !!at && (Date.now() - at) < SWITCH_COOLDOWN_MS;
+        } catch (e) { return false; }
+      }
+      function markAutoSwitched() {
+        try { sessionStorage.setItem("inkdropViewSwitchedAt", String(Date.now())); } catch (e) {}
+      }
+      try {
+        var requested = new URLSearchParams(location.search).get("view");
+        if (requested === "mobile" || requested === "desktop") {
+          sessionStorage.setItem("inkdropViewPreference", requested);
+        }
+      } catch (e) {}
+      function isNarrow() {
+        return !!(window.matchMedia && window.matchMedia(BREAKPOINT).matches);
+      }
+      function maybeSwitch() {
+        if (window.__INKDROP_SETUP_REQUIRED__) return;
+        var pref = preference();
+        if (pref === "desktop") return;
+        if (pref === "mobile") { location.replace("/m" + location.search + location.hash); return; }
+        if (isNarrow() && !recentlyAutoSwitched()) {
+          markAutoSwitched();
+          location.replace("/m" + location.search + location.hash);
+        }
+      }
+      maybeSwitch();
+      if (window.matchMedia) {
+        var mql = window.matchMedia(BREAKPOINT);
+        var settleTimer = null;
+        var onChange = function () {
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(maybeSwitch, CHANGE_SETTLE_MS);
+        };
+        if (mql.addEventListener) mql.addEventListener("change", onChange);
+        else if (mql.addListener) mql.addListener(onChange);
+      }
+      // Belt-and-suspenders re-check once the page is actually shown --
+      // covers a bfcache restore (back/forward navigation resurrects the
+      // page without re-running from a network load) and any environment
+      // where the viewport isn't fully settled at the moment this
+      // head-of-document script runs.
+      window.addEventListener("pageshow", maybeSwitch);
+    })();
+  </script>
+  <meta name="theme-color" content="#181c21">
+  <link rel="icon" type="image/png" href="/inkdrop-logo-mark.png?v=20260728-opaque-logo">
+  <link rel="apple-touch-icon" href="/inkdrop-logo-mark.png?v=20260728-opaque-logo">
+  <title>InkDrop</title>
+  <style id="inkdrop-critical-fallback">
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #181c21; color: #dce4ec; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #181c21; color: #dce4ec; }
+    main { width: min(1280px, calc(100vw - 24px)); margin: 0 auto; padding: 12px 0 32px; }
+    .arr-nav-shell { display: grid; gap: 8px; padding: 10px; border: 1px solid #343c46; background: #1e2329; }
+    .arr-nav, .arr-settings-subnav, .arr-activity-subnav { display: flex; flex-wrap: wrap; gap: 6px; }
+    button, input, select { min-height: 34px; border: 1px solid #46515d; background: #252b32; color: inherit; padding: 6px 9px; }
+    [hidden] { display: none !important; }
+  </style>
+  <link rel="stylesheet" href="/static/css/inkdrop.css?v=__INKDROP_UI_CSS_VERSION__" onload="document.getElementById('inkdrop-critical-fallback')?.remove()">
+  <script src="/static/js/inkdrop-api.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
+  <script src="/static/js/inkdrop-manual-search.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
+  <script src="/static/js/inkdrop-auth-ui.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
+  <script src="/static/js/inkdrop-download-clients-ui.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
+  <script src="/static/js/inkdrop-missing-recovery.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
+  <!-- Built by web/frontend (Vite); defines window.InkDropReact. A checkout
+       that hasn't run the frontend build 404s here harmlessly -- every call
+       site guards with window.InkDropReact?. and falls back to the existing
+       vanilla rendering path. -->
+  <script src="/static/dist/inkdrop-react.js?v=__INKDROP_UI_REACT_VERSION__" defer></script>
+</head>
+<body>
+  <div id="inkdropAuthRoot" class="inkdrop-auth-root" aria-live="polite"></div>
+  <main id="inkdropAppShell" hidden>
+    <header>
+      <div class="inkdrop-header-brand">
+        <span class="inkdrop-logo-mark" aria-hidden="true"><img class="inkdrop-logo-img" src="/inkdrop-logo-mark.png?v=20260728-opaque-logo" alt="" loading="eager" decoding="async"></span>
+        <div>
+          <h1>InkDrop</h1>
+          <p class="lede">Add or monitor a series. InkDrop keeps missing issues moving through automation and separates real decisions from parked source checks.</p>
+      </div>
+      <div class="status-pill" id="status">Status: <strong>loading...</strong></div>
+    </header>
+
+    <div class="arr-nav-shell">
+      <div class="arr-nav-brand">
+        <span class="arr-nav-mark inkdrop-logo-mark" aria-hidden="true"><img class="inkdrop-logo-img" src="/inkdrop-logo-mark.png?v=20260728-opaque-logo" alt="" loading="eager" decoding="async"></span>
+        <div>
+          <strong>InkDrop</strong>
+        </div>
+      </div>
+      <input class="arr-nav-search" id="inkdropSeriesNavSearch" type="search" placeholder="Search Series..." autocomplete="off" aria-label="Search existing series">
+      <nav class="arr-nav" aria-label="InkDrop sections">
+        <span class="arr-nav-group-label">Library</span>
+        <!-- Pulled for this release: no forward-looking release-date data yet. See INKDROP_CALENDAR_ENABLED. -->
+        <button type="button" data-arr-section="calendar" data-arr-icon-key="calendar" data-arr-static-nav="true" onclick="openInkdropNavSection('calendar')" hidden aria-hidden="true"><span class="arr-nav-label">Calendar</span></button>
+        <button type="button" data-arr-section="pull_list" data-arr-icon-key="calendar" data-arr-static-nav="true" onclick="openInkdropNavSection('pull_list')"><span class="arr-nav-label">Pull List</span></button>
+        <button type="button" data-arr-section="series" data-arr-icon-key="series" data-arr-badge-mode="label" onclick="openInkdropNavSection('series')"><span class="arr-nav-label">Series</span><span class="arr-nav-count" id="navSeriesCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
+        <span class="arr-nav-group-label">Operations</span>
+        <button type="button" data-arr-section="wanted" data-arr-icon-key="wanted" data-arr-badge-mode="label" onclick="openInkdropNavSection('wanted')"><span class="arr-nav-label">Wanted</span><span class="arr-nav-count" id="navWantedCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
+        <button type="button" data-arr-section="activity" data-arr-icon-key="activity" data-arr-badge-mode="label" onclick="openInkdropNavSection('activity')"><span class="arr-nav-label">Activity</span><span class="arr-nav-count" id="navActivityCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
+        <div class="arr-activity-subnav" aria-label="Activity areas">
+          <button type="button" data-arr-section="queue" data-arr-subsection="activity" onclick="openInkdropNavSection('queue')">Queue</button>
+          <button type="button" data-arr-section="history" data-arr-subsection="activity" onclick="openInkdropNavSection('history')">History</button>
+          <button type="button" data-arr-section="source_memory" data-arr-subsection="activity" onclick="openInkdropNavSection('source_memory')">Blocklist</button>
+        </div>
+        <button type="button" data-arr-section="manual_review" data-arr-icon-key="manual-review" data-arr-badge-mode="label" onclick="openInkdropNavSection('manual_review')"><span class="arr-nav-label">Manual Review</span><span class="arr-nav-count" id="navReviewCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
+        <button type="button" data-arr-section="reliability" data-arr-icon-key="diagnostics" data-arr-static-nav="true" onclick="openInkdropNavSection('reliability')"><span class="arr-nav-label">Reliability</span></button>
+        <span class="arr-nav-group-label">Administration</span>
+        <button type="button" data-arr-section="settings" data-arr-icon-key="settings" data-arr-static-nav="true" onclick="openInkdropSettingsArea('setup')"><span class="arr-nav-label">Settings</span></button>
+        <div class="arr-settings-subnav" aria-label="Settings areas">
+          <button type="button" data-settings-nav-area="setup" onclick="openInkdropSettingsArea('setup')">Setup</button>
+          <button type="button" data-settings-nav-area="media_management" onclick="openInkdropSettingsArea('media_management')">Media Management</button>
+          <button type="button" data-settings-nav-area="language" onclick="openInkdropSettingsArea('language')">Language</button>
+          <button type="button" data-settings-nav-area="indexers" onclick="openInkdropSettingsArea('indexers')">Indexers</button>
+          <button type="button" data-settings-nav-area="download_clients" onclick="openInkdropSettingsArea('download_clients')">Download Clients</button>
+          <!-- Pulled for this release: no working import source behind it yet. See INKDROP_IMPORT_LISTS_ENABLED. -->
+          <button type="button" data-settings-nav-area="import_lists" onclick="openInkdropSettingsArea('import_lists')" hidden aria-hidden="true">Import Lists</button>
+          <button type="button" data-settings-nav-area="connect" onclick="openInkdropSettingsArea('connect')">Connect</button>
+          <button type="button" data-settings-nav-area="metadata" onclick="openInkdropSettingsArea('metadata')">Metadata</button>
+          <button type="button" data-settings-nav-area="general" onclick="openInkdropSettingsArea('general')">General</button>
+          <button type="button" data-settings-nav-area="ui" onclick="openInkdropSettingsArea('ui')">UI</button>
+          <button type="button" data-settings-nav-area="root_folders" onclick="openInkdropSettingsArea('root_folders')">Paths</button>
+          <!-- Nav entry pulled for this release: the "Add source" list under here
+               mixes real Automatic Search tuning with a generic source-template
+               catalog that includes non-comic templates (Gutendex, Standard Ebooks)
+               InkDrop has no feature behind. The templates are real backend
+               registrations shared with other source types, not dead scaffolding,
+               so only the nav entry is hidden here -- the settings area and its
+               backing providers are untouched. -->
+          <button type="button" data-settings-nav-area="automation" onclick="openInkdropSettingsArea('automation')" hidden aria-hidden="true">Automatic Search</button>
+        </div>
+        <button type="button" data-arr-section="system" data-arr-icon-key="system" data-arr-static-nav="true" onclick="openInkdropNavSection('system')"><span class="arr-nav-label">System</span></button>
+      </nav>
+      <div class="arr-nav-actions">
+        <button class="arr-nav-add" type="button" onclick="goToWorkflowTarget('seriesSearchSection')">Add Series</button>
+      </div>
+      <div class="activity-region" aria-live="polite">
+        <button class="activity-status" id="activityStatus" type="button" hidden></button>
+        <section class="activity-dock" id="activityDock" hidden>
+          <button class="activity-sidebar-link" id="activitySidebarLink" type="button">
+            <span id="activityDockTitle">Activity · unavailable</span>
+          </button>
+          <div class="activity-dock-legacy" hidden inert aria-hidden="true">
+            <span id="activityDockSummary"></span>
+            <span id="activityCount"></span>
+            <button id="activityDockPrimaryAction" type="button" hidden disabled tabindex="-1"></button>
+            <button id="activityDockToggle" type="button" hidden disabled tabindex="-1"></button>
+            <div id="activityDockDestination" hidden></div>
+            <div id="activityDockCompactTarget" hidden></div>
+            <div id="activitySummary" hidden></div>
+            <div id="activityOperatorBoard" hidden></div>
+            <div id="activityDockNowRail" hidden></div>
+            <div id="activityDockLaneStrip" hidden></div>
+            <div id="activityRouteStrip" hidden></div>
+            <div id="activityList" hidden></div>
+          </div>
+        </section>
+        <div class="toast" id="toast"></div>
+      </div>
+    </div>
+
+    <div class="arr-content-shell">
+    <section class="arr-page-masthead" id="inkdropPageMasthead" aria-live="polite">
+      <div class="arr-page-heading">
+        <span class="arr-page-eyebrow" id="inkdropPageEyebrow">InkDrop</span>
+        <h2 id="inkdropPageTitle">Series</h2>
+        <p id="inkdropPageDescription">Library index, monitoring, and add-series intake. Missing issues move automatically into Wanted and Queue.</p>
+      </div>
+      <div class="arr-page-side">
+        <div class="arr-page-stats" id="inkdropPageStats"></div>
+        <div class="arr-page-actions" id="inkdropPageActions"></div>
+      </div>
+    </section>
+    <section class="arr-page-alert-banner" id="inkdropPageAlertBanner" hidden></section>
+
+    <section class="notice" id="packReviewBanner" hidden></section>
+
+    <details class="card source-health workflow-snapshot-drawer" id="workflowSnapshot" data-arr-page="history" hidden>
+      <summary>
+        <div class="section-title">
+          <div>
+            <h2>Activity Summary</h2>
+            <p class="mini" id="workflowSnapshotSummary">Current work, decisions, and parked source checks.</p>
+          </div>
+          <span class="queue-toggle"><span class="closed-label">Show snapshot</span><span class="open-label">Hide snapshot</span></span>
+        </div>
+      </summary>
+      <div class="workflow-snapshot-body">
+        <div class="workflow-actions">
+          <button onclick="goToWorkflowTarget('manualReview')">Manual Review</button>
+          <button onclick="goToWorkflowTarget('unmatchedDownloads')">Unmatched</button>
+          <button onclick="goToWorkflowTarget('sabComicFailures')">SAB</button>
+        </div>
+        <div class="workflow-next" id="workflowNextAction" hidden></div>
+        <div class="workflow-grid" id="workflowSnapshotGrid"></div>
+      </div>
+    </details>
+
+    <div class="op-detail-dock" id="opDetailDock">
+    <section class="card source-health" id="inkdropCore" data-arr-page="series wanted queue activity history manual_review source_memory" hidden>
+      <div class="section-title core-shell-title" hidden aria-hidden="true">
+        <div>
+          <h2>InkDrop Core</h2>
+          <p class="mini">Standalone state owned by InkDrop: wanted items, queue movement, source attempts, imports, and history.</p>
+        </div>
+        <div class="workflow-actions">
+          <button id="inkdropCoreSyncBtn" type="button" data-arr-control-label="Sync State" aria-label="Sync State">Sync State</button>
+        </div>
+      </div>
+      <details class="core-overview-drawer" id="inkdropCoreOverview" hidden aria-hidden="true">
+        <summary>
+          <div>
+            <strong>Core Overview</strong>
+            <span id="inkdropCoreOverviewSummary">Section counts, current queue, and recent history.</span>
+          </div>
+          <span class="queue-toggle"><span class="closed-label">Show overview</span><span class="open-label">Hide overview</span></span>
+        </summary>
+        <div class="core-overview-body">
+          <div class="arr-section-grid" id="inkdropCoreSections"></div>
+          <div class="core-activity-strip" id="inkdropActivitySummary" hidden></div>
+          <div class="library-truth-panel" id="libraryTruthPanel" hidden></div>
+          <div class="core-columns">
+            <div class="core-panel">
+              <h3>Queue</h3>
+              <div class="core-list" id="inkdropQueuePreview">
+                <div class="mini">Loading queue...</div>
+              </div>
+            </div>
+            <div class="core-panel">
+              <h3>History</h3>
+              <div class="core-list" id="inkdropHistoryPreview">
+                <div class="mini">Loading history...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+      <div class="core-panel" id="inkdropSectionPanel" hidden>
+        <div class="section-commandbar">
+          <div class="section-heading">
+            <span class="section-eyebrow" id="inkdropSectionEyebrow">InkDrop</span>
+            <h3 id="inkdropSectionTitle">Section</h3>
+            <p class="mini" id="inkdropSectionMeta"></p>
+          </div>
+          <div class="section-command-actions">
+            <div class="section-view-mode" id="inkdropSectionViewMode" hidden></div>
+            <span class="section-active-filter" id="inkdropSectionActiveFilter">Loading</span>
+            <button class="section-refresh" id="inkdropSectionRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh section">Refresh</button>
+            <button class="section-refresh bad" id="inkdropSectionResetAttemptsBtn" type="button" data-arr-control-label="Clear attempts" aria-label="Clear this series' recorded attempts" hidden>Clear attempts</button>
+          </div>
+        </div>
+        <div class="series-add-top-slot" id="seriesAddTopSlot" hidden></div>
+        <div class="section-operator-now" id="inkdropOperatorNow" hidden></div>
+        <div class="section-policy-strip" id="inkdropPolicyStrip" hidden></div>
+        <div class="series-art-coverage-strip" id="inkdropSeriesArtCoverage" hidden></div>
+        <div class="series-library-toolbar" id="inkdropSeriesLibraryToolbar" hidden></div>
+        <div class="section-triage-strip" id="inkdropTriageStrip" hidden></div>
+        <div class="section-workbench" id="inkdropSectionWorkbench" hidden></div>
+        <section class="missing-recovery" id="inkdropMissingRecovery" aria-live="polite" hidden></section>
+        <div class="core-section-summary" id="inkdropSectionSummary" hidden></div>
+        <section class="notice" id="inkdropSectionNotice" hidden></section>
+        <div class="core-filter-bar" id="inkdropSectionFilters" hidden></div>
+        <div class="section-lane-board" id="inkdropLaneBoard" hidden></div>
+        <div class="section-lane-ribbon" id="inkdropLaneRibbon" hidden></div>
+        <div class="worker-activity-panel" id="inkdropWorkerActivityPanel" hidden></div>
+        <div class="core-list" id="inkdropSectionRows"></div>
+      </div>
+    </section>
+    <section class="series-remove-modal manual-review-decision-modal" id="manualReviewDecisionModal" role="dialog" aria-modal="true" aria-labelledby="manualReviewDecisionTitle" aria-describedby="manualReviewDecisionCopy" hidden>
+      <div class="series-remove-dialog manual-review-decision-dialog" id="manualReviewDecisionDialog">
+        <div class="series-remove-head">
+          <div class="manual-review-decision-heading">
+            <h3 id="manualReviewDecisionTitle">Review Manual Decision</h3>
+            <span class="mini" id="manualReviewDecisionSubtitle"></span>
+          </div>
+          <button class="series-remove-close" id="manualReviewDecisionClose" type="button" aria-label="Close Manual Review decision panel" onclick="closeManualReviewDecisionModal()">&times;</button>
+        </div>
+        <div class="series-remove-body manual-review-decision-body">
+          <div class="series-remove-alert warn" id="manualReviewDecisionAlert">
+            <strong id="manualReviewDecisionProblem">Needs Review</strong>
+            <span id="manualReviewDecisionCopy">Review the candidate before InkDrop imports it.</span>
+          </div>
+          <div class="manual-review-evidence-columns" id="manualReviewDecisionEvidence">
+            <div class="manual-review-evidence-column">
+              <h4>Expected</h4>
+              <div class="manual-review-decision-grid" id="manualReviewDecisionExpectedFacts"></div>
+            </div>
+            <div class="manual-review-evidence-column">
+              <h4>Candidate</h4>
+              <div class="manual-review-decision-grid" id="manualReviewDecisionCandidateFacts"></div>
+            </div>
+          </div>
+          <div class="manual-review-decision-note" id="manualReviewDecisionSafety"></div>
+          <details class="manual-review-decision-advanced" id="manualReviewDecisionAdvanced">
+            <summary>Advanced</summary>
+            <div class="manual-review-decision-actions-secondary" id="manualReviewDecisionAdvancedActions"></div>
+          </details>
+        </div>
+        <!-- A failed decision leaves this panel open, and on a narrow
+             viewport the toast that used to be the only report of the failure
+             paints behind this overlay: .activity-region sits inside the nav
+             shell's own stacking context (z-index 20/30), below the modal
+             layer (120), so no z-index on the toast can lift it out. The
+             failure is reported here instead, pinned outside the scrolling
+             body so it is visible wherever the person has scrolled to. -->
+        <div class="manual-review-decision-status" id="manualReviewDecisionStatus" role="status" hidden></div>
+        <div class="series-remove-foot manual-review-decision-actions" id="manualReviewDecisionActions">
+          <button type="button" onclick="closeManualReviewDecisionModal()">Close</button>
+        </div>
+        <div class="manual-review-decision-nav" id="manualReviewDecisionNav" hidden>
+          <button type="button" id="manualReviewDecisionPrev" onclick="stepManualReviewDecision(-1)">&lsaquo; Previous</button>
+          <span id="manualReviewDecisionNavPosition"></span>
+          <button type="button" id="manualReviewDecisionNext" onclick="stepManualReviewDecision(1)">Next &rsaquo;</button>
+        </div>
+      </div>
+    </section>
+    <section class="series-remove-modal source-memory-detail-panel" id="sourceMemoryDetailPanel" role="dialog" aria-modal="true" aria-labelledby="sourceMemoryDetailTitle" hidden>
+      <div class="series-remove-dialog source-memory-detail-dialog" id="sourceMemoryDetailDialog">
+        <div class="series-remove-head">
+          <div class="source-memory-detail-heading">
+            <img class="source-memory-detail-cover" id="sourceMemoryDetailCover" alt="" hidden>
+            <div>
+              <h3 id="sourceMemoryDetailTitle">Blocked candidate</h3>
+              <span class="mini" id="sourceMemoryDetailSubtitle"></span>
+            </div>
+          </div>
+          <button class="series-remove-close" id="sourceMemoryDetailClose" type="button" aria-label="Close blocklist detail panel" onclick="closeSourceMemoryDetailPanel()">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="source-memory-detail-section-label">Details</div>
+          <div class="manual-review-decision-grid" id="sourceMemoryDetailFacts"></div>
+          <div class="source-memory-detail-section-label">Actions</div>
+          <div class="source-memory-detail-action-stack" id="sourceMemoryDetailActionStack"></div>
+          <div class="source-memory-detail-section-label">More</div>
+          <div class="source-memory-detail-more" id="sourceMemoryDetailMore"></div>
+        </div>
+        <div class="series-remove-foot manual-review-decision-actions" id="sourceMemoryDetailActions"></div>
+      </div>
+    </section>
+    </div>
+
+    <details class="card source-health settings-drawer" id="inkdropSettings" data-arr-page="settings" data-settings-page-shell="index" hidden open>
+      <summary>
+        <div class="section-title">
+          <div>
+            <h2>Settings</h2>
+            <p class="mini">Indexers, download clients, paths, language rules, and automation defaults.</p>
+          </div>
+          <span class="queue-toggle"><span class="closed-label">Expand</span><span class="open-label">Collapse</span></span>
+        </div>
+      </summary>
+        <div class="settings-body">
+        <div class="workflow-actions settings-actions">
+          <div class="settings-toolbar-cluster" role="group" aria-label="Settings actions">
+            <button id="inkdropSettingsAdvancedBtn" type="button" data-settings-action="advanced" data-arr-control-label="Show Advanced" aria-label="Show Advanced" aria-pressed="false">Show Advanced</button>
+            <button id="inkdropSettingsDirtyState" type="button" data-settings-action="clean" data-arr-control-label="No Changes" aria-label="No Changes" disabled>No Changes</button>
+            <button id="inkdropSettingsTestAllBtn" type="button" data-settings-action="test" data-arr-control-label="Test All" aria-label="Test All" hidden>Test All</button>
+            <button id="inkdropSettingsSyncBtn" type="button" data-settings-action="refresh" data-arr-control-label="Refresh" aria-label="Refresh settings">Refresh</button>
+          </div>
+          <label class="settings-search" data-settings-search-control="1" for="inkdropSettingsSearch">
+            <input id="inkdropSettingsSearch" type="search" placeholder="Search Settings" autocomplete="off" aria-label="Search Settings">
+          </label>
+        </div>
+        <div class="settings-grid" id="inkdropSettingsGrid">
+          <div class="mini">Loading settings...</div>
+        </div>
+      </div>
+    </details>
+
+    <section class="card source-health system-page" id="inkdropSystem" data-arr-page="system" hidden>
+      <div class="system-page-head">
+        <div>
+          <h2>System</h2>
+          <p class="mini">InkDrop health, current tasks, logs, and installed version.</p>
+        </div>
+        <div class="workflow-actions">
+          <button id="inkdropSystemRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh system">Refresh</button>
+        </div>
+      </div>
+      <div class="system-page-subnav" id="inkdropSystemSubnav" aria-label="System subviews"></div>
+      <div class="system-page-grid" id="inkdropSystemGrid">
+        <div class="mini">Loading system status...</div>
+      </div>
+    </section>
+
+    <section class="card calendar-page" id="inkdropCalendar" data-arr-page="calendar" hidden>
+      <div class="calendar-page-head">
+        <div>
+          <h2>Calendar</h2>
+          <p class="mini">What came out, on which day, and whether you have it. ComicVine and MangaDex do not publish forward release dates yet, so upcoming days stay empty until a provider does.</p>
+        </div>
+        <div class="workflow-actions">
+          <label class="calendar-window-control">
+            <span class="mini">Window</span>
+            <select id="inkdropCalendarWindow" aria-label="Calendar window">
+              <option value="14">Last 2 weeks</option>
+              <option value="30">Last month</option>
+              <option value="90">Last 3 months</option>
+            </select>
+          </label>
+          <button id="inkdropCalendarRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh calendar">Refresh</button>
+        </div>
+      </div>
+      <div class="calendar-page-body" id="inkdropCalendarBody">
+        <div class="mini">Loading calendar...</div>
+      </div>
+    </section>
+
+    <section class="card pull-list-page" id="inkdropPullList" data-arr-page="pull_list" hidden>
+      <div class="pull-list-page-head">
+        <div>
+          <h2>Pull List</h2>
+          <p class="mini" id="inkdropPullListRangeLabel">This week's releases for what you follow, and whether you've got them yet.</p>
+        </div>
+        <div class="workflow-actions pull-list-week-nav">
+          <button id="inkdropPullListPrevBtn" type="button" data-arr-control-label="Previous week" aria-label="Previous week">&lt; Prev</button>
+          <button id="inkdropPullListThisWeekBtn" type="button" data-arr-control-label="This week" aria-label="Jump to this week">This week</button>
+          <button id="inkdropPullListNextBtn" type="button" data-arr-control-label="Next week" aria-label="Next week">Next &gt;</button>
+          <button id="inkdropPullListRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh pull list">Refresh</button>
+        </div>
+      </div>
+      <div class="pull-list-page-body" id="inkdropPullListBody">
+        <div class="mini">Loading pull list...</div>
+      </div>
+    </section>
+
+    <details class="card watch-panel manual-review-support-tools" id="manualReviewSupportTools" data-arr-page="manual_review">
+      <summary>
+        <div class="section-title">
+          <div>
+            <h2>Support tools</h2>
+            <p class="mini">Secondary inboxes and diagnostics. Normal Manual Review work stays in the decision table above.</p>
+          </div>
+        </div>
+        <span class="queue-toggle"><span class="closed-label">Open support tools</span><span class="open-label">Close support tools</span></span>
+      </summary>
+      <div class="support-tools-body">
+        <details class="card watch-panel exception-drawer" id="manualReviewPanel" data-arr-page="manual_review">
+          <summary>
+            <div class="section-title">
+              <div>
+                <h2>Decision details</h2>
+                <p class="mini">Detailed exception cards are collapsed here. Use the table above for normal review work.</p>
+              </div>
+            </div>
+            <span class="queue-toggle"><span class="closed-label">Show details</span><span class="open-label">Hide details</span></span>
+          </summary>
+          <div class="exception-drawer-body">
+            <div id="manualReview" class="review-card-list">
+              <div class="mini">Nothing to act on.</div>
+            </div>
+          </div>
+        </details>
+        <details class="card watch-panel exception-drawer" id="manualIntake" data-arr-page="manual_review">
+          <summary>
+            <div class="section-title">
+              <div class="side">
+                <h2>Manual Intake</h2>
+                <p class="mini">Explicit inbox fallback for legally acquired files when automatic sources cannot find a safe match.</p>
+              </div>
+            </div>
+            <span class="queue-toggle"><span class="closed-label">Show fallback</span><span class="open-label">Hide fallback</span></span>
+          </summary>
+          <div class="exception-drawer-body">
+            <p class="mini">InkDrop only processes these explicit inboxes, matches against monitored InkDrop series, copies into the correct library folder, then scans and verifies.</p>
+            <div class="manual-intake-grid">
+              <div class="manual-intake-box">
+                <strong>Comics / Manga Inbox</strong>
+                <p class="mini"><code id="manualComicsInboxPath">/manual-inbox/comics</code></p>
+                <p class="mini">Matches monitored series, converts PDFs to CBZ when needed, scans Kavita, and leaves source files in place.</p>
+                <div class="actions">
+                  <button id="manualComicsPreview">Preview Inbox</button>
+                  <button class="primary" id="manualComicsRun">Process Inbox</button>
+                </div>
+              </div>
+              <!-- Pulled for this release: no ebook feature exists in InkDrop. The
+                   inbox path, preview/process wiring, and backend importer support
+                   are untouched -- only this card is hidden. -->
+              <div class="manual-intake-box" hidden aria-hidden="true">
+                <strong>Ebooks Inbox</strong>
+                <p class="mini"><code id="manualEbooksInboxPath">/manual-inbox/ebooks</code></p>
+                <p class="mini">Processes monitored ebook files from the explicit inbox only; unsupported files stay in the inbox.</p>
+                <div class="actions">
+                  <button id="manualEbooksPreview">Preview Inbox</button>
+                  <button class="primary" id="manualEbooksRun">Process Inbox</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </details>
+        <details class="card watch-panel exception-drawer" id="unmatchedDownloadsPanel" data-arr-page="manual_review">
+          <summary>
+            <div class="section-title">
+              <div>
+                <h2>Unmatched Downloads</h2>
+                <p class="mini">Fallback area for local files InkDrop found but could not safely match automatically.</p>
+              </div>
+            </div>
+            <span class="queue-toggle"><span class="closed-label">Show fallback</span><span class="open-label">Hide fallback</span></span>
+          </summary>
+          <div class="exception-drawer-body">
+            <p class="mini">Expand a group to search, preview a series match, import matched files, or quarantine temp-only leftovers.</p>
+            <button id="refreshUnmatchedBtn" data-arr-control-label="Refresh" aria-label="Refresh unmatched downloads" onclick="loadUnmatchedDownloads()">Refresh</button>
+            <div id="unmatchedDownloads" class="review-card-list">
+              <div class="mini">Checking unmatched downloads...</div>
+            </div>
+          </div>
+        </details>
+        <details class="card watch-panel exception-drawer" id="sabComicFailuresPanel" data-arr-page="manual_review">
+          <summary>
+            <div class="section-title">
+              <div class="side">
+                <h2>SAB Comic / Manga Failures</h2>
+                <p class="mini">Fallback learning area for comic and manga NZB failures.</p>
+              </div>
+            </div>
+            <span class="queue-toggle"><span class="closed-label">Show fallback</span><span class="open-label">Hide fallback</span></span>
+          </summary>
+          <div class="exception-drawer-body">
+            <p class="mini">Use this when failures need retry, re-source, or rescue attention.</p>
+            <button id="learnSabFailuresBtn" onclick="learnSabFailures()">Learn Failures</button>
+            <div id="sabComicFailures" class="sab-failure-list">
+              <div class="mini">Checking SAB...</div>
+            </div>
+          </div>
+        </details>
+      </div>
+    </details>
+
+    <section class="card source-health" id="sourceHealth" data-arr-page="queue" hidden>
+      <div class="section-title">
+        <div>
+          <h2>Source Health</h2>
+          <p class="mini">Provider health and source trouble. Queue links stay with the work rows.</p>
+        </div>
+      </div>
+      <div class="source-grid" id="sourceHealthGrid"></div>
+    </section>
+
+    <div id="seriesSearchLegacySlot" hidden></div>
+    <section class="card watch-panel" id="seriesSearchSection" data-arr-page="series queue" aria-expanded="false">
+      <div class="series-add-head">
+        <div>
+          <strong>Add Series</strong>
+          <span>Find a series by title, then let InkDrop track it and fill in the issues you are missing.</span>
+        </div>
+        <button class="series-add-collapse" type="button" onclick="setSeriesAddPanelOpen(false)">Collapse</button>
+      </div>
+      <div class="series-grid">
+        <label>Series
+          <input id="seriesQuery" placeholder="Berserk, Saga, Ice Cream Man, One Piece...">
+        </label>
+        <label>Source
+          <select id="seriesProvider">
+            <option value="all" selected>All sources</option>
+            <option value="comicvine">ComicVine</option>
+            <option value="mangadex">MangaDex pilot</option>
+            <option value="metron">Metron</option>
+          </select>
+        </label>
+        <label>Limit
+          <select id="seriesLimit">
+            <option selected>10</option>
+            <option>25</option>
+            <option>50</option>
+            <option>100</option>
+          </select>
+        </label>
+        <label>Mode
+          <span class="checkline"><input id="seriesAuto" type="checkbox" checked> Monitored</span>
+        </label>
+        <button class="primary" id="seriesSearchBtn">Search Series</button>
+      </div>
+      <p class="hint">Monitor &amp; Backfill fetches missing issues right away. Automatic Search status for future releases is shown below.</p>
+      <div class="autopilot-strip automation-readiness" id="automaticSearchReadiness" data-automatic-search-readiness="add-series" role="status" aria-live="polite">
+        <div>
+          <div class="autopilot-title"><strong>Automatic Search</strong><span class="autopilot-state">Checking</span></div>
+          <div class="autopilot-mini">Checking runner configuration, worker freshness, and next-run status.</div>
+        </div>
+        <div class="autopilot-actions"><button type="button" onclick="openInkdropSettingsArea('automation')">Configure</button></div>
+      </div>
+      <table class="responsive">
+        <thead>
+          <tr>
+            <th>Series Match</th>
+            <th>Year</th>
+            <th>Issues</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="seriesResults">
+          <tr><td colspan="4" class="mini">Search comic or manga titles here.</td></tr>
+        </tbody>
+      </table>
+      <div class="autopilot-strip" id="seriesAutopilotStrip" hidden>
+        <div>
+          <div class="autopilot-title">
+            <strong>Series automation</strong>
+            <span class="autopilot-state" id="seriesAutopilotState">Idle</span>
+          </div>
+          <div class="autopilot-mini" id="seriesAutopilotDetail">Watched series move through Wanted and Activity > Queue automatically.</div>
+        </div>
+        <div class="autopilot-actions">
+          <button id="seriesAutopilotRun">Run Now</button>
+        </div>
+      </div>
+      <details class="queue-drawer" id="processQueueDrawer">
+        <summary>
+          <div class="section-title">
+            <div>
+              <h2>Watched Series</h2>
+              <p class="mini">Automation settings for one series at a time. Missing issues themselves show up in Wanted and in Activity's Queue.</p>
+            </div>
+            <div class="queue-summary-right">
+              <span class="queue-count" id="seriesWatchCount">0 watched</span>
+              <span class="queue-toggle">Expand</span>
+            </div>
+          </div>
+        </summary>
+        <section class="notice" id="automationSourceNotice" hidden></section>
+        <div id="seriesWatches" class="series-card-list">
+          <div class="mini">No ComicVine series watches yet.</div>
+        </div>
+      </details>
+    </section>
+
+    <details class="advanced card watch-panel" id="advancedOps" data-arr-page="system">
+      <summary>
+        <span class="advanced-ops-title">
+          <strong>Maintenance</strong>
+          <span>Manual jobs, source probes, and raw watcher controls for diagnostics.</span>
+        </span>
+      </summary>
+      <p class="advanced-ops-note">Advanced operator tools for recovery and targeted diagnostics. These are not normal Settings; day-to-day work should stay in Series, Wanted, Queue, Activity, Manual Review, and provider Settings.</p>
+      <div class="advanced-ops">
+        <button class="primary" id="processReadyBtn">Process All Ready</button>
+        <button id="freshSweepBtn">Fast Fresh Sweep</button>
+        <button id="rssDiscoveryBtn">GetComics RSS Sweep</button>
+        <button id="comicscodesDiscoveryBtn">ComicsCodes Sweep</button>
+        <button id="dryComics">Comics Dry Run</button>
+        <!-- Pulled for this release: no ebook feature exists in InkDrop. The
+             importer("ebooks", ...) wiring behind this button is untouched. -->
+        <button id="dryEbooks" hidden aria-hidden="true">Ebooks Dry Run</button>
+        <button id="suwayomiDry">Managed Folder Import Dry Run</button>
+        <button id="suwayomiRun">Process Managed Folder Imports</button>
+        <button class="warn" id="importNow">Run Import Now</button>
+      </div>
+      <div class="grid">
+        <section class="card">
+          <div class="toolbar">
+            <label>Raw Search
+              <input id="query" placeholder="Berserk Vol 42, Batman Year One, Locke & Key...">
+            </label>
+            <label>Type
+              <select id="type">
+                <option value="comics">Comics / Manga</option>
+              </select>
+            </label>
+            <label>Prefer
+              <select id="prefer">
+                <option value="torrent">Torrent</option>
+                <option value="usenet">Usenet</option>
+                <option value="any">Any</option>
+              </select>
+            </label>
+            <label>Limit
+              <select id="limit">
+                <option>5</option>
+                <option selected>10</option>
+                <option>25</option>
+                <option>50</option>
+                <option>100</option>
+              </select>
+            </label>
+            <button class="primary" id="searchBtn">Search</button>
+            <button id="probeBtn">Probe Sources</button>
+          </div>
+          <table class="responsive">
+            <thead>
+              <tr>
+                <th>Result</th>
+                <th>Indexer</th>
+                <th>Protocol</th>
+                <th>Size</th>
+                <th>Seeds</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="results">
+              <tr><td colspan="6" class="mini">Search results will appear here.</td></tr>
+            </tbody>
+          </table>
+        </section>
+        <aside class="card side">
+          <h2>Last Output</h2>
+          <pre id="output">Ready.</pre>
+        </aside>
+      </div>
+      <details class="advanced card watch-panel">
+      <summary>Raw Source Watches</summary>
+    <section>
+      <div class="watch-grid">
+        <label>Watch Query
+          <input id="watchQuery" placeholder="Saga, Berserk, Fire Punch...">
+        </label>
+        <label>Type
+          <select id="watchType">
+            <option value="comics">Comics / Manga</option>
+          </select>
+        </label>
+        <label>Prefer
+          <select id="watchPrefer">
+            <option value="torrent">Torrent</option>
+            <option value="usenet">Usenet</option>
+            <option value="any">Any</option>
+          </select>
+        </label>
+        <label>Limit
+          <select id="watchLimit">
+            <option selected>10</option>
+            <option>25</option>
+            <option>50</option>
+            <option>100</option>
+          </select>
+        </label>
+        <label>Mode
+          <span class="checkline"><input id="watchAuto" type="checkbox" checked> Auto future</span>
+        </label>
+        <button id="addWatch">Add Watch</button>
+        <button class="primary" id="scanWatches">Scan All</button>
+      </div>
+      <p class="hint">New watches baseline current results first, then track future matches. Auto future is capped to avoid backlog floods.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Watch</th>
+            <th>Mode</th>
+            <th>Last Scan</th>
+            <th>New</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="watches">
+          <tr><td colspan="5" class="mini">No tracked searches yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+      </details>
+    </details>
+    </div>
+    <section class="series-remove-modal" id="seriesRemoveModal" role="dialog" aria-modal="true" aria-labelledby="seriesRemoveTitle" aria-describedby="seriesRemoveCopy" hidden>
+      <div class="series-remove-dialog">
+        <div class="series-remove-head">
+          <h3 id="seriesRemoveTitle">Remove Series</h3>
+          <button class="series-remove-close" id="seriesRemoveClose" type="button" aria-label="Close remove series dialog" onclick="closeSeriesRemoveModal()">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="series-remove-alert" id="seriesRemoveAlert">
+            <strong id="seriesRemoveActionTitle">Remove from InkDrop automation</strong>
+            <span id="seriesRemoveCopy">This parks the series, stops future monitoring, and retires active Wanted/Queue. Files and history stay intact.</span>
+          </div>
+          <div class="series-remove-series">
+            <strong id="seriesRemoveName">Series</strong>
+            <div class="series-remove-meta" id="seriesRemoveMeta"></div>
+          </div>
+          <div class="series-remove-impact" id="seriesRemoveImpact"></div>
+          <label class="series-remove-option">
+            <input id="seriesRemoveDeleteFiles" type="checkbox" onchange="updateSeriesRemoveFileMode()">
+            Remove files from disk
+            <span id="seriesRemoveDeleteFilesCopy">Files stay on disk unless this is enabled.</span>
+          </label>
+          <input id="seriesRemoveKeepFiles" type="hidden" value="true">
+          <label class="series-remove-option">
+            <input id="seriesRemoveKeepHistory" type="checkbox" checked disabled>
+            Keep history and evidence
+            <span>History, imports, attempts, and source memory stay available for audit.</span>
+          </label>
+        </div>
+        <div class="series-remove-foot">
+          <button id="seriesRemoveCancel" type="button" onclick="closeSeriesRemoveModal()">Cancel</button>
+          <button class="series-remove-confirm" id="seriesRemoveConfirm" type="button" onclick="confirmSeriesRemove()">Remove from InkDrop</button>
+        </div>
+      </div>
+    </section>
+    <section class="series-remove-modal series-library-modal" id="seriesLibraryModal" role="dialog" aria-modal="true" aria-labelledby="seriesLibraryTitle" aria-describedby="seriesLibraryCopy" hidden>
+      <div class="series-remove-dialog">
+        <div class="series-remove-head">
+          <h3 id="seriesLibraryTitle">Move Library</h3>
+          <button class="series-remove-close" id="seriesLibraryClose" type="button" aria-label="Close move library dialog" onclick="closeSeriesLibraryModal()">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="series-remove-alert" id="seriesLibraryAlert">
+            <strong id="seriesLibraryActionTitle">Change content type or root folder</strong>
+            <span id="seriesLibraryCopy">Pick the library this series belongs in. InkDrop can move the existing folder for you, or just update the assignment so future imports land in the right place.</span>
+          </div>
+          <div class="series-remove-series">
+            <strong id="seriesLibraryName">Series</strong>
+            <div class="series-remove-meta" id="seriesLibraryMeta"></div>
+          </div>
+          <div class="inkdrop-text-field">
+            <label id="seriesLibraryDestinationLabel" for="seriesLibraryDestination">Move to</label>
+            <select id="seriesLibraryDestination" onchange="updateSeriesLibraryModalPreview()"></select>
+          </div>
+          <label class="series-remove-option">
+            <input id="seriesLibraryMoveFiles" type="checkbox" onchange="updateSeriesLibraryModalPreview()">
+            Move existing files to the new folder
+            <span id="seriesLibraryMoveFilesCopy">Files stay right where they are unless this is enabled.</span>
+          </label>
+          <div class="series-remove-impact" id="seriesLibraryImpact"></div>
+        </div>
+        <div class="series-remove-foot">
+          <button id="seriesLibraryCancel" type="button" onclick="closeSeriesLibraryModal()">Cancel</button>
+          <button class="series-remove-confirm" id="seriesLibraryConfirm" type="button" disabled onclick="confirmSeriesLibraryMigration()">Move Library</button>
+        </div>
+      </div>
+    </section>
+    <section class="series-remove-modal inkdrop-confirm-modal" id="inkdropConfirmModal" role="dialog" aria-modal="true" aria-labelledby="inkdropConfirmTitle" aria-describedby="inkdropConfirmCopy" hidden>
+      <div class="series-remove-dialog" id="inkdropConfirmDialog">
+        <div class="series-remove-head">
+          <h3 id="inkdropConfirmTitle">Confirm Action</h3>
+          <button class="series-remove-close" id="inkdropConfirmClose" type="button" aria-label="Close confirmation dialog" onclick="closeInkdropConfirmModal(false)">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="series-remove-alert" id="inkdropConfirmAlert">
+            <strong id="inkdropConfirmAction">Confirm action</strong>
+            <span id="inkdropConfirmCopy">Review the action before continuing.</span>
+          </div>
+          <div class="series-remove-series">
+            <strong id="inkdropConfirmSubject">Item</strong>
+            <div class="series-remove-meta" id="inkdropConfirmMeta"></div>
+          </div>
+          <div class="series-remove-impact" id="inkdropConfirmDetails"></div>
+        </div>
+        <div class="series-remove-foot">
+          <button id="inkdropConfirmCancel" type="button" onclick="closeInkdropConfirmModal(false)">Cancel</button>
+          <button class="series-remove-confirm" id="inkdropConfirmAccept" type="button" onclick="closeInkdropConfirmModal(true)">Confirm</button>
+        </div>
+      </div>
+    </section>
+    <section class="series-remove-modal inkdrop-text-modal" id="inkdropTextModal" role="dialog" aria-modal="true" aria-labelledby="inkdropTextTitle" aria-describedby="inkdropTextCopy" hidden>
+      <div class="series-remove-dialog" id="inkdropTextDialog">
+        <div class="series-remove-head">
+          <h3 id="inkdropTextTitle">Enter Value</h3>
+          <button class="series-remove-close" id="inkdropTextClose" type="button" aria-label="Close input dialog" onclick="closeInkdropTextModal(null)">&times;</button>
+        </div>
+        <div class="series-remove-body">
+          <div class="series-remove-alert" id="inkdropTextAlert">
+            <strong id="inkdropTextAction">Choose value</strong>
+            <span id="inkdropTextCopy">Enter a value before continuing.</span>
+          </div>
+          <div class="series-remove-series">
+            <strong id="inkdropTextSubject">Item</strong>
+            <div class="series-remove-meta" id="inkdropTextMeta"></div>
+          </div>
+          <div class="inkdrop-text-field">
+            <label id="inkdropTextLabel" for="inkdropTextInput">Value</label>
+            <input id="inkdropTextInput" type="text" autocomplete="off">
+          </div>
+          <div class="series-remove-impact" id="inkdropTextDetails"></div>
+        </div>
+        <div class="series-remove-foot">
+          <button id="inkdropTextCancel" type="button" onclick="closeInkdropTextModal(null)">Cancel</button>
+          <button class="series-remove-confirm" id="inkdropTextAccept" type="button" onclick="acceptInkdropTextModal()">Continue</button>
+        </div>
+      </div>
+    </section>
+  </main>

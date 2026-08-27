@@ -52,8 +52,6 @@ SUWAYOMI_API_BASE = str(os.environ.get("INKDROP_SUWAYOMI_API_BASE_URL") or "").s
 GETCOMICS_FEED_URL = "https://getcomics.org/feed/"
 GETCOMICS_DISCOVERY_HOSTS = ("getcomics.org", "www.getcomics.org")
 PIXELDRAIN_TRANSPORT_HOSTS = ("pixeldrain.com", "www.pixeldrain.com")
-WETRANSFER_TRANSPORT_HOSTS = ("wetransfer.com", "www.wetransfer.com")
-BUZZHEAVIER_TRANSPORT_HOSTS = ("buzzheavier.com", "www.buzzheavier.com")
 COMICSCODES_FEED_URL = "https://comics.codes/feed/"
 COMICSCODES_LIST_URLS = (
     "https://comics.codes/all-comics-list/",
@@ -3106,7 +3104,7 @@ def _rss_discovery_allowed_hosts(row):
         row,
         ("feed_detail_allowed_hosts", "rss_allowed_hosts", "source_allowed_hosts"),
     )
-    if row.get("provider_id") == "rss_getcomics":
+    if providers.uses_getcomics_transport_profile(row):
         return list(GETCOMICS_DISCOVERY_HOSTS)
     return _normalized_request_hosts(configured)
 
@@ -3117,7 +3115,7 @@ def _direct_transport_allowed_hosts(row):
         row,
         ("transport_allowed_hosts", "direct_download_allowed_hosts", "direct_allowed_hosts"),
     )
-    if row.get("provider_id") == "rss_getcomics":
+    if providers.uses_getcomics_transport_profile(row):
         return list(PIXELDRAIN_TRANSPORT_HOSTS)
     return _normalized_request_hosts(configured)
 
@@ -3154,7 +3152,7 @@ def rss_direct_feed_request(row, plan, wanted_item=None, limit=20):
 
 
 def rss_detail_direct_feed_request(row, plan, wanted_item=None, limit=20):
-    default_url = GETCOMICS_FEED_URL if (row or {}).get("provider_id") == "rss_getcomics" else ""
+    default_url = GETCOMICS_FEED_URL if providers.uses_getcomics_transport_profile(row) else ""
     base = _base_url(row, default_url)
     if not base:
         return None
@@ -3169,7 +3167,7 @@ def rss_detail_direct_feed_request(row, plan, wanted_item=None, limit=20):
 
 
 def rss_detail_probe_feed_request(row, plan, wanted_item=None, limit=20):
-    default_url = GETCOMICS_FEED_URL if (row or {}).get("provider_id") == "rss_getcomics" else ""
+    default_url = GETCOMICS_FEED_URL if providers.uses_getcomics_transport_profile(row) else ""
     base = _base_url(row, default_url)
     if not base:
         return None
@@ -3634,62 +3632,6 @@ def direct_file_probe_request(url, index, method="HEAD", allowed_hosts=None):
         allowed_hosts=allowed_hosts,
         max_bytes=1024 if method == "GET" else None,
         purpose="probe_direct_file_headers",
-    )
-
-
-def wetransfer_resolve_request(url, index=0):
-    """Build the API request that resolves a wetransfer.com share URL to a
-    real downloadable file, per WeTransfer's documented transfer-download
-    API (transfer_id + security_hash from the share URL, no auth). Returns
-    None for anything that doesn't parse as a WeTransfer share URL.
-
-    NOTE: this endpoint shape has not been exercised against a live
-    WeTransfer share -- no InkDrop source surfaces WeTransfer links today,
-    so there was nothing real to verify it against. Treat as unverified
-    until confirmed against an actual share.
-    """
-    transfer_id, security_hash = providers._wetransfer_transfer_id_and_hash(url)
-    if not transfer_id or not security_hash:
-        return None
-    return _request(
-        f"wetransfer_resolve_{index}",
-        "POST",
-        f"https://wetransfer.com/api/v4/transfers/{transfer_id}/download",
-        json_body={"security_hash": security_hash, "intent": "entire_transfer"},
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-        allowed_hosts=WETRANSFER_TRANSPORT_HOSTS,
-        purpose="resolve_wetransfer_share_link",
-    )
-
-
-def buzzheavier_download_request(url, index=0):
-    """Build the request that resolves a buzzheavier.com share URL to a
-    real downloadable file. There is no documented "resolve this share
-    link" API -- Buzzheavier's official API covers uploading/managing your
-    own files, not fetching someone else's share. This mirrors the request
-    shape a real page load actually sends: a GET to <file_id>/download
-    carrying the htmx-style headers (hx-request, hx-current-url, referer)
-    that a live page visit would attach, since a bare/header-less request
-    to that same path draws a Cloudflare bot challenge.
-
-    NOTE: confirmed the header'd request reaches the application layer
-    (a made-up file_id returns a clean 404, not a challenge) but this has
-    not been exercised against a real, valid Buzzheavier share -- no
-    InkDrop source surfaces Buzzheavier links today, so there was nothing
-    real to verify it against. Treat as unverified until confirmed against
-    an actual share.
-    """
-    file_id = providers._buzzheavier_file_id(url)
-    if not file_id:
-        return None
-    share_url = f"https://buzzheavier.com/{file_id}"
-    return _request(
-        f"buzzheavier_resolve_{index}",
-        "GET",
-        f"{share_url}/download",
-        headers={"hx-request": "true", "hx-current-url": share_url, "referer": share_url},
-        allowed_hosts=BUZZHEAVIER_TRANSPORT_HOSTS,
-        purpose="resolve_buzzheavier_share_link",
     )
 
 

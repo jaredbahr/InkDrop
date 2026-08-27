@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit, urluns
 
 from core import inkdrop_import_evidence
 from core import inkdrop_review_reasons
+from core.inkdrop_display_labels import display_label
 from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
 from core import inkdrop_db
@@ -47,7 +48,7 @@ except Exception:
     inkdrop_sources = None
 
 STATE_DB_NAME = "inkdrop-state.sqlite3"
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 STATE_SOURCE_FILES = (
     "comic-series-watches.json",
     "series-autopilot-queue.json",
@@ -1336,6 +1337,14 @@ def init_schema_uncached(con):
             entity_id text,
             series_id text,
             issue_id text,
+            -- Which want this event settled. Nullable: most event types do not
+            -- answer a want at all, and a row written before this column
+            -- existed has no honest value to backfill. Without it a verified
+            -- import could only be tied back to a want by re-deriving
+            -- (series_id, issue_id) at read time, which cannot distinguish two
+            -- wanted rows for the same issue -- a re-enrolment, a superseded
+            -- duplicate, or a different unit.
+            wanted_id text,
             event_type text not null,
             source text,
             message text,
@@ -1651,6 +1660,10 @@ def init_schema_uncached(con):
     )
     history_columns = {row["name"] for row in con.execute("pragma table_info(history_events)")}
     history_bucket_column_missing = "history_bucket" not in history_columns
+    # Additive and nullable, so an existing database gains it without a rewrite
+    # and every pre-existing row reads back as NULL rather than being invented a
+    # value it never had.
+    ensure_columns(con, "history_events", {"wanted_id": "text"})
     if history_bucket_column_missing:
         con.execute("alter table history_events add column history_bucket text not null default 'diagnostic'")
     # Older additive schemas can have import_results without the source-attempt
@@ -2785,15 +2798,93 @@ def series_raw_removed_or_parked(raw):
     return bool(raw.get("removed_by_user")) or reason in SERIES_REMOVED_PARK_REASONS
 
 
-def series_row_allows_removed_reactivation(row):
+SERIES_USER_ADD_TIME_KEYS = ("inkdropAddedAt", "inkdrop_user_added_at", "user_added_at")
+SERIES_REMOVAL_TIME_KEYS = ("removed_at", "automation_parked_at")
+
+
+def series_row_user_add_time(row):
+    if not isinstance(row, dict):
+        return 0.0
+    for key in SERIES_USER_ADD_TIME_KEYS:
+        value = safe_float(row.get(key))
+        if value:
+            return value
+    return 0.0
+
+
+def series_raw_removal_time(raw):
+    if not isinstance(raw, dict):
+        return 0.0
+    for key in SERIES_REMOVAL_TIME_KEYS:
+        value = safe_float(raw.get(key))
+        if value:
+            return value
+    return 0.0
+
+
+def series_row_allows_removed_reactivation(row, removal_time=0.0):
+    """May this incoming payload un-remove a series the operator removed?
+
+    THE MARKER ALONE IS NOT AN ANSWER, AND THAT WAS THE DEFECT.
+        sync_watches() re-reads comic-series-watches.json every pass and hands
+        each record straight to upsert_series(). The add markers below are
+        written once, when a series is first added, and never expire -- so a
+        record added in July still says "the user is adding this" in August.
+        An operator removed a series and its files at 12:57:59Z on 2026-08-26;
+        the next replay read a marker from 2026-07-02 and cleared every removal
+        flag at 13:05:36Z. Eight minutes, no history event. On that install 217
+        of 353 watch records carried such a marker.
+
+    SO THE QUESTION ASKED HERE IS WHETHER THE ADD IS NEWER THAN THE REMOVAL.
+        A genuine re-add is written by the add path at the moment the user
+        clicks, so its timestamp is necessarily newer than the removal it is
+        undoing. A replayed record from before the removal is not.
+
+    THIS ONLY WORKS BECAUSE THE ADD PATH REFRESHES ITS STAMP. inkdrop_web
+        used to set inkdropAddedAt with `or`, preserving the first-add value
+        across re-adds; comicvine_native_watch() still preserves "created"
+        the same way, which is why "created" is deliberately NOT consulted
+        here. A recency test against a preserved stamp refuses genuine
+        re-adds -- the same over-refusal, arrived at from the other side.
+
+    PROVENANCE FIRST, RECENCY ONLY FOR THE STORED MARKERS.
+        inkdrop_explicit_user_add is written by record_series_added() while
+        an add request is being served and is never persisted to a watch
+        record -- 0 of 353 stored records carry it -- so it is a statement
+        about the current request and is honoured on its own. inkdropUserAdded
+        and createdBy live on the record, 217 of 353 carry them, and every
+        sync replays them unchanged; those must prove recency.
+
+        Requiring a timestamp from BOTH families was the first attempt and
+        it over-refused: a legitimate title-restore whose payload carries
+        the request-scoped marker and no timestamp was blocked, which the
+        series-tombstone-alias smoke caught. That is the same over-refusal
+        this gate exists to avoid, reached from the other direction.
+
+        For the stored family a missing timestamp still refuses, and that is
+        a decision rather than a default: every one of the 26 currently
+        user-removed series carries a removal stamp, so it costs nothing
+        today -- which is exactly when a silent default goes unnoticed.
+    """
     if not isinstance(row, dict):
         return False
-    return bool(
-        row.get("inkdrop_explicit_user_add")
-        or row.get("explicit_user_add")
-        or row.get("inkdropUserAdded")
-        or row.get("createdBy") == "inkdrop_add_series"
-    )
+    # A request-scoped marker is written by record_series_added() while an
+    # add request is being served, so its presence IS the fact that a user
+    # is adding this series right now. Measured on the live install: 0 of
+    # 353 stored watch records carry either of these keys, so no replay can
+    # produce one.
+    if row.get("inkdrop_explicit_user_add") or row.get("explicit_user_add"):
+        return True
+    # The remaining markers are stored ON the watch record -- 217 of those
+    # 353 carry them -- and are replayed verbatim on every sync, so their
+    # presence says only that someone added this series at some point.
+    # Those have to prove the add is newer than the removal.
+    if not (row.get("inkdropUserAdded") or row.get("createdBy") == "inkdrop_add_series"):
+        return False
+    removal_time = safe_float(removal_time)
+    if not removal_time:
+        return False
+    return series_row_user_add_time(row) > removal_time
 
 
 class SeriesIdentityTombstoneBlocked(RuntimeError):
@@ -5294,7 +5385,9 @@ def upsert_series(con, row, now):
         existing
         and series_raw_user_removed(existing_raw)
         and existing_parked_reason == "user_removed"
-        and series_row_allows_removed_reactivation(row)
+        and series_row_allows_removed_reactivation(
+            row, series_raw_removal_time(existing_raw)
+        )
     )
     preserve_removed_or_parked = bool(existing_removed_or_parked and not explicit_removed_reactivation)
     if preserve_removed_or_parked:
@@ -8373,6 +8466,23 @@ SLSKD_CONCURRENT_TRANSFER_CAP_SETTING_KEY = "automation.slskd_concurrent_transfe
 SLSKD_CONCURRENT_TRANSFER_CAP_DEFAULT = 20
 SLSKD_CONCURRENT_TRANSFER_CAP_MIN = 1
 SLSKD_CONCURRENT_TRANSFER_CAP_MAX = 100
+# A handoff SLSKD accepted but that never moved a byte is not part of the
+# burst the cap above exists to smooth. It is a request parked in some peer's
+# upload queue -- or on a peer that quietly went away -- and it costs InkDrop
+# no bandwidth at all, so holding an admission slot for it starves real work
+# for nothing. Before this window existed such a task occupied a slot for the
+# entire never-started timeout: measured on production 2026-08-14, every task
+# then holding a cap slot was `started_waiting` with no recorded transfer
+# evidence, aged 11 to 16 hours.
+#
+# Past this window the task stops occupying an admission slot. Nothing about
+# its lifecycle changes -- cleanup_stale_active_slskd_download_tasks still
+# owns retiring it (retry-eligible) at the never-started/stall thresholds --
+# so releasing the slot frees capacity without orphaning the attempt.
+SLSKD_SLOT_RELEASE_SETTING_KEY = "automation.slskd_stale_slot_release_minutes"
+SLSKD_SLOT_RELEASE_MINUTES_DEFAULT = 15
+SLSKD_SLOT_RELEASE_MIN_MINUTES = 1
+SLSKD_SLOT_RELEASE_MAX_MINUTES = 1440
 DOWNLOAD_TASK_QUEUE_SETTLE_SECONDS = 15 * 60
 DOWNLOAD_TASK_SENT_QUEUE_SETTLE_SECONDS = 24 * 60 * 60
 STAGED_TASK_QUEUE_SETTLE_SECONDS = 60 * 60
@@ -13231,6 +13341,65 @@ def direct_import_already_satisfied(raw):
     return False
 
 
+VOLUME_PAGE_PACK_COVERAGE_REASON = "mangadex_volume_page_pack_covered_issue"
+
+# The keys `classify_inkdrop_client_file()` writes onto the import detail right
+# after `mangadex_volume_page_pack_context()` returns, in
+# core/inkdrop_reconcile_imports.py:
+#
+#     detail.update({
+#         "trusted_issue": volume_pack_context["trusted_issue"],
+#         "volume_page_pack_context": volume_pack_context,
+#         "volume_page_pack_reason": volume_pack_context["reason"],
+#     })
+#
+# Either one present means the number sitting beside it is a COVERAGE
+# ASSERTION, not a reading of the artifact being graded. This is a marker
+# lookup, deliberately, and not a guess from the filename's shape: `v07` in a
+# name proves nothing, and a guard that trusted it would let `Powers #028` back
+# in behind a `v`.
+#
+# EVERY KEY HERE IS ONE PRODUCTION ACTUALLY WRITES. A marker this list honours
+# but nothing emits would read like coverage and be inert -- the same shape of
+# mistake as the fixture that carried a field production has never carried.
+VOLUME_PAGE_PACK_COVERAGE_MARKER_KEYS = (
+    "volume_page_pack_reason",
+    "volume_page_pack_context",
+)
+
+
+def payload_carries_volume_page_pack_coverage(item):
+    """True when THIS payload dict's unit number is a coverage assertion.
+
+    The question a destination grade has to answer is not "did this number come
+    from the payload" -- it is WHERE THE PAYLOAD GOT IT.
+
+      * Derived from the artifact being graded -- the importer read `028` off
+        `Powers #028 (2000).cbz` and recorded it -- the number is the claim
+        under test and cannot also be the standard. CIRCULAR, ignore it.
+      * Computed by a separate authority -- `mangadex_volume_page_pack_context()`
+        reads a sidecar bound to the exact download task, refuses unless the
+        covered chapter is listed in the pack's own chapter set, and only then
+        declares the volume number as the import unit. That assertion is about
+        the QUEUE ROW, derived independently of the destination filename.
+        LEGITIMATE, honour it.
+
+    The marker is checked on the same dict the number is read from, because
+    provenance does not travel: a pack marker on a sibling payload says nothing
+    about where a neighbouring number came from.
+    """
+    if not isinstance(item, dict):
+        return False
+    for key in VOLUME_PAGE_PACK_COVERAGE_MARKER_KEYS:
+        value = item.get(key)
+        if value not in (None, "", {}, [], ()):
+            return True
+    for key in ("reason", "reconciliation_reason"):
+        if str(item.get(key) or "").strip().lower() == VOLUME_PAGE_PACK_COVERAGE_REASON:
+            return True
+    return False
+
+
 def proven_collection_coverage_edge(raw, queue):
     """True only when `raw` carries a collected-edition coverage edge that
     record_pack_import_results() already proved (via inkdrop_pack_import.py's
@@ -13272,8 +13441,41 @@ def proven_collection_coverage_edge(raw, queue):
 def direct_import_destination_unit_gate(con, queue, dest_path, raw, *, already_satisfied_destination=False):
     if not dest_path or not queue:
         return None
+    # WHEN GRADING THE DESTINATION, THE PAYLOAD'S NUMBER IS THE CLAIM UNDER
+    # TEST AND CANNOT ALSO BE THE STANDARD. Reading `trusted_issue` out of the
+    # import row's own raw payload is circular whenever the payload and the
+    # destination filename came from the same file: they agree, and the gate
+    # accepts. Measured on the live build -- `Powers #028 (2000).cbz` is credited
+    # to issue #1; the payload carries trusted_issue='028'; the gate graded 028
+    # against 028 and returned ACCEPT for a row that is issue 1. Same shape for
+    # `The Metabarons #002 (2015).cbz` credited to issue #1. That is the standing
+    # `--trusted-issue is a filename guess` trap: the gate compares InkDrop to
+    # itself.
+    #
+    # PR #926 answered it by skipping the payload wholesale on this call, AND
+    # THAT WAS REVERTED, because the payload is not one kind of thing. A
+    # MangaDex volume page-pack covering chapters 27-31 deliberately resolves
+    # every covered chapter to `trusted_issue = "7"` -- the volume number -- as
+    # its import semantics. Chapter 30 is credited through Volume 7's identity on
+    # purpose, and that is how a covered child queue row terminates. Skipping the
+    # payload made this gate compare "chapter 30" against a "Volume 7" file and
+    # refuse, stranding the row;
+    # inkdrop-build187-mangadex-volume-pack-recovery-smoke went red at "covered
+    # child queue must terminate".
+    #
+    # SO THE QUESTION IS NOT WHETHER THE NUMBER CAME FROM THE PAYLOAD -- IT IS
+    # WHERE THE PAYLOAD GOT IT. Derived from the artifact being graded, it is
+    # circular and worthless. Computed by a separate authority as a coverage
+    # assertion about the queue row, it is evidence and must be honoured. The
+    # marker that tells them apart is already written onto the payload, so this
+    # reads the marker instead of guessing from the filename's shape -- see
+    # payload_carries_volume_page_pack_coverage(). Source grading is unchanged:
+    # there the question really is "is this file what the payload says it is",
+    # and the payload IS the right reference.
     trusted_issue = None
     for item in iter_import_result_raw_sources(raw if isinstance(raw, dict) else {}):
+        if already_satisfied_destination and not payload_carries_volume_page_pack_coverage(item):
+            continue
         for key in ("trusted_issue", "issue_number", "normalized_number"):
             value = str(item.get(key) or "").strip()
             if value:
@@ -18657,9 +18859,9 @@ def record_reconciliation_import_result(con, record, queue, queue_state, ts, mes
     con.execute(
         """
         insert or ignore into history_events(
-            id, entity_type, entity_id, series_id, issue_id, event_type,
+            id, entity_type, entity_id, series_id, issue_id, wanted_id, event_type,
             source, message, outcome, display_phase, created_at, raw_json
-        ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+        ) values(?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             stable_id("reconciliation_import_history", result["id"], result["status"]),
@@ -18667,6 +18869,7 @@ def record_reconciliation_import_result(con, record, queue, queue_state, ts, mes
             result["id"],
             result["series_id"],
             result["issue_id"],
+            _resolve_import_wanted_id(con, result),
             event_type,
             "download_reconciliation",
             message,
@@ -18677,6 +18880,84 @@ def record_reconciliation_import_result(con, record, queue, queue_state, ts, mes
         ),
     )
     return result["id"]
+
+
+def _resolve_import_wanted_id(con, result):
+    """The wanted row this import answered, or None.
+
+    Prefers a wanted_id the import row already carries, because that is the want
+    the pipeline was actually working. Falls back to the queue row that produced
+    the import, then to the live want for the same series and issue.
+
+    Returns None rather than guessing whenever more than one candidate matches.
+    An ambiguous answer recorded as fact is worse than a recorded absence, and
+    NULL here reads exactly like every row written before the column existed.
+    """
+    result = result if isinstance(result, dict) else {}
+    direct = str(result.get("wanted_id") or "").strip()
+    if direct:
+        return direct
+    series_id = str(result.get("series_id") or "").strip()
+    issue_id = str(result.get("issue_id") or "").strip()
+    if not series_id or not issue_id:
+        return None
+    if table_exists(con, "queue_items"):
+        rows = con.execute(
+            """
+            select distinct q.wanted_id as wanted_id
+              from queue_items q
+             where q.series_id = ? and q.issue_id = ?
+               and coalesce(nullif(trim(q.wanted_id), ''), '') <> ''
+             limit 2
+            """,
+            (series_id, issue_id),
+        ).fetchall()
+        if len(rows) == 1:
+            return str(rows[0]["wanted_id"])
+    if not table_exists(con, "wanted_items"):
+        return None
+    live = con.execute(
+        """
+        select id from wanted_items
+         where series_id = ? and issue_id = ?
+           and lower(coalesce(status, '')) not in ('retired', 'cancelled', 'removed')
+         limit 2
+        """,
+        (series_id, issue_id),
+    ).fetchall()
+    if len(live) == 1:
+        return str(live[0]["id"])
+    return None
+
+
+def import_verified_history_wanted_id(db_path, import_result_id):
+    """The wanted_id recorded on an import's history event, or None.
+
+    A read helper so want-satisfaction can be counted directly off
+    history_events rather than re-derived from (series_id, issue_id), which is
+    the proxy this column exists to replace.
+    """
+    import_result_id = str(import_result_id or "").strip()
+    if not import_result_id:
+        return None
+    with connect_read(db_path) as con:
+        names = {row["name"] for row in con.execute("pragma table_info(history_events)")}
+        if "wanted_id" not in names:
+            return None
+        row = con.execute(
+            """
+            select wanted_id from history_events
+             where entity_type = 'import_result' and entity_id = ?
+               and event_type in ('import_verified', 'import_reconciled')
+             order by coalesce(created_at, 0) desc
+             limit 1
+            """,
+            (import_result_id,),
+        ).fetchone()
+    if not row:
+        return None
+    value = str(row["wanted_id"] or "").strip()
+    return value or None
 
 
 def reconciliation_wrong_unit_page_pack_row(con, record, queue):
@@ -21508,6 +21789,45 @@ def queue_item_stall_retry_count(con, queue_id):
     return int(row["c"]) if row and row["c"] is not None else 0
 
 
+RETIRED_TASK_REPEAT_BACKOFF_SECONDS = (0, 600, 1800, 3600, 7200, 14400, 21600)
+
+
+def retired_download_task_repeat_signature(source_key, status, failure):
+    return "|".join(str(part or "").strip().lower() for part in (source_key, status, failure))
+
+
+def retired_download_task_repeat_backoff(previous_signature, previous_count, signature):
+    """How long to wait before handing back a row whose task retired the same way again.
+
+    cleanup_queue_items_with_retired_download_tasks() used to re-queue the row
+    with `retry_after = <its own already-past value> or now`, so a row selected
+    because it was due became due again immediately. Nothing escalated, so a row
+    whose download task retires identically every pass had no exit from the
+    loop.
+
+    Measured on production 2026-08-15: the worst rows logged 134-151 "automatic
+    retry scheduled" events in seven days (~20/day each), and the system-wide
+    rate grew from 219/day on 08-01 to 1,295/day on 08-13 across a roughly flat
+    ~200 distinct rows -- the same rows retrying faster, not more rows failing.
+    The top offenders are all rows whose underlying defect is elsewhere ("That
+    download was chapters, not the volume this series collects", "A recheck
+    could not confirm this import"), so the retry cadence is what burns the
+    budget, not the retirement itself.
+
+    A first retirement stays immediate: it is usually a genuine transient -- a
+    stale client handoff, or a superseded duplicate whose successor is already
+    live -- and delaying it would slow real recovery. Only a *repeat* of the
+    same (source, status, failure) signature escalates, and any genuine
+    forward progress clears the counter via queue_raw_clear_retry_backoff().
+    """
+
+    if not signature or signature != str(previous_signature or "").strip():
+        return 1, 0.0
+    count = max(1, int(safe_float(previous_count, 1) or 1)) + 1
+    index = min(count - 1, len(RETIRED_TASK_REPEAT_BACKOFF_SECONDS) - 1)
+    return count, float(RETIRED_TASK_REPEAT_BACKOFF_SECONDS[index])
+
+
 def cleanup_queue_items_with_retired_download_tasks(con, now):
     if not con:
         return 0
@@ -21644,6 +21964,12 @@ def cleanup_queue_items_with_retired_download_tasks(con, now):
             message = f"{source_label} candidate retired; automatic retry scheduled"
         raw = json_loads(item.get("raw_json") or "{}", {})
         raw = raw if isinstance(raw, dict) else {}
+        repeat_signature = retired_download_task_repeat_signature(source_key, status, failure)
+        repeat_count, repeat_delay = retired_download_task_repeat_backoff(
+            raw.get("retired_download_task_signature"),
+            raw.get("retired_download_task_repeat_count"),
+            repeat_signature,
+        )
         raw["state"] = "queued"
         raw["current_source"] = None
         raw["last_event"] = message
@@ -21651,8 +21977,23 @@ def cleanup_queue_items_with_retired_download_tasks(con, now):
         raw["retired_download_task_status"] = status
         raw["retired_download_task_at"] = now_ts
         raw["retired_download_task_at_iso"] = utc_stamp(now_ts)
+        raw["retired_download_task_signature"] = repeat_signature
+        raw["retired_download_task_repeat_count"] = repeat_count
         values = queue_provider_status_column_values("queued", None, message, raw, download_task={})
-        retry_after = safe_float(item.get("retry_after"), None) or now_ts
+        existing_retry_after = safe_float(item.get("retry_after"), None)
+        owned_retry_after = safe_float(raw.get("retired_download_task_retry_after"), 0.0)
+        if repeat_delay > 0:
+            retry_after = now_ts + repeat_delay
+        elif existing_retry_after and owned_retry_after and abs(existing_retry_after - owned_retry_after) < 1.0:
+            # The only wait on this row is one we set for a signature that has
+            # since changed, so it no longer describes anything. Preserving it
+            # would make a genuinely new failure serve out the old loop's
+            # sentence. A wait we did not set (a provider-health backoff, an
+            # explicit retry promise) is still honoured by the branch below.
+            retry_after = now_ts
+        else:
+            retry_after = existing_retry_after or now_ts
+        raw["retired_download_task_retry_after"] = retry_after
         con.execute(
             """
             update queue_items
@@ -22215,6 +22556,14 @@ def queue_raw_clear_retry_backoff(raw):
         "retry_wait_seconds",
         "retry_wait_until",
         "retry_wait_until_iso",
+        # Every caller clears the backoff because a *different* candidate is
+        # now available to try, which is exactly the forward progress that
+        # should reset the retired-task repeat escalation too -- otherwise a
+        # row that recovers onto a fresh candidate would keep the old
+        # signature's accumulated wait.
+        "retired_download_task_signature",
+        "retired_download_task_repeat_count",
+        "retired_download_task_retry_after",
     ):
         raw.pop(key, None)
     return raw
@@ -22302,6 +22651,43 @@ def download_client_bad_candidate_payload(record, task_payload, snapshot=None, *
 
 
 STALE_BAD_CANDIDATES_WATERMARK_KEY = "stale_download_task_bad_candidates_watermark"
+
+
+# Which reasons may become a DURABLE blocklist row -- a verdict about the
+# candidate's content that later refuses it by path, title or peer.
+#
+# This list is not invented here. core/inkdrop_missing_acquire.py has carried it
+# as DURABLE_BAD_SOURCE_REASONS, and record_durable_bad_source_result() refuses
+# anything outside it. The judgement was correct and the coverage was not: on
+# the 2026-08-25 snapshot only 440 of 10,444 blocklist rows (4.2%) were written
+# under one of these reasons. The other 10,004 came from writers that never
+# asked, 7,435 of them from sync_stale_download_task_bad_candidates() below.
+#
+# Kept here rather than imported because inkdrop_missing_acquire imports this
+# module; the smoke asserts the two agree rather than letting them drift.
+DURABLE_BAD_SOURCE_REASONS = frozenset({
+    "bad_archive",
+    "failed_download_duplicate_nzb",
+    "false_positive",
+    "known_bad_pack_archive_history",
+    "known_bad_source_candidate",
+    "sab_not_complete",
+    "sab_url_fetch_failed",
+    "wrong_series_or_subseries",
+})
+
+
+def durable_bad_source_reason(reason):
+    """May this reason become a durable verdict about a candidate's content?"""
+    return str(reason or "").strip().lower() in DURABLE_BAD_SOURCE_REASONS
+
+
+# Statuses that record InkDrop's own inability to establish an outcome, not an
+# observation about the file. Neither can support a verdict about content.
+INCONCLUSIVE_TRANSFER_STATUSES = frozenset({
+    "transfer_stale_unknown",
+    "transfer_missing_stale",
+})
 
 
 def sync_stale_download_task_bad_candidates(con, now=None, limit=None):
@@ -22412,6 +22798,41 @@ def sync_stale_download_task_bad_candidates(con, now=None, limit=None):
         # Tail #30, and partially 5 Worlds #5).
         failure_classification = manual_source_autoresolve.classify_candidate_failure(failure_reason)
         if failure_classification.get("kind") == "transient":
+            continue
+        # The transient split above is about WHEN a failure might clear. This is
+        # about WHETHER the failure says anything about the file at all.
+        #
+        # Three of the four statuses this scan selects -- stale_no_local_file,
+        # transfer_missing_stale, transfer_stale_unknown -- report only that a
+        # file was not where InkDrop expected it. That is a fact about the
+        # search, and a permanent inability to find something is still not
+        # evidence that the something is bad. Written as a durable blocklist row
+        # it becomes a verdict that refuses the candidate by path, title and
+        # peer -- including, repeatedly, files that are sitting on disk.
+        # Confirmed live on a seven-volume manga folder: six valid archives
+        # still in the staging tree, each with a blocklist entry minted from
+        # transfer_stale_unknown.
+        #
+        # NARROWER THAN THAT ARGUMENT, DELIBERATELY. The wider version -- gate
+        # on durable_bad_source_reason(status_key), so only
+        # wrong_series_or_subseries survives -- also drops stale_no_local_file,
+        # and that would silently overturn a decision another author made on
+        # purpose. tests/inkdrop-stale-relabel-never-dispatched-smoke.py pins
+        # "a genuinely sent-then-stale task should still be recorded", drawing
+        # the line at whether the task was ever dispatched rather than at
+        # whether the status describes content. That is a real judgement with a
+        # test behind it and it is not mine to reverse in passing; the 3,969
+        # stale_no_local_file rows are raised separately.
+        #
+        # These two are indefensible under either reading. They do not report an
+        # observation about the file -- they report that InkDrop could not
+        # establish what happened. "unknown" is in the name. A durable verdict
+        # about a candidate's content, minted from an explicitly inconclusive
+        # outcome, refuses that candidate by path, title and peer forever after.
+        # Confirmed live on a seven-volume manga folder: six valid archives
+        # still present in the staging tree, each carrying a blocklist entry
+        # written from transfer_stale_unknown.
+        if status_key in INCONCLUSIVE_TRANSFER_STATUSES:
             continue
         payload = download_client_bad_candidate_payload(
             record,
@@ -27612,12 +28033,34 @@ def reconcile_verified_queue_wanted_statuses(con, now):
             w.id = q.wanted_id
             or (coalesce(q.issue_id, '') <> '' and w.issue_id = q.issue_id)
         )
-        where lower(coalesce(q.state, '')) in ('verified', 'satisfied')
-          and lower(coalesce(w.status, '')) not in ('satisfied', 'ignored', 'removed_by_user')
+        where lower(coalesce(w.status, '')) not in ('satisfied', 'ignored', 'removed_by_user')
+          -- The queue state is deliberately NOT filtered here. It read
+          -- `q.state in ('verified','satisfied')`, a redundant pre-filter in
+          -- front of a check that is already sufficient: every row selected here
+          -- is then put through verified_import_for_queue(...,
+          -- require_existing_destination=True) -> import_result_strict_completion_valid()
+          -- -- identity match, not bad or retracted, no unsafe completion
+          -- evidence, destination resolved inside a managed root, and a strict
+          -- archive validation of the file itself.
+          --
+          -- Measured on production 2026-08-24: 241 issues held a verified import
+          -- while still `wanted`, 226 with an active queue row, and 365 of their
+          -- queue rows were excluded by this gate against 15 admitted. The
+          -- control showing the path itself works: of the 3,564 issues that DID
+          -- retire, 3,559 had q.state='verified'. The gate was not protecting
+          -- anything -- it hid rows from a check that refuses the unsafe ones.
         """
     ).fetchall()
     changed = 0
     for row in rows:
+        # OUT OF SCOPE ON PURPOSE. 139 of the 241 stuck issues sit at
+        # superseded_duplicate: a duplicate queue row took the file, was retired
+        # as a duplicate, and the surviving wanted row was never credited.
+        # Crediting a survivor from a duplicate-retired row is how false
+        # satisfactions get manufactured, and that judgement belongs with the
+        # canonical work key rather than with this repair.
+        if str(row["queue_state"] or "").strip().lower() == "superseded_duplicate":
+            continue
         if not verified_import_for_queue(
             con,
             row["queue_id"],
@@ -30340,6 +30783,61 @@ def cached_artifact_content_identity(con, candidate):
     }
 
 
+DESTINATION_ABSENT_EVIDENCE_REASONS = (
+    # The destination grade could not find evidence. It is not saying the file is
+    # wrong, so it cannot be read as saying so -- these pass.
+    #
+    # Membership is decided by what PRODUCES the code, never by how the string
+    # reads. Each of these comes from a site that reports a shortage of evidence:
+    #
+    #   trusted_issue_missing_source_number  the destination names no unit at all.
+    #                                        A collected edition lands as
+    #                                        `Saga - Book One.cbz` by design, so
+    #                                        the silence is expected and benign.
+    #
+    # ONE MEMBER, AND THE LIST STAYS THAT SHORT. `filename_confidence_too_low`
+    # and `weak_filename_unit_evidence` were here and are removed -- putting them
+    # in was a real leak, shipped and then caught by PR #933's coverage:
+    #
+    #     target The Spectre #15, destination `Batman Beyond #015.cbz`
+    #     armed reason: filename_confidence_too_low  -> credited. WRONG.
+    #
+    # The reasoning that put them here read the producer (`if score < 4`, "did
+    # not provide enough title and unit evidence") and concluded absence. That is
+    # true about the CODE and wrong about this CALLER. Grading a destination asks
+    # "is this file the thing we are about to credit"; a shortage of evidence
+    # that it IS the target cannot be read as an absence of evidence AGAINST it,
+    # because the destination is the artifact being credited. A file from an
+    # entirely different series scores low precisely BECAUSE it does not match.
+    #
+    # `trusted_issue_missing_source_number` is genuinely different: the
+    # destination is silent about the unit by design, and the series identity has
+    # already been established elsewhere. Silence about the number is expected
+    # there; silence about whether this is the right file at all is not.
+    #
+    # A code that ASSERTS something about the file belongs nowhere near this list,
+    # however tentative its wording. `wrong_series_or_subseries` comes from
+    # related_subseries_source_blocker() and is a claim that the file is a
+    # different subseries; `unit_model_mismatch` is a claim that a chapter file
+    # was matched to a volume target. Both are contradictions and both refuse.
+    "trusted_issue_missing_source_number",
+)
+
+
+def destination_reason_is_absent_evidence(destination_reason):
+    """Whether a destination grade's reason is a shortage of evidence, not a finding.
+
+    No reason at all is the ordinary pass. Anything recognised as absence passes.
+    Everything else -- including a code this build has never seen -- refuses,
+    because the gate delegates its reason to a classifier whose vocabulary grows,
+    and a new adverse code must not become a silent pass by being unknown here.
+    """
+    reason = str(destination_reason or "").strip()
+    if not reason:
+        return True
+    return reason.startswith(DESTINATION_ABSENT_EVIDENCE_REASONS)
+
+
 def import_result_strict_completion_valid(con, row, series_id, issue_id, managed_roots=None):
     """Validate one import row before any path may mark queue/wanted complete."""
     if not row or not series_id or not issue_id:
@@ -30397,7 +30895,61 @@ def import_result_strict_completion_valid(con, row, series_id, issue_id, managed
         collection_guard_record_from_import_result(row, queue_context),
     ):
         return False
-    return not direct_import_destination_unit_gate(con, queue_context, row_value(row, "dest_path"), raw)
+    dest_path = row_value(row, "dest_path")
+    if direct_import_destination_unit_gate(con, queue_context, dest_path, raw):
+        return False
+    # Grade the DESTINATION too, not just whatever evidence path the gate picked.
+    # Left to itself the gate uses `source_path or dest_path`, so a correct
+    # download recorded against a different file in the library passes: for The
+    # Spectre #15 the source really is `The Spectre 015 (1994).cbr`, the gate
+    # grades that and says yes, and `dest_path` -- `The Spectre #003 (1992).cbz`,
+    # a pre-existing unrelated file -- is never looked at. Ten Spectre issues
+    # were satisfied that way and none of them is in the library folder.
+    #
+    # This is the rule the other caller of this gate already applies, in the
+    # same words: "'Already present' is an outcome hint, not unit identity. The
+    # destination must independently satisfy the durable target."
+    #
+    # ONLY A CONTRADICTION COUNTS -- absence of a number is not evidence against.
+    # Grading the destination produces two very different verdicts and they must
+    # not be treated alike:
+    #
+    #   trusted_issue_mismatch:003!=015     the destination names a unit and it
+    #                                       DISAGREES -- adverse, refuse
+    #   trusted_issue_missing_source_number the destination names no unit at all
+    #                                       -- absent, prove nothing
+    #
+    # THE SPLIT IS RIGHT; ENUMERATING ONE ADVERSE CODE WAS NOT. This used to read
+    # `not destination_reason.startswith("trusted_issue_mismatch")`, which honours
+    # exactly one contradiction and lets every other one through. The gate's reason
+    # is `gate.get("reason") or "direct_import_dest_unit_mismatch"` delegated to an
+    # inner classifier, so its vocabulary is open-ended: each adverse code that
+    # classifier learns was silently a pass here.
+    #
+    # Measured live on 2026-08-25, `Injustice 2 #001 (2017).cbz` credited to issue 2
+    # -- the destination grade returned `wrong_series_or_subseries`, which is
+    # `related_subseries_source_blocker()` asserting the file belongs to a DIFFERENT
+    # subseries, and this returned True anyway. The want reads satisfied and the
+    # library holds exactly one file, #001, for a want that is issue 2.
+    #
+    # So absence is now the allow-list rather than contradiction being the deny-list,
+    # and an unrecognised code refuses. That direction is deliberate: a wrong refusal
+    # costs a pass and shows the operator a row, a wrong acceptance costs a book
+    # silently. The membership is by PRODUCER, not by how the string reads --
+    # see DESTINATION_ABSENT_EVIDENCE_REASONS.
+    #
+    # A collected edition lands under InkDrop's own canonical rename: the source
+    # `Saga Issues 001-002 Omnibus.cbz` carries the coverage proof and the
+    # destination becomes `Saga - Book One.cbz`, which names no issue by design.
+    # Refusing on absence breaks every pack settlement -- caught by
+    # inkdrop-collected-edition-coverage-settlement-smoke, which passes on qa and
+    # went red on the first version of this change. Over-refusal here un-satisfies
+    # books that are genuinely present, which is worse than the leak being closed.
+    destination_verdict = direct_import_destination_unit_gate(
+        con, queue_context, dest_path, raw, already_satisfied_destination=True,
+    )
+    destination_reason = str((destination_verdict or {}).get("reason") or "")
+    return destination_reason_is_absent_evidence(destination_reason)
 
 
 def import_result_download_task_ids(raw):
@@ -31467,6 +32019,23 @@ def _retention_categories(con, now, *, diagnostic_days, lifecycle_days, source_a
             history_guards.append(
                 "not (t.entity_type = 'queue_item' and exists ("
                 "select 1 from queue_items q where q.id = t.entity_id and coalesce(q.active, 0) = 1))"
+            )
+        if table_exists(con, "series"):
+            # Same shape as the queue_item guard above, and for the same reason.
+            # inkdrop_source_worker_scheduler's series_initial_search_priority
+            # CTE reads the `series_added` row to decide a newly-added series'
+            # first-search reservation. That row is written with the default
+            # history_bucket of 'diagnostic' -- the lifecycle backfill promotes
+            # only download/import/Kavita shapes and this matches none of them --
+            # so it aged out at 30 days and took the reservation with it,
+            # silently, for a series that still exists.
+            #
+            # Existence, not a permanent exemption: a marker whose series has
+            # been removed still ages out on the ordinary schedule, so this
+            # cannot make history_events unbounded.
+            history_guards.append(
+                "not (t.event_type = 'series_added' and exists ("
+                "select 1 from series s where s.id = t.series_id))"
             )
         guard_sql = "\n              and " + "\n              and ".join(history_guards)
         for bucket, days in (("diagnostic", diagnostic_days), ("lifecycle", lifecycle_days)):
@@ -40935,8 +41504,28 @@ def slskd_concurrent_transfer_cap(con):
     return int(max(SLSKD_CONCURRENT_TRANSFER_CAP_MIN, min(value, SLSKD_CONCURRENT_TRANSFER_CAP_MAX)))
 
 
-def slskd_active_transfer_slot_count(con):
-    """Count download_tasks currently occupying an SLSKD transfer slot.
+def slskd_stale_slot_release_seconds(con):
+    """How long a never-started SLSKD handoff keeps holding an admission slot.
+
+    A plain user-editable setting, matching slskd_concurrent_transfer_cap
+    above -- the two are read together and there's no reason for one to have
+    an extra runtime/environment resolution layer the other lacks.
+    """
+    row = con.execute(
+        "select value_json from app_settings where key=?",
+        (SLSKD_SLOT_RELEASE_SETTING_KEY,),
+    ).fetchone()
+    minutes = safe_float(
+        json_loads(row["value_json"], SLSKD_SLOT_RELEASE_MINUTES_DEFAULT) if row else SLSKD_SLOT_RELEASE_MINUTES_DEFAULT,
+        SLSKD_SLOT_RELEASE_MINUTES_DEFAULT,
+    )
+    minutes = max(SLSKD_SLOT_RELEASE_MIN_MINUTES, min(minutes, SLSKD_SLOT_RELEASE_MAX_MINUTES))
+    return int(minutes * 60)
+
+
+def slskd_active_transfer_slot_breakdown(con, now=None):
+    """Split open SLSKD tasks into the ones still holding an admission slot
+    and the never-started ones whose slot has been released back to the pool.
 
     Covers both an actively-transferring task and one that's been handed to
     SLSKD but hasn't started moving bytes yet (SLSKD_ACTIVE_DOWNLOAD_STATUSES)
@@ -40945,11 +41534,22 @@ def slskd_active_transfer_slot_count(con):
     that's finished transferring and is only waiting on our own import/
     verification pipeline no longer holds an SLSKD-side slot, so it's
     correctly excluded once it reaches a staged status.
+
+    The one exception is the leak SLSKD_SLOT_RELEASE_SETTING_KEY exists for:
+    a handoff with no recorded transfer evidence at all, untouched for longer
+    than the release window, is not a live request -- it is dead weight that
+    would otherwise hold a slot until the never-started watchdog got to it
+    hours later. Liveness is the most recent of every timestamp the row
+    carries, so anything still being refreshed keeps its slot; only rows
+    nothing has touched are released.
     """
+    now = time.time() if now is None else (safe_float(now, None) or time.time())
+    release_seconds = slskd_stale_slot_release_seconds(con)
     placeholders = ",".join("?" for _ in SLSKD_ACTIVE_DOWNLOAD_STATUSES)
-    row = con.execute(
+    rows = con.execute(
         f"""
-        select count(*) as c
+        select dt.id, dt.queue_id, dt.title, dt.status, dt.progress, dt.progress_at,
+               dt.started_at, dt.updated_at, dt.completed_at, dt.raw_json
         from download_tasks dt
         join queue_items q on q.id = dt.queue_id
         where q.active = 1
@@ -40962,8 +41562,48 @@ def slskd_active_transfer_slot_count(con):
           )
         """,
         tuple(SLSKD_ACTIVE_DOWNLOAD_STATUSES),
-    ).fetchone()
-    return int(row["c"]) if row and row["c"] is not None else 0
+    ).fetchall()
+    counted = 0
+    released = []
+    for row in rows:
+        task = dict(row)
+        # One authority for "this handoff never moved a byte": the same
+        # predicate cleanup_stale_active_slskd_download_tasks retires on, not
+        # a second copy that could drift away from it.
+        if not slskd_download_task_never_started_transfer(task):
+            counted += 1
+            continue
+        last_seen = max(
+            download_task_timestamp(task),
+            download_task_original_timestamp(task),
+            safe_float(task.get("progress_at"), 0) or 0,
+        )
+        if last_seen <= 0 or now - last_seen < release_seconds:
+            counted += 1
+            continue
+        released.append(
+            {
+                "download_task_id": task.get("id"),
+                "queue_id": task.get("queue_id"),
+                "title": task.get("title"),
+                "status": task.get("status"),
+                "idle_seconds": int(now - last_seen),
+                "last_seen_at": last_seen,
+                "last_seen_at_iso": utc_stamp(last_seen),
+            }
+        )
+    return {
+        "counted": counted,
+        "released": released,
+        "released_count": len(released),
+        "open_task_count": len(rows),
+        "release_seconds": release_seconds,
+    }
+
+
+def slskd_active_transfer_slot_count(con, now=None):
+    """Count download_tasks currently occupying an SLSKD transfer slot."""
+    return int(slskd_active_transfer_slot_breakdown(con, now=now)["counted"])
 
 
 def slskd_queued_wait_stall_policy(con):
@@ -46477,7 +47117,37 @@ def review_exception_row_from_record(row):
         import_id=raw.get("import_id"),
         review_id=out.get("review_id") or raw.get("review_id"),
     )
+    # The `reason` COLUMN is display copy, not a code. sync_review_exceptions()
+    # fills it with `row.get("review_reason") or row.get("reason")` -- the human
+    # sentence wins there -- so a writer's machine reason survives only inside
+    # raw_json. Reading the column back hands manual_review_contract() a
+    # paragraph where it expects an identifier, and every substring test in it
+    # then keys on wording: "Rejection code: extraction_failed" plus "other
+    # sources were searched" is enough to make `source_failed` fire and drop the
+    # row out of Manual Review entirely.
+    #
+    # raw_json still holds what the writer declared, so promote that into
+    # reason_code, which the contract consults before anything else. Read-side
+    # on purpose: the column is what several surfaces render, and changing what
+    # gets persisted there would move display text everywhere.
+    declared_code = _clean_reason_code(raw.get("reason_code") or raw.get("reason"))
+    if declared_code and not _clean_reason_code(out.get("reason_code")):
+        out["reason_code"] = declared_code
     return apply_manual_review_contract(out, contract_input={**raw, **out})
+
+
+def _clean_reason_code(value):
+    """Return `value` only when it reads as an identifier, never as a sentence.
+
+    A reason code is a token a writer chose (`wrong_issue_number`,
+    `slskd_transfer_missing_staged_file_repeat`). Prose that happens to sit in
+    the same field must not be promoted into the classification slot -- that is
+    the defect this guards, not a shape to re-admit through another door.
+    """
+    text = str(value or "").strip()
+    if not text or " " in text or len(text) > 96:
+        return ""
+    return text
 
 
 def review_exception_rows(db_path, limit=80, states=None):
@@ -47468,6 +48138,44 @@ def series_review_attention_counts(db_path, series_ids=None):
     return counts
 
 
+def series_thumb_images_by_series_id(db_path, series_ids):
+    """Cover-thumbnail lookup for rows that never joined to `series`.
+
+    review_exceptions rows (the parked/provider_wait half of Manual Review)
+    are read with a plain `select * from review_exceptions` and carry no
+    series metadata at all -- unlike queue-origin Manual Review rows, which
+    already get an image via queue_row_from_record()'s join to `series`. This
+    is the one small addition needed to cover both halves of the same screen:
+    a single batched query, keyed by series_id, mirroring the shape of
+    series_provider_wait_counts()/series_review_attention_counts() above.
+    """
+
+    images = {}
+    path = Path(db_path)
+    if not path.exists():
+        return images
+    scoped_ids = scoped_series_ids(series_ids)
+    if not scoped_ids:
+        return images
+    with connect_read(path) as con:
+        for row in con.execute(
+            f"""
+            select id, raw_json
+            from series
+            where id in ({','.join('?' for _ in scoped_ids)})
+            """,
+            tuple(scoped_ids),
+        ):
+            series_id = str(row["id"] or "").strip()
+            if not series_id:
+                continue
+            raw = json_loads(row["raw_json"] or "{}", {})
+            image = series_thumb_image_from_raw(raw if isinstance(raw, dict) else {})
+            if image:
+                images[series_id] = image
+    return images
+
+
 def series_attention_count(db_path):
     path = Path(db_path)
     if not path.exists():
@@ -47565,39 +48273,85 @@ def compact_count(value):
     return str(number)
 
 
-def source_display_label(value):
-    key = str(value or "").strip().lower()
-    labels = {
-        "local": "Local Library Check",
-        "source_ladder": "Source Ladder",
-        "failed_retry": "Retry",
-        "prowlarr": "Prowlarr",
-        "rss": "RSS",
-        "comicscodes": "ComicsCodes",
-        "comicvine": "ComicVine",
-        "mangadex": "MangaDex",
-        "metron": "Metron",
-        "suwayomi": "Suwayomi",
-        "slskd": "SLSKD",
-        "download_client": "Download client",
-        "qbittorrent": "qBittorrent",
-        "sabnzbd": "SABnzbd",
-        "pack_import": "Pack Import",
-        "bad_source_memory": "Bad Source Memory",
-        "kavita": "Kavita",
-        "komga": "Komga",
-        "media_management": "Media Management",
-        "importer": "Importer",
-        "queue": "Queue",
-        "autopilot": "Autopilot",
+SOURCE_DISPLAY_LABELS = {
+    "local": "Local Library Check",
+    "source_ladder": "Source Ladder",
+    "failed_retry": "Retry",
+    "prowlarr": "Prowlarr",
+    "rss": "RSS",
+    "comicscodes": "ComicsCodes",
+    "comicvine": "ComicVine",
+    "mangadex": "MangaDex",
+    "metron": "Metron",
+    "suwayomi": "Suwayomi",
+    "slskd": "SLSKD",
+    "download_client": "Download client",
+    "qbittorrent": "qBittorrent",
+    "sabnzbd": "SABnzbd",
+    "pack_import": "Pack Import",
+    "bad_source_memory": "Bad Source Memory",
+    "kavita": "Kavita",
+    "komga": "Komga",
+    "kapowarr": "Kapowarr",
+    "media_management": "Media Management",
+    "importer": "Importer",
+    "queue": "Queue",
+    "autopilot": "Autopilot",
+    # Short forms and buckets the BROWSER used to name on its own. They were
+    # in sourceBucketLabel()'s table and not in this one, so the day a client
+    # stopped writing its own table down, "sab" would have become "SAB", "cv"
+    # would have become "Cv" and "hidden" would have become "Hidden". Naming
+    # them here is what makes it safe for the clients to stop.
+    "sab": "SABnzbd",
+    "qb": "qBittorrent",
+    "qbit": "qBittorrent",
+    "cv": "ComicVine",
+    "hidden": "Hidden Sources",
+}
+
+SOURCE_DISPLAY_ACRONYMS = {"slskd", "sab", "sabnzbd", "nzb", "rss", "cbr", "cbz"}
+
+
+def source_display_vocabulary():
+    """The source-naming vocabulary, in the form the browser is handed.
+
+    source_display_label() below calls itself this repo's one source-naming
+    function, and says a second copy in JavaScript is how the two would drift.
+    There were three more -- sourceBucketLabel() in core/inkdrop_web.py, the
+    series-detail island's NON_LABEL_PROVIDERS, and mobile's humanizeToken()
+    fallback -- sharing 14 of this table's keys between them, and they had
+    already drifted: the same download-client row read "Download client" from
+    the server and "Download Client" on the desktop page.
+
+    So the table is not written twice. The server renders this object into
+    window.__INKDROP_SOURCE_DISPLAY__ on both documents and one shared
+    function in web/static/js/inkdrop-api.js applies
+    core/inkdrop_display_labels.display_label()'s rule to it.
+
+    The acronym set travels with the table on purpose: without it a derived
+    name for an unmapped key ("rss_feed") would come back title-cased on one
+    side and upper-cased on the other, which is the same drift one layer down.
+    """
+    return {
+        "labels": dict(SOURCE_DISPLAY_LABELS),
+        "acronyms": sorted(SOURCE_DISPLAY_ACRONYMS),
     }
-    if key in labels:
-        return labels[key]
-    if not key:
-        return "Source Ladder"
-    acronym_words = {"slskd", "sab", "sabnzbd", "nzb", "rss", "cbr", "cbz"}
-    words = str(value).replace("_", " ").split(" ")
-    return " ".join(word.upper() if word.lower() in acronym_words else word.title() for word in words if word) or "Source Ladder"
+
+
+def source_display_label(value):
+    """The friendly name for a source, or the value back untouched.
+
+    `source` carries a provider id on most rows and a filesystem path on
+    staged-file rows. This used to title-case whatever it was handed, which
+    turned the second kind into a path that no longer exists. The judgement
+    about which kind a value is now lives in core/inkdrop_display_labels.py.
+    """
+    return display_label(
+        value,
+        SOURCE_DISPLAY_LABELS,
+        acronyms=SOURCE_DISPLAY_ACRONYMS,
+        empty="Source Ladder",
+    )
 
 
 def library_visibility_provider_label(value):
@@ -54045,6 +54799,10 @@ def queue_row_from_record(row, provider_health=None, db_path=None, media_managem
         "series": row["series"],
         "year": row["series_year"] if "series_year" in row.keys() else None,
         "image": series_image_from_raw(json_loads(row["series_raw_json"] or "{}", {})) if "series_raw_json" in row.keys() else "",
+        # Small variant of the same field, for surfaces that render this row
+        # at thumbnail size (mobile Needs Review) rather than fetching the
+        # full-size "image" above and scaling it down client-side.
+        "image_thumb": series_thumb_image_from_raw(json_loads(row["series_raw_json"] or "{}", {})) if "series_raw_json" in row.keys() else "",
         "media_type": row["media_type"],
         "metadata_provider": row["metadata_provider"],
         "metadata_id": row["metadata_id"],
@@ -56765,6 +57523,25 @@ def manual_review_canonical_snapshot(db_path, limit=5000):
         limit,
         states=MANUAL_REVIEW_FILTERS["all"][1],
     )
+    # review_exceptions rows never join to `series` (review_exception_rows()
+    # is a plain `select * from review_exceptions`), so unlike queue-origin
+    # rows above they carry no image_thumb yet. One batched lookup rather
+    # than a per-row query -- see series_thumb_images_by_series_id().
+    missing_image_series_ids = {
+        str(row.get("series_id") or "").strip()
+        for row in review_candidates
+        if not row.get("image_thumb") and str(row.get("series_id") or "").strip()
+    }
+    if missing_image_series_ids:
+        thumb_images = series_thumb_images_by_series_id(db_path, list(missing_image_series_ids))
+        if thumb_images:
+            for row in review_candidates:
+                if row.get("image_thumb"):
+                    continue
+                series_id = str(row.get("series_id") or "").strip()
+                image = thumb_images.get(series_id)
+                if image:
+                    row["image_thumb"] = image
     # The action handlers record a decided review_id in manual-review-actions.json
     # instead of mutating queue/review_exceptions state directly, because none of
     # these decisions has a natural terminal state on either source table at the
@@ -59890,25 +60667,45 @@ def series_filter_clause(series_filter):
     return value, series_not_removed_sql("s"), []
 
 
-def series_image_from_raw(raw):
+SERIES_IMAGE_KEY_ORDER = (
+    "super_url",
+    "screen_url",
+    "medium_url",
+    "small_url",
+    "thumb_url",
+    "original_url",
+    "tiny_url",
+    "icon_url",
+    "url",
+    "cover_url",
+)
+# Smallest real cover art first, not the icon-sized crops (tiny_url, icon_url
+# are square-cropped thumbnails meant for UI chrome, not a book cover) and
+# never super_url/original_url/screen_url, which is what made mobile Home's
+# "Your series" rail hotlink a several-hundred-KB image for a ~48px tile.
+SERIES_THUMB_IMAGE_KEY_ORDER = (
+    "thumb_url",
+    "small_url",
+    "medium_url",
+    "screen_url",
+    "super_url",
+    "original_url",
+    "icon_url",
+    "tiny_url",
+    "url",
+    "cover_url",
+)
+
+
+def series_image_from_raw(raw, prefer_small=False):
     raw = raw if isinstance(raw, dict) else {}
+    key_order = SERIES_THUMB_IMAGE_KEY_ORDER if prefer_small else SERIES_IMAGE_KEY_ORDER
 
     def image_value(value):
         if isinstance(value, str):
             return value.strip()
         if isinstance(value, dict):
-            for key in (
-                "super_url",
-                "screen_url",
-                "medium_url",
-                "small_url",
-                "thumb_url",
-                "original_url",
-                "tiny_url",
-                "icon_url",
-                "url",
-                "cover_url",
-            ):
+            for key in key_order:
                 text = str(value.get(key) or "").strip()
                 if text:
                     return text
@@ -59925,6 +60722,17 @@ def series_image_from_raw(raw):
             if image:
                 return image
     return ""
+
+
+def series_thumb_image_from_raw(raw):
+    """Same resolver as series_image_from_raw(), preferring the small ComicVine
+    variant already present in the same payload (thumb_url/small_url) instead
+    of super_url. MangaDex covers are stored as a single already-256px string
+    (see mangadex_cover_url()), so this returns the identical value for those
+    regardless of the key order -- only ComicVine's nested image object, which
+    carries several sizes, is affected."""
+
+    return series_image_from_raw(raw, prefer_small=True)
 
 
 def series_metadata_sources(raw):
@@ -59945,15 +60753,48 @@ def series_metadata_sources(raw):
     return sources
 
 
+# Tags that end a run of text. Dropping one of these has to leave a separator
+# behind or the two blocks run together ("mini-series.Collected in").
+SERIES_DESCRIPTION_BLOCK_TAG_RE = re.compile(
+    r"(?i)</?(?:p|div|br|hr|li|ul|ol|dl|dd|dt|tr|td|th|table|thead|tbody|"
+    r"h[1-6]|section|article|aside|header|footer|figure|figcaption|"
+    r"blockquote|pre)\b[^>]*>"
+)
+
+# Whitespace sitting directly in front of sentence punctuation. Prose never
+# writes that; it is only ever left behind by markup removal.
+SERIES_DESCRIPTION_ORPHAN_SPACE_RE = re.compile(r"\s+(?=[.,;:!?])")
+
+
 def series_clean_description(value):
+    """Provider description HTML as plain prose, spaced the way HTML reads.
+
+    This used to replace EVERY tag with a space, which put a space in front of
+    the sentence's own punctuation whenever a provider linked something at the
+    end of a clause. Confirmed live on the running build: ComicVine writes
+    `Collected in <a ...>Rare Flavours</a>.` and the series page rendered
+    "Collected in Rare Flavours ." -- the "Collected in" half is ComicVine's
+    prose, which is why that sentence appears nowhere in this repository.
+    7 of the 21 series carrying a description were rendering one of these.
+
+    A block boundary separates text and an inline one does not -- a browser
+    renders `<b>a</b><i>b</i>` as "ab" -- so block tags become a space and
+    inline markup is removed outright.
+
+    The final pass exists because the damage was also PERSISTED: a cleaned
+    description is written back to series.raw_json, and nothing re-fetches it,
+    so rows cleaned before this fix carry the space with no tag left to
+    explain it. It removes whitespace before punctuation, which the prose
+    never had, rather than trimming the string.
+    """
     text = str(value or "").strip()
     if not text:
         return ""
-    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
-    text = re.sub(r"</p\s*>", " ", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
+    text = SERIES_DESCRIPTION_BLOCK_TAG_RE.sub(" ", text)
+    text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return SERIES_DESCRIPTION_ORPHAN_SPACE_RE.sub("", text)
 
 
 def series_first_metadata_value(sources, *keys):
@@ -63422,8 +64263,8 @@ _RELIABILITY_INCOMPLETE_NEEDLES = (
 # reporting itself unavailable is a different claim from "we asked and it
 # timed out". Kept as its own evidence class rather than folded into
 # "never_completed" so the two populations (affirmative timeout/error vs.
-# unproven-start) stay countable and describable separately, per the
-# Prompt117 audit: 94 affirmative vs. 22 provider_unavailable, live 2026-08-18.
+# unproven-start) stay countable and describable separately. Measured live
+# 2026-08-18: 94 affirmative vs. 22 provider_unavailable.
 _RELIABILITY_UNAVAILABLE_STATUSES = {"provider_unavailable"}
 
 # A usable candidate was found and no decision was ever taken -- neither a
@@ -63632,6 +64473,34 @@ def _reliability_known_bad_signal(last_attempt_status, last_attempt_failure_reas
     return status in _RELIABILITY_KNOWN_BAD_STATUSES or failure_reason in _RELIABILITY_KNOWN_BAD_STATUSES
 
 
+def _reliability_blocking_evidence(row):
+    """The (status, failure_reason) pair `known_bad_blocked` is allowed to read.
+
+    Deliberately the latest REAL attempt, not the latest ledger row of any
+    kind. `source_attempts` is overwhelmingly lifecycle bookkeeping (queued,
+    retry_scheduled, activity), so a bucket keyed on last_attempt_* moves
+    whenever an unrelated retry is written -- in both directions. A genuinely
+    blocked item stopped reading as blocked the moment a retry row landed
+    behind it, and an item whose only blocking string sat on a bookkeeping row
+    read as blocked without any provider having refused anything.
+
+    Six sibling fields in reliability_bucket_for_item()'s own span already read
+    last_real_attempt_*, and reliability_search_outcome_bucket() carries the
+    reasoning verbatim. This is that convention applied to the one bucket that
+    was left out.
+
+    "Column absent" and "column present and empty" mean opposite things, the
+    same distinction has_provider_attempt already draws: a caller that never
+    selected the last_real_attempt_* family gets the unfiltered pair rather
+    than having the bucket silently blanked. Every production row comes from
+    _reliability_source_rows_sql(), which always selects them.
+    """
+    row = row if isinstance(row, dict) else {}
+    if "last_real_attempt_status" in row or "last_real_attempt_failure_reason" in row:
+        return row.get("last_real_attempt_status"), row.get("last_real_attempt_failure_reason")
+    return row.get("last_attempt_status"), row.get("last_attempt_failure_reason")
+
+
 def _reliability_budget_signal(last_event, last_attempt_status=None, last_attempt_display_phase=None, last_attempt_failure_reason=None):
     if str(last_attempt_status or "").strip().lower() in _RELIABILITY_BUDGET_STATUS_VALUES:
         return True
@@ -63679,7 +64548,7 @@ def reliability_bucket_for_item(row, now=None):
     if queue_state == "superseded_duplicate":
         return "superseded_duplicate"
     if queue_state in {"queued", "searching", ""} and _reliability_known_bad_signal(
-        row.get("last_attempt_status"), row.get("last_attempt_failure_reason")
+        *_reliability_blocking_evidence(row)
     ):
         return "known_bad_blocked"
     if queue_state in {"queued", "searching", ""} and _reliability_budget_signal(
@@ -63697,7 +64566,7 @@ def reliability_bucket_for_item(row, now=None):
 
 
 def current_pickable_candidate_reference(row):
-    """Prompt122: the bounded proof seam behind `candidate_awaiting_pick`.
+    """The bounded proof seam behind `candidate_awaiting_pick`.
 
     282 wanted|in_progress identities carried this bucket live 2026-08-18 on
     evidence alone: three prose needles ("candidates available for
@@ -63763,7 +64632,8 @@ def reliability_search_outcome_bucket(row):
     # single newest source_attempts row of ANY kind, which is frequently
     # internal wait/retry bookkeeping (queued, retry_scheduled, activity)
     # written well after the last genuine search. Judging the bucket off that
-    # row is exactly the Prompt117 classifier bug: a real zero-result search
+    # row is exactly the classifier bug this column family exists to fix: a
+    # real zero-result search
     # from days ago, sitting behind a fresh retry_scheduled row, displayed as
     # "still timing out" even though a decisive answer already exists.
     # last_event (the queue's own prose) is untouched -- it is queue-level
@@ -63899,7 +64769,7 @@ def attach_residual_evidence_buckets(db_path, items, now=None):
 
 
 def demote_unconfirmed_active_rows(db_path, items, now=None):
-    """Prompt121: "actively_processing" must mean a live claim, an unexpired
+    """"actively_processing" must mean a live claim, an unexpired
     lease, or a mapped owner proved current work -- not merely that
     queue_state is one of searching/downloading/importing/source_wait.
     Measured live 2026-08-18: 39-40 wanted|in_progress identities carried that
@@ -64205,7 +65075,7 @@ def _reliability_source_rows_sql(where_sql, now):
                lra.source as last_real_attempt_source,
                lra.completed_at as last_real_attempt_completed_at,
                lra.started_at as last_real_attempt_started_at,
-               -- Prompt122: candidate_awaiting_pick's own proof seam. Reads
+               -- candidate_awaiting_pick's own proof seam. Reads
                -- off the SAME row (lra) that produced the awaiting_pick
                -- classification, not `la` above (a different, possibly
                -- newer bookkeeping row) -- current_pickable_candidate_reference()
@@ -64332,7 +65202,7 @@ def reliability_view_rows(db_path, statuses=None, now=None):
             # nearly every row.
             "has_provider_attempt": bool(row["has_provider_attempt"]),
             "has_rejected_attempt": bool(row["has_rejected_attempt"]),
-            # Prompt121: an unexpired queue_claims row for this queue_id --
+            # An unexpired queue_claims row for this queue_id --
             # one of the two proofs reliability_bucket_for_item() now requires
             # before it will call a searching/downloading/importing/source_wait
             # row "actively_processing". The other is a fresh handoff task,

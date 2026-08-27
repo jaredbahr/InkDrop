@@ -16,6 +16,7 @@ import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from core import inkdrop_safe_xml
 
 import inkdrop_completed_import as importer
 from inkdrop_manga_metadata_guard import read_bounded_comicinfo, env_path, STATE_DIR
@@ -102,7 +103,7 @@ def inspect_archive(path):
     except Exception as exc:
         return {"action": "archive_error", "raw": None, "error": f"{type(exc).__name__}: {exc}"}
     try:
-        root = ET.fromstring(raw)
+        root = inkdrop_safe_xml.fromstring(raw)
     except ET.ParseError as exc:
         return {"action": "malformed_comicinfo", "raw": raw, "error": f"{type(exc).__name__}: {exc}"}
     node = root.find("Publisher")
@@ -112,7 +113,7 @@ def inspect_archive(path):
 
 
 def write_publisher(path, raw_original, publisher):
-    root = ET.fromstring(raw_original)
+    root = inkdrop_safe_xml.fromstring(raw_original)
     node = ET.SubElement(root, "Publisher")
     node.text = publisher
     format_node = root.find("Format")

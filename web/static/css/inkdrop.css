@@ -1009,6 +1009,20 @@
     .core-section-summary .summary-chip.good { border-color: rgba(120, 217, 155, .34); }
     .core-section-summary .summary-chip.warn { border-color: rgba(247, 201, 111, .44); }
     .core-section-summary .summary-chip.bad { border-color: rgba(255, 125, 125, .44); }
+    /* The row count, not a fourth facet. Every chip after it is an independent
+       filter that can count the same row twice, so the total has to look like
+       the total. */
+    .core-section-summary .summary-chip.count {
+      border-color: rgba(114, 210, 255, .40);
+      background: rgba(15, 30, 48, .70);
+    }
+    .core-section-summary .summary-facet-note {
+      grid-column: 1 / -1;
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
     .section-operator-now {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -6066,10 +6080,29 @@
     body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flags {
       display: none;
     }
+    /* Manual Review was the only operational table declaring a multi-track row
+       grid WITHOUT the min-width + overflow-x pair every sibling declares --
+       queue, wanted, history, source_memory, issues, source_attempts,
+       download_tasks and imports all pin a row min-width (940-1040px) and give
+       their container `overflow-x: auto`. Without the pair there is nothing to
+       scroll, so once the row exceeds its container the right-hand tracks are
+       simply unreachable: the Review Decision button was measured at x1332-1436
+       against a 1224px client width, and again at x2050-2130 against 1393px.
+       Those are the primary controls on this view, so they were invisible
+       rather than inert.
+       The tracks below sum to 880px, plus 3x8px gaps and the row's 20px
+       horizontal padding = 924px, so 940px is the honest floor for this grid
+       and sits inside the 940-1040 range its siblings already use. */
     body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-head,
     body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row {
+      min-width: 940px;
       grid-template-columns: minmax(290px, 1.28fr) minmax(112px, .42fr) minmax(258px, .84fr) minmax(220px, .72fr);
       gap: 8px;
+    }
+    body[data-inkdrop-view="manual_review"] .section-table-manual_review {
+      overflow-x: auto;
+      overflow-y: visible;
+      scrollbar-width: thin;
     }
     body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row {
       align-items: center;
@@ -6720,9 +6753,18 @@
        bordered cluster (.settings-toolbar-cluster, markup in
        inkdrop_web.py's settings shell) and the search input sits apart on
        the right -- it used to be mixed into the middle of the action row.
-       This file owns all toolbar styling; 15-redesign-shell.css must not
+       This file owns the toolbar CLUSTER -- .settings-toolbar-cluster is
+       declared here and nowhere else -- and 15-redesign-shell.css must not
        restyle these selectors (inkdrop-css-selector-conflict-smoke.py
-       enforces it). */
+       enforces that part).
+
+       It does NOT own all toolbar styling, which the earlier wording claimed.
+       .settings-actions is also declared in 06-settings-forms.css,
+       10-responsive-tables.css and 11-responsive-layout.css, so a change to
+       the action row has three other files to check. The narrow claim about
+       15-redesign-shell.css was accurate; the broad one was not, and a
+       sole-ownership comment that is false is worse than none because it
+       stops people looking. */
     .settings-actions {
       flex-wrap: wrap;
       justify-content: space-between;
@@ -9673,7 +9715,12 @@
     .series-poster-shelf-full .series-poster-body {
       padding: 6px 7px 4px;
       min-height: 65px;
-      grid-template-rows: 30px 25px;
+      /* The title row's own two-line clamp renders taller than a flat 30px in
+         practice (font metrics vary by platform), so a fixed track clipped
+         long titles into the meta row below them. minmax keeps the same
+         30px floor for the common case but lets the row grow to whatever a
+         genuine two-line title actually needs. */
+      grid-template-rows: minmax(30px, auto) minmax(0, auto);
       align-content: start;
     }
     .series-poster-title {

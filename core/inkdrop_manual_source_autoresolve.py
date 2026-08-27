@@ -1057,7 +1057,31 @@ def db_import_retry_records(min_age_seconds=120, limit=DB_IMPORT_RETRY_LIMIT):
             transfer = dict(transfer) if isinstance(transfer, dict) else {}
             transfer.setdefault("id", row["external_id"])
             transfer.setdefault("filename", filename)
-            transfer.setdefault("state", "Completed, Succeeded")
+            # setdefault ONLY defaults when there is something to default over,
+            # and on these rows there is not. The raw_json they carry is FLAT --
+            # transfer_state, transfer_ended_at, transfer_requested_at,
+            # transfer_percent, transfer_bytes_remaining -- with no nested
+            # `transfer` / `slskd_transfer` object, so `transfer` is {} and this
+            # line stamped a success over a state the row had already recorded.
+            #
+            # Measured live 2026-08-25 across the 121 rows at
+            # status='transfer_succeeded_missing_stage' (window 2026-07-10 ..
+            # 2026-08-23): only 4 carry a nested object at all; 96 record a flat
+            # `Completed, Succeeded`, 1 records nothing, and 20 record
+            # `Completed, TimedOut`. Every one of those 20 was replayed as a
+            # clean completion.
+            #
+            # So read what the row actually says first. The literal survives only
+            # as the last resort for a row that recorded no state at all, where
+            # the task's own status is the only evidence there is -- and that
+            # status already asserts the transfer succeeded, so it is not an
+            # invention. The two setdefault() calls below are a different case
+            # and correctly left alone: transfer_ended_at / transfer_requested_at
+            # are read from their flat keys explicitly further down.
+            transfer.setdefault(
+                "state",
+                first_text(task_raw.get("transfer_state")) or "Completed, Succeeded",
+            )
             # This dict is a replay of a completion SLSKD reported once, not a
             # live reading, so it has to carry when that completion happened.
             #
@@ -2206,6 +2230,13 @@ def mark_manual_source_candidate_bad(review_id, record, detected, reason, transf
             transfer.get("state"),
             (record or {}).get("slskd_transfer_state"),
         ),
+        # SLSKD's own rejection/error text (e.g. "Transfer rejected: Banned",
+        # "Transfer rejected: File not shared.", "File read error.") -- kept
+        # separate from `reason`/`detail` above, which classify_candidate_
+        # failure() keys off of via substring matching; changing what those
+        # carry would silently change candidate-bad/retry classification.
+        # This field is purely additive diagnostic detail.
+        "slskd_transfer_exception": transfer.get("exception"),
         "slskd_transfer_requested_at": first_present(
             transfer.get("requestedAt"),
             (record or {}).get("slskd_transfer_requested_at"),
@@ -3041,8 +3072,64 @@ def repeat_bad_candidate_park_reason(known_bad):
         return f"been found and rejected {failure_count} times"
     age_seconds = (now() - first_seen_at) if first_seen_at > 0 else 0
     if age_seconds >= REPEAT_BAD_CANDIDATE_PARK_AGE_SECONDS:
-        return f"been rejected every time for {int(age_seconds // 3600)}h straight with no other candidate found"
+        # This used to end "... with no other candidate found", which this
+        # function cannot know. Its entire input is one known_bad record: a
+        # failure count and a first-seen timestamp for ONE candidate. It has no
+        # view of the candidate set, of whether any other result was returned,
+        # or of whether a search ran at all. `age_seconds` is arithmetic on a
+        # timestamp -- a statement about a timer was being rendered as a
+        # statement about search results.
+        #
+        # Reported live 2026-08-20: 24 occurrences across 12 rows, 68h to 430h,
+        # the oldest 17.9 days, with the operator's own reaction being "I have a
+        # feeling its wrong". He was right, and the direction of the error is
+        # the expensive one: it tells him to stop looking for a book that may
+        # well be findable. "No source found" is a search defect, never proof
+        # that nothing exists -- and this was not even a search result.
+        return f"been rejected every time we re-checked it over the last {int(age_seconds // 3600)}h"
     return None
+
+
+def repeat_bad_candidate_review_sentence(park_reason, known_bad):
+    """What this row can honestly say, and the thing it must not imply.
+
+    The closing sentence is load-bearing rather than padding. A parked
+    candidate reads as a dead end, and the copy this replaces actively said so
+    -- so an operator who trusted it stopped looking for a book that other
+    sources may well have. Nothing in this path searched anywhere else, so the
+    row says what it saw and explicitly disclaims the rest.
+
+    The candidate's own rejection reason is included when there is one: it is
+    the single most useful thing on the row for deciding what to do, and it was
+    already being carried in the payload while the prose talked about timers.
+    """
+    reason = ""
+    if isinstance(known_bad, dict):
+        reason = str(known_bad.get("reason") or "").strip()
+
+    parts = [f"This SLSKD candidate has {park_reason}."]
+    if reason and not looks_like_bare_token(reason):
+        parts.append(f"It was rejected because: {reason}.")
+    elif reason:
+        # An identifier is still worth surfacing, but not dressed as a
+        # sentence -- see the reason-vocabulary work on the same surface.
+        parts.append(f"Rejection code: {reason}.")
+    parts.append("It's stopped auto-retrying and needs a decision from you.")
+    parts.append(
+        "This is about this one file. It does not mean other sources were "
+        "searched, or that nothing else is available."
+    )
+    return " ".join(parts)
+
+
+def looks_like_bare_token(value):
+    """A lowercase underscored identifier, whole-string."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    import re as _re
+
+    return bool(_re.match(r"^[a-z0-9]+(?:_[a-z0-9]+)+$", text))
 
 
 def repeat_bad_candidate_review_row(
@@ -3057,16 +3144,41 @@ def repeat_bad_candidate_review_row(
         "state": "needs_you",
         "manual_review_actionable": True,
         "reason": reason_key,
-        "review_reason": review_reason or (
-            f"This SLSKD candidate has {park_reason}. "
-            "It's stopped auto-retrying and needs a decision from you."
-        ),
+        "review_reason": review_reason or repeat_bad_candidate_review_sentence(park_reason, known_bad),
         "next_action": next_action or "Review the SLSKD candidate and either supply a different source or clear/ignore this one.",
         "activity_summary": known_bad.get("detail") or known_bad.get("reason"),
         "candidate_reason": known_bad.get("reason"),
         "failure_count": known_bad.get("failure_count"),
         "first_seen_at": known_bad.get("first_seen_at"),
         "last_seen_at": known_bad.get("last_seen_at"),
+        # WHICH candidate. This row asks the operator to judge one and used to
+        # name only the reason it was rejected: 25 of these were live on
+        # 2026-08-25 and not one carried a filename, a path or a peer, so the
+        # decision panel had an expected side and nothing to put opposite it.
+        #
+        # known_bad is a bad_source_candidates record (durable_bad_source_
+        # candidate_match returns dict(row)) and has carried all three the whole
+        # time. Verbatim, never through a label function -- a peer path is data
+        # the operator copies, and title-casing one hands them a path that does
+        # not resolve (tracker #820).
+        #
+        # `source` above stays the provider id. decision_evidence()'s
+        # source_is_path and mobile's staged-path branch both key off it, so
+        # putting a path there instead would reopen exactly that defect.
+        "candidate_path": first_text(
+            known_bad.get("source_path"),
+            known_bad.get("candidate_path"),
+            known_bad.get("path"),
+        ) or None,
+        "candidate_title": first_text(
+            known_bad.get("title"),
+            known_bad.get("filename"),
+            known_bad.get("filename_leaf"),
+        ) or None,
+        "candidate_provider": first_text(
+            known_bad.get("provider"),
+            known_bad.get("username"),
+        ) or None,
     }
     queue_id = first_text(record.get("autopilot_queue_key"), record.get("queue_key"))
     if queue_id and inkdrop_state is not None and db_path.exists():
@@ -3673,6 +3785,14 @@ def compact_transfer(row):
         "remote_path": row.get("remote_path") or row.get("path"),
         "state": row.get("state"),
         "stateDescription": row.get("stateDescription"),
+        # SLSKD's state/stateDescription are just the generic phase+result
+        # pair ("Completed, Rejected") -- the actual reason (peer banned us,
+        # peer's share no longer has the file, a corrupt read on their end,
+        # etc.) only exists in this separate `exception` field, and nothing
+        # in InkDrop read it before this. Carrying it through here makes a
+        # real rejection reason visible in the durable bad-candidate record
+        # instead of only being discoverable by opening SLSKD's own web UI.
+        "exception": row.get("exception"),
         "bytesTransferred": row.get("bytesTransferred"),
         "bytesRemaining": row.get("bytesRemaining"),
         "percentComplete": row.get("percentComplete"),

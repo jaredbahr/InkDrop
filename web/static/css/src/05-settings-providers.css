@@ -605,9 +605,18 @@ body[data-inkdrop-view="manual_review"] .manual-review-inline-decision {
        bordered cluster (.settings-toolbar-cluster, markup in
        inkdrop_web.py's settings shell) and the search input sits apart on
        the right -- it used to be mixed into the middle of the action row.
-       This file owns all toolbar styling; 15-redesign-shell.css must not
+       This file owns the toolbar CLUSTER -- .settings-toolbar-cluster is
+       declared here and nowhere else -- and 15-redesign-shell.css must not
        restyle these selectors (inkdrop-css-selector-conflict-smoke.py
-       enforces it). */
+       enforces that part).
+
+       It does NOT own all toolbar styling, which the earlier wording claimed.
+       .settings-actions is also declared in 06-settings-forms.css,
+       10-responsive-tables.css and 11-responsive-layout.css, so a change to
+       the action row has three other files to check. The narrow claim about
+       15-redesign-shell.css was accurate; the broad one was not, and a
+       sole-ownership comment that is false is worse than none because it
+       stops people looking. */
     .settings-actions {
       flex-wrap: wrap;
       justify-content: space-between;

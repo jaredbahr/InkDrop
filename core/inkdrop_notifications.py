@@ -32,6 +32,7 @@ import requests
 from core import inkdrop_bounded_read
 from core import inkdrop_manual_search
 from core import inkdrop_notification_store as store
+from core.inkdrop_display_labels import display_label
 
 logger = logging.getLogger("inkdrop.notifications")
 
@@ -379,7 +380,12 @@ def public_channel_status(db_path):
             "id": connector["id"],
             "type": connector["type"],
             "name": connector["name"],
-            "display_name": cls.display_name if cls else connector["type"].title(),
+            # The display twin of the fallback in store.create_connector(). A
+            # connector type this build has no class for is shown as it is
+            # rather than re-cased; `type` reaches here already lower-cased for
+            # storage, so a path survives but an unknown type's original
+            # letter-case does not -- `name` above is what carries that.
+            "display_name": cls.display_name if cls else display_label(connector["type"]),
             # This connector's own switch, deliberately not folded together
             # with the master switch. The Configure modal binds its Enabled
             # toggle to this field and writes it straight back on Save, so

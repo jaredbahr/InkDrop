@@ -49,7 +49,10 @@
     importing: ["Importing"],
     waiting_for_library_scan: ["Waiting"],
     complete: ["Complete"],
-    needs_attention: ["Needs Review", "Failed", "Blocked"],
+    // Matched against coreStateLabel()'s rendered OUTPUT (see the comment
+    // above). The second copy of this table lives in core/inkdrop_web.py and
+    // both are load-bearing; a smoke pins them together.
+    needs_attention: ["Needs you", "Failed", "Blocked"],
   });
 
   function element(tag, className, text) {
@@ -274,7 +277,15 @@
     }
     else if (!payload.can_manage) live.textContent = "Sign in as an administrator to start or pause recovery.";
     else if (payload.control?.paused) live.textContent = "New recovery admission is paused. Active transfers and imports continue.";
-    else if (payload.control?.requested_at) live.textContent = `Last requested ${payload.control.requested_at}.`;
+    // The server sends the wording (`requested_at_label`, "6h ago"); this used
+    // to print `requested_at` itself, which is an ISO-8601 wire stamp. The raw
+    // value stays on the element's title so the exact moment is still one
+    // hover away, and is the fallback if an older payload has no label.
+    else if (payload.control?.requested_at) {
+      const requestedLabel = String(payload.control.requested_at_label || "").trim();
+      live.textContent = `Last requested ${requestedLabel || payload.control.requested_at}.`;
+      live.title = String(payload.control.requested_at || "");
+    }
     footer.append(result, live, actions);
     host.append(footer);
     scheduleRefresh(payload);

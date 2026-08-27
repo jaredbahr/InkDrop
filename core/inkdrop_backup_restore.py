@@ -40,6 +40,7 @@ import time
 import zipfile
 from pathlib import Path
 from stat import S_ISLNK
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -103,6 +104,7 @@ SECRET_KEY_MARKERS = ("API_KEY", "PASSWORD", "TOKEN", "SECRET", "USERNAME")
 CREDENTIAL_PASSPHRASE_MIN_LENGTH = 8
 CREDENTIAL_KDF_ITERATIONS = 480_000
 CREDENTIAL_TABLES = ("provider_configs", "notification_connectors")
+REDACTED_MARKER = "<redacted>"
 # Naming-format templates hold tokens like "{Series Title} ({Year})", never
 # host paths; comic_issue_format already exports, this keeps its sibling from
 # being excluded for having FOLDER in its name.
@@ -140,6 +142,22 @@ def utc_stamp(ts=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts if ts is not None else time.time())))
 
 
+def readable_stamp(ts=None):
+    """A calendar moment an operator can read: "Aug 30, 2026 at 21:49 UTC".
+
+    utc_stamp() above is the wire format and stays the wire format -- it is
+    what the *_iso payload keys carry and what a consumer parses. This is only
+    for prose, and only for a moment in the FUTURE: elapsed time in the past
+    already has one vocabulary across the whole product
+    (inkdrop_state.relative_time_label(), "6h ago"), and a forward-looking
+    "due in 5 days" formatter would have been a fourth time vocabulary to keep
+    in agreement with the other three. A due date is a date, so it prints as
+    one.
+    """
+    moment = time.gmtime(float(ts if ts is not None else time.time()))
+    return f"{time.strftime('%b', moment)} {moment.tm_mday}, {moment.tm_year} at {time.strftime('%H:%M', moment)} UTC"
+
+
 def compact_stamp(ts=None):
     return time.strftime("%Y%m%d-%H%M%S", time.gmtime(float(ts if ts is not None else time.time())))
 
@@ -149,8 +167,49 @@ def path_text(path):
 
 
 def is_secret_key(key):
-    normalized = str(key or "").upper()
-    return any(marker in normalized for marker in SECRET_KEY_MARKERS)
+    # Separators are stripped before matching so apikey, api-key, api key and
+    # api_key are all one field. Matching the literal markers only meant
+    # "apikey" -- the spelling every indexer RSS URL uses for its query
+    # parameter, and a common settings key -- read as an ordinary field and
+    # exported in the clear.
+    normalized = re.sub(r"[^A-Z0-9]+", "", str(key or "").upper())
+    return any(marker.replace("_", "") in normalized for marker in SECRET_KEY_MARKERS)
+
+
+def sanitize_url_credentials(value):
+    """Strip credentials a URL carries in its own text.
+
+    A service URL is exportable; the credentials people bury inside one are
+    not. Two channels matter and neither shows up in the field name, so
+    is_secret_key() never sees them: userinfo (``http://admin:pw@host``) and
+    secret-named query parameters (``?apikey=...``, the shape every indexer
+    RSS feed uses). Both survive a name-based filter untouched, so every
+    export that ships a URL has to run it through here first.
+    """
+    text = str(value or "")
+    if "://" not in text:
+        return text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        # Unparseable, so nothing here can be trusted to be credential-free.
+        return REDACTED_MARKER
+    netloc = parsed.netloc
+    if "@" in netloc:
+        host = netloc.rsplit("@", 1)[1]
+        netloc = f"{REDACTED_MARKER}@{host}" if host else REDACTED_MARKER
+    query = parsed.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        if pairs:
+            query = urlencode(
+                [
+                    (name, REDACTED_MARKER if (item and is_secret_key(name)) else item)
+                    for name, item in pairs
+                ],
+                safe="<>",
+            )
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
 
 
 def sanitized_provider_settings(settings):
@@ -184,6 +243,14 @@ def sanitized_provider_settings(settings):
             # Nested provider settings are rare and may bury credentials one
             # level down; drop them rather than guessing which leaves are safe.
             removed.append(name)
+            continue
+        if isinstance(value, str) and "://" in value:
+            # feed_url, webhook endpoints and friends pass is_secret_key()
+            # cleanly while carrying the credential in the URL itself.
+            cleaned = sanitize_url_credentials(value)
+            if cleaned != value:
+                removed.append(name)
+            kept[name] = cleaned
             continue
         kept[name] = value
     return kept, removed
@@ -887,24 +954,40 @@ def redact_provider_secrets(target_db: Path):
         con.execute("pragma journal_mode=delete")
         tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
         if "provider_configs" in tables:
-            rows = con.execute("select id, settings_json from provider_configs").fetchall()
-            for provider_id, settings_json in rows:
+            columns = {str(row[1]) for row in con.execute('pragma table_info("provider_configs")')}
+            has_base_url = "base_url" in columns
+            select = "select id, settings_json" + (", base_url" if has_base_url else "") + " from provider_configs"
+            rows = con.execute(select).fetchall()
+            for row in rows:
+                provider_id, settings_json = row[0], row[1]
+                base_url = row[2] if has_base_url else None
                 report["rows_scanned"] += 1
                 try:
                     settings = json.loads(settings_json or "{}")
                 except (TypeError, ValueError):
-                    continue
-                if not isinstance(settings, dict):
-                    continue
-                kept, removed = sanitized_provider_settings(settings)
-                if not removed:
-                    continue
-                con.execute(
-                    "update provider_configs set settings_json=? where id=?",
-                    (_canonical_json(kept), provider_id),
+                    settings = None
+                kept, removed = (
+                    sanitized_provider_settings(settings) if isinstance(settings, dict) else ({}, [])
                 )
+                # base_url is its own column, so the settings_json filter never
+                # saw it; a URL with userinfo or an apikey query parameter
+                # shipped verbatim in the archived SQLite copy.
+                clean_base_url = sanitize_url_credentials(base_url) if base_url else base_url
+                base_url_changed = has_base_url and clean_base_url != base_url
+                if not removed and not base_url_changed:
+                    continue
+                if isinstance(settings, dict) and removed:
+                    con.execute(
+                        "update provider_configs set settings_json=? where id=?",
+                        (_canonical_json(kept), provider_id),
+                    )
+                if base_url_changed:
+                    con.execute(
+                        "update provider_configs set base_url=? where id=?",
+                        (clean_base_url, provider_id),
+                    )
                 report["rows_redacted"] += 1
-                report["fields_redacted"] += len(removed)
+                report["fields_redacted"] += len(removed) + (1 if base_url_changed else 0)
         if "notification_connectors" in tables:
             _redact_notification_connectors(con, report)
         con.commit()
@@ -1448,15 +1531,16 @@ def backup_health_summary(*, backup_dir=None, state_db_path=None, environ=None, 
         state = "warning"
         label = "Overdue"
         detail = (
-            f"The last full backup was {utc_stamp(last['created_at'])} and the next was due "
-            f"{utc_stamp(next_due_at)}. Nothing has been written since, so the scheduled pass "
-            "is probably not running."
+            f"The last full backup was {inkdrop_state.relative_time_label(now - last['created_at'])} "
+            f"and the next was due {readable_stamp(next_due_at)}. Nothing has been written since, "
+            "so the scheduled pass is probably not running."
         )
     else:
         state = "healthy"
         label = "Healthy"
         detail = (
-            f"Last full backup {utc_stamp(last['created_at'])}, next due {utc_stamp(next_due_at)}. "
+            f"Last full backup {inkdrop_state.relative_time_label(now - last['created_at'])}, "
+            f"next due {readable_stamp(next_due_at)}. "
             f"Keeping the {retention['retention_count']} most recent and deleting anything over "
             f"{retention['retention_days']} days."
         )

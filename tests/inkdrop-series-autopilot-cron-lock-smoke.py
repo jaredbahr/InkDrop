@@ -13,7 +13,7 @@ from core import inkdrop_container_scheduler as scheduler
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "inkdrop-series-autopilot-cron.sh"
+WRAPPER = ROOT / "scripts/inkdrop-series-autopilot-cron.sh"
 
 
 def require(condition, message):

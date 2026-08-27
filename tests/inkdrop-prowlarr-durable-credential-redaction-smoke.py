@@ -109,16 +109,15 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-credential-cleanup-") as tmp:
             ("prowlarr_test", "indexer", "Prowlarr", 1, json.dumps({"api_key": SECRET, "secret_fields": ["api_key"]})),
         )
         con.commit()
-    # 20 calls, not 10: cleanup_persisted_credentials() splits its per-call
-    # budget evenly across every (table, column) target, and the credential
-    # exposure follow-up added 2 more bad_source_candidates text targets
-    # (title, normalized_title) -- at budget=20 that's an even 1 row/target/
-    # call with no remainder, so history_events.raw_json's cursor needs 11
-    # calls just to reach the 11th seeded row (5 benign + malformed + the 5
-    # "history:*" rows), not the 10 that were sufficient when there were
-    # fewer targets sharing the same fixed budget.
     cleanups = [inkdrop_credential_evidence_cleanup.cleanup_persisted_credentials(db_path, batch_size=20) for _ in range(20)]
-    require(all(item["examined"] <= 20 for item in cleanups), cleanups)
+    # batch_size caps rows REWRITTEN, scan_window caps rows READ. They used to
+    # be the same number, which pinned the cursor to batch_size/len(targets)
+    # rows per pass -- 5 rows every 180s in production, against tables growing
+    # tens of thousands of rows a day. Both bounds are still enforced, but on
+    # the costs they actually describe: writes take the lock, reads do not.
+    targets = len(inkdrop_credential_evidence_cleanup.JSON_TARGETS) + len(inkdrop_credential_evidence_cleanup.TEXT_TARGETS)
+    require(all(item["changed"] <= 20 for item in cleanups), cleanups)
+    require(all(item["examined"] <= item["scan_window"] * targets for item in cleanups), cleanups)
     require(sum(item["changed"] for item in cleanups) >= 2, cleanups)
     require(sum(item["malformed"] for item in cleanups) == 1, cleanups)
     with inkdrop_state.connect_read(db_path) as con:

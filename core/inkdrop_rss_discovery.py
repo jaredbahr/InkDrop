@@ -22,6 +22,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 from pathlib import Path
 
 import requests
@@ -770,7 +771,7 @@ def xml_text(node, name):
 def parse_feed(xml):
     if not xml:
         return []
-    root = ET.fromstring(xml)
+    root = inkdrop_safe_xml.fromstring(xml)
     items = []
     for item in root.findall(".//channel/item"):
         title = xml_text(item, "title")

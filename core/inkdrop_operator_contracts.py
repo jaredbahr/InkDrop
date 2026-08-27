@@ -121,47 +121,24 @@ def manual_review_contract(row):
     """
     row = row if isinstance(row, dict) else {}
     state = _lower(row.get("state") or row.get("queue_state"))
+    # Machine fields first, the human sentence last. review_reason is copy
+    # written for a person; it used to sit second here, ahead of the very
+    # reason codes it describes, so every substring test below read the
+    # operator-facing prose instead of the signal. Improving a message then
+    # silently changed a row's eligibility -- adding "Rejection code:
+    # extraction_failed" plus "other sources were searched" is enough to make
+    # `source_failed` fire on wording alone and drop the row out of Manual
+    # Review entirely. A sentence must never be load-bearing for eligibility
+    # while a code is available.
     reason_text = _lower(
         row.get("reason_code")
-        or row.get("review_reason")
         or row.get("reason")
         or row.get("failure_reason")
+        or row.get("review_reason")
         or row.get("last_event")
         or state
     )
     reason_code = re.sub(r"[^a-z0-9]+", "_", reason_text).strip("_")
-    raw_actions = _listish(row.get("available_actions"))
-    if raw_actions:
-        actions = raw_actions
-    elif state == "needs_you" and reason_code == "manual_review_required":
-        # This is the durable queue event emitted when InkDrop has intentionally
-        # paused a candidate for a human decision. Require both the queue state
-        # and the canonical event so unrelated needs_you rows remain excluded.
-        actions = list(HUMAN_REASON_ACTIONS["manual_review"])
-    else:
-        actions = list(HUMAN_REASON_ACTIONS.get(reason_code, ()))
-
-    if not actions and state == "needs_you" and bool(row.get("manual_review_actionable_declared")):
-        # Any origin's reason vocabulary can outrun HUMAN_REASON_ACTIONS's closed
-        # whitelist -- the legacy manual-review feed (manual-review.jsonl) did
-        # first (e.g. "weak_filename_unit_evidence", "candidate_title_mismatch"),
-        # and this fallback was originally scoped to only that origin (PR #162).
-        # The identical silent-drop shape then recurred for a different origin
-        # (review_exceptions rows synced from the SLSKD repeat-bad-candidate
-        # circuit breaker, reason "slskd_transfer_missing_staged_file_repeat") --
-        # see RECOVERY-P1-02. manual_review_actionable_declared (set in
-        # review_exception_row_from_record()) is narrower than the raw SQL
-        # `actionable` column -- that column defaults to true for the whole
-        # needs_you/failed/blocked state class regardless of writer intent,
-        # so trusting it directly would let ANY unrecognized reason code
-        # through. _declared only reflects a write payload that explicitly
-        # set manual_review_actionable=True itself (a deliberate assertion
-        # from a purpose-built writer, e.g. manual_review_legacy_row()'s
-        # computed per-item decision or repeat_bad_candidate_review_row()'s
-        # hardcoded flag) -- trust that regardless of origin instead of
-        # re-litigating this gap one origin at a time.
-        actions = list(HUMAN_REASON_ACTIONS["manual_review"])
-
     retry_eligible = bool(row.get("retry_eligible"))
     automation_will_retry = bool(
         row.get("automation_will_retry")
@@ -197,17 +174,71 @@ def manual_review_contract(row):
         "verification_pending",
         "download_failed_retry",
     } or ("archive" in reason_text and "retry" in reason_text)
+    # A writer that set manual_review_actionable itself is making a deliberate
+    # assertion that a human must decide this row -- see the long note below on
+    # why the raw `actionable` column is not trusted in its place. It decides
+    # two things now: which actions the row gets, and whether the exclusion
+    # arms above may overrule it. They may not.
+    declared_actionable = bool(row.get("manual_review_actionable_declared"))
+    raw_actions = _listish(row.get("available_actions"))
+    if raw_actions:
+        actions = raw_actions
+    elif state == "needs_you" and reason_code == "manual_review_required":
+        # This is the durable queue event emitted when InkDrop has intentionally
+        # paused a candidate for a human decision. Require both the queue state
+        # and the canonical event so unrelated needs_you rows remain excluded.
+        actions = list(HUMAN_REASON_ACTIONS["manual_review"])
+    else:
+        actions = list(HUMAN_REASON_ACTIONS.get(reason_code, ()))
+
+    if not actions and state == "needs_you" and declared_actionable:
+        # Any origin's reason vocabulary can outrun HUMAN_REASON_ACTIONS's closed
+        # whitelist -- the legacy manual-review feed (manual-review.jsonl) did
+        # first (e.g. "weak_filename_unit_evidence", "candidate_title_mismatch"),
+        # and this fallback was originally scoped to only that origin (PR #162).
+        # The identical silent-drop shape then recurred for a different origin
+        # (review_exceptions rows synced from the SLSKD repeat-bad-candidate
+        # circuit breaker, reason "slskd_transfer_missing_staged_file_repeat") --
+        # see RECOVERY-P1-02. manual_review_actionable_declared (set in
+        # review_exception_row_from_record()) is narrower than the raw SQL
+        # `actionable` column -- that column defaults to true for the whole
+        # needs_you/failed/blocked state class regardless of writer intent,
+        # so trusting it directly would let ANY unrecognized reason code
+        # through. _declared only reflects a write payload that explicitly
+        # set manual_review_actionable=True itself (a deliberate assertion
+        # from a purpose-built writer, e.g. manual_review_legacy_row()'s
+        # computed per-item decision or repeat_bad_candidate_review_row()'s
+        # hardcoded flag) -- trust that regardless of origin instead of
+        # re-litigating this gap one origin at a time.
+        actions = list(HUMAN_REASON_ACTIONS["manual_review"])
+
+    # Every arm above is matched out of `reason_text`, and for the rows this
+    # matters to there is no code to match instead -- their whole `reason` is a
+    # sentence a person wrote. Two live classes, both of which set
+    # manual_review_actionable themselves:
+    #
+    #   "automatic sources found only unsafe/rejected SLSKD candidates;
+    #    extended retry scheduled"          12 rows, 2026-08-25
+    #   "This SLSKD candidate has been rejected every time we re-checked it
+    #    ... It's stopped auto-retrying and needs a decision from you."
+    #                                       25 rows, 2026-08-25
+    #
+    # `source_failed` needs "source" and "failed" in the same sentence. Those
+    # say "rejected" and "unsafe", so they are one word away from being hidden,
+    # and rewording either one would have hidden it. This file already says a
+    # sentence must never be load-bearing for eligibility; a deliberate
+    # declaration from the writer is the thing it must not outrank.
+    #
+    # Dropped from this expression: `(automation_will_retry and not actions)`
+    # and `(retry_eligible and not actions)`, plus the `if eligible and not
+    # actions` line that followed it. `eligible` already requires
+    # `bool(actions)`, so when `not actions` holds the answer is False before
+    # any of the three is consulted. They never changed an outcome.
     automatic_only = bool(
-        provider_wait
-        or no_candidate
-        or source_failed
-        or recoverable_import
-        or (automation_will_retry and not actions)
-        or (retry_eligible and not actions)
+        (provider_wait or no_candidate or source_failed or recoverable_import)
+        and not declared_actionable
     )
     eligible = bool(actions) and not automatic_only
-    if eligible and not actions:
-        eligible = False
     safe_default = "automation_retry" if automatic_only or automation_will_retry else "leave_unresolved"
     recommended_action = _clean(row.get("recommended_action") or row.get("next_action"))
     if not recommended_action:

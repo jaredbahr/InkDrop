@@ -809,7 +809,16 @@ def download_direct_task(
     # partial_path would make the confinement check meaningless: a path is
     # always "inside" its own parent, so any stored path would trivially pass.
     resolved_incomplete_root = incomplete_root or resolved_download_root
-    ext = providers.normalize_extension(local_path or candidate.get("extension") or download_url)
+    # Fall back on the first source that actually yields an extension, not on
+    # the first source that happens to be non-empty. A local path is always
+    # present, so an argument-level `or` chain never reached the candidate's
+    # own probed extension when the path could not be parsed -- and a task
+    # with no derivable extension is refused outright, before any request.
+    ext = ""
+    for extension_source in (local_path, candidate.get("extension"), download_url):
+        ext = providers.normalize_extension(extension_source)
+        if ext:
+            break
     derived_extensions = allowed_extensions or candidate.get("allowed_extensions") or ([ext] if ext else [])
     derived_content_types = allowed_content_types or [candidate.get("content_type") or providers.content_type_for_extension(ext)]
     direct_artifact = seed_raw.get("direct_artifact") if isinstance(seed_raw.get("direct_artifact"), dict) else {}

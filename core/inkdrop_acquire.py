@@ -21,6 +21,7 @@ import urllib.parse
 from pathlib import Path
 
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 
 try:
     import requests
@@ -1709,7 +1710,7 @@ def _bounded_nzb_payload(response, max_bytes=SAB_NZB_MAX_BYTES, *, deadline=None
     payload = bytes(body)
     _nzb_deadline_check(deadline, clock)
     try:
-        root = ET.fromstring(payload)
+        root = inkdrop_safe_xml.fromstring(payload)
     except (ET.ParseError, ValueError) as exc:
         raise RuntimeError("Prowlarr returned a malformed NZB payload") from exc
     _nzb_deadline_check(deadline, clock)

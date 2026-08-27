@@ -25,6 +25,7 @@ import threading
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 from pathlib import Path
 from urllib.parse import quote
 
@@ -37,6 +38,7 @@ from core import inkdrop_manga_unit_policy
 from core import inkdrop_runtime_config
 from core import inkdrop_qbittorrent_auth
 from core import inkdrop_acquire
+from core.inkdrop_display_labels import display_label
 
 try:
     from core import inkdrop_language
@@ -224,7 +226,7 @@ manga_unit_policy_for_model = inkdrop_manga_unit_policy.manga_unit_policy_for_mo
 def manga_unit_policy_payload(model):
     normalized_model = normalize_manga_unit_model(model)
     policy = manga_unit_policy_for_model(normalized_model)
-    label = MANGA_UNIT_POLICY_LABELS.get(normalized_model) or MANGA_UNIT_POLICY_LABELS.get(policy, policy.replace("_", " ").title())
+    label = MANGA_UNIT_POLICY_LABELS.get(normalized_model) or display_label(policy, MANGA_UNIT_POLICY_LABELS)
     return {
         "series_unit_policy": policy,
         "series_unit_policy_label": label,
@@ -307,6 +309,72 @@ def exact_numbered_series_title(title_pattern, value):
         str(value or ""),
         re.I,
     ))
+
+
+ANCESTOR_FOLDER_LEADING_RUN_RE = re.compile(
+    r"^(?:v|vol|volume)\s*0*\d+(?:\s*[-–—]\s*(?:v(?:ol(?:ume)?)?\s*)?0*\d+)?(?=[\s._+-]|$)"
+    r"|^0*\d+\s*[-–—]\s*0*\d+(?=[\s._+-]|$)",
+    re.I,
+)
+
+# The bare-number alternative above -- "001-008" with no v/vol marker -- is an
+# ISSUE run, and it is the only thing in the folder name that says which issues
+# the pack holds. Stripping it unconditionally threw away the one piece of
+# evidence that proves a file does not belong: "Batman - White Knight 001-008
+# (2017-2018)" holding "Batman - White Knight 099.cbz" read as a benign year
+# annotation once "001-008" was gone, so a wrong issue imported instead of
+# being blocked. A "v1"/"vol 1-8" marker is a publishing-run label rather than
+# an issue number, so it carries no such claim and is still stripped outright.
+ANCESTOR_FOLDER_LEADING_ISSUE_RUN_RE = re.compile(
+    r"^0*(\d+)\s*[-–—]\s*0*(\d+)(?=[\s._+-]|$)",
+)
+
+
+def ancestor_folder_leading_run_prefix_stripped(tail, issue_number=None):
+    """Drop a bare run/volume marker leading an *ancestor folder's* tail.
+
+    A pack folder sometimes states the run it holds before its bracketed
+    annotations rather than inside them -- "Spawn v1 (1992-)" and
+    "Spawn 001-200 (1992-2011) (Minutemen-DarthScanner)" are both real
+    uploader folder names for a correctly single-issue file sitting inside,
+    and neither wraps its run marker in brackets. Only ever call this for an
+    ancestor directory tail, never a release's own name -- that "v1" is a
+    publishing-run label, not the release's unit number, so this does not
+    check it against any wanted issue. A release's own leading unit marker
+    is compared to the wanted issue number by benign_exact_title_publication_tail
+    instead, which this never bypasses.
+    """
+
+    text = str(tail or "").strip()
+    text = re.sub(r"^[\s._+-]+", "", text)
+    match = ANCESTOR_FOLDER_LEADING_RUN_RE.match(text)
+    if not match:
+        return text
+    issue_run = ANCESTOR_FOLDER_LEADING_ISSUE_RUN_RE.match(text)
+    if issue_run and not _issue_number_inside_run(issue_number, issue_run):
+        # The folder names an issue run this file falls outside of, or one we
+        # cannot compare against. Leave the tail intact so the range still
+        # speaks -- refusing a file that belongs costs a retry, importing one
+        # that does not costs the wrong book in the library.
+        return text
+    return re.sub(r"^[\s._+-]+", "", text[match.end():])
+
+
+def _issue_number_inside_run(issue_number, issue_run):
+    """True only when issue_number provably falls inside the matched run."""
+
+    try:
+        low = int(issue_run.group(1))
+        high = int(issue_run.group(2))
+    except (TypeError, ValueError):
+        return False
+    if low > high:
+        return False
+    raw = str(issue_number or "").strip()
+    candidate = re.match(r"^0*(\d+)$", raw)
+    if not candidate:
+        return False
+    return low <= int(candidate.group(1)) <= high
 
 
 def related_subseries_source_blocker(
@@ -501,7 +569,7 @@ def related_subseries_source_blocker(
         if words:
             tail_text = match.group("tail") or ""
             if segment_index > 0 and inkdrop_artifact_acceptance.benign_exact_title_organizational_folder_tail(
-                tail_text, issue_number
+                ancestor_folder_leading_run_prefix_stripped(tail_text, issue_number), issue_number
             ):
                 continue
             publication_tails = [tail_text]
@@ -1027,7 +1095,7 @@ def _read_comicinfo_members(path, names):
         # read, not a document that happens to be empty.
         return {}, False
     try:
-        root = ET.fromstring(raw)
+        root = inkdrop_safe_xml.fromstring(raw)
     except ET.ParseError:
         # We read the document fine; it is the document that is malformed. That
         # is a fact about the file and is safe to remember.
@@ -1667,7 +1735,7 @@ def set_manga_unit_model(series_title, unit_model, source="importer", kapowarr_v
         "normalized_series": normalized,
         "manga_unit_model": unit_model,
         "manga_unit_policy": policy,
-        "manga_unit_policy_label": MANGA_UNIT_POLICY_LABELS.get(unit_model) or MANGA_UNIT_POLICY_LABELS.get(policy, policy.replace("_", " ").title()),
+        "manga_unit_policy_label": MANGA_UNIT_POLICY_LABELS.get(unit_model) or display_label(policy, MANGA_UNIT_POLICY_LABELS),
     }
 
 
@@ -3904,6 +3972,19 @@ def extract_cbr_images(source, workdir=None):
         return images, meta
 
 
+class ArchiveRepackRefused(RuntimeError):
+    """A repacked .cbz was refused by the shared soundness authority.
+
+    Carries the refusal dict so callers can tell an "invalid" verdict about the
+    bytes from an "undetermined" read that never finished -- the distinction
+    that must survive all the way to whatever records the outcome.
+    """
+
+    def __init__(self, refusal):
+        self.refusal = refusal if isinstance(refusal, dict) else {}
+        super().__init__(str(self.refusal.get("reason") or "archive_repack_refused"))
+
+
 def repack_cbr_to_cbz(source, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     # No workdir passed -- if validate_comic_archive() already extracted this
@@ -3926,6 +4007,23 @@ def repack_cbr_to_cbz(source, dest):
             # kept under a non-colliding name instead of overwriting or
             # fighting that write, rather than being discarded outright.
             archive.writestr("ComicInfo.xml.source-embedded", source_comicinfo)
+    # ONE authority on whether the result is sound, shared with
+    # inkdrop_archive_conversion rather than restated here. This function used
+    # to refuse only on zero images, so a source whose RAR checksums failed
+    # repacked cleanly into a .cbz holding undecodable pages, and that archive
+    # reached a library and rendered as a broken thumbnail. The pages are
+    # checked where they can be checked: on the .cbz, after it is written and
+    # before it replaces anything.
+    #
+    # The temp file is judged and discarded on refusal, so a rejected repack
+    # leaves nothing behind at `dest`.
+    refusal = inkdrop_artifact_acceptance.archive_output_refusal(tmp_cbz)
+    if refusal is not None:
+        try:
+            tmp_cbz.unlink()
+        except OSError:
+            pass
+        raise ArchiveRepackRefused(refusal)
     tmp_cbz.replace(dest)
     # The raw XML has now been written into the archive, which was its only
     # purpose. Drop it here rather than letting it ride along in meta: this dict
@@ -5263,11 +5361,20 @@ def verification_status_for(item):
     if not item.get("host_exists"):
         return "verification_failed"
     if item.get("kapowarr_status") == "not_linked":
-        # Kapowarr is the truth source for this row (a truth anchor and a
-        # manual-match attempt exist), but the match failed or was never
-        # confirmed linked. Without this, the row could pass verification on
-        # local-file/library-visibility grounds alone while Kapowarr's own
-        # tracking still shows the issue missing forever.
+        # An ADVERSE verdict from Kapowarr: a truth anchor and a manual-match
+        # attempt exist, and the match failed or was never confirmed linked.
+        # Without this the row could pass on local-file/library-visibility
+        # grounds alone while Kapowarr's own tracking shows the issue missing
+        # forever.
+        #
+        # Nothing currently produces "not_linked" -- Kapowarr is retired, so
+        # kapowarr_status_for() returns adapter_disabled / _linked_optional /
+        # _not_applicable and never this. Until 2026-08-22 the no-anchor case
+        # was labelled "not_linked" and fell in here, which meant every fresh
+        # comic import failed verification on an adapter that had not been
+        # asked. Kept as a guard rather than deleted: if a Kapowarr producer
+        # is ever reintroduced, an adverse verdict must still block. It is
+        # deliberately unreachable, not accidentally dead.
         return "verification_failed"
     library_required = bool(item.get("library_visibility_required"))
     library_visible = library_visible_for_result(item)
@@ -5336,6 +5443,29 @@ def completion_has_kapowarr_truth_anchor(item):
     return adapter_provider == "kapowarr"
 
 
+def kapowarr_status_for(item, truth_model):
+    """Classify what Kapowarr has to say about a row -- including "nothing".
+
+    Extracted from verify_imported_items() so a test can compose this with
+    verification_status_for() instead of hand-writing the intermediate value.
+    That is not tidying: the previous test asserted that a row with no anchor
+    carries "not_checked", which this path has never produced, so it passed
+    while production did the opposite. An intermediate nobody can reach is
+    where that kind of false green lives.
+
+    "adapter_not_applicable" is the case that was mislabelled. Kapowarr is
+    retired; a fresh import has no anchor, so the adapter is never consulted
+    and holds no opinion about the row. That is not the same as "not_checked"
+    (the pre-check default, for a row that never got this far) and it is very
+    much not the same as "not_linked".
+    """
+    if completion_has_kapowarr_truth_anchor(item):
+        return "adapter_disabled"
+    if truth_model == "kavita_manga":
+        return "kapowarr_linked_optional"
+    return "adapter_not_applicable"
+
+
 def completion_has_native_truth_anchor(item):
     if not isinstance(item, dict):
         return False
@@ -5395,6 +5525,17 @@ def is_kapowarr_truth_model(truth_model):
     if not value.startswith("kapowarr_") and value not in {"kapowarr", "kapowarr_comic"}:
         return False
     return True
+
+
+# The vocabulary verify_imported_items() classifies each checked item into.
+# Module-level so partition_verified_imports() can't drift from what
+# verify_imported_items() itself treats as "not a failure" -- a pending scan
+# is not yet a verdict either way, so it counts as not-failed here exactly as
+# it does in verify_imported_items()'s own failure collection below.
+IMPORT_VERIFICATION_COMPLETED_STATUSES = {"folder_verified", "library_visible", "kavita_verified"}
+IMPORT_VERIFICATION_PENDING_SCAN_STATUSES = {
+    "waiting_for_library_scan", "waiting_for_kavita_scan", "library_scan_timeout", "kavita_scan_timeout",
+}
 
 
 def verify_imported_items(
@@ -5474,14 +5615,7 @@ def verify_imported_items(
                     # for a fresh import, but a historical truth anchor on an
                     # older row still needs to report as adapter-disabled
                     # rather than a hard verification failure.
-                    result["kapowarr_status"] = (
-                        "adapter_disabled"
-                        if completion_has_kapowarr_truth_anchor(item)
-                        else
-                        "kapowarr_linked_optional"
-                        if result["truth_model"] == "kavita_manga"
-                        else "not_linked"
-                    )
+                    result["kapowarr_status"] = kapowarr_status_for(item, result["truth_model"])
                     reader_expectation = reader_expectation_for_import(item, dest_path, kavita_conn)
                     result["reader_expectation"] = reader_expectation or {}
                     visibility = inkdrop_library_frontends.check_library_visibility(
@@ -5512,8 +5646,8 @@ def verify_imported_items(
     checked = check_once()
     poll_attempts = 0
     waited_seconds = 0
-    pending_scan_statuses = {"waiting_for_library_scan", "waiting_for_kavita_scan", "library_scan_timeout", "kavita_scan_timeout"}
-    completed_statuses = {"folder_verified", "library_visible", "kavita_verified"}
+    pending_scan_statuses = IMPORT_VERIFICATION_PENDING_SCAN_STATUSES
+    completed_statuses = IMPORT_VERIFICATION_COMPLETED_STATUSES
     if poll_library_visibility and any(item.get("verification_status") in {"waiting_for_library_scan", "waiting_for_kavita_scan"} for item in checked):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -5581,6 +5715,36 @@ def verify_imported_items(
         "poll_seconds": waited_seconds,
         "verified_at": time.time(),
     }
+
+
+def partition_verified_imports(imported, verification):
+    """Split `imported` into what verify_imported_items() found real and what it didn't.
+
+    import_files() placed each of these artifacts, wrote its ledger row, and
+    reported it as imported before asking verify_imported_items() whether it
+    actually landed -- so `imported` on its own is a claim, not a verdict.
+    `verification["checked"]` is verify_imported_items()'s per-item verdict,
+    positional with `imported` (the same invariant its own failure-collection
+    loop relies on via `zip(imported, checked)`), and unlike
+    `verification["failures"]` it is never truncated -- callers that want
+    every unverified item, not just the first 20, read the partition from
+    here rather than from `failures`.
+
+    A caller reporting `imported_count` from the unpartitioned list, or
+    persisting `imported` for a downstream consumer to act on, restates the
+    pre-verification claim as though it were the verdict.
+    """
+    checked = verification.get("checked") if isinstance(verification, dict) else None
+    if not checked or len(checked) != len(imported):
+        # No verification ran against this batch (dry run, non-comics import,
+        # or nothing was imported) -- there is no verdict to partition by.
+        return list(imported), []
+    ok_statuses = IMPORT_VERIFICATION_COMPLETED_STATUSES | IMPORT_VERIFICATION_PENDING_SCAN_STATUSES
+    verified, unverified = [], []
+    for item, result in zip(imported, checked):
+        target = verified if result.get("verification_status") in ok_statuses else unverified
+        target.append(item)
+    return verified, unverified
 
 
 def kind_from_path(path):
@@ -6081,16 +6245,38 @@ def existing_canonical_dest(target_dir, canonical, source):
         names.append(base.name)
     if source.suffix.lower() in {".cbr", ".zip"} or source.name.lower().endswith(".cbz.zip"):
         names.append(base.with_suffix(".cbz").name)
+    try:
+        source_size = source.stat().st_size
+    except OSError:
+        return None
+    source_digest = None
+    # A shared filename is not proof of shared content: two different
+    # volumes/series can land on the same canonical name. Only report a
+    # candidate here once its bytes are confirmed identical to the source,
+    # the same size-then-sha256 identity check used elsewhere for duplicate
+    # detection (see find_same_file above).
     for name in dict.fromkeys(names):
-        candidate = Path(target_dir) / name
-        if candidate.exists():
-            return candidate
+        candidates = [Path(target_dir) / name]
         try:
-            for nested in Path(target_dir).rglob(name):
-                if nested.is_file():
-                    return nested
+            candidates.extend(Path(target_dir).rglob(name))
         except OSError:
             pass
+        for candidate in dict.fromkeys(candidates):
+            try:
+                if not candidate.is_file() or candidate.stat().st_size != source_size:
+                    continue
+            except OSError:
+                continue
+            if source_digest is None:
+                try:
+                    source_digest = sha256(source)
+                except OSError:
+                    return None
+            try:
+                if sha256(candidate) == source_digest:
+                    return candidate
+            except OSError:
+                continue
     return None
 
 
@@ -7305,9 +7491,17 @@ def _existing_file_rejected_by_artifact_gate(path, dest_path, event, decision, c
     artifact_acceptance_skip_event(event, decision)
     log(event)
     if not dry_run:
-        # Recording the bad content is unconditional -- that is how the file
-        # stops being retried. Only the human decision is conditional.
-        event["bad_content_identity"] = record_artifact_bad_content_memory(conn, digest, path, decision)
+        # Recording the bad content is unconditional FOR A VERDICT -- that is
+        # how a bad file stops being retried. It is NOT unconditional for a
+        # read that never happened: an EACCES or a vanished file would
+        # otherwise buy the file a seven-day block on its content identity,
+        # keyed on content, so it would follow the file to every provider and
+        # every path. decision_is_content_verdict() is the only thing that
+        # withholds this write, and it withholds nothing else.
+        if inkdrop_artifact_acceptance.decision_is_content_verdict(decision):
+            event["bad_content_identity"] = record_artifact_bad_content_memory(conn, digest, path, decision)
+        else:
+            event["bad_content_identity_withheld"] = "archive_read_undetermined"
         if skip_needs_manual_review(event):
             append_manual_review(
                 "artifact_acceptance_gate",
@@ -10087,9 +10281,14 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     attach_media_management_preview(event, target, path, event.get("dest"))
                     log(event)
                     if not dry_run:
-                        event["bad_content_identity"] = record_artifact_bad_content_memory(
-                            conn, digest, path, decision
-                        )
+                        # Same gate as the existing-file path above; see the
+                        # comment there. Both writers ask one predicate.
+                        if inkdrop_artifact_acceptance.decision_is_content_verdict(decision):
+                            event["bad_content_identity"] = record_artifact_bad_content_memory(
+                                conn, digest, path, decision
+                            )
+                        else:
+                            event["bad_content_identity_withheld"] = "archive_read_undetermined"
                         if skip_needs_manual_review(event):
                             append_manual_review(
                                 "artifact_acceptance_gate",
@@ -10367,6 +10566,12 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
         if not dry_run and kind == "comics" and imported
         else {}
     )
+    # imported[] is a claim made before verify_imported_items() ran -- placed,
+    # ledgered, and reported before anything asked whether it actually
+    # landed. Everything reported below and persisted to import-status.json
+    # (which verify_last_status() later reads to drive cover injection and
+    # library scans) has to report the verdict, not the claim.
+    verified_imported, unverified_imported = partition_verified_imports(imported, verification)
     missing_after = {}
     if verification.get("failure_count"):
         append_manual_review(
@@ -10408,8 +10613,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
         write_import_status(
             {
                 "kind": kind,
-                "imported_count": len(imported),
-                "imported": imported[-20:],
+                "imported_count": len(verified_imported),
+                "imported": verified_imported[-20:],
+                "unverified_count": len(unverified_imported),
+                "unverified_imported": unverified_imported[-20:],
                 "skipped_count": len(skipped),
                 "skipped": skipped[-20:],
                 "bad_archive_count": len(skipped_bad_archives),
@@ -10441,8 +10648,10 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
             }
         )
     print(json.dumps({
-        "imported": imported,
-        "count": len(imported),
+        "imported": verified_imported,
+        "count": len(verified_imported),
+        "unverified_imported": unverified_imported,
+        "unverified_count": len(unverified_imported),
         "skipped": skipped,
         "skipped_count": len(skipped),
         "kapowarr_scan_tasks": kapowarr_scan_tasks,

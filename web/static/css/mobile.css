@@ -317,78 +317,6 @@ body {
   color: var(--m-text-dim);
 }
 
-.m-status-banner {
-  display: flex;
-  /* Top-aligned, not centred: the detail below can run to several lines and
-     a centred dot drifts into the middle of the paragraph. */
-  align-items: flex-start;
-  gap: 10px;
-  background: var(--m-surface);
-  border: 1px solid var(--m-border);
-  border-radius: 14px;
-  padding: 14px;
-}
-
-.m-status-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex: none;
-  /* Optically centred on the status word's cap height. */
-  margin-top: 6px;
-  background: var(--m-text-faint);
-}
-
-.m-status-dot.m-status-ok { background: var(--m-ok); }
-.m-status-dot.m-status-warn { background: var(--m-warn); }
-.m-status-dot.m-status-problem { background: var(--m-danger); }
-
-.m-status-text {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  font-size: 14px;
-  color: var(--m-text);
-}
-
-/* status.json's `detail` is one long sentence written for the desktop
-   status bar -- on a phone it ran to ~10 lines and pushed every tile below
-   the fold, so the first thing you saw on opening the app was a paragraph
-   rather than your numbers. Clamped to three lines with a toggle; the full
-   text is still one tap away and is never truncated in the DOM, so
-   copy/paste and screen readers get all of it either way. */
-.m-status-text .m-status-detail {
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  color: var(--m-text-dim);
-  font-size: 12.5px;
-  line-height: 1.45;
-  margin-top: 2px;
-}
-
-.m-status-banner.is-expanded .m-status-text .m-status-detail {
-  -webkit-line-clamp: unset;
-  line-clamp: unset;
-  overflow: visible;
-}
-
-.m-status-more {
-  align-self: flex-start;
-  margin-top: 6px;
-  padding: 4px 0;
-  min-height: 32px;
-  background: none;
-  border: 0;
-  color: var(--m-accent);
-  font: inherit;
-  font-size: 12.5px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
 .m-meta-row {
   display: flex;
   justify-content: space-between;
@@ -413,6 +341,57 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* Needs Review and Add results carry a cover; the Series screen's own
+   .m-item-card does not and must keep the plain column layout above -- a
+   second class rather than changing .m-item-card itself. */
+.m-item-card.m-item-card-cover {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.m-item-card-cover .m-item-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Same placeholder-then-image stacking as the Home rail's .m-rail-cover, at
+   list-thumbnail rather than rail-card size. */
+.m-item-cover {
+  position: relative;
+  display: block;
+  flex: 0 0 auto;
+  width: 52px;
+  aspect-ratio: 2 / 3;
+  border-radius: 6px;
+  border: 1px solid var(--m-border);
+  background: var(--m-surface-raised);
+  overflow: hidden;
+}
+
+.m-item-cover::before {
+  content: attr(data-letter);
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--m-text-faint);
+}
+
+.m-item-cover-img {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .m-item-title {

@@ -2676,8 +2676,37 @@ def _is_ageing_lane_plan(plan):
     return str((plan or {}).get(queue_fairness.LANE_FIELD) or "") == queue_fairness.LANE_AGED
 
 
-def _ageing_lane_head_priority(plan):
-    """Keep a reserved aged row from being the first thing the budget drops.
+# One guaranteed head slot per pass, not one per reserved row. The reservation
+# is sized against the eligible window, but the runtime budget seats far fewer
+# than that -- measured live, a window of 10 seats 3 to 4. Guaranteeing every
+# reserved aged row a head position therefore handed ageing half of a four-row
+# pass, over the quarter it is capped at. One slot is 25-33% of the passes this
+# instance actually runs, and any further aged row has to earn its place in the
+# ordinary order like everything else.
+AGEING_LANE_HEAD_SLOTS = 1
+
+
+def _ageing_lane_head_plan_ids(plans, limit=AGEING_LANE_HEAD_SLOTS):
+    try:
+        limit = max(0, min(int(limit), 10))
+    except Exception:
+        limit = AGEING_LANE_HEAD_SLOTS
+    if limit <= 0:
+        return set()
+    candidates = []
+    for index, plan in enumerate(plans or []):
+        reserve = (plan or {}).get(AGEING_LANE_RESERVE_FIELD)
+        if not (isinstance(reserve, dict) and reserve.get("reserved")):
+            continue
+        candidates.append((-_float(plan.get(queue_fairness.AGEING_SCORE_FIELD), 0.0),
+                           -_float(plan.get(queue_fairness.STALL_SECONDS_FIELD), 0.0),
+                           index, id(plan)))
+    candidates.sort()
+    return {plan_id for _score, _stall, _index, plan_id in candidates[:limit]}
+
+
+def _ageing_lane_head_priority(plan, head_plan_ids):
+    """Keep the pass's one aged row from being the first thing the budget drops.
 
     The stages between the scan and execution both sort rows that have already
     been attempted to the back -- _spread_by_source_attempt_coverage groups
@@ -2685,13 +2714,8 @@ def _ageing_lane_head_priority(plan):
     right for the ordinary rotation and fatal for the aged lane, whose rows are
     by definition ones we have already tried. Without a head slot the lane's
     share would be assembled by the scan and then thrown away here.
-
-    Bounded by the reservation that sets the field: at the live eligible limit
-    of 10 that is 2 rows, so the guarantee costs a quarter of the pass and
-    cannot grow into it.
     """
-    reserve = (plan or {}).get(AGEING_LANE_RESERVE_FIELD)
-    return 0 if isinstance(reserve, dict) and reserve.get("reserved") else 1
+    return 0 if id(plan) in (head_plan_ids or set()) else 1
 
 
 def _reserve_ageing_lane_slots(plans, window, limit):
@@ -2885,6 +2909,7 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
     comic_pack_head_ids = _runtime_head_comic_pack_plan_ids(plans)
     local_page_pack_head_ids = _runtime_local_page_pack_head_plan_ids(plans)
     runtime_starved_head_ids = _runtime_budget_starved_plan_ids(plans, now=now)
+    ageing_lane_head_ids = _ageing_lane_head_plan_ids(plans)
     source_retry_starved_head_ids = _source_retry_starved_plan_ids(plans, now=now)
     source_floor_head_ids = _source_floor_head_plan_ids(
         plans,
@@ -2904,7 +2929,7 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
             (
                 (
                     0 if (plan or {}).get(INITIAL_SEARCH_PRIORITY_FIELD) else 1,
-                    _ageing_lane_head_priority(plan),
+                    _ageing_lane_head_priority(plan, ageing_lane_head_ids),
                     _runtime_comic_pack_head_priority(plan, comic_pack_head_ids),
                     _runtime_budget_starved_priority(plan, runtime_starved_head_ids),
                     _runtime_budget_starved_age_priority(plan, runtime_starved_head_ids, now=now),

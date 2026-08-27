@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { request, InkDropApiError } from "../api";
 import { useRowActions } from "../rowActions";
 import type { QueueRow, QueueRowDetail, QueueTransfer, QueueViewPayload, QueueRunResult, QueueBlockResult, StateViewFilter } from "./queueTypes";
+import { rowStateLabel } from "./stateLabel";
 
 const PAGE_SIZE = 80;
 
@@ -60,10 +61,7 @@ function statusTone(row: QueueRow): string {
   return "warn";
 }
 
-function statusText(row: QueueRow): string {
-  const raw = row.display_state_label || row.display_state || row.state || "queued";
-  return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
+const statusText = (row: QueueRow): string => rowStateLabel(row, "queued");
 
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value < 0) return "";
@@ -452,7 +450,12 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
       {attentionCount > 0 && (
         <div className="queue-attention-banner" role="status">
           <span>
-            {attentionCount === 1 ? "1 item needs attention." : `${attentionCount} items need attention.`}
+            {/* Names the facet it counts. The vanilla masthead above this
+                renders its own banner counting Manual Review rows, and both
+                used to say "need attention" for different populations. */}
+            {attentionCount === 1
+              ? "1 of these rows is an exception."
+              : `${attentionCount} of these rows are exceptions.`}
           </span>
           <button type="button" onClick={() => selectFilter("exceptions")}>
             Review problems

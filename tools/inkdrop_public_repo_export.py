@@ -238,6 +238,11 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "tools/inkdrop_state_schema_audit.py",
     "tools/inkdrop_text_output.py",
     "tools/inkdrop_web_surface_audit.py",
+    "inkdrop-candidate-matching-benchmark.py",
+    "inkdrop-candidate-matching-benchmark-smoke.py",
+    "tests/fixtures/inkdrop-candidate-matching-benchmark-v1.json",
+    "tests/fixtures/inkdrop-candidate-matching-benchmark-baseline.json",
+    "docs/inkdrop/candidate-matching-adversarial-benchmark-v1.md",
 )
 
 CURRENT_RELEASE_CONTRACT = "docs/inkdrop/releases/current.json"
@@ -400,8 +405,10 @@ __pycache__/
 """
 
 
-def export_content_overrides(root: Path = ROOT):
+def export_content_overrides(root: Path = ROOT, paths=None):
     """Paths whose shipped content differs from the working-tree file."""
+    if paths is None:
+        paths = public_repo_paths()[0]
     overrides = {
         "README.md": public_readme_bytes(root),
         "docker-compose.yml": public_compose_bytes(root),
@@ -414,9 +421,19 @@ def export_content_overrides(root: Path = ROOT):
     # through the override map rather than at copy time so the manifest hashes
     # the bytes that actually ship; hashing the pre-rewrite file would leave the
     # manifest describing something the repo does not contain.
-    for source in sorted(Path(root).glob("*.py")):
-        relative = Path(source.name)
-        if not is_relocatable_test_script(relative):
+    #
+    # Driven by the export's own path list, not by a glob of the root directory.
+    # Those are not the same set: the allowlist names a test by its bare name,
+    # and resolve_source() will find that name under tests/ if it has already
+    # been filed there in this repo. Globbing the root therefore missed every
+    # such test while the export went on relocating it by name -- so
+    # inkdrop-import-ready-worker-smoke.py shipped still holding
+    # `ROOT / "scripts/inkdrop-import-ready-worker.sh"` while the script it names ships
+    # under scripts/, and it died on a missing file in every public run.
+    # Iterating the shipped paths means the rewriter sees exactly what the
+    # export writes, which is the only set that can be wrong here.
+    for relative in paths:
+        if resolve_source(Path(root), relative).suffix != ".py":
             continue
         rewritten = relocated_script_bytes(Path(root), relative)
         if rewritten is not None:
@@ -503,29 +520,51 @@ def relocated_script_bytes(root: Path, relative: Path):
     source = resolve_source(root, relative)
     if source.suffix != ".py":
         return None
-    depth = len(export_destination(relative).parts) - 1
+    destination = export_destination(relative)
+    depth = len(destination.parts) - 1
     if depth < 1:
         return None
+    # Whether this file's own location changes decides which rewrites apply.
+    # A file that moves has had its self-relative anchors invalidated, so its
+    # `.parent` and `.with_name()` expressions must be re-pointed. A file that
+    # stays put -- a test already filed under tests/ here -- still resolves its
+    # own neighbours correctly, and rewriting those anchors breaks them: doing
+    # so turned `with_name("fixtures")`, which correctly meant tests/fixtures,
+    # into a root-level path that does not exist. Only the names of *other*
+    # files that moved need fixing in that case, which is _JOINED_NAME below.
+    #
+    # Compared against where the file actually sits, not against the name the
+    # allowlist uses for it. Those differ: the allowlist names tests by their
+    # bare name and resolve_source() finds them under tests/, so comparing the
+    # name would report every already-filed test as moving when it does not.
+    try:
+        source_relative = _normalize(source.resolve().relative_to(Path(root).resolve()))
+    except ValueError:
+        source_relative = relative
+    moved = source_relative.as_posix() != destination.as_posix()
     text = source.read_text(encoding="utf-8")
-    # ".parent.parent" first: rewriting ".parent" alone would corrupt it.
-    updated = text.replace(
-        "Path(__file__).resolve().parent.parent",
-        f"Path(__file__).resolve().parents[{depth + 1}]",
-    )
-    updated = _ROOT_FROM_FILE.sub(f"Path(__file__).resolve().parents[{depth}]", updated)
-    updated = _ROOT_FROM_FILE_SHORT.sub(f"Path(__file__).resolve().parents[{depth}]", updated)
+    updated = text
+    if moved:
+        # ".parent.parent" first: rewriting ".parent" alone would corrupt it.
+        updated = updated.replace(
+            "Path(__file__).resolve().parent.parent",
+            f"Path(__file__).resolve().parents[{depth + 1}]",
+        )
+        updated = _ROOT_FROM_FILE.sub(f"Path(__file__).resolve().parents[{depth}]", updated)
+        updated = _ROOT_FROM_FILE_SHORT.sub(f"Path(__file__).resolve().parents[{depth}]", updated)
 
-    # with_name() means "the file next to me", which held while tests sat beside
-    # the modules they exercise. After the move the neighbour may have stayed at
-    # the root or moved elsewhere, so each name is re-resolved through the same
-    # destination map the export uses rather than assumed to travel along.
-    def _retarget(match):
-        name = match.group("name")
-        dest = export_destination(Path(name)).as_posix()
-        parts = "".join(f' / "{part}"' for part in dest.split("/"))
-        return f"(Path(__file__).resolve().parents[{depth}]{parts})"
+        # with_name() means "the file next to me", which held while tests sat
+        # beside the modules they exercise. After the move the neighbour may
+        # have stayed at the root or moved elsewhere, so each name is
+        # re-resolved through the same destination map the export uses rather
+        # than assumed to travel along.
+        def _retarget(match):
+            name = match.group("name")
+            dest = export_destination(Path(name)).as_posix()
+            parts = "".join(f' / "{part}"' for part in dest.split("/"))
+            return f"(Path(__file__).resolve().parents[{depth}]{parts})"
 
-    updated = _WITH_NAME.sub(_retarget, updated)
+        updated = _WITH_NAME.sub(_retarget, updated)
 
     # `SOMETHING / "inkdrop-foo.sh"` is a path built from the repo root, so the
     # literal has to name where that file actually lands. Only rewritten when
@@ -605,7 +644,7 @@ RELOCATABLE_SCRIPTS_DIR_FILES = (
     "inkdrop-completion-identity-audit-diff-check.sh",
     "inkdrop-import-ready-worker.sh",
     "inkdrop-series-autopilot-cron.sh",
-    "inkdrop-source-worker-mangadex-cron.sh",
+    "inkdrop-source-worker-cron.sh",
     "inkdrop-source-worker-suwayomi-cron.sh",
     "inkdrop-source-worker.sh",
     "inkdrop-state-path-contract-sync-regression-alert.sh",

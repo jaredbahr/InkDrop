@@ -16,6 +16,7 @@ import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from core import inkdrop_safe_xml
 
 from core import inkdrop_library_paths
 
@@ -221,7 +222,7 @@ def archive_info(path):
             if not name:
                 return info
             info["comicinfo"] = True
-            root = ET.fromstring(read_bounded_comicinfo(archive, name))
+            root = inkdrop_safe_xml.fromstring(read_bounded_comicinfo(archive, name))
             for tag in ["Series", "Title", "Number", "Volume", "Format", "LanguageISO"]:
                 node = root.find(tag)
                 if node is not None and node.text is not None:
@@ -251,7 +252,7 @@ def remove_number_from_volume_comicinfo(path, info):
         comicinfo_name = next((n for n in src.namelist() if n.lower().endswith("comicinfo.xml")), None)
         if not comicinfo_name:
             return False
-        root = ET.fromstring(read_bounded_comicinfo(src, comicinfo_name))
+        root = inkdrop_safe_xml.fromstring(read_bounded_comicinfo(src, comicinfo_name))
         number_node = root.find("Number")
         if number_node is not None:
             root.remove(number_node)

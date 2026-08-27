@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 import unicodedata
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
@@ -43,6 +44,7 @@ from core import inkdrop_artifact_acceptance
 from core import inkdrop_manga_unit_policy
 from core import inkdrop_manual_search
 from core import inkdrop_sources
+from core import inkdrop_title_identity
 
 try:
     from core import inkdrop_language
@@ -2059,8 +2061,8 @@ def is_manga_title(title, publisher=None):
 
 def row_is_manga(row):
     row = row if isinstance(row, dict) else {}
-    media_type = str(row.get("media_type") or row.get("mediaType") or "").strip().lower()
-    return media_type in {"manga", "manhwa", "manhua", "webtoon"} or is_manga_title(
+    media_type = row.get("media_type") or row.get("mediaType")
+    return inkdrop_title_identity.media_type_is_manga_shaped(media_type) or is_manga_title(
         row.get("title"), row.get("publisher")
     )
 
@@ -2581,21 +2583,27 @@ def bad_result_strong_key(series, issue_number, result_or_title):
     )
 
 
-DURABLE_BAD_SOURCE_REASONS = {
-    "bad_archive",
-    "failed_download_duplicate_nzb",
-    "false_positive",
-    "known_bad_pack_archive_history",
-    "known_bad_source_candidate",
-    "sab_not_complete",
-    "sab_url_fetch_failed",
-    "wrong_series_or_subseries",
-}
+# One list, in the module that writes the rows. This file held the only copy and
+# the only caller that consulted it, which is how 95.8% of the blocklist came to
+# be written by paths that never asked.
+#
+# inkdrop_state is a guarded import here, and without it nothing can be recorded
+# anyway -- record_durable_bad_source_result() returns early on the same check --
+# so an empty set is the honest answer for that case rather than a second copy
+# of the list sitting here waiting to drift.
+# getattr, not attribute access: tests install a stub `inkdrop_state` into
+# sys.modules before importing this module (see
+# tests/inkdrop-quality-language-rules-pack-size-smoke.py's install_state_stub),
+# and a stub carries only what that test needs. Reading the real attribute at
+# IMPORT time turned every such test into an AttributeError at module load.
+# An absent list resolves empty, which refuses to record rather than recording
+# wrongly.
+DURABLE_BAD_SOURCE_REASONS = getattr(inkdrop_state, "DURABLE_BAD_SOURCE_REASONS", frozenset())
 
 
 def durable_bad_source_reason(reason):
-    text = str(reason or "").strip().lower()
-    return text in DURABLE_BAD_SOURCE_REASONS
+    resolver = getattr(inkdrop_state, "durable_bad_source_reason", None)
+    return bool(resolver) and resolver(reason)
 
 
 def record_durable_bad_source_result(series, issue_number, result_or_title, reason):
@@ -3822,7 +3830,7 @@ def nzb_file_entries(data, limit=PACK_DETAIL_MAX_ENTRIES):
         text = str(data or "")
     entries = []
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
         for elem in root.iter():
             tag = xml_tag_name(elem.tag)
             if tag == "file":

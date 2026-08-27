@@ -199,6 +199,78 @@ CREATOR_BYLINE_RE = re.compile(
     r"digital\b|retail\b|cbr\b|cbz\b|pdf\b|epub\b|\(|\[)|\s*$)"
 )
 
+# Scene and library filenames put a creator credit in front of the work with an
+# explicit delimiter. These are the delimiters, not a general separator list:
+# the SIGNAL is that someone wrote one deliberately.
+CREATOR_CREDIT_DELIMITERS = (" -- ", " \u2014 ", " \u2013 ", " - ")
+
+# A credit is a person, so it is short. Four tokens covers "Gael Bertrand",
+# "Alan Moore", "Kentaro Miura" and a double-barrelled name with an initial,
+# and stops a long descriptive prefix from being mistaken for one.
+MAX_CREATOR_CREDIT_TOKENS = 4
+
+
+def release_tokens_after_creator_credit(release_title, target_tokens):
+    """Re-anchor a release name past a LEADING creator credit, positively.
+
+    Returns the token list to compare against the target, or None when there is
+    no credit to skip. The caller then applies its ordinary prefix-anchored
+    comparison to the result -- this widens where the anchor sits, it does not
+    weaken the anchor.
+
+    THE SIGNAL IS THE DELIMITER AND THE SHAPE OF THE CREDIT, NEVER THE ABSENCE
+    OF A MATCH. This deliberately does not search for the target inside the
+    release name: that would let a target "Tarot" match "A Land Called Tarot",
+    a different work, and an absence rule is exactly what must not be built
+    here. It splits on ONE explicit credit delimiter, checks the discarded half
+    is short and alphabetic and carries no unit or format vocabulary, and hands
+    back what is left for the caller to judge normally.
+
+    Only the FIRST delimiter is consumed. "A Land Called Tarot - Gael Bertrand"
+    must keep failing rather than have its title thrown away, and a work whose
+    own title contains a dash keeps every token after the first segment.
+
+    Both singleton matchers call this, for the same reason both call
+    release_group_suffix_only(): #337 found them answering the trailing-tag
+    question differently and fixed it with one predicate. This is the identical
+    asymmetry at the other end of the string -- an irrelevant token tolerated
+    after the title and fatal before it -- and it gets the identical treatment.
+    """
+    release_title = str(release_title or "").strip()
+    target_tokens = list(target_tokens or [])
+    if not release_title or not target_tokens:
+        return None
+    for delimiter in CREATOR_CREDIT_DELIMITERS:
+        head, found, tail = release_title.partition(delimiter)
+        if not found or not tail.strip():
+            continue
+        credit_tokens = _normalized_title(head).split()
+        if not 1 <= len(credit_tokens) <= MAX_CREATOR_CREDIT_TOKENS:
+            continue
+        # A person's name carries no digits, no unit words and no format tags.
+        # Anything that does is a description of the release, not a credit, and
+        # discarding it would be discarding evidence.
+        if not all(token.isalpha() for token in credit_tokens):
+            continue
+        if any(token in SINGLETON_NEUTRAL_SUFFIX_TOKENS for token in credit_tokens):
+            continue
+        if any(token in CREDIT_DISQUALIFYING_TOKENS for token in credit_tokens):
+            continue
+        return _normalized_title(tail).split()
+    return None
+
+
+# Words that make a leading segment a description of the release rather than a
+# person. Kept explicit and small: every entry here is a token that, if thrown
+# away, would throw away a unit or edition claim with it.
+CREDIT_DISQUALIFYING_TOKENS = frozenset({
+    "vol", "volume", "v", "book", "chapter", "ch", "issue", "no", "number",
+    "part", "pt", "omnibus", "deluxe", "tpb", "hc", "hardcover", "paperback",
+    "collection", "collected", "edition", "annual", "special", "one", "shot",
+    "oneshot", "variant", "reprint", "remaster", "remastered", "series",
+})
+
+
 EDITION_PATTERNS = (
     ("complete_collection", re.compile(r"(?i)\bcomplete\s+(?:series|collection|edition)\b")),
     ("omnibus", re.compile(r"(?i)\bomnibus\b")),
@@ -892,7 +964,10 @@ def _singleton_exact_title_match(candidate, wanted_item, target, evidence, *, al
     target_tokens = target_title.split()
     release_tokens = _normalized_title(release_title).split()
     if release_tokens[: len(target_tokens)] != target_tokens:
-        return False
+        recredited = release_tokens_after_creator_credit(release_title, target_tokens)
+        if recredited is None or recredited[: len(target_tokens)] != target_tokens:
+            return False
+        release_tokens = recredited
     target_year = _year(_first(wanted.get("year"), wanted.get("release_date"), wanted.get("date")))
     candidate_year = _year(_first(candidate.get("year"), candidate.get("release_date"), evidence.get("year")))
     if target_year and candidate_year and target_year != candidate_year and not missing_count_collected_proof:
@@ -1009,7 +1084,10 @@ def _collected_singleton_exact_title_match(candidate, wanted_item, target, evide
     target_tokens = target_title.split()
     release_tokens = _normalized_title(release_title).split()
     if release_tokens[: len(target_tokens)] != target_tokens:
-        return False
+        recredited = release_tokens_after_creator_credit(release_title, target_tokens)
+        if recredited is None or recredited[: len(target_tokens)] != target_tokens:
+            return False
+        release_tokens = recredited
     target_year = _year(_first(wanted.get("year"), wanted.get("release_date"), wanted.get("date")))
     candidate_year = _year(_first(candidate.get("year"), candidate.get("release_date"), evidence.get("year")))
     if target_year and candidate_year and target_year != candidate_year and not edition_indifferent:

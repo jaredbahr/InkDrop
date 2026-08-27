@@ -282,7 +282,7 @@ def replay_compatibility(candidate, wanted_item, *, source="", settings=None):
         # raises here instead of quietly degrading to an empty verdict that
         # would read as "nothing refuses this any more".
         verdict, _identity_text = inkdrop_slskd_source_probe.candidate_identity_compatibility(
-            candidate, _slskd_filename(candidate), wanted_item
+            candidate, _slskd_filename(candidate), wanted_item, settings=settings
         )
     else:
         verdict = inkdrop_candidate_matching.candidate_compatibility(candidate, wanted_item, settings=settings)

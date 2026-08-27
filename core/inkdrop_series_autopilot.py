@@ -35,6 +35,7 @@ from core.inkdrop_acquire import detect_pack_info
 
 from core import inkdrop_bounded_read
 from core import inkdrop_db
+from core import inkdrop_deferred_sync
 from core import inkdrop_runtime_config
 from core import inkdrop_internal_jobs
 from core import inkdrop_slskd_refusal_vocabulary
@@ -387,6 +388,14 @@ DEFAULT_SLSKD_BROAD_MAX_TOTAL = 8
 DEFAULT_SLSKD_BROAD_PROBE_BUDGET_SECONDS = 120
 DEFAULT_SLSKD_BROAD_MIN_PROBE_BUDGET_SECONDS = 60
 DEFAULT_EXHAUSTION_CYCLES = 6
+# mark_automation_exhausted() re-queues a low-confidence-only result forever
+# with nothing that ever escalates it to a human -- confirmed live, 22 wanted
+# items with automation_exhausted_count > 0, one at 451 cycles, zero of them
+# ever reaching review_exceptions. This mirrors
+# REPEAT_BAD_CANDIDATE_PARK_FAILURE_THRESHOLD's existing precedent (also 12)
+# for "how many repeats of the same outcome before it stops being autopilot's
+# call and starts being a human's."
+AUTOMATION_EXHAUSTED_ESCALATION_THRESHOLD = 12
 ADAPTIVE_SLSKD_MIN_LADDER_ATTEMPTS = 2
 AUTOMATION_RETRY_GENERATION = 2
 NO_ACTIONABLE_SOURCE_RETRY_SECONDS = 60 * 60
@@ -404,7 +413,10 @@ LIBRARY_IMPORT_SCAN_RETRY_SETTLE_SECONDS = 10 * 60
 KAVITA_IMPORT_SCAN_RETRY_SECONDS = LIBRARY_IMPORT_SCAN_RETRY_SECONDS
 KAVITA_IMPORT_SCAN_RETRY_LIMIT = LIBRARY_IMPORT_SCAN_RETRY_LIMIT
 KAVITA_IMPORT_SCAN_RETRY_SETTLE_SECONDS = LIBRARY_IMPORT_SCAN_RETRY_SETTLE_SECONDS
-DEFERRED_MANUAL_SOURCE_QUEUE_SYNC_TTL_SECONDS = 48 * 3600
+# Owned by inkdrop_deferred_sync: past this window this reader drops a snapshot
+# for good, so the reconciler's reclaim pass keys off the same number to decide
+# which rows it is now solely responsible for.
+DEFERRED_MANUAL_SOURCE_QUEUE_SYNC_TTL_SECONDS = inkdrop_deferred_sync.REPLAY_TTL_SECONDS
 DEFERRED_MANUAL_SOURCE_QUEUE_SYNC_MAX_ITEMS = 80
 FAILED_RECONCILIATION_STATES = {"failed_download", "bad_archive", "false_positive", "stale_no_local_file", "wrong_series_or_subseries"}
 FAILED_RETRY_CONTINUE_REASONS = {
@@ -503,6 +515,12 @@ AUTOMATION_REVIEW_REASONS = {
 }
 HUMAN_REVIEW_REASONS = {
     "unsafe_or_missing_target_folder",
+    # Set by mark_automation_exhausted() once AUTOMATION_EXHAUSTED_ESCALATION_
+    # THRESHOLD is crossed. Must be a member of this set or the sweep at the
+    # bottom of the reconciliation loop ("needs_you with a reason nobody
+    # recognises is a stray, put it back") clears it on the very next pass --
+    # the same pass that set it.
+    "automation_exhausted",
 }
 SOFT_REVIEW_REASONS = NEEDS_SOURCE_REASONS | AUTOMATION_REVIEW_REASONS
 SLSKD_NO_AUTOMATIC_RESULT_STATES = {"searched_no_candidates", "no_query", "failed_candidates_exhausted"}
@@ -6304,7 +6322,7 @@ def effective_safe_slskd_count_for_row(row, item=None):
 
 
 def has_cached_safe_slskd_candidate(item):
-    """Prompt122: the scheduling half of the current_pickable_candidate proof
+    """The scheduling half of the current_pickable_candidate proof
     seam (current_pickable_candidate_reference(), core/inkdrop_state.py, is
     the Reliability-display half -- same principle, different evidence
     domain, since this one has to prove against the mutable SLSKD probe
@@ -7141,8 +7159,9 @@ def mark_automation_exhausted(item, now, *, source="annotation"):
     except (TypeError, ValueError):
         exhausted_count = 0
     item["automation_exhausted_count"] = exhausted_count + 1
+    unsafe_candidates_only = candidate_count > 0 and safe_count <= 0
     retry_delay = no_actionable_source_retry_delay(item)
-    if candidate_count > 0 and safe_count <= 0:
+    if unsafe_candidates_only:
         item["last_event"] = slskd_no_safe_candidate_event(
             item,
             extended=retry_delay > NO_ACTIONABLE_SOURCE_RETRY_SECONDS,
@@ -7162,8 +7181,235 @@ def mark_automation_exhausted(item, now, *, source="annotation"):
         "ts_iso": now_iso(now),
         "source": "autopilot",
         "status": "automation_exhausted_retry_scheduled",
-        "reason": "low_confidence_slskd_candidates" if candidate_count > 0 and safe_count <= 0 else "sources_exhausted",
+        "reason": "low_confidence_slskd_candidates" if unsafe_candidates_only else "sources_exhausted",
     })
+    # Everything above ran unconditionally before this fix too, and it always
+    # looped the item straight back to "queued" -- automation_exhausted_count
+    # was written here and read nowhere, so nothing ever stopped the loop.
+    # Only the low-confidence shape escalates (a genuine "sources_exhausted"
+    # with zero candidates is a different, out-of-scope question); crossing
+    # the threshold hands the item to release_automation_exhausted_for_retry()'s
+    # existing generation ladder, which already knows how to give it one more
+    # automatic try before holding it for a human -- it has simply never been
+    # reachable before now.
+    if unsafe_candidates_only and item["automation_exhausted_count"] >= AUTOMATION_EXHAUSTED_ESCALATION_THRESHOLD:
+        escalate_automation_exhausted_to_review(item, now, source=source)
+
+
+AUTOMATION_EXHAUSTED_REVIEW_ORIGIN = "automation_exhausted"
+
+
+class AutomationExhaustedRowsUnavailable(RuntimeError):
+    """The existing escalation rows could not be read.
+
+    Raised rather than returning an empty mapping, because the caller's next
+    move is a snapshot-replacing write: an empty mapping and an unreadable
+    store would produce the same one-row batch, and that batch retires every
+    other item's escalation. The escalation is skipped for this pass instead;
+    the item's in-memory needs_you state is already set either way, so the next
+    pass tries the write again.
+    """
+
+
+def _active_automation_exhausted_review_rows(db_path):
+    """Every currently-active review_exceptions row this mechanism owns.
+
+    sync_review_exceptions() retires whatever is NOT in the batch it is
+    given, so writing one escalated item's row in isolation would silently
+    resolve every other item's row filed under this origin. Read the
+    existing set back and merge into it rather than replacing it -- the same
+    correctness requirement a full re-sync always has, just satisfied by
+    hand here since this call only ever knows about one item at a time.
+    """
+    if inkdrop_state is None or not Path(db_path).exists():
+        # NOT an empty set. sync_review_exceptions() retires whatever is not in
+        # the batch it is handed, so returning {} here would hand it a one-row
+        # snapshot built from a failed read and silently retire every other
+        # item's escalation. "I could not read the existing rows" and "there
+        # are no existing rows" are opposite facts and the caller has to be
+        # able to tell them apart.
+        raise AutomationExhaustedRowsUnavailable("state module or database unavailable")
+    try:
+        with inkdrop_state.connect_read(db_path) as con:
+            rows = con.execute(
+                "select raw_json from review_exceptions where origin=? and active=1",
+                (AUTOMATION_EXHAUSTED_REVIEW_ORIGIN,),
+            ).fetchall()
+    except Exception as exc:
+        raise AutomationExhaustedRowsUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    out = {}
+    for row in rows:
+        try:
+            parsed = json.loads(row["raw_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        review_id = str(parsed.get("review_id") or "").strip()
+        if review_id:
+            out[review_id] = parsed
+    return out
+
+
+def store_slskd_refusal_evidence(item, row):
+    """Keep the probe row's refusal codes on the item itself.
+
+    item["attempts"] is capped at 240 entries and deduplicated, so the attempt
+    carrying the evidence can age out before the escalation threshold is
+    crossed -- escalation happens after repeated exhausted cycles, which is
+    exactly when the oldest attempts are being dropped. Storing the codes
+    directly means the escalated review row can still name them.
+
+    Only overwritten when the new probe actually refused something: a later
+    probe that refused nothing is not evidence the earlier refusals did not
+    happen.
+    """
+    if not isinstance(item, dict) or not isinstance(row, dict):
+        return
+    query_rows = [entry for entry in (row.get("queries") or []) if isinstance(entry, dict)]
+    evidence = inkdrop_slskd_refusal_vocabulary.merge_refusal_evidence(
+        [entry.get("refusal_evidence") for entry in query_rows]
+    )
+    if not isinstance(evidence, dict):
+        return
+    reasons = [str(code) for code in (evidence.get("reasons") or []) if str(code or "").strip()]
+    if not reasons:
+        return
+    detail = evidence.get("detail") if isinstance(evidence.get("detail"), dict) else {}
+    counts = detail.get("reason_counts") if isinstance(detail.get("reason_counts"), dict) else {}
+    item["last_slskd_refusal_reasons"] = reasons
+    item["last_slskd_refusal_reason_counts"] = dict(counts)
+
+
+def automation_exhausted_refusal_evidence(item):
+    """(codes, counts) from the item's own most recent SLSKD refusal.
+
+    Read off the attempt that produced the escalation rather than recomputed,
+    so the codes on the review row are the same ones the ledger carries. Newest
+    SLSKD attempt first; the first one carrying refusal evidence wins, because
+    a later probe that refused nothing is not a statement that the earlier
+    refusals did not happen.
+    """
+    item = item if isinstance(item, dict) else {}
+    stored = item.get("last_slskd_refusal_reasons")
+    if isinstance(stored, (list, tuple)) and stored:
+        counts = item.get("last_slskd_refusal_reason_counts")
+        return (
+            [str(code) for code in stored if str(code or "").strip()],
+            dict(counts) if isinstance(counts, dict) else {},
+        )
+    attempts = item.get("attempts")
+    if not isinstance(attempts, list):
+        return [], {}
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict) or attempt.get("source") != "slskd":
+            continue
+        evidence = attempt.get("refusal_evidence")
+        if not isinstance(evidence, dict):
+            continue
+        reasons = [str(code) for code in (evidence.get("reasons") or []) if str(code or "").strip()]
+        if not reasons:
+            continue
+        detail = evidence.get("detail") if isinstance(evidence.get("detail"), dict) else {}
+        counts = detail.get("reason_counts") if isinstance(detail.get("reason_counts"), dict) else {}
+        return reasons, dict(counts)
+    return [], {}
+
+
+def escalate_automation_exhausted_to_review(item, now, *, source="annotation"):
+    """Surface an item that has repeatedly found only low-confidence SLSKD
+    candidates to a human, instead of retrying it forever.
+
+    Reuses the review_exceptions surface repeat_bad_candidate_review_row()
+    already writes to for its own circuit breaker (core/inkdrop_manual_
+    source_autoresolve.py) rather than inventing a second one -- same table,
+    same sync_review_exceptions() writer, same review_exception_row_from_
+    record() reader, same Manual Review / React Reason column rendering.
+    Nothing here is a new display surface.
+    """
+    item["state"] = "needs_you"
+    item["needs_you_reason"] = AUTOMATION_EXHAUSTED_REVIEW_ORIGIN
+    if inkdrop_state is None:
+        return None
+    item_key = str(
+        item.get("key") or item.get("queue_identity") or item.get("legacy_key") or ""
+    ).strip()
+    if not item_key:
+        return None
+    review_id = f"{AUTOMATION_EXHAUSTED_REVIEW_ORIGIN}:{item_key}"
+    row = {
+        "review_id": review_id,
+        "series": item.get("series"),
+        "issue_number": item.get("issue"),
+        "series_id": item.get("series_id"),
+        "issue_id": item.get("issue_id"),
+        "source": "slskd",
+        "state": "needs_you",
+        "manual_review_actionable": True,
+        "reason": AUTOMATION_EXHAUSTED_REVIEW_ORIGIN,
+        # The exact sentence autopilot itself just computed above -- already
+        # distinguishes "found only unsafe/rejected" from "found only
+        # low-confidence" (slskd_no_safe_candidate_event()) rather than a
+        # generic message invented here.
+        "review_reason": item.get("last_event") or (
+            "Autopilot has repeatedly found only low-confidence SLSKD "
+            "candidates and stopped auto-retrying. It needs a decision "
+            "from you."
+        ),
+        "next_action": (
+            "Review the SLSKD candidates and either approve one, supply a "
+            "different source, or clear/ignore this item."
+        ),
+        # These counts are refreshed on every autopilot pass, including this
+        # one, so what lands in review reflects this pass, not the pass that
+        # first crossed the threshold.
+        "activity_summary": (
+            f"{item.get('last_slskd_candidate_count') or 0} candidate(s) found, "
+            f"{item.get('last_slskd_auto_grab_review_count') or 0} needing review, "
+            f"{item.get('last_slskd_auto_grab_blocked_count') or 0} blocked, none "
+            f"auto-grab safe, across {item.get('automation_exhausted_count')} "
+            "exhausted retry cycles."
+        ),
+        "candidate_reason": "low_confidence_slskd_candidates",
+        "last_seen_at": now,
+    }
+    # The codes the probe actually refused on, not only the sentence. Without
+    # these the escalated row said "candidates were not safe enough" and an
+    # operator had no way to see WHICH check refused WHAT -- a census of the
+    # rows this writer produced found review_reasons and rejection_codes in
+    # zero of them. merge_refusal_evidence() has computed exactly this per
+    # probe row since it was written; it simply never reached here.
+    reasons, reason_counts = automation_exhausted_refusal_evidence(item)
+    if reasons:
+        row["rejection_codes"] = reasons
+        row["review_reasons"] = reasons
+    if reason_counts:
+        row["rejection_reason_counts"] = reason_counts
+    try:
+        active = _active_automation_exhausted_review_rows(INKDROP_STATE_DB)
+        active[review_id] = row
+        return inkdrop_state.sync_review_exceptions(
+            INKDROP_STATE_DB, list(active.values()), origin=AUTOMATION_EXHAUSTED_REVIEW_ORIGIN,
+        )
+    except AutomationExhaustedRowsUnavailable as exc:
+        # Skip the write entirely rather than replace the snapshot with one row
+        # built on a failed read. The item is already needs_you in memory.
+        log(
+            "automation_exhausted_escalation_skipped_unreadable_rows",
+            review_id=review_id,
+            error=str(exc),
+        )
+        return None
+    except Exception as exc:
+        # A search must never fail because its escalation could not be
+        # written -- state/needs_you_reason above are already set on the
+        # in-memory item either way, so the next pass tries the write again.
+        log(
+            "automation_exhausted_escalation_failed",
+            review_id=review_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return None
 
 
 def release_automation_exhausted_for_retry(item, now):
@@ -8828,6 +9074,7 @@ def annotate_states(queue, max_seconds=None, reason=None, row_keys=None):
             item["last_slskd_auto_grab_safe_count"] = effective_safe_count
             item["last_slskd_auto_grab_review_count"] = int(srow.get("auto_grab_review_count") or 0)
             item["last_slskd_auto_grab_blocked_count"] = int(srow.get("auto_grab_blocked_count") or 0)
+            store_slskd_refusal_evidence(item, srow)
             item["last_slskd_at"] = srow.get("checked_at") or srow.get("staged_scan_at") or now
             review_id = str(srow.get("review_id") or "")
             if not rrow and not irow and stale_slskd_detected_probe_row(srow, now):
@@ -10798,6 +11045,7 @@ def apply_slskd_checked(queue, result):
             item["last_slskd_auto_grab_safe_count"] = effective_safe_slskd_count_for_row(row, item=item)
             item["last_slskd_auto_grab_review_count"] = int(row.get("auto_grab_review_count") or 0)
             item["last_slskd_auto_grab_blocked_count"] = int(row.get("auto_grab_blocked_count") or 0)
+            store_slskd_refusal_evidence(item, row)
             touched["checked"] += 1
             if append_unique_queue_attempt(item, slskd_checked_attempt_from_row(row, item, now)):
                 touched["attempts"] += 1
@@ -12797,6 +13045,98 @@ def slskd_hot_retry_candidate(item, now):
     return bool(cached_safe_slskd_entry_for_item(item)[0])
 
 
+def last_dispatch_at_by_queue_id(db_path, queue_ids):
+    """One query: {queue_id: newest download_tasks.started_at}.
+
+    KEYED ON QUEUE ID, NOT WANTED ID, AND THAT IS THE WHOLE FIX. This was
+    `last_dispatch_at_by_wanted()`, reading `item.get("wanted_id")` off queue
+    QUEUE-DOCUMENT items. Measured on the live system 2026-08-24: the database
+    carries `wanted_id` on 8,702 of 8,702 queue rows -- 100%, every state,
+    every age -- and the queue document carries it on 0 of 3,581 items. The
+    value was never missing; the caller was asking the wrong representation
+    for it.
+
+    The document's `key` IS `queue_items.id`, proven by matching 149/149 and
+    301/325 row sets between document and database on that field alone, and
+    `download_tasks` carries `queue_id` beside `wanted_id`. Measured both ways
+    on the same eligible pool: **0 of 393 resolve on wanted_id, 353 of 393 on
+    queue_id**, with delivery ages spreading 0.1 to 72.8 days (median 15.6)
+    where there was previously no clock at all. The 0500 audit reached the
+    same conclusion independently from a different direction -- 364 of 364
+    mapping on queue id against 0 of 364 on wanted id.
+
+    Read once per pass for the eligible set, not once per item. The sort needs
+    time-since-DELIVERY and nothing on the queue item records it --
+    `last_download_task_*` exists on a minority of rows and carries no
+    timestamp.
+    """
+    ids = [q for q in {str(x) for x in queue_ids if x} if q]
+    if not db_path or not ids:
+        return {}
+    out = {}
+    try:
+        with inkdrop_state.connect_read(db_path) as con:
+            for chunk_start in range(0, len(ids), 400):
+                chunk = ids[chunk_start:chunk_start + 400]
+                placeholders = ",".join("?" * len(chunk))
+                rows = con.execute(
+                    "select queue_id, max(started_at) from download_tasks "
+                    "where queue_id in (%s) group by queue_id" % placeholders,
+                    chunk,
+                ).fetchall()
+                for qid, ts in rows:
+                    value = numeric_timestamp(ts)
+                    if value > 0:
+                        out[str(qid)] = value
+    except Exception:
+        # A read failure must not reorder the lane on partial data. Returning
+        # empty falls the caller back to the previous key, which is wrong but
+        # is at least the behaviour everyone already reasons about.
+        return {}
+    return out
+
+
+def hot_retry_delivery_age(item, dispatch_at_by_wanted, now=None):
+    """Seconds since this row last DELIVERED anything, or since it was created.
+
+    THE CLOCK IS THE POINT. The previous key aged a row by
+    `max(last_failed_candidate_at, last_slskd_at)`, and `last_slskd_at` is
+    refreshed by every probe -- so searching a row reset its place in the
+    queue and a daily-searched row never aged. Measured 2026-08-23 on
+    `aae79c00`: 352 rows eligible, the 33 known-stalled ranked median 166th
+    with a median sort-age of 1.27 days against 0.96 for all eligible. They
+    looked FRESHER than average precisely because they were being worked.
+
+    `download_tasks.started_at` cannot be refreshed by a probe. Rows that have
+    never dispatched fall back to queue creation, so an old never-delivered
+    row outranks a new one instead of both colliding at infinity -- that is
+    also what keeps a freshly-created row from jumping the backlog.
+    """
+    if now is None:
+        now = time.time()
+    # Keyed on the document's `key` (== queue_items.id), matching
+    # last_dispatch_at_by_queue_id(). Reading `wanted_id` here returned None
+    # for every item, so this lookup missed on every row and the age silently
+    # fell through to queue creation time for the entire pool.
+    queue_key = str((item or {}).get("key") or "")
+    delivered_at = (dispatch_at_by_wanted or {}).get(queue_key, 0)
+    if not delivered_at:
+        delivered_at = queue_created_ts(item)
+    if not delivered_at:
+        return 0.0
+    return max(0.0, float(now) - float(delivered_at))
+
+
+def slskd_hot_retry_delivery_sort_key(item, dispatch_at_by_wanted, now=None):
+    """Oldest delivery first, then the existing tiebreakers unchanged."""
+    return (
+        -hot_retry_delivery_age(item, dispatch_at_by_wanted, now=now),
+        queue_attempt_count(item),
+        normalize(item.get("series") or ""),
+        normalize(str(item.get("issue") or "")),
+    )
+
+
 def slskd_hot_retry_sort_key(item):
     # Cached candidates have already paid the discovery and safety-gate cost.
     # Serve the oldest retained result first so a freshly retried row rotates
@@ -13146,7 +13486,16 @@ def slskd_hot_retry_rows(queue, args):
         if review_id:
             seen_review_ids.add(review_id)
         rows.append(item)
-    rows.sort(key=slskd_hot_retry_sort_key)
+    # Order by time since DELIVERY, not by time since activity. See
+    # hot_retry_delivery_age(). Falls back to the previous key only if the
+    # read fails, so a database problem cannot silently reorder the lane.
+    dispatch_at = last_dispatch_at_by_queue_id(
+        INKDROP_STATE_DB, [item.get("key") for item in rows]
+    )
+    if dispatch_at:
+        rows.sort(key=lambda item: slskd_hot_retry_delivery_sort_key(item, dispatch_at, now=now))
+    else:
+        rows.sort(key=slskd_hot_retry_sort_key)
     return rows[:limit]
 
 

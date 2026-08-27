@@ -141,17 +141,27 @@ def check_log_export(tmp):
     os.utime(log_dir / "inkdrop-import.log", (newest, newest))
     os.utime(log_dir / "inkdrop-acquire.log.1", (newest - 60, newest - 60))
 
-    payload, manifest = inkdrop_log_export.build_log_archive_bytes(log_dir=log_dir, per_file_cap_bytes=4096)
+    # v2 routes collection and redaction through inkdrop_support_bundle, which
+    # fails closed on an unusable secret inventory -- pass an explicit empty
+    # environment so this check tests the caps, not the host's config files.
+    export_kwargs = {"environ": {}, "secret_root": Path(tmp) / "log-export-secrets"}
+    payload, manifest = inkdrop_log_export.build_log_archive_bytes(
+        log_dir=log_dir, per_file_cap_bytes=4096, **export_kwargs
+    )
     with zipfile.ZipFile(__import__("io").BytesIO(payload)) as archive:
         names = set(archive.namelist())
-        require(names == {"logs/inkdrop-import.log", "logs/inkdrop-acquire.log.1", "manifest.json"}, f"unexpected archive contents: {names}")
+        # Members are index-prefixed so two rotated logs cannot collide on name.
+        require(names == {"logs/001-inkdrop-import.log", "logs/002-inkdrop-acquire.log.1", "manifest.json"}, f"unexpected archive contents: {names}")
         embedded = json.loads(archive.read("manifest.json"))
-    require(embedded["schema"] == "inkdrop.log_export.v1", "manifest schema missing")
+    require(embedded["schema"] == "inkdrop.log_export.v2", "manifest schema missing")
+    require(embedded["redacted"] is True, "v2 manifest must record that logs were redacted")
     by_name = {row["name"]: row for row in manifest["files"]}
-    require(by_name["inkdrop-import.log"]["included_bytes"] == 4096 and by_name["inkdrop-import.log"]["truncated"], f"big log should be tail-capped: {by_name}")
-    require(by_name["inkdrop-acquire.log.1"]["included_bytes"] == 200 and not by_name["inkdrop-acquire.log.1"]["truncated"], f"small log should be whole: {by_name}")
+    require(by_name["logs/001-inkdrop-import.log"]["included_bytes"] == 4096 and by_name["logs/001-inkdrop-import.log"]["truncated"], f"big log should be tail-capped: {by_name}")
+    require(by_name["logs/002-inkdrop-acquire.log.1"]["included_bytes"] == 200 and not by_name["logs/002-inkdrop-acquire.log.1"]["truncated"], f"small log should be whole: {by_name}")
 
-    _, tight = inkdrop_log_export.build_log_archive_bytes(log_dir=log_dir, per_file_cap_bytes=4096, total_cap_bytes=4096)
+    _, tight = inkdrop_log_export.build_log_archive_bytes(
+        log_dir=log_dir, per_file_cap_bytes=4096, total_cap_bytes=4096, **export_kwargs
+    )
     require(len(tight["files"]) == 1 and len(tight["skipped"]) == 1, f"total cap should drop the older file into skipped: {tight}")
     require(inkdrop_log_export.log_archive_filename(0).startswith("inkdrop-logs-"), "filename prefix changed")
 

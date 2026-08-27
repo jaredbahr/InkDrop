@@ -1009,6 +1009,20 @@
     .core-section-summary .summary-chip.good { border-color: rgba(120, 217, 155, .34); }
     .core-section-summary .summary-chip.warn { border-color: rgba(247, 201, 111, .44); }
     .core-section-summary .summary-chip.bad { border-color: rgba(255, 125, 125, .44); }
+    /* The row count, not a fourth facet. Every chip after it is an independent
+       filter that can count the same row twice, so the total has to look like
+       the total. */
+    .core-section-summary .summary-chip.count {
+      border-color: rgba(114, 210, 255, .40);
+      background: rgba(15, 30, 48, .70);
+    }
+    .core-section-summary .summary-facet-note {
+      grid-column: 1 / -1;
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
     .section-operator-now {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;

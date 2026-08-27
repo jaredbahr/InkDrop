@@ -87,6 +87,21 @@ def looks_like_path(value):
     return "/" in text or "\\" in text
 
 
+def path_leaf(value):
+    """The last segment of a path, whichever separator it uses.
+
+    posixpath.basename() splits on "/" only, and an SLSKD peer path is
+    backslash-separated (`@@adarr\\Literature\\Comics\\...\\Steel v2 #06.cbz`),
+    so it returned the whole path where a file name belonged. looks_like_path()
+    directly above already accepts either separator; this is the same judgement
+    applied to the split.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.split(r"[\\/]", text)[-1]
+
+
 def parse_composite_reason(value):
     """`trusted_issue_mismatch:198!=001` -> gate/found/expected, or None.
 
@@ -155,10 +170,23 @@ def decision_evidence(row):
         "unit": (parsed or {}).get("expected") or str(row.get("issue_number") or "").strip(),
     }
 
+    # The candidate this row is about, when the writer recorded one. A
+    # circuit-breaker row's `source` is the provider id ("slskd"), not a file,
+    # so before this the found side of those rows was always empty -- see
+    # repeat_bad_candidate_review_row(). Read first, because it names the
+    # artifact directly where `source` only sometimes does.
+    candidate_path = _first_text(row, ("candidate_path",))
+    found_path = candidate_path or (source_value if source_is_path else "")
+    # 65.6% of bad_source_candidates carry a source_path; 100% carry a title
+    # (2026-08-25 snapshot, 10,444 rows). The title is what the candidate is
+    # called -- a file or folder name off the peer, e.g. "The Wicked + The
+    # Divine 1923 1 (2018).cbz" -- so a row with no path still has something
+    # true to put opposite the expected side. `path` stays empty for those: it
+    # is a path field, and a name is not a path.
     found = {
         # Verbatim. Never through a label function -- see the module docstring.
-        "path": source_value if source_is_path else "",
-        "file_name": posixpath.basename(source_value) if source_is_path else "",
+        "path": found_path,
+        "file_name": path_leaf(found_path) or _first_text(row, ("candidate_title",)),
         "unit": (parsed or {}).get("found", ""),
     }
 
@@ -181,7 +209,10 @@ def decision_evidence(row):
         # True when we could not say what was wanted or what was found. A card
         # should say "no evidence recorded" rather than render empty fields
         # that read as "nothing was expected".
-        "incomplete": not (expected["series"] or expected["unit"]) or not (found["path"] or found["unit"]),
+        # file_name counts: a candidate InkDrop can name is a candidate the
+        # operator can judge, whether or not a full path was recorded.
+        "incomplete": not (expected["series"] or expected["unit"])
+        or not (found["path"] or found["unit"] or found["file_name"]),
     }
 
 

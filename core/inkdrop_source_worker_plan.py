@@ -109,11 +109,32 @@ CONTRACTS_BY_PROVIDER_ID = {
         "manual_review_only": False,
         "evidence_only": False,
     },
+    # The detail-direct family reads a candidate's extension straight off the
+    # link text, so it only ever accepts a URL that already looks like a file.
+    # Real direct-download sites hand out an extensionless, tokenised
+    # redirector instead (getcomics.org/dls/<token> -> a shared-file host), and
+    # the bare mirror URLs that *do* carry a visible extension are the stale
+    # ones -- checked live 2026-08-14 against getcomics.org, where the only
+    # extension-bearing link on a current detail page (datanodes.to/....cbz)
+    # answered 404 while the two /dls/ redirectors resolved to a live 30MB
+    # .cbz. That combination made this provider structurally incapable of ever
+    # producing an artifact-safe candidate: every automatic pass since the row
+    # was created recorded "no safe automatic candidate" and the system has
+    # never written a single inkdrop_direct download task.
+    #
+    # The probe family is the same feed->detail walk plus the two steps that
+    # make the difference: it follows the redirector to whatever shared-file
+    # host it lands on, and it HEAD-probes the resolved URL so the extension,
+    # content type and size that gate auto-download come from the response
+    # rather than from guessing at the link text. That is strictly more
+    # capable *and* strictly more conservative than what it replaces, so it is
+    # the right contract for a provider the operator has already allowed to
+    # download automatically.
     "rss": {
-        "adapter_family": "rss_detail_direct_feed",
-        "adapter_id": "rss_native_detail_direct_feed",
-        "search_operation": "poll_feed_then_fetch_matching_detail_pages_for_direct_file_links",
-        "candidate_parser": "direct_file_detail_candidates_from_payload",
+        "adapter_family": "rss_detail_probe_feed",
+        "adapter_id": "rss_native_detail_probe_feed",
+        "search_operation": "poll_feed_then_fetch_detail_pages_and_probe_candidate_file_headers",
+        "candidate_parser": "direct_file_probe_candidates_from_payload",
         "verdict_helper": "direct_artifact_verdict",
         "attempt_seed_helper": "direct_candidate_attempt_seed",
         "handoff_kind": "inkdrop_direct",

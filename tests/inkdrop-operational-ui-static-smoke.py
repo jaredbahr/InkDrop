@@ -19,9 +19,14 @@ def catalog_matches_release_contract():
     tag = str(contract.get("tag") or "")
     expected_slug = tag.replace(".", "-").lower()
     return f'version: "{tag}"' in catalog and f'slug: "{expected_slug}"' in catalog
-# inkdrop_web_config.py holds the static-asset registration constants that
+# inkdrop_web_config.py holds the static-asset registration constants and
+# web/templates/inkdrop-shell.html holds the shell markup, both of which
 # used to live directly in inkdrop_web.py.
-web = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8") + (ROOT / "core" / "inkdrop_web_config.py").read_text(encoding="utf-8")
+web = (
+    (ROOT / "web/templates/inkdrop-shell.html").read_text(encoding="utf-8")
+    + (ROOT / "core/inkdrop_web.py").read_text(encoding="utf-8")
+    + (ROOT / "core/inkdrop_web_config.py").read_text(encoding="utf-8")
+)
 css = (ROOT / "web/static/css/inkdrop.css").read_text(encoding="utf-8")
 dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 gaps = (ROOT / "docs/inkdrop/UI_BACKEND_GAPS.md").read_text(encoding="utf-8")

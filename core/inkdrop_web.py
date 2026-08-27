@@ -6,6 +6,7 @@ if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
 import base64
+import calendar
 import faulthandler
 import gzip
 import hashlib
@@ -104,920 +105,8 @@ except Exception:
 from core.inkdrop_web_config import *  # noqa: F401,F403 -- re-exports every name below for inkdrop_web.NAME callers
 
 
-HTML = r"""<!doctype html>
-<html lang="en" class="inkdrop-auth-pending">
-<head>
-  <meta charset="utf-8">
-  <script>
-    // Server-computed at request time (see send_html()) so the redirect
-    // decision below never needs a network round trip. While true, nobody
-    // has claimed this install yet and /m has no bootstrap form of its
-    // own -- see INKDROP_AUTH_SETUP_SAFE_PATHS -- so every viewport stays
-    // on this shell until inkdrop-auth-ui.js renders the setup flow.
-    window.__INKDROP_SETUP_REQUIRED__ = __INKDROP_SETUP_REQUIRED_JSON__;
-  </script>
-  <script>
-    // Auto-switch to the lightweight mobile view (/m) on a narrow viewport,
-    // before any of this page's CSS/JS below is requested. Runs again on
-    // every crossing of the breakpoint (matchMedia's change event) so
-    // resizing or rotating an already-open window switches live too, not
-    // just on initial load -- not a one-time user-agent sniff. A visitor
-    // who explicitly asked to stay on desktop (the mobile page's "Desktop
-    // site" link, or ?view=desktop) is remembered for this browser tab via
-    // sessionStorage so it doesn't bounce them back.
-    //
-    // The auto-detect branch (no explicit preference) is guarded by a
-    // shared sessionStorage cooldown: dragging a window edge through 768px
-    // fires matchMedia's change event on every transient crossing, and each
-    // one used to trigger an immediate location.replace -- a full document
-    // reload takes long enough that the width can drift back across the
-    // breakpoint again before the new page's own gate script runs, so /
-    // and /m kept bouncing each other back and forth (visible as constant
-    // flashing). A redirect this script fires now stamps the time; neither
-    // side's auto-detect branch will fire again for a short window after,
-    // so the loop can't sustain itself. Explicit preferences (query param
-    // or the "Desktop site" link) bypass the cooldown entirely -- they're a
-    // single deliberate decision, not a repeatable auto-trigger, so nothing
-    // about them can loop.
-    (function () {
-      var BREAKPOINT = "(max-width: 768px)";
-      var SWITCH_COOLDOWN_MS = 1500;
-      var CHANGE_SETTLE_MS = 250;
-      function preference() {
-        try { return sessionStorage.getItem("inkdropViewPreference"); } catch (e) { return null; }
-      }
-      function recentlyAutoSwitched() {
-        try {
-          var at = Number(sessionStorage.getItem("inkdropViewSwitchedAt") || 0);
-          return !!at && (Date.now() - at) < SWITCH_COOLDOWN_MS;
-        } catch (e) { return false; }
-      }
-      function markAutoSwitched() {
-        try { sessionStorage.setItem("inkdropViewSwitchedAt", String(Date.now())); } catch (e) {}
-      }
-      try {
-        var requested = new URLSearchParams(location.search).get("view");
-        if (requested === "mobile" || requested === "desktop") {
-          sessionStorage.setItem("inkdropViewPreference", requested);
-        }
-      } catch (e) {}
-      function isNarrow() {
-        return !!(window.matchMedia && window.matchMedia(BREAKPOINT).matches);
-      }
-      function maybeSwitch() {
-        if (window.__INKDROP_SETUP_REQUIRED__) return;
-        var pref = preference();
-        if (pref === "desktop") return;
-        if (pref === "mobile") { location.replace("/m" + location.search); return; }
-        if (isNarrow() && !recentlyAutoSwitched()) {
-          markAutoSwitched();
-          location.replace("/m" + location.search);
-        }
-      }
-      maybeSwitch();
-      if (window.matchMedia) {
-        var mql = window.matchMedia(BREAKPOINT);
-        var settleTimer = null;
-        var onChange = function () {
-          if (settleTimer) clearTimeout(settleTimer);
-          settleTimer = setTimeout(maybeSwitch, CHANGE_SETTLE_MS);
-        };
-        if (mql.addEventListener) mql.addEventListener("change", onChange);
-        else if (mql.addListener) mql.addListener(onChange);
-      }
-      // Belt-and-suspenders re-check once the page is actually shown --
-      // covers a bfcache restore (back/forward navigation resurrects the
-      // page without re-running from a network load) and any environment
-      // where the viewport isn't fully settled at the moment this
-      // head-of-document script runs.
-      window.addEventListener("pageshow", maybeSwitch);
-    })();
-  </script>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#181c21">
-  <link rel="icon" type="image/png" href="/inkdrop-logo-mark.png?v=20260728-opaque-logo">
-  <link rel="apple-touch-icon" href="/inkdrop-logo-mark.png?v=20260728-opaque-logo">
-  <title>InkDrop</title>
-  <style id="inkdrop-critical-fallback">
-    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #181c21; color: #dce4ec; }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: #181c21; color: #dce4ec; }
-    main { width: min(1280px, calc(100vw - 24px)); margin: 0 auto; padding: 12px 0 32px; }
-    .arr-nav-shell { display: grid; gap: 8px; padding: 10px; border: 1px solid #343c46; background: #1e2329; }
-    .arr-nav, .arr-settings-subnav, .arr-activity-subnav { display: flex; flex-wrap: wrap; gap: 6px; }
-    button, input, select { min-height: 34px; border: 1px solid #46515d; background: #252b32; color: inherit; padding: 6px 9px; }
-    [hidden] { display: none !important; }
-  </style>
-  <link rel="stylesheet" href="/static/css/inkdrop.css?v=__INKDROP_UI_CSS_VERSION__" onload="document.getElementById('inkdrop-critical-fallback')?.remove()">
-  <script src="/static/js/inkdrop-api.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
-  <script src="/static/js/inkdrop-manual-search.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
-  <script src="/static/js/inkdrop-auth-ui.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
-  <script src="/static/js/inkdrop-download-clients-ui.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
-  <script src="/static/js/inkdrop-missing-recovery.js?v=__INKDROP_UI_JS_VERSION__" defer></script>
-  <!-- Built by web/frontend (Vite); defines window.InkDropReact. A checkout
-       that hasn't run the frontend build 404s here harmlessly -- every call
-       site guards with window.InkDropReact?. and falls back to the existing
-       vanilla rendering path. -->
-  <script src="/static/dist/inkdrop-react.js?v=__INKDROP_UI_REACT_VERSION__" defer></script>
-</head>
-<body>
-  <div id="inkdropAuthRoot" class="inkdrop-auth-root" aria-live="polite"></div>
-  <main id="inkdropAppShell" hidden>
-    <header>
-      <div class="inkdrop-header-brand">
-        <span class="inkdrop-logo-mark" aria-hidden="true"><img class="inkdrop-logo-img" src="/inkdrop-logo-mark.png?v=20260728-opaque-logo" alt="" loading="eager" decoding="async"></span>
-        <div>
-          <h1>InkDrop</h1>
-          <p class="lede">Add or monitor a series. InkDrop keeps missing issues moving through automation and separates real decisions from parked source checks.</p>
-      </div>
-      <div class="status-pill" id="status">Status: <strong>loading...</strong></div>
-    </header>
-
-    <div class="arr-nav-shell">
-      <div class="arr-nav-brand">
-        <span class="arr-nav-mark inkdrop-logo-mark" aria-hidden="true"><img class="inkdrop-logo-img" src="/inkdrop-logo-mark.png?v=20260728-opaque-logo" alt="" loading="eager" decoding="async"></span>
-        <div>
-          <strong>InkDrop</strong>
-        </div>
-      </div>
-      <input class="arr-nav-search" id="inkdropSeriesNavSearch" type="search" placeholder="Search Series..." autocomplete="off" aria-label="Search existing series">
-      <nav class="arr-nav" aria-label="InkDrop sections">
-        <span class="arr-nav-group-label">Library</span>
-        <!-- Pulled for this release: no forward-looking release-date data yet. See INKDROP_CALENDAR_ENABLED. -->
-        <button type="button" data-arr-section="calendar" data-arr-icon-key="calendar" data-arr-static-nav="true" onclick="openInkdropNavSection('calendar')" hidden aria-hidden="true"><span class="arr-nav-label">Calendar</span></button>
-        <button type="button" data-arr-section="pull_list" data-arr-icon-key="calendar" data-arr-static-nav="true" onclick="openInkdropNavSection('pull_list')"><span class="arr-nav-label">Pull List</span></button>
-        <button type="button" data-arr-section="series" data-arr-icon-key="series" data-arr-badge-mode="label" onclick="openInkdropNavSection('series')"><span class="arr-nav-label">Series</span><span class="arr-nav-count" id="navSeriesCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
-        <span class="arr-nav-group-label">Operations</span>
-        <button type="button" data-arr-section="wanted" data-arr-icon-key="wanted" data-arr-badge-mode="label" onclick="openInkdropNavSection('wanted')"><span class="arr-nav-label">Wanted</span><span class="arr-nav-count" id="navWantedCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
-        <button type="button" data-arr-section="activity" data-arr-icon-key="activity" data-arr-badge-mode="label" onclick="openInkdropNavSection('activity')"><span class="arr-nav-label">Activity</span><span class="arr-nav-count" id="navActivityCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
-        <div class="arr-activity-subnav" aria-label="Activity areas">
-          <button type="button" data-arr-section="queue" data-arr-subsection="activity" onclick="openInkdropNavSection('queue')">Queue</button>
-          <button type="button" data-arr-section="history" data-arr-subsection="activity" onclick="openInkdropNavSection('history')">History</button>
-          <button type="button" data-arr-section="source_memory" data-arr-subsection="activity" onclick="openInkdropNavSection('source_memory')">Blocklist</button>
-        </div>
-        <button type="button" data-arr-section="manual_review" data-arr-icon-key="manual-review" data-arr-badge-mode="label" onclick="openInkdropNavSection('manual_review')"><span class="arr-nav-label">Manual Review</span><span class="arr-nav-count" id="navReviewCount" hidden aria-hidden="true" data-arr-badge-hidden="true">...</span></button>
-        <button type="button" data-arr-section="reliability" data-arr-icon-key="diagnostics" data-arr-static-nav="true" onclick="openInkdropNavSection('reliability')"><span class="arr-nav-label">Reliability</span></button>
-        <span class="arr-nav-group-label">Administration</span>
-        <button type="button" data-arr-section="settings" data-arr-icon-key="settings" data-arr-static-nav="true" onclick="openInkdropSettingsArea('setup')"><span class="arr-nav-label">Settings</span></button>
-        <div class="arr-settings-subnav" aria-label="Settings areas">
-          <button type="button" data-settings-nav-area="setup" onclick="openInkdropSettingsArea('setup')">Setup</button>
-          <button type="button" data-settings-nav-area="media_management" onclick="openInkdropSettingsArea('media_management')">Media Management</button>
-          <button type="button" data-settings-nav-area="language" onclick="openInkdropSettingsArea('language')">Language</button>
-          <button type="button" data-settings-nav-area="indexers" onclick="openInkdropSettingsArea('indexers')">Indexers</button>
-          <button type="button" data-settings-nav-area="download_clients" onclick="openInkdropSettingsArea('download_clients')">Download Clients</button>
-          <!-- Pulled for this release: no working import source behind it yet. See INKDROP_IMPORT_LISTS_ENABLED. -->
-          <button type="button" data-settings-nav-area="import_lists" onclick="openInkdropSettingsArea('import_lists')" hidden aria-hidden="true">Import Lists</button>
-          <button type="button" data-settings-nav-area="connect" onclick="openInkdropSettingsArea('connect')">Connect</button>
-          <button type="button" data-settings-nav-area="metadata" onclick="openInkdropSettingsArea('metadata')">Metadata</button>
-          <button type="button" data-settings-nav-area="general" onclick="openInkdropSettingsArea('general')">General</button>
-          <button type="button" data-settings-nav-area="ui" onclick="openInkdropSettingsArea('ui')">UI</button>
-          <button type="button" data-settings-nav-area="root_folders" onclick="openInkdropSettingsArea('root_folders')">Paths</button>
-          <!-- Nav entry pulled for this release: the "Add source" list under here
-               mixes real Automatic Search tuning with a generic source-template
-               catalog that includes non-comic templates (Gutendex, Standard Ebooks)
-               InkDrop has no feature behind. The templates are real backend
-               registrations shared with other source types, not dead scaffolding,
-               so only the nav entry is hidden here -- the settings area and its
-               backing providers are untouched. -->
-          <button type="button" data-settings-nav-area="automation" onclick="openInkdropSettingsArea('automation')" hidden aria-hidden="true">Automatic Search</button>
-        </div>
-        <button type="button" data-arr-section="system" data-arr-icon-key="system" data-arr-static-nav="true" onclick="openInkdropNavSection('system')"><span class="arr-nav-label">System</span></button>
-      </nav>
-      <div class="arr-nav-actions">
-        <button class="arr-nav-add" type="button" onclick="goToWorkflowTarget('seriesSearchSection')">Add Series</button>
-      </div>
-      <div class="activity-region" aria-live="polite">
-        <button class="activity-status" id="activityStatus" type="button" hidden></button>
-        <section class="activity-dock" id="activityDock" hidden>
-          <button class="activity-sidebar-link" id="activitySidebarLink" type="button">
-            <span id="activityDockTitle">Activity · unavailable</span>
-          </button>
-          <div class="activity-dock-legacy" hidden inert aria-hidden="true">
-            <span id="activityDockSummary"></span>
-            <span id="activityCount"></span>
-            <button id="activityDockPrimaryAction" type="button" hidden disabled tabindex="-1"></button>
-            <button id="activityDockToggle" type="button" hidden disabled tabindex="-1"></button>
-            <div id="activityDockDestination" hidden></div>
-            <div id="activityDockCompactTarget" hidden></div>
-            <div id="activitySummary" hidden></div>
-            <div id="activityOperatorBoard" hidden></div>
-            <div id="activityDockNowRail" hidden></div>
-            <div id="activityDockLaneStrip" hidden></div>
-            <div id="activityRouteStrip" hidden></div>
-            <div id="activityList" hidden></div>
-          </div>
-        </section>
-        <div class="toast" id="toast"></div>
-      </div>
-    </div>
-
-    <div class="arr-content-shell">
-    <section class="arr-page-masthead" id="inkdropPageMasthead" aria-live="polite">
-      <div class="arr-page-heading">
-        <span class="arr-page-eyebrow" id="inkdropPageEyebrow">InkDrop</span>
-        <h2 id="inkdropPageTitle">Series</h2>
-        <p id="inkdropPageDescription">Library index, monitoring, and add-series intake. Missing issues move automatically into Wanted and Queue.</p>
-      </div>
-      <div class="arr-page-side">
-        <div class="arr-page-stats" id="inkdropPageStats"></div>
-        <div class="arr-page-actions" id="inkdropPageActions"></div>
-      </div>
-    </section>
-    <section class="arr-page-alert-banner" id="inkdropPageAlertBanner" hidden></section>
-
-    <section class="notice" id="packReviewBanner" hidden></section>
-
-    <details class="card source-health workflow-snapshot-drawer" id="workflowSnapshot" data-arr-page="history" hidden>
-      <summary>
-        <div class="section-title">
-          <div>
-            <h2>Activity Summary</h2>
-            <p class="mini" id="workflowSnapshotSummary">Current work, decisions, and parked source checks.</p>
-          </div>
-          <span class="queue-toggle"><span class="closed-label">Show snapshot</span><span class="open-label">Hide snapshot</span></span>
-        </div>
-      </summary>
-      <div class="workflow-snapshot-body">
-        <div class="workflow-actions">
-          <button onclick="goToWorkflowTarget('manualReview')">Manual Review</button>
-          <button onclick="goToWorkflowTarget('unmatchedDownloads')">Unmatched</button>
-          <button onclick="goToWorkflowTarget('sabComicFailures')">SAB</button>
-        </div>
-        <div class="workflow-next" id="workflowNextAction" hidden></div>
-        <div class="workflow-grid" id="workflowSnapshotGrid"></div>
-      </div>
-    </details>
-
-    <div class="op-detail-dock" id="opDetailDock">
-    <section class="card source-health" id="inkdropCore" data-arr-page="series wanted queue activity history manual_review source_memory" hidden>
-      <div class="section-title core-shell-title" hidden aria-hidden="true">
-        <div>
-          <h2>InkDrop Core</h2>
-          <p class="mini">Standalone state owned by InkDrop: wanted items, queue movement, source attempts, imports, and history.</p>
-        </div>
-        <div class="workflow-actions">
-          <button id="inkdropCoreSyncBtn" type="button" data-arr-control-label="Sync State" aria-label="Sync State">Sync State</button>
-        </div>
-      </div>
-      <details class="core-overview-drawer" id="inkdropCoreOverview" hidden aria-hidden="true">
-        <summary>
-          <div>
-            <strong>Core Overview</strong>
-            <span id="inkdropCoreOverviewSummary">Section counts, current queue, and recent history.</span>
-          </div>
-          <span class="queue-toggle"><span class="closed-label">Show overview</span><span class="open-label">Hide overview</span></span>
-        </summary>
-        <div class="core-overview-body">
-          <div class="arr-section-grid" id="inkdropCoreSections"></div>
-          <div class="core-activity-strip" id="inkdropActivitySummary" hidden></div>
-          <div class="library-truth-panel" id="libraryTruthPanel" hidden></div>
-          <div class="core-columns">
-            <div class="core-panel">
-              <h3>Queue</h3>
-              <div class="core-list" id="inkdropQueuePreview">
-                <div class="mini">Loading queue...</div>
-              </div>
-            </div>
-            <div class="core-panel">
-              <h3>History</h3>
-              <div class="core-list" id="inkdropHistoryPreview">
-                <div class="mini">Loading history...</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </details>
-      <div class="core-panel" id="inkdropSectionPanel" hidden>
-        <div class="section-commandbar">
-          <div class="section-heading">
-            <span class="section-eyebrow" id="inkdropSectionEyebrow">InkDrop</span>
-            <h3 id="inkdropSectionTitle">Section</h3>
-            <p class="mini" id="inkdropSectionMeta"></p>
-          </div>
-          <div class="section-command-actions">
-            <div class="section-view-mode" id="inkdropSectionViewMode" hidden></div>
-            <span class="section-active-filter" id="inkdropSectionActiveFilter">Loading</span>
-            <button class="section-refresh" id="inkdropSectionRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh section">Refresh</button>
-            <button class="section-refresh bad" id="inkdropSectionResetAttemptsBtn" type="button" data-arr-control-label="Clear attempts" aria-label="Clear this series' recorded attempts" hidden>Clear attempts</button>
-          </div>
-        </div>
-        <div class="series-add-top-slot" id="seriesAddTopSlot" hidden></div>
-        <div class="section-operator-now" id="inkdropOperatorNow" hidden></div>
-        <div class="section-policy-strip" id="inkdropPolicyStrip" hidden></div>
-        <div class="series-art-coverage-strip" id="inkdropSeriesArtCoverage" hidden></div>
-        <div class="series-library-toolbar" id="inkdropSeriesLibraryToolbar" hidden></div>
-        <div class="section-triage-strip" id="inkdropTriageStrip" hidden></div>
-        <div class="section-workbench" id="inkdropSectionWorkbench" hidden></div>
-        <section class="missing-recovery" id="inkdropMissingRecovery" aria-live="polite" hidden></section>
-        <div class="core-section-summary" id="inkdropSectionSummary" hidden></div>
-        <section class="notice" id="inkdropSectionNotice" hidden></section>
-        <div class="core-filter-bar" id="inkdropSectionFilters" hidden></div>
-        <div class="section-lane-board" id="inkdropLaneBoard" hidden></div>
-        <div class="section-lane-ribbon" id="inkdropLaneRibbon" hidden></div>
-        <div class="worker-activity-panel" id="inkdropWorkerActivityPanel" hidden></div>
-        <div class="core-list" id="inkdropSectionRows"></div>
-      </div>
-    </section>
-    <section class="series-remove-modal manual-review-decision-modal" id="manualReviewDecisionModal" role="dialog" aria-modal="true" aria-labelledby="manualReviewDecisionTitle" aria-describedby="manualReviewDecisionCopy" hidden>
-      <div class="series-remove-dialog manual-review-decision-dialog" id="manualReviewDecisionDialog">
-        <div class="series-remove-head">
-          <div class="manual-review-decision-heading">
-            <h3 id="manualReviewDecisionTitle">Review Manual Decision</h3>
-            <span class="mini" id="manualReviewDecisionSubtitle"></span>
-          </div>
-          <button class="series-remove-close" id="manualReviewDecisionClose" type="button" aria-label="Close Manual Review decision panel" onclick="closeManualReviewDecisionModal()">&times;</button>
-        </div>
-        <div class="series-remove-body manual-review-decision-body">
-          <div class="series-remove-alert warn" id="manualReviewDecisionAlert">
-            <strong id="manualReviewDecisionProblem">Needs Review</strong>
-            <span id="manualReviewDecisionCopy">Review the candidate before InkDrop imports it.</span>
-          </div>
-          <div class="manual-review-evidence-columns" id="manualReviewDecisionEvidence">
-            <div class="manual-review-evidence-column">
-              <h4>Expected</h4>
-              <div class="manual-review-decision-grid" id="manualReviewDecisionExpectedFacts"></div>
-            </div>
-            <div class="manual-review-evidence-column">
-              <h4>Candidate</h4>
-              <div class="manual-review-decision-grid" id="manualReviewDecisionCandidateFacts"></div>
-            </div>
-          </div>
-          <div class="manual-review-decision-note" id="manualReviewDecisionSafety"></div>
-          <details class="manual-review-decision-advanced" id="manualReviewDecisionAdvanced">
-            <summary>Advanced</summary>
-            <div class="manual-review-decision-actions-secondary" id="manualReviewDecisionAdvancedActions"></div>
-          </details>
-        </div>
-        <!-- A failed decision leaves this panel open, and on a narrow
-             viewport the toast that used to be the only report of the failure
-             paints behind this overlay: .activity-region sits inside the nav
-             shell's own stacking context (z-index 20/30), below the modal
-             layer (120), so no z-index on the toast can lift it out. The
-             failure is reported here instead, pinned outside the scrolling
-             body so it is visible wherever the person has scrolled to. -->
-        <div class="manual-review-decision-status" id="manualReviewDecisionStatus" role="status" hidden></div>
-        <div class="series-remove-foot manual-review-decision-actions" id="manualReviewDecisionActions">
-          <button type="button" onclick="closeManualReviewDecisionModal()">Close</button>
-        </div>
-        <div class="manual-review-decision-nav" id="manualReviewDecisionNav" hidden>
-          <button type="button" id="manualReviewDecisionPrev" onclick="stepManualReviewDecision(-1)">&lsaquo; Previous</button>
-          <span id="manualReviewDecisionNavPosition"></span>
-          <button type="button" id="manualReviewDecisionNext" onclick="stepManualReviewDecision(1)">Next &rsaquo;</button>
-        </div>
-      </div>
-    </section>
-    <section class="series-remove-modal source-memory-detail-panel" id="sourceMemoryDetailPanel" role="dialog" aria-modal="true" aria-labelledby="sourceMemoryDetailTitle" hidden>
-      <div class="series-remove-dialog source-memory-detail-dialog" id="sourceMemoryDetailDialog">
-        <div class="series-remove-head">
-          <div class="source-memory-detail-heading">
-            <img class="source-memory-detail-cover" id="sourceMemoryDetailCover" alt="" hidden>
-            <div>
-              <h3 id="sourceMemoryDetailTitle">Blocked candidate</h3>
-              <span class="mini" id="sourceMemoryDetailSubtitle"></span>
-            </div>
-          </div>
-          <button class="series-remove-close" id="sourceMemoryDetailClose" type="button" aria-label="Close blocklist detail panel" onclick="closeSourceMemoryDetailPanel()">&times;</button>
-        </div>
-        <div class="series-remove-body">
-          <div class="source-memory-detail-section-label">Details</div>
-          <div class="manual-review-decision-grid" id="sourceMemoryDetailFacts"></div>
-          <div class="source-memory-detail-section-label">Actions</div>
-          <div class="source-memory-detail-action-stack" id="sourceMemoryDetailActionStack"></div>
-          <div class="source-memory-detail-section-label">More</div>
-          <div class="source-memory-detail-more" id="sourceMemoryDetailMore"></div>
-        </div>
-        <div class="series-remove-foot manual-review-decision-actions" id="sourceMemoryDetailActions"></div>
-      </div>
-    </section>
-    </div>
-
-    <details class="card source-health settings-drawer" id="inkdropSettings" data-arr-page="settings" data-settings-page-shell="index" hidden open>
-      <summary>
-        <div class="section-title">
-          <div>
-            <h2>Settings</h2>
-            <p class="mini">Indexers, download clients, paths, language rules, and automation defaults.</p>
-          </div>
-          <span class="queue-toggle"><span class="closed-label">Expand</span><span class="open-label">Collapse</span></span>
-        </div>
-      </summary>
-        <div class="settings-body">
-        <div class="workflow-actions settings-actions">
-          <div class="settings-toolbar-cluster" role="group" aria-label="Settings actions">
-            <button id="inkdropSettingsAdvancedBtn" type="button" data-settings-action="advanced" data-arr-control-label="Show Advanced" aria-label="Show Advanced" aria-pressed="false">Show Advanced</button>
-            <button id="inkdropSettingsDirtyState" type="button" data-settings-action="clean" data-arr-control-label="No Changes" aria-label="No Changes" disabled>No Changes</button>
-            <button id="inkdropSettingsTestAllBtn" type="button" data-settings-action="test" data-arr-control-label="Test All" aria-label="Test All" hidden>Test All</button>
-            <button id="inkdropSettingsSyncBtn" type="button" data-settings-action="refresh" data-arr-control-label="Refresh" aria-label="Refresh settings">Refresh</button>
-          </div>
-          <label class="settings-search" data-settings-search-control="1" for="inkdropSettingsSearch">
-            <input id="inkdropSettingsSearch" type="search" placeholder="Search Settings" autocomplete="off" aria-label="Search Settings">
-          </label>
-        </div>
-        <div class="settings-grid" id="inkdropSettingsGrid">
-          <div class="mini">Loading settings...</div>
-        </div>
-      </div>
-    </details>
-
-    <section class="card source-health system-page" id="inkdropSystem" data-arr-page="system" hidden>
-      <div class="system-page-head">
-        <div>
-          <h2>System</h2>
-          <p class="mini">InkDrop health, current tasks, logs, and installed version.</p>
-        </div>
-        <div class="workflow-actions">
-          <button id="inkdropSystemRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh system">Refresh</button>
-        </div>
-      </div>
-      <div class="system-page-subnav" id="inkdropSystemSubnav" aria-label="System subviews"></div>
-      <div class="system-page-grid" id="inkdropSystemGrid">
-        <div class="mini">Loading system status...</div>
-      </div>
-    </section>
-
-    <section class="card calendar-page" id="inkdropCalendar" data-arr-page="calendar" hidden>
-      <div class="calendar-page-head">
-        <div>
-          <h2>Calendar</h2>
-          <p class="mini">What came out, on which day, and whether you have it. ComicVine and MangaDex do not publish forward release dates yet, so upcoming days stay empty until a provider does.</p>
-        </div>
-        <div class="workflow-actions">
-          <label class="calendar-window-control">
-            <span class="mini">Window</span>
-            <select id="inkdropCalendarWindow" aria-label="Calendar window">
-              <option value="14">Last 2 weeks</option>
-              <option value="30">Last month</option>
-              <option value="90">Last 3 months</option>
-            </select>
-          </label>
-          <button id="inkdropCalendarRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh calendar">Refresh</button>
-        </div>
-      </div>
-      <div class="calendar-page-body" id="inkdropCalendarBody">
-        <div class="mini">Loading calendar...</div>
-      </div>
-    </section>
-
-    <section class="card pull-list-page" id="inkdropPullList" data-arr-page="pull_list" hidden>
-      <div class="pull-list-page-head">
-        <div>
-          <h2>Pull List</h2>
-          <p class="mini" id="inkdropPullListRangeLabel">This week's releases for what you follow, and whether you've got them yet.</p>
-        </div>
-        <div class="workflow-actions pull-list-week-nav">
-          <button id="inkdropPullListPrevBtn" type="button" data-arr-control-label="Previous week" aria-label="Previous week">&lt; Prev</button>
-          <button id="inkdropPullListThisWeekBtn" type="button" data-arr-control-label="This week" aria-label="Jump to this week">This week</button>
-          <button id="inkdropPullListNextBtn" type="button" data-arr-control-label="Next week" aria-label="Next week">Next &gt;</button>
-          <button id="inkdropPullListRefreshBtn" type="button" data-arr-control-label="Refresh" aria-label="Refresh pull list">Refresh</button>
-        </div>
-      </div>
-      <div class="pull-list-page-body" id="inkdropPullListBody">
-        <div class="mini">Loading pull list...</div>
-      </div>
-    </section>
-
-    <details class="card watch-panel manual-review-support-tools" id="manualReviewSupportTools" data-arr-page="manual_review">
-      <summary>
-        <div class="section-title">
-          <div>
-            <h2>Support tools</h2>
-            <p class="mini">Secondary inboxes and diagnostics. Normal Manual Review work stays in the decision table above.</p>
-          </div>
-        </div>
-        <span class="queue-toggle"><span class="closed-label">Open support tools</span><span class="open-label">Close support tools</span></span>
-      </summary>
-      <div class="support-tools-body">
-        <details class="card watch-panel exception-drawer" id="manualReviewPanel" data-arr-page="manual_review">
-          <summary>
-            <div class="section-title">
-              <div>
-                <h2>Decision details</h2>
-                <p class="mini">Detailed exception cards are collapsed here. Use the table above for normal review work.</p>
-              </div>
-            </div>
-            <span class="queue-toggle"><span class="closed-label">Show details</span><span class="open-label">Hide details</span></span>
-          </summary>
-          <div class="exception-drawer-body">
-            <div id="manualReview" class="review-card-list">
-              <div class="mini">Nothing to act on.</div>
-            </div>
-          </div>
-        </details>
-        <details class="card watch-panel exception-drawer" id="manualIntake" data-arr-page="manual_review">
-          <summary>
-            <div class="section-title">
-              <div class="side">
-                <h2>Manual Intake</h2>
-                <p class="mini">Explicit inbox fallback for legally acquired files when automatic sources cannot find a safe match.</p>
-              </div>
-            </div>
-            <span class="queue-toggle"><span class="closed-label">Show fallback</span><span class="open-label">Hide fallback</span></span>
-          </summary>
-          <div class="exception-drawer-body">
-            <p class="mini">InkDrop only processes these explicit inboxes, matches against monitored InkDrop series, copies into the correct library folder, then scans and verifies.</p>
-            <div class="manual-intake-grid">
-              <div class="manual-intake-box">
-                <strong>Comics / Manga Inbox</strong>
-                <p class="mini"><code id="manualComicsInboxPath">/manual-inbox/comics</code></p>
-                <p class="mini">Matches monitored series, converts PDFs to CBZ when needed, scans Kavita, and leaves source files in place.</p>
-                <div class="actions">
-                  <button id="manualComicsPreview">Preview Inbox</button>
-                  <button class="primary" id="manualComicsRun">Process Inbox</button>
-                </div>
-              </div>
-              <!-- Pulled for this release: no ebook feature exists in InkDrop. The
-                   inbox path, preview/process wiring, and backend importer support
-                   are untouched -- only this card is hidden. -->
-              <div class="manual-intake-box" hidden aria-hidden="true">
-                <strong>Ebooks Inbox</strong>
-                <p class="mini"><code id="manualEbooksInboxPath">/manual-inbox/ebooks</code></p>
-                <p class="mini">Processes monitored ebook files from the explicit inbox only; unsupported files stay in the inbox.</p>
-                <div class="actions">
-                  <button id="manualEbooksPreview">Preview Inbox</button>
-                  <button class="primary" id="manualEbooksRun">Process Inbox</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </details>
-        <details class="card watch-panel exception-drawer" id="unmatchedDownloadsPanel" data-arr-page="manual_review">
-          <summary>
-            <div class="section-title">
-              <div>
-                <h2>Unmatched Downloads</h2>
-                <p class="mini">Fallback area for local files InkDrop found but could not safely match automatically.</p>
-              </div>
-            </div>
-            <span class="queue-toggle"><span class="closed-label">Show fallback</span><span class="open-label">Hide fallback</span></span>
-          </summary>
-          <div class="exception-drawer-body">
-            <p class="mini">Expand a group to search, preview a series match, import matched files, or quarantine temp-only leftovers.</p>
-            <button id="refreshUnmatchedBtn" data-arr-control-label="Refresh" aria-label="Refresh unmatched downloads" onclick="loadUnmatchedDownloads()">Refresh</button>
-            <div id="unmatchedDownloads" class="review-card-list">
-              <div class="mini">Checking unmatched downloads...</div>
-            </div>
-          </div>
-        </details>
-        <details class="card watch-panel exception-drawer" id="sabComicFailuresPanel" data-arr-page="manual_review">
-          <summary>
-            <div class="section-title">
-              <div class="side">
-                <h2>SAB Comic / Manga Failures</h2>
-                <p class="mini">Fallback learning area for comic and manga NZB failures.</p>
-              </div>
-            </div>
-            <span class="queue-toggle"><span class="closed-label">Show fallback</span><span class="open-label">Hide fallback</span></span>
-          </summary>
-          <div class="exception-drawer-body">
-            <p class="mini">Use this when failures need retry, re-source, or rescue attention.</p>
-            <button id="learnSabFailuresBtn" onclick="learnSabFailures()">Learn Failures</button>
-            <div id="sabComicFailures" class="sab-failure-list">
-              <div class="mini">Checking SAB...</div>
-            </div>
-          </div>
-        </details>
-      </div>
-    </details>
-
-    <section class="card source-health" id="sourceHealth" data-arr-page="queue" hidden>
-      <div class="section-title">
-        <div>
-          <h2>Source Health</h2>
-          <p class="mini">Provider health and source trouble. Queue links stay with the work rows.</p>
-        </div>
-      </div>
-      <div class="source-grid" id="sourceHealthGrid"></div>
-    </section>
-
-    <div id="seriesSearchLegacySlot" hidden></div>
-    <section class="card watch-panel" id="seriesSearchSection" data-arr-page="series queue" aria-expanded="false">
-      <div class="series-add-head">
-        <div>
-          <strong>Add Series</strong>
-          <span>Find a series by title, then let InkDrop track it and fill in the issues you are missing.</span>
-        </div>
-        <button class="series-add-collapse" type="button" onclick="setSeriesAddPanelOpen(false)">Collapse</button>
-      </div>
-      <div class="series-grid">
-        <label>Series
-          <input id="seriesQuery" placeholder="Berserk, Saga, Ice Cream Man, One Piece...">
-        </label>
-        <label>Source
-          <select id="seriesProvider">
-            <option value="all" selected>All sources</option>
-            <option value="comicvine">ComicVine</option>
-            <option value="mangadex">MangaDex pilot</option>
-            <option value="metron">Metron</option>
-          </select>
-        </label>
-        <label>Limit
-          <select id="seriesLimit">
-            <option selected>10</option>
-            <option>25</option>
-            <option>50</option>
-            <option>100</option>
-          </select>
-        </label>
-        <label>Mode
-          <span class="checkline"><input id="seriesAuto" type="checkbox" checked> Monitored</span>
-        </label>
-        <button class="primary" id="seriesSearchBtn">Search Series</button>
-      </div>
-      <p class="hint">Monitor &amp; Backfill adds missing work now. Monitoring future releases does not enable the Automatic Search worker.</p>
-      <div class="autopilot-strip automation-readiness" id="automaticSearchReadiness" data-automatic-search-readiness="add-series" role="status" aria-live="polite">
-        <div>
-          <div class="autopilot-title"><strong>Automatic Search</strong><span class="autopilot-state">Checking</span></div>
-          <div class="autopilot-mini">Checking runner configuration, worker freshness, and next-run status.</div>
-        </div>
-        <div class="autopilot-actions"><button type="button" onclick="openInkdropSettingsArea('automation')">Configure</button></div>
-      </div>
-      <table class="responsive">
-        <thead>
-          <tr>
-            <th>Series Match</th>
-            <th>Year</th>
-            <th>Issues</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="seriesResults">
-          <tr><td colspan="4" class="mini">Search comic or manga titles here.</td></tr>
-        </tbody>
-      </table>
-      <div class="autopilot-strip" id="seriesAutopilotStrip" hidden>
-        <div>
-          <div class="autopilot-title">
-            <strong>Series automation</strong>
-            <span class="autopilot-state" id="seriesAutopilotState">Idle</span>
-          </div>
-          <div class="autopilot-mini" id="seriesAutopilotDetail">Watched series move through Wanted and Activity > Queue automatically.</div>
-        </div>
-        <div class="autopilot-actions">
-          <button id="seriesAutopilotRun">Run Now</button>
-        </div>
-      </div>
-      <details class="queue-drawer" id="processQueueDrawer">
-        <summary>
-          <div class="section-title">
-            <div>
-              <h2>Watched Series</h2>
-              <p class="mini">Automation settings for one series at a time. Missing issues themselves show up in Wanted and in Activity's Queue.</p>
-            </div>
-            <div class="queue-summary-right">
-              <span class="queue-count" id="seriesWatchCount">0 watched</span>
-              <span class="queue-toggle">Expand</span>
-            </div>
-          </div>
-        </summary>
-        <section class="notice" id="automationSourceNotice" hidden></section>
-        <div id="seriesWatches" class="series-card-list">
-          <div class="mini">No ComicVine series watches yet.</div>
-        </div>
-      </details>
-    </section>
-
-    <details class="advanced card watch-panel" id="advancedOps" data-arr-page="system">
-      <summary>
-        <span class="advanced-ops-title">
-          <strong>Maintenance</strong>
-          <span>Manual jobs, source probes, and raw watcher controls for diagnostics.</span>
-        </span>
-      </summary>
-      <p class="advanced-ops-note">Advanced operator tools for recovery and targeted diagnostics. These are not normal Settings; day-to-day work should stay in Series, Wanted, Queue, Activity, Manual Review, and provider Settings.</p>
-      <div class="advanced-ops">
-        <button class="primary" id="processReadyBtn">Process All Ready</button>
-        <button id="freshSweepBtn">Fast Fresh Sweep</button>
-        <button id="rssDiscoveryBtn">GetComics RSS Sweep</button>
-        <button id="comicscodesDiscoveryBtn">ComicsCodes Sweep</button>
-        <button id="dryComics">Comics Dry Run</button>
-        <!-- Pulled for this release: no ebook feature exists in InkDrop. The
-             importer("ebooks", ...) wiring behind this button is untouched. -->
-        <button id="dryEbooks" hidden aria-hidden="true">Ebooks Dry Run</button>
-        <button id="suwayomiDry">Managed Folder Import Dry Run</button>
-        <button id="suwayomiRun">Process Managed Folder Imports</button>
-        <button class="warn" id="importNow">Run Import Now</button>
-      </div>
-      <div class="grid">
-        <section class="card">
-          <div class="toolbar">
-            <label>Raw Search
-              <input id="query" placeholder="Berserk Vol 42, Batman Year One, Locke & Key...">
-            </label>
-            <label>Type
-              <select id="type">
-                <option value="comics">Comics / Manga</option>
-              </select>
-            </label>
-            <label>Prefer
-              <select id="prefer">
-                <option value="torrent">Torrent</option>
-                <option value="usenet">Usenet</option>
-                <option value="any">Any</option>
-              </select>
-            </label>
-            <label>Limit
-              <select id="limit">
-                <option>5</option>
-                <option selected>10</option>
-                <option>25</option>
-                <option>50</option>
-                <option>100</option>
-              </select>
-            </label>
-            <button class="primary" id="searchBtn">Search</button>
-            <button id="probeBtn">Probe Sources</button>
-          </div>
-          <table class="responsive">
-            <thead>
-              <tr>
-                <th>Result</th>
-                <th>Indexer</th>
-                <th>Protocol</th>
-                <th>Size</th>
-                <th>Seeds</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="results">
-              <tr><td colspan="6" class="mini">Search results will appear here.</td></tr>
-            </tbody>
-          </table>
-        </section>
-        <aside class="card side">
-          <h2>Last Output</h2>
-          <pre id="output">Ready.</pre>
-        </aside>
-      </div>
-      <details class="advanced card watch-panel">
-      <summary>Raw Source Watches</summary>
-    <section>
-      <div class="watch-grid">
-        <label>Watch Query
-          <input id="watchQuery" placeholder="Saga, Berserk, Fire Punch...">
-        </label>
-        <label>Type
-          <select id="watchType">
-            <option value="comics">Comics / Manga</option>
-          </select>
-        </label>
-        <label>Prefer
-          <select id="watchPrefer">
-            <option value="torrent">Torrent</option>
-            <option value="usenet">Usenet</option>
-            <option value="any">Any</option>
-          </select>
-        </label>
-        <label>Limit
-          <select id="watchLimit">
-            <option selected>10</option>
-            <option>25</option>
-            <option>50</option>
-            <option>100</option>
-          </select>
-        </label>
-        <label>Mode
-          <span class="checkline"><input id="watchAuto" type="checkbox" checked> Auto future</span>
-        </label>
-        <button id="addWatch">Add Watch</button>
-        <button class="primary" id="scanWatches">Scan All</button>
-      </div>
-      <p class="hint">New watches baseline current results first, then track future matches. Auto future is capped to avoid backlog floods.</p>
-      <table>
-        <thead>
-          <tr>
-            <th>Watch</th>
-            <th>Mode</th>
-            <th>Last Scan</th>
-            <th>New</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="watches">
-          <tr><td colspan="5" class="mini">No tracked searches yet.</td></tr>
-        </tbody>
-      </table>
-    </section>
-      </details>
-    </details>
-    </div>
-    <section class="series-remove-modal" id="seriesRemoveModal" role="dialog" aria-modal="true" aria-labelledby="seriesRemoveTitle" aria-describedby="seriesRemoveCopy" hidden>
-      <div class="series-remove-dialog">
-        <div class="series-remove-head">
-          <h3 id="seriesRemoveTitle">Remove Series</h3>
-          <button class="series-remove-close" id="seriesRemoveClose" type="button" aria-label="Close remove series dialog" onclick="closeSeriesRemoveModal()">&times;</button>
-        </div>
-        <div class="series-remove-body">
-          <div class="series-remove-alert" id="seriesRemoveAlert">
-            <strong id="seriesRemoveActionTitle">Remove from InkDrop automation</strong>
-            <span id="seriesRemoveCopy">This parks the series, stops future monitoring, and retires active Wanted/Queue. Files and history stay intact.</span>
-          </div>
-          <div class="series-remove-series">
-            <strong id="seriesRemoveName">Series</strong>
-            <div class="series-remove-meta" id="seriesRemoveMeta"></div>
-          </div>
-          <div class="series-remove-impact" id="seriesRemoveImpact"></div>
-          <label class="series-remove-option">
-            <input id="seriesRemoveDeleteFiles" type="checkbox" onchange="updateSeriesRemoveFileMode()">
-            Remove files from disk
-            <span id="seriesRemoveDeleteFilesCopy">Files stay on disk unless this is enabled.</span>
-          </label>
-          <input id="seriesRemoveKeepFiles" type="hidden" value="true">
-          <label class="series-remove-option">
-            <input id="seriesRemoveKeepHistory" type="checkbox" checked disabled>
-            Keep history and evidence
-            <span>History, imports, attempts, and source memory stay available for audit.</span>
-          </label>
-        </div>
-        <div class="series-remove-foot">
-          <button id="seriesRemoveCancel" type="button" onclick="closeSeriesRemoveModal()">Cancel</button>
-          <button class="series-remove-confirm" id="seriesRemoveConfirm" type="button" onclick="confirmSeriesRemove()">Remove from InkDrop</button>
-        </div>
-      </div>
-    </section>
-    <section class="series-remove-modal series-library-modal" id="seriesLibraryModal" role="dialog" aria-modal="true" aria-labelledby="seriesLibraryTitle" aria-describedby="seriesLibraryCopy" hidden>
-      <div class="series-remove-dialog">
-        <div class="series-remove-head">
-          <h3 id="seriesLibraryTitle">Move Library</h3>
-          <button class="series-remove-close" id="seriesLibraryClose" type="button" aria-label="Close move library dialog" onclick="closeSeriesLibraryModal()">&times;</button>
-        </div>
-        <div class="series-remove-body">
-          <div class="series-remove-alert" id="seriesLibraryAlert">
-            <strong id="seriesLibraryActionTitle">Change content type or root folder</strong>
-            <span id="seriesLibraryCopy">Pick the library this series belongs in. InkDrop can move the existing folder for you, or just update the assignment so future imports land in the right place.</span>
-          </div>
-          <div class="series-remove-series">
-            <strong id="seriesLibraryName">Series</strong>
-            <div class="series-remove-meta" id="seriesLibraryMeta"></div>
-          </div>
-          <div class="inkdrop-text-field">
-            <label id="seriesLibraryDestinationLabel" for="seriesLibraryDestination">Move to</label>
-            <select id="seriesLibraryDestination" onchange="updateSeriesLibraryModalPreview()"></select>
-          </div>
-          <label class="series-remove-option">
-            <input id="seriesLibraryMoveFiles" type="checkbox" onchange="updateSeriesLibraryModalPreview()">
-            Move existing files to the new folder
-            <span id="seriesLibraryMoveFilesCopy">Files stay right where they are unless this is enabled.</span>
-          </label>
-          <div class="series-remove-impact" id="seriesLibraryImpact"></div>
-        </div>
-        <div class="series-remove-foot">
-          <button id="seriesLibraryCancel" type="button" onclick="closeSeriesLibraryModal()">Cancel</button>
-          <button class="series-remove-confirm" id="seriesLibraryConfirm" type="button" disabled onclick="confirmSeriesLibraryMigration()">Move Library</button>
-        </div>
-      </div>
-    </section>
-    <section class="series-remove-modal inkdrop-confirm-modal" id="inkdropConfirmModal" role="dialog" aria-modal="true" aria-labelledby="inkdropConfirmTitle" aria-describedby="inkdropConfirmCopy" hidden>
-      <div class="series-remove-dialog" id="inkdropConfirmDialog">
-        <div class="series-remove-head">
-          <h3 id="inkdropConfirmTitle">Confirm Action</h3>
-          <button class="series-remove-close" id="inkdropConfirmClose" type="button" aria-label="Close confirmation dialog" onclick="closeInkdropConfirmModal(false)">&times;</button>
-        </div>
-        <div class="series-remove-body">
-          <div class="series-remove-alert" id="inkdropConfirmAlert">
-            <strong id="inkdropConfirmAction">Confirm action</strong>
-            <span id="inkdropConfirmCopy">Review the action before continuing.</span>
-          </div>
-          <div class="series-remove-series">
-            <strong id="inkdropConfirmSubject">Item</strong>
-            <div class="series-remove-meta" id="inkdropConfirmMeta"></div>
-          </div>
-          <div class="series-remove-impact" id="inkdropConfirmDetails"></div>
-        </div>
-        <div class="series-remove-foot">
-          <button id="inkdropConfirmCancel" type="button" onclick="closeInkdropConfirmModal(false)">Cancel</button>
-          <button class="series-remove-confirm" id="inkdropConfirmAccept" type="button" onclick="closeInkdropConfirmModal(true)">Confirm</button>
-        </div>
-      </div>
-    </section>
-    <section class="series-remove-modal inkdrop-text-modal" id="inkdropTextModal" role="dialog" aria-modal="true" aria-labelledby="inkdropTextTitle" aria-describedby="inkdropTextCopy" hidden>
-      <div class="series-remove-dialog" id="inkdropTextDialog">
-        <div class="series-remove-head">
-          <h3 id="inkdropTextTitle">Enter Value</h3>
-          <button class="series-remove-close" id="inkdropTextClose" type="button" aria-label="Close input dialog" onclick="closeInkdropTextModal(null)">&times;</button>
-        </div>
-        <div class="series-remove-body">
-          <div class="series-remove-alert" id="inkdropTextAlert">
-            <strong id="inkdropTextAction">Choose value</strong>
-            <span id="inkdropTextCopy">Enter a value before continuing.</span>
-          </div>
-          <div class="series-remove-series">
-            <strong id="inkdropTextSubject">Item</strong>
-            <div class="series-remove-meta" id="inkdropTextMeta"></div>
-          </div>
-          <div class="inkdrop-text-field">
-            <label id="inkdropTextLabel" for="inkdropTextInput">Value</label>
-            <input id="inkdropTextInput" type="text" autocomplete="off">
-          </div>
-          <div class="series-remove-impact" id="inkdropTextDetails"></div>
-        </div>
-        <div class="series-remove-foot">
-          <button id="inkdropTextCancel" type="button" onclick="closeInkdropTextModal(null)">Cancel</button>
-          <button class="series-remove-confirm" id="inkdropTextAccept" type="button" onclick="acceptInkdropTextModal()">Continue</button>
-        </div>
-      </div>
-    </section>
-  </main>
-  <script>
+INKDROP_UI_SHELL_FILE = _ROOT / "web" / "templates" / "inkdrop-shell.html"
+HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
     const $ = (id) => document.getElementById(id);
     let lastKind = "comics";
     let lastStatusData = null;
@@ -1270,10 +359,24 @@ HTML = r"""<!doctype html>
       return utilityInkdropSectionPages[key] || activeInkdropPrimarySection || "series";
     }
 
-    function inkdropStateSectionCount(state, key, fallback=0) {
+    // Returns null when nothing has said what the count is yet -- NOT 0.
+    //
+    // Reported live: a Manual Review masthead tile reading "0 NEEDS DECISION"
+    // directly beside a chip reading "Needs Decision 25". The counters do not
+    // disagree; every Manual Review count in the payload is the same number
+    // (157 from state_sections(), state_view_total_count() and the
+    // manual_review view itself on 2026-08-25). The masthead simply paints
+    // before the status poll lands, and this function used to end in
+    // `Number(fallback || 0)` -- so "I have not been told" and "there are
+    // none" were the same value, rendered with the same confidence.
+    //
+    // A caller that genuinely knows the count is zero passes 0 and still gets
+    // 0; only an absent section row AND an absent fallback produce null.
+    function inkdropStateSectionCount(state, key, fallback=null) {
       const sections = Array.isArray(state?.sections) ? state.sections : [];
       const row = sections.find(item => String(item?.key || "") === key);
-      return row ? Number(row.count || 0) : Number(fallback || 0);
+      if (row) return Number(row.count || 0);
+      return Number.isFinite(Number(fallback)) && fallback !== null ? Number(fallback) : null;
     }
 
     function mastheadAction(label, options={}) {
@@ -1290,7 +393,18 @@ HTML = r"""<!doctype html>
       const wantedCount = inkdropStateSectionCount(state, "wanted", wantedFallback);
       const queueFallback = Number(state.queue_work_items ?? state.queue_active_work_items ?? state.active_queue_items ?? 0);
       const queueCount = inkdropStateSectionCount(state, "queue", queueFallback);
-      const manualCount = inkdropStateSectionCount(state, "manual_review", Number(lastStatusData?.manual_review_actionable_count || 0));
+      // `|| 0` here would defeat inkdropStateSectionCount's null: an absent
+      // status payload has to arrive as absent, not as a zero it invented.
+      const manualStatusCount = Number.isFinite(Number(lastStatusData?.manual_review_actionable_count))
+        ? Number(lastStatusData.manual_review_actionable_count)
+        : null;
+      const manualCount = inkdropStateSectionCount(state, "manual_review", manualStatusCount);
+      // One vocabulary for every queue counter on the page. The chips and the
+      // table both count display state (queue_filter_options ->
+      // queue_display_states_for_filter), so the masthead does too; the raw
+      // column is the fallback for a payload predating the display field.
+      const queueDisplayStates = state.queue_by_display_active_state
+        || state.queue_by_active_state || state.queue_by_state || {};
       const systemHealth = data?.system_health || lastStatusData?.system_health || {};
       const systemProblemCount = Number(systemHealth.problem_count || 0);
       const activityItems = currentServerActivities(lastStatusData || data || state);
@@ -1358,18 +472,48 @@ HTML = r"""<!doctype html>
           description: "Downloads and imports in progress.",
           stats: [
             stat("working now", queueCount, "", true, "bolt"),
-            stat("downloading", Number((state.queue_by_active_state || state.queue_by_state || {}).downloading || 0), "", true, "download"),
+            // DISPLAY state, not the raw `state` column. queue_filter_options()
+            // counts the chips with the display vocabulary and the queue view
+            // filters its rows with it too, so the chip and the table agree
+            // with each other; this tile was the only counter on the screen
+            // still reading the raw column. Measured 2026-08-25:
+            // queue_by_active_state.downloading = 4 while
+            // queue_by_display_active_state.downloading = 1 and
+            // .source_wait = 3 -- a row whose state column says "downloading"
+            // but which is waiting on a source displays as Source Wait, so the
+            // tile said 4 next to a chip saying 1 for the same rows.
+            //
+            // Falls back to the raw vocabulary: queue_by_display_active_state
+            // is the newer field and a payload without it must still count
+            // rather than render every tile as zero.
+            stat("downloading", Number(queueDisplayStates.downloading || 0), "", true, "download"),
             // Importing broken out from the combined download_task_active_items
             // count -- queue_by_active_state already carries it split out, so
             // this needed no backend change, just reading the field that was
             // already there instead of the pre-aggregated total.
-            stat("importing", Number((state.queue_by_active_state || state.queue_by_state || {}).importing || 0), "good", true, "upload"),
+            stat("importing", Number(queueDisplayStates.importing || 0), "good", true, "upload"),
+            // No "source wait" tile here on purpose, even though that is where
+            // the rows leaving Downloading go. queue_filter_options() counts
+            // the Source Wait CHIP from queue_provider_wait_count() -- a
+            // separate DB query, 129 on 2026-08-25 -- while
+            // queue_by_display_active_state.source_wait is 3. A tile reading 3
+            // beside a chip reading 129 for the same words would be the same
+            // defect this change exists to remove. The rows are not lost:
+            // "working now" is the section total and the chip below is the
+            // precise breakdown.
             stat("waiting", Number(state.queue_backlog_provider_wait_items || state.queue_backlog_source_limited_items || 0), "warn", true, "clock"),
           ],
           banner: {
             count: manualCount,
             tone: "bad",
-            title: manualCount === 1 ? "1 download needs attention" : `${compactNumber(manualCount)} downloads need attention`,
+            // Says which rows, and where they are. The React island renders its
+            // own banner about 180px below this one, counting the queue's
+            // `exceptions` facet -- a different population -- and both used to
+            // say "need attention", so the screen appeared to contradict
+            // itself while both numbers were right.
+            title: manualCount === 1
+              ? "1 row needs a decision in Manual Review"
+              : `${compactNumber(manualCount)} rows need a decision in Manual Review`,
             detail: "Open the failed items to retry, block the release, or choose another source.",
             actionLabel: "Review problems",
             section: "manual_review",
@@ -1617,8 +761,13 @@ HTML = r"""<!doctype html>
       if (stats) {
         stats.innerHTML = "";
         for (const item of model.stats || []) {
+          // null/undefined means nobody has said yet. compactNumber(0) would
+          // print a confident "0" for it, which is the "0 NEEDS DECISION
+          // beside Needs Decision 25" defect.
+          const unknownValue = item.value == null;
           const numeric = Number(item.value || 0);
-          if (!item.force && !numeric) continue;
+          if (!item.force && !numeric && !unknownValue) continue;
+          if (!item.force && unknownValue) continue;
           const chip = document.createElement("div");
           chip.className = `arr-page-stat ${item.tone || ""}`;
           if (item.icon) {
@@ -1631,7 +780,10 @@ HTML = r"""<!doctype html>
           const body = document.createElement("div");
           body.className = "arr-page-stat-body";
           const strong = document.createElement("strong");
-          strong.textContent = typeof item.value === "string" ? item.value : compactNumber(numeric);
+          strong.textContent = unknownValue
+            ? "\u2014"
+            : (typeof item.value === "string" ? item.value : compactNumber(numeric));
+          if (unknownValue) strong.title = "Not loaded yet";
           const span = document.createElement("span");
           span.textContent = item.label || "";
           body.append(strong, span);
@@ -1842,8 +994,23 @@ HTML = r"""<!doctype html>
     }
 
     function size(bytes) {
+      // BINARY DIVISIONS NEED BINARY NAMES. This divided by 1024 and labelled
+      // the result GB/TB, so every figure it produced was a GiB/TiB magnitude
+      // wearing a decimal name -- about 7% adrift at these scales.
+      //
+      // It showed up on System > Disk Space, where the row reads its two
+      // numbers from different places: Free Space renders `free_gib` with a
+      // literal "GiB", Total Space goes through here. So one row printed
+      // "282.31 GiB free" beside "636.5 GB total" -- the same unit under two
+      // names, which reads as two unit systems and makes the numbers look
+      // incomparable when in fact they always were.
+      //
+      // Binary is the convention this repo already chose:
+      // missing_recovery_bytes_label() in this same file divides by 1024 and
+      // labels TiB/GiB/MiB. This brings the JavaScript in line with it rather
+      // than adding a fourth opinion about units.
       if (!bytes && bytes !== 0) return "";
-      const units = ["B", "KB", "MB", "GB", "TB"];
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
       let n = Number(bytes), i = 0;
       while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
       return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
@@ -8372,10 +7539,16 @@ HTML = r"""<!doctype html>
 
         const logsBody = appendSystemSection(grid, "Log Files", "size on disk");
         if (inkdropUserIsAdministrator()) {
+          const logsDescription = document.createElement("p");
+          logsDescription.id = "inkdropLogDownloadDescription";
+          logsDescription.className = "mini";
+          logsDescription.textContent = "Recent log files only, redacted the same way the support bundle is. Titles and file paths can still appear, so review the ZIP before sharing.";
+          logsBody.appendChild(logsDescription);
           const downloadLogsButton = document.createElement("button");
           downloadLogsButton.type = "button";
           downloadLogsButton.className = "system-download-logs";
           downloadLogsButton.textContent = "Download logs only";
+          downloadLogsButton.setAttribute("aria-describedby", logsDescription.id);
           downloadLogsButton.onclick = async () => {
             downloadLogsButton.disabled = true;
             const originalText = downloadLogsButton.textContent;
@@ -11597,40 +10770,25 @@ HTML = r"""<!doctype html>
       return "";
     }
 
+    // No table here any more. window.__INKDROP_SOURCE_DISPLAY__ is the
+    // server's own SOURCE_DISPLAY_LABELS, and window.InkDropSourceLabel
+    // (web/static/js/inkdrop-api.js) applies the server's rule to it -- brand
+    // names with internal capitals included, which is what the local table
+    // existed for. The "source" default keeps this function's own contract:
+    // an empty value has always rendered as a word here rather than blank.
+    //
+    // inkdrop-api.js is a deferred <head> script and this block is an inline
+    // one at the end of <body>, so it is parsed BEFORE the shared function
+    // exists. Nothing calls this during that parse -- the page boots on the
+    // inkdrop-auth-ready event, fired from another deferred script, by which
+    // time every deferred script has run -- but that is a load-order argument
+    // and this is a label. coreStateLabel() is the fallback the local table
+    // always had behind it: it names a source no better than it ever did, and
+    // it means a page that somehow reaches here early renders a word instead
+    // of throwing.
     function sourceBucketLabel(value) {
-      const key = String(value || "").trim().toLowerCase();
-      const labels = {
-        prowlarr: "Prowlarr",
-        rss: "RSS",
-        comicscodes: "ComicsCodes",
-        slskd: "SLSKD",
-        failed_retry: "Retry",
-        local: "Local Library Check",
-        queued: "Queued",
-        sab: "SABnzbd",
-        sabnzbd: "SABnzbd",
-        qb: "qBittorrent",
-        qbit: "qBittorrent",
-        qbittorrent: "qBittorrent",
-        torrent: "Torrent",
-        usenet: "Usenet",
-        download_client: "Download Client",
-        source_ladder: "Source Ladder",
-        visible: "Visible",
-        hidden: "Hidden Sources",
-        // Unmapped input falls through to coreStateLabel(), which lowercases
-        // then re-capitalizes only each word's first letter -- fine for plain
-        // words, but it mangles brand names with internal capitals ("MangaDex"
-        // -> "Mangadex", "ComicVine" -> "Comicvine"). Confirmed live: a Manual
-        // Review row's MangaDex source rendered as "Mangadex" before this.
-        mangadex: "MangaDex",
-        comicvine: "ComicVine",
-        cv: "ComicVine",
-        kapowarr: "Kapowarr",
-        kavita: "Kavita",
-        komga: "Komga",
-      };
-      return labels[key] || coreStateLabel(key || "source");
+      const key = String(value || "").trim() || "source";
+      return window.InkDropSourceLabel ? window.InkDropSourceLabel(key) : coreStateLabel(key);
     }
 
     function transferDetail(row, maxLength=132) {
@@ -15027,7 +14185,11 @@ HTML = r"""<!doctype html>
       importing: ["Importing"],
       waiting_for_library_scan: ["Waiting"],
       complete: ["Complete"],
-      needs_attention: ["Needs Review", "Failed", "Blocked"],
+      // Matched against coreStateLabel()'s rendered OUTPUT, so this list has
+      // to move whenever that wording does or the tile selects nothing and
+      // says nothing about it. Pinned by
+      // tests/inkdrop-one-state-name-for-needs-you-smoke.py.
+      needs_attention: ["Needs you", "Failed", "Blocked"],
     };
 
     function inkdropTableRowMatchesText(row, text) {
@@ -16788,7 +15950,12 @@ HTML = r"""<!doctype html>
         folder_complete: "Complete", folder_verified: "Complete", library_visible: "Complete",
         failed: "Failed", error: "Failed", library_scan_timeout: "Failed", scan_timeout: "Failed", kavita_scan_timeout: "Failed",
         blocked: "Blocked", policy_block: "Blocked", language_blocked: "Blocked",
-        needs_you: "Needs Review", needs_user: "Needs Review", manual_exception: "Needs Review", manual_review: "Needs Review",
+        // The server names this state ("Needs you", sentence-cased onto
+        // state_label by manual_review_canonical_snapshot) and mobile renders
+        // what the server says. This table used to say "Needs Review" for the
+        // same rows, so one state had two names depending on which surface you
+        // were looking at. The server's wording is the wording.
+        needs_you: "Needs you", needs_user: "Needs you", manual_exception: "Needs you", manual_review: "Needs you",
       };
       if (lifecycleAliases[lower]) return lifecycleAliases[lower];
       const labels = {
@@ -16994,12 +16161,12 @@ HTML = r"""<!doctype html>
     }
 
     function appendSectionSummaryChip(parent, label, value, tone="", force=false) {
-      if (!parent) return;
+      if (!parent) return null;
       const numeric = typeof value === "number" || (typeof value === "string" && value.trim() !== "" && !Number.isNaN(Number(value)));
       const numberValue = numeric ? Number(value) : null;
       if (!force) {
-        if (numeric && !numberValue) return;
-        if (!numeric && (value === undefined || value === null || value === "")) return;
+        if (numeric && !numberValue) return null;
+        if (!numeric && (value === undefined || value === null || value === "")) return null;
       }
       const chip = document.createElement("div");
       chip.className = `summary-chip ${tone || ""}`;
@@ -17009,6 +16176,36 @@ HTML = r"""<!doctype html>
       span.textContent = label || "";
       chip.append(strong, span);
       parent.appendChild(chip);
+      return chip;
+    }
+
+    // The first chip on every section strip counts ROWS. Every chip after it
+    // counts a filter, and the filters are independent -- an issue can be both
+    // wanted and active, and both facets count it.
+    //
+    // Reported live from a series page header: "24 shown · 2 active · 2 wanted
+    // · 21 verified", which adds to 25. All four numbers are right; the one
+    // issue that is both wanted and active is the one-item difference. What
+    // was wrong is that four identical chips in a row read as a breakdown, so
+    // the honest reading of correct numbers was that one of them must be
+    // wrong. The count is marked as the count, and the facets say so.
+    function appendSectionRowCountChip(parent, label, value) {
+      const chip = appendSectionSummaryChip(parent, label, value, "", true);
+      if (chip) chip.className = `${chip.className} count`;
+      return chip;
+    }
+
+    function appendSectionFacetOverlapNote(parent, rowCountPhrase) {
+      // Nothing overlaps when the row count is alone on the strip, and a note
+      // about an absent group is just noise.
+      if (!parent || parent.children.length < 2) return;
+      const note = document.createElement("p");
+      note.className = "summary-facet-note";
+      // Names the actual number rather than saying "the count": the misread
+      // this fixes is arithmetic, and the reader is looking straight at the
+      // number that did not add up.
+      note.textContent = `A row can be in more than one of these, so they aren\u2019t a breakdown of the ${rowCountPhrase}.`;
+      parent.appendChild(note);
     }
 
     function renderInkdropSectionSummary(viewPayload) {
@@ -17023,7 +16220,7 @@ HTML = r"""<!doctype html>
       const summary = viewPayload.summary || {};
       const total = Number(viewPayload.total_count ?? viewPayload.count ?? (viewPayload.rows || []).length ?? 0);
       const loaded = Number(viewPayload.loaded_count ?? (viewPayload.rows || []).length ?? 0);
-      appendSectionSummaryChip(box, total > loaded ? "loaded" : "shown", total > loaded ? `${compactNumber(loaded)} / ${compactNumber(total)}` : total, "", true);
+      appendSectionRowCountChip(box, total > loaded ? "loaded" : "shown", total > loaded ? `${compactNumber(loaded)} / ${compactNumber(total)}` : total);
 
       if (view === "queue") {
         const active = summary.queue_by_display_active_state || summary.queue_by_active_state || summary.queue_by_state || {};
@@ -17132,6 +16329,12 @@ HTML = r"""<!doctype html>
         appendSectionSummaryChip(box, "waiting", Math.max(sectionFilterCount(viewPayload, "parked"), sectionFilterCount(viewPayload, "source_waiting"), sectionFilterCount(viewPayload, "source_checked")), "warn");
         appendSectionSummaryChip(box, "blocked", sectionFilterCount(viewPayload, "blocked"), "warn");
       }
+      appendSectionFacetOverlapNote(
+        box,
+        total > loaded
+          ? `${compactNumber(loaded)} rows loaded`
+          : `${compactNumber(total)} row${total === 1 ? "" : "s"} shown`,
+      );
       box.hidden = !box.children.length;
     }
 
@@ -17868,13 +17071,31 @@ HTML = r"""<!doctype html>
     }
 
     function manualReviewSourceCopy(row={}) {
-      return row?.provider_label
-        || row?.display_source
-        || row?.source_label
-        || row?.source
-        || row?.current_source
-        || row?.download_client
-        || "";
+      // The first three are already named -- provider_label and source_label
+      // are source_display_label() output from the server, display_source is
+      // rendered copy. The last three are RAW PROVIDER IDS, and returning one
+      // put a bare `slskd` in the decision panel's SOURCE field while the
+      // sibling branch of the very same field rendered "SLSKD staged file".
+      // One field, two casings, decided by whether the source happened to be
+      // a path.
+      //
+      // sourceBucketLabel() is this file's own source namer and already maps
+      // slskd -> SLSKD; operationalRowSourceLabel() a few hundred lines away
+      // calls it for exactly this purpose. Nothing new is introduced here --
+      // this call site simply never used it.
+      const labelled = row?.provider_label || row?.display_source || row?.source_label || "";
+      if (labelled) return labelled;
+      const raw = String(row?.source || row?.current_source || row?.download_client || "").trim();
+      if (!raw) return "";
+      // Tracker #820: `source` carries a filesystem path on staged-file rows,
+      // and every naming function here title-cases what it is handed -- which
+      // turns a path into one that no longer resolves and hands the operator a
+      // broken string to copy. The only caller today guards on sourceIsPath
+      // before reaching this, so a path cannot arrive; the check is repeated
+      // INSIDE so a second caller added later cannot reopen #820 by omitting
+      // the guard it does not know about.
+      if (/^([A-Za-z]:[\\/]|\/)/.test(raw) || /[\\/]/.test(raw)) return raw;
+      return sourceBucketLabel(raw) || raw;
     }
 
     function manualReviewIssueCopy(row={}) {
@@ -24763,8 +23984,6 @@ HTML = r"""<!doctype html>
         // resolvers other sources depend on (currently GetComics->Pixeldrain).
         // See the matching comment on settings_provider_group_public().
         pixeldrain: ["download_clients", "Download Clients", "Download clients, download handling and remote path mappings"],
-        wetransfer: ["download_clients", "Download Clients", "Download clients, download handling and remote path mappings"],
-        buzzheavier: ["download_clients", "Download Clients", "Download clients, download handling and remote path mappings"],
       };
       if (providerGroups[id]) return providerGroups[id];
       if (/(_sources|_trackers|reader_sites|search_engines|ddl_blogs|book_sites)$/.test(id)) {
@@ -28033,6 +27252,7 @@ HTML = r"""<!doctype html>
       body.appendChild(loadMoreButton);
 
       let oldestSeen = null;
+      let oldestSeenId = null;
       const appendRow = row => {
         const tr = document.createElement("tr");
         tr.className = "notifications-history-row";
@@ -28057,12 +27277,18 @@ HTML = r"""<!doctype html>
         };
         tbody.appendChild(tr);
         oldestSeen = row.created_at;
+        oldestSeenId = row.id;
       };
 
       const loadPage = async () => {
         loadMoreButton.disabled = true;
         try {
-          const query = oldestSeen ? `?limit=${NOTIFICATIONS_HISTORY_PAGE_LIMIT}&before=${oldestSeen}` : `?limit=${NOTIFICATIONS_HISTORY_PAGE_LIMIT}`;
+          // Page on (created_at, id), not created_at alone -- every delivery a
+          // single dispatch pass writes shares a timestamp, so a timestamp-only
+          // cursor drops the rest of the tie group at a page boundary.
+          const query = oldestSeen
+            ? `?limit=${NOTIFICATIONS_HISTORY_PAGE_LIMIT}&before=${oldestSeen}&before_id=${encodeURIComponent(oldestSeenId || "")}`
+            : `?limit=${NOTIFICATIONS_HISTORY_PAGE_LIMIT}`;
           const data = await getJsonWithTimeout(`/api/notifications/deliveries${query}`, 12000, "Loading delivery history");
           const rows = data?.deliveries || [];
           if (!oldestSeen && !rows.length) {
@@ -29176,6 +28402,34 @@ HTML = r"""<!doctype html>
               mergePreviewButton.disabled = false;
             }
           };
+          const verifyDetail = document.createElement("div");
+          verifyDetail.className = "settings-backup-merge-preview";
+          verifyDetail.hidden = true;
+          const verifyButton = document.createElement("button");
+          verifyButton.type = "button";
+          verifyButton.textContent = "Verify backup";
+          verifyButton.title = "Check that this backup's databases are intact and would restore cleanly. Read-only -- nothing is changed, and this works even while restoring is disabled.";
+          verifyButton.onclick = async () => {
+            verifyButton.disabled = true;
+            verifyDetail.hidden = false;
+            verifyDetail.replaceChildren();
+            const loading = document.createElement("p");
+            loading.className = "mini";
+            loading.textContent = "Checking this backup's databases…";
+            verifyDetail.appendChild(loading);
+            try {
+              const data = await api("/api/inkdrop-settings/backup/archives/restore/preview", {name: archive.name}, {timeoutMs: 300000});
+              renderRestoreVerifyDetail(verifyDetail, data?.result);
+            } catch (error) {
+              verifyDetail.replaceChildren();
+              const failed = document.createElement("p");
+              failed.className = "settings-backup-verify-failed";
+              failed.textContent = `This backup failed verification: ${error?.message || error}`;
+              verifyDetail.appendChild(failed);
+            } finally {
+              verifyButton.disabled = false;
+            }
+          };
           const deleteButton = document.createElement("button");
           deleteButton.type = "button";
           deleteButton.className = "danger";
@@ -29192,10 +28446,53 @@ HTML = r"""<!doctype html>
               deleteButton.disabled = false;
             }
           };
-          row.append(label, downloadLink, restoreButton, mergePreviewButton, deleteButton);
-          rowWrap.append(row, mergePreviewDetail);
+          row.append(label, downloadLink, restoreButton, verifyButton, mergePreviewButton, deleteButton);
+          rowWrap.append(row, verifyDetail, mergePreviewDetail);
           list.appendChild(rowWrap);
         }
+      }
+
+      function renderRestoreVerifyDetail(container, result) {
+        container.replaceChildren();
+        if (!result) {
+          const empty = document.createElement("p");
+          empty.textContent = "No verification data was returned.";
+          container.appendChild(empty);
+          return;
+        }
+        const manifest = result.manifest || {};
+        const databaseValidation = result.database_validation || {};
+        const wouldRestore = result.would_restore || {};
+        const headline = document.createElement("p");
+        headline.textContent = `Backup from ${manifest.created_at || "an unknown time"} (label "${manifest.label || "unknown"}") passed every check below -- it would restore cleanly.`;
+        container.appendChild(headline);
+        const ul = document.createElement("ul");
+        ul.className = "mini";
+        const dbLabels = {state_db: "State database", auth_db: "Auth database"};
+        for (const [key, label] of Object.entries(dbLabels)) {
+          if (!wouldRestore[key]) continue;
+          const validation = databaseValidation[key] || {};
+          const li = document.createElement("li");
+          li.textContent = `${label}: SQLite integrity check ${validation.quick_check === "ok" ? "passed" : "did not pass"}, ${validation.foreign_key_violations ?? 0} foreign-key violation(s).`;
+          ul.appendChild(li);
+        }
+        for (const [key, label] of Object.entries({config_export: "App settings", secret_refs: "Encrypted secret references"})) {
+          const li = document.createElement("li");
+          li.textContent = `${label}: ${wouldRestore[key] ? "present in this backup" : "not included in this backup"}.`;
+          ul.appendChild(li);
+        }
+        container.appendChild(ul);
+        const pathWarnings = Array.isArray(result.path_warnings) ? result.path_warnings : [];
+        if (pathWarnings.length) {
+          const warnings = document.createElement("p");
+          warnings.className = "settings-backup-verify-warning";
+          warnings.textContent = `${pathWarnings.length} path setting${pathWarnings.length === 1 ? "" : "s"} from when this backup was made no longer exist on this host and would need updating after a restore.`;
+          container.appendChild(warnings);
+        }
+        const note = document.createElement("p");
+        note.className = "mini";
+        note.textContent = "This is a check only -- nothing has been changed. Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed; see the notice above.";
+        container.appendChild(note);
       }
 
       function describeMergePreview(result) {
@@ -33316,6 +32613,38 @@ HTML = r"""<!doctype html>
       return art;
     }
 
+    function seriesResultSourceLink(item, providerName) {
+      // Eight Image results for "Head Lopper" and nothing in the app to tell
+      // them apart. The URL is already in the payload and was being dropped
+      // here; a wrong pick creates wanted rows that then compete for the same
+      // search capacity as everything else, so this is cheaper than the mess
+      // it prevents.
+      const href = String(item?.siteUrl || "").trim();
+      if (!/^https:\/\//i.test(href)) return null;
+      const constructed = String(item?.siteUrlSource || "") === "constructed";
+      const wrap = document.createElement("div");
+      wrap.className = "mini series-result-source";
+      const a = document.createElement("a");
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = `Open ${providerName} page`;
+      // A constructed link is SAID to be constructed rather than quietly
+      // presented as the provider's own. MangaDex publishes no detail URL and
+      // Metron's search payload carries none, so both are built from the id.
+      a.title = constructed
+        ? `Built from this record's id — ${providerName} does not return a page URL for search results`
+        : `${providerName} returned this link for this record`;
+      wrap.appendChild(a);
+      if (constructed) {
+        const note = document.createElement("span");
+        note.className = "series-result-source-note";
+        note.textContent = " (built from the id)";
+        wrap.appendChild(note);
+      }
+      return wrap;
+    }
+
     function renderSeriesResults(items) {
       const body = $("seriesResults");
       if (!items.length) {
@@ -33344,6 +32673,7 @@ HTML = r"""<!doctype html>
         title.textContent = item.name || "";
         const meta = document.createElement("div");
         meta.className = "mini";
+        const sourceLink = seriesResultSourceLink(item, providerName);
         const metaBits = [
           item.publisher || providerName,
           item.matchScore !== undefined && item.matchScore !== null ? `match ${item.matchScore}` : "",
@@ -33355,6 +32685,7 @@ HTML = r"""<!doctype html>
         ].filter(Boolean);
         meta.textContent = metaBits.join(" · ");
         resultText.append(title, meta);
+        if (sourceLink) resultText.append(sourceLink);
         let descriptionEl = null;
         if (item.description) {
           descriptionEl = document.createElement("p");
@@ -37910,9 +37241,17 @@ HTML = r"""<!doctype html>
 </body>
 </html>
 """
+# One JSON rendering of the server's source-naming vocabulary, shared by both
+# documents. sort_keys so the bytes are stable across restarts and the page's
+# ETag/version does not churn on dict ordering alone.
+INKDROP_SOURCE_DISPLAY_JSON = json.dumps(
+    inkdrop_state.source_display_vocabulary(), sort_keys=True, separators=(",", ":")
+)
+
 HTML = HTML.replace("__INKDROP_UI_CSS_VERSION__", INKDROP_UI_CSS_VERSION)
 HTML = HTML.replace("__INKDROP_UI_JS_VERSION__", INKDROP_UI_JS_VERSION)
 HTML = HTML.replace("__INKDROP_UI_REACT_VERSION__", INKDROP_UI_REACT_VERSION)
+HTML = HTML.replace("__INKDROP_SOURCE_DISPLAY_JSON__", INKDROP_SOURCE_DISPLAY_JSON)
 
 # Standalone lightweight mobile status view. Deliberately its own tiny HTML
 # document rather than a responsive mode of the desktop shell above -- a
@@ -37927,10 +37266,20 @@ MOBILE_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Must precede the view-switch script below: without it the browser
+       has not yet adopted the real device width, so matchMedia reads
+       against the ~980px desktop-page default instead of the phone's
+       actual width -- see the redirect script's own comment. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <script>
     // Server-computed at request time -- see send_mobile_html() and the
     // matching flag on the desktop shell ("/").
     window.__INKDROP_SETUP_REQUIRED__ = __INKDROP_SETUP_REQUIRED_JSON__;
+    // The one source-naming vocabulary, rendered from
+    // core/inkdrop_state.SOURCE_DISPLAY_LABELS. Constant for the life of
+    // the process, so it is substituted once at import rather than per
+    // request. web/static/js/inkdrop-api.js turns it into a name.
+    window.__INKDROP_SOURCE_DISPLAY__ = __INKDROP_SOURCE_DISPLAY_JSON__;
   </script>
   <script>
     // Mirror of the gate script in the desktop shell ("/"): a wide viewport
@@ -37977,13 +37326,13 @@ MOBILE_HTML = r"""<!doctype html>
         return !!(window.matchMedia && window.matchMedia(BREAKPOINT).matches);
       }
       function maybeSwitch() {
-        if (window.__INKDROP_SETUP_REQUIRED__) { location.replace("/" + location.search); return; }
+        if (window.__INKDROP_SETUP_REQUIRED__) { location.replace("/" + location.search + location.hash); return; }
         var pref = preference();
         if (pref === "mobile") return;
-        if (pref === "desktop") { location.replace("/" + location.search); return; }
+        if (pref === "desktop") { location.replace("/" + location.search + location.hash); return; }
         if (!isNarrow() && !recentlyAutoSwitched()) {
           markAutoSwitched();
-          location.replace("/" + location.search);
+          location.replace("/" + location.search + location.hash);
         }
       }
       maybeSwitch();
@@ -38000,7 +37349,6 @@ MOBILE_HTML = r"""<!doctype html>
       window.addEventListener("pageshow", maybeSwitch);
     })();
   </script>
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#12141a">
   <meta name="robots" content="noindex">
   <title>InkDrop</title>
@@ -38128,6 +37476,7 @@ MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_UI_JS_VERSION__", INKDROP_UI_JS_VER
 MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_MOBILE_CSS_VERSION__", INKDROP_MOBILE_CSS_VERSION)
 MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_MOBILE_JS_VERSION__", INKDROP_MOBILE_JS_VERSION)
 MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_MOBILE_LOGO_VERSION__", INKDROP_LOGO_MARK_MOBILE_VERSION)
+MOBILE_HTML = MOBILE_HTML.replace("__INKDROP_SOURCE_DISPLAY_JSON__", INKDROP_SOURCE_DISPLAY_JSON)
 
 
 def command_env(extra=None):
@@ -40604,6 +39953,11 @@ def metron_search_series(query, limit=8, timeout=15, attempts=2):
             "issueCount": item.get("issue_count"),
             "description": "",
             "siteUrl": f"{METRON_SITE_URL}/{series_id}/" if series_id else "",
+            # Metron's SEARCH payload carries no resource_url, so this is
+            # constructed. The detail fetch below does get one and is marked
+            # "provider" there -- the same series can legitimately differ
+            # between the two calls.
+            "siteUrlSource": "constructed" if series_id else "",
             "image": "",
         }
         scoring = comicvine_result_score(query, result, quality_settings)
@@ -40636,6 +39990,8 @@ def metron_fetch_series(metron_id, timeout=15, attempts=2):
         "description": inkdrop_state.series_clean_description(data.get("desc") or ""),
         "genres": [g.get("name") for g in genres if isinstance(g, dict) and g.get("name")],
         "siteUrl": data.get("resource_url") or (f"{METRON_SITE_URL}/{data.get('id')}/" if data.get("id") else ""),
+        "siteUrlSource": ("provider" if data.get("resource_url")
+                          else ("constructed" if data.get("id") else "")),
         "image": "",
     }
 
@@ -41162,6 +40518,10 @@ def mangadex_search_manga(query, limit=8, timeout=15):
         description = inkdrop_state.series_clean_description(
             mangadex_localized_value(attrs.get("description"), settings.get("translated_languages"))
         )
+        # Already a 256px-wide cover (mangadex_cover_url()'s .256.jpg suffix
+        # is MangaDex's own CDN resize convention), so the search-result
+        # thumbnail is the same value as the full image, not a second fetch.
+        cover_image = mangadex_cover_url(manga_id, item.get("relationships") or [])
         results.append(
             {
                 "provider": "mangadex",
@@ -41173,7 +40533,13 @@ def mangadex_search_manga(query, limit=8, timeout=15):
                 "issueCount": issue_count,
                 "description": description,
                 "siteUrl": f"{MANGADEX_SITE_URL}/{manga_id}" if manga_id else "",
-                "image": mangadex_cover_url(manga_id, item.get("relationships") or []),
+                # MangaDex's API returns NO detail URL. This is constructed
+                # from the id against a documented, stable path, and it is
+                # marked as constructed rather than passed off as the
+                # provider's own.
+                "siteUrlSource": "constructed" if manga_id else "",
+                "image": cover_image,
+                "image_thumb": cover_image,
                 "status": attrs.get("status"),
                 "contentRating": attrs.get("contentRating"),
                 "publicationDemographic": attrs.get("publicationDemographic"),
@@ -41804,6 +41170,20 @@ def comicvine_image_url(image):
     return ""
 
 
+def comicvine_thumb_image_url(image):
+    """Same object as comicvine_image_url(), reading the small variant
+    ComicVine already returns alongside super_url in the same /search/
+    response -- used where a result is shown at thumbnail size (mobile Add)
+    rather than fetched full-size and scaled down client-side."""
+
+    image = image if isinstance(image, dict) else {}
+    for key in ("thumb_url", "small_url", "medium_url", "screen_url", "super_url", "original_url", "icon_url", "tiny_url"):
+        text = str(image.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def comicvine_search_volumes(query, limit=8, timeout=30, attempts=2):
     # ComicVine's own /search/ relevance ranking is not date-based, so a
     # currently-publishing volume can sit well outside a small raw-fetch
@@ -41843,7 +41223,13 @@ def comicvine_search_volumes(query, limit=8, timeout=30, attempts=2):
             "description": inkdrop_state.series_clean_description(item.get("description") or item.get("deck")),
             "deck": item.get("deck"),
             "siteUrl": item.get("site_detail_url"),
+            # ComicVine RETURNS this field; it is not built by us. The Add
+            # Series UI labels provider-supplied and constructed links
+            # differently, so the provenance has to travel with the URL --
+            # a guessed link that 404s is worse than no link.
+            "siteUrlSource": "provider" if item.get("site_detail_url") else "",
             "image": comicvine_image_url(image),
+            "image_thumb": comicvine_thumb_image_url(image),
         }
         scoring = comicvine_result_score(query, result, quality_settings)
         result["matchScore"] = scoring["score"]
@@ -42626,7 +42012,13 @@ def add_comic_series(payload):
         watch["autoGrabUserSetAt"] = time.time()
     watch["enabled"] = True
     watch["inkdropUserAdded"] = True
-    watch["inkdropAddedAt"] = watch.get("inkdropAddedAt") or time.time()
+    # An explicit user add is a fact about THIS request, so its timestamp is
+    # rewritten every time. The previous `or` preserved the first-add stamp
+    # forever, which left upsert_series() unable to tell "the user is adding
+    # this now" from "the user added this in July" -- see
+    # series_row_allows_removed_reactivation(). Nothing reads this field for
+    # display, so refreshing it changes no other behaviour.
+    watch["inkdropAddedAt"] = time.time()
     watch["createdBy"] = watch.get("createdBy") or "inkdrop_add_series"
     if watch.get("kapowarrId") not in (None, ""):
         watch["metadataAdapterStatus"] = "registered"
@@ -44649,7 +44041,14 @@ def slskd_autoresolve_row_activity_ts(row, default_ts=0):
         if not value:
             continue
         try:
-            best = max(best, time.mktime(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S")))
+            # These are SLSKD's "...Z" stamps. time.mktime() reads a struct_time
+            # as LOCAL time, so it returned a value the host's UTC offset away
+            # from the truth and this row sorted and aged wrong by that much.
+            # Latent rather than live -- the container sets no TZ, so it runs
+            # UTC and the two agree there -- but it is the last site in the tree
+            # still pairing strptime with mktime, and iso_stamp_relative_label()
+            # above exists because of the same mistake.
+            best = max(best, float(calendar.timegm(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S"))))
         except (TypeError, ValueError):
             pass
     return best
@@ -45299,10 +44698,35 @@ def missing_recovery_runtime_enabled():
     )
 
 
+def iso_stamp_relative_label(value, now=None):
+    """"6h ago" for an ISO-8601 UTC stamp, or "" when it is not one.
+
+    The control file records an ISO stamp because that is what a file on disk
+    should carry. What the panel prints is a different question, and the
+    answer is already written: inkdrop_state.relative_time_label() is the
+    product's one past-time vocabulary. This is the join between the two, so
+    the panel is handed wording rather than deriving its own.
+
+    time.mktime() would read the parsed struct as LOCAL time and land the
+    host's UTC offset away from the truth on a "...Z" stamp; calendar.timegm()
+    is the UTC-correct pair for time.strptime().
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return ""
+    reference = time.time() if now is None else float(now)
+    return inkdrop_state.relative_time_label(reference - calendar.timegm(parsed))
+
+
 def read_missing_recovery_control():
     default = {
         "paused": False,
         "requested_at": None,
+        "requested_at_label": "",
         "requested_by_hash": None,
         "one_shot_requested": False,
         "last_outcome": None,
@@ -45329,6 +44753,7 @@ def read_missing_recovery_control():
     return {
         "paused": raw.get("paused") is True,
         "requested_at": safe_optional_text(raw.get("requested_at"), 80) or None,
+        "requested_at_label": iso_stamp_relative_label(raw.get("requested_at")),
         "requested_by_hash": safe_optional_text(raw.get("requested_by_hash"), 80) or None,
         "one_shot_requested": raw.get("one_shot_requested") is True,
         "last_outcome": safe_optional_text(raw.get("last_outcome"), 40) or None,
@@ -45669,6 +45094,7 @@ def missing_recovery_dashboard_status(principal=None, *, force=False):
         payload["control"] = {
             "paused": control["paused"],
             "requested_at": control["requested_at"],
+            "requested_at_label": control["requested_at_label"],
             "one_shot_requested": control["one_shot_requested"],
             "last_outcome": control["last_outcome"],
             "last_outcome_at": control["last_outcome_at"],
@@ -45701,6 +45127,7 @@ def missing_recovery_dashboard_status(principal=None, *, force=False):
     payload["control"] = {
         "paused": control["paused"],
         "requested_at": control["requested_at"],
+        "requested_at_label": control["requested_at_label"],
         "one_shot_requested": control["one_shot_requested"],
         "valid": control["valid"],
         "reason": control["reason"],
@@ -45782,7 +45209,7 @@ def request_missing_recovery_start(principal):
         })
     threading.Thread(target=run_missing_recovery_one_shot, name="missing-recovery-one-shot", daemon=True).start()
     record_missing_recovery_audit_detached("start", actor_hash)
-    return {"ok": True, "requested": True, "control": {"paused": False, "requested_at": control["requested_at"], "one_shot_requested": True}}
+    return {"ok": True, "requested": True, "control": {"paused": False, "requested_at": control["requested_at"], "requested_at_label": iso_stamp_relative_label(control["requested_at"]), "one_shot_requested": True}}
 
 
 def request_missing_recovery_pause(principal):
@@ -47375,6 +46802,71 @@ def operator_system_health_summary():
         }
     )
     return summary
+
+
+def run_deferred_queue_sync_reconcile(payload):
+    """Operator-triggered run of the deferred queue-sync reconciler.
+
+    The reconciler otherwise only runs from the queue runner's own cadence, so
+    an operator looking at a stuck backlog had no way to act on it and no way
+    to find out what a run actually did. The reply reports what changed *and*
+    what it could not touch -- a run that repairs nothing must not read the
+    same as a run that had nothing to repair.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    batch_size = payload.get("batch_size", payload.get("batchSize"))
+    try:
+        batch_size = max(1, min(int(batch_size or 25), 100))
+    except (TypeError, ValueError):
+        batch_size = 25
+    try:
+        result = inkdrop_deferred_sync.reconcile_deferred_syncs(INKDROP_STATE_DB, batch_size=batch_size)
+    except Exception as exc:
+        watch_log("inkdrop_deferred_queue_sync_reconcile_failed", {"error": f"{type(exc).__name__}: {exc}"})
+        return {"ok": False, "reason": "reconcile_failed", "error": f"{type(exc).__name__}: {exc}"}
+    reconciled = int(result.get("reconciled") or 0)
+    replayed = int(result.get("replayed_attempts") or 0)
+    waiting = int(result.get("not_actionable_now") or 0)
+    failed = int(result.get("failed") or 0)
+    remaining = max(0, int(result.get("count") or 0) - reconciled)
+    if reconciled or replayed:
+        parts = []
+        if reconciled:
+            parts.append(f"retired {reconciled} stale snapshot{'' if reconciled == 1 else 's'}")
+        if replayed:
+            parts.append(f"replayed {replayed} lost source attempt{'' if replayed == 1 else 's'}")
+        message = "Reconciled the deferred queue-sync backlog: " + ", and ".join(parts) + "."
+    elif failed:
+        message = (
+            f"Nothing was retired: {failed} snapshot{'' if failed == 1 else 's'} still hold writes that "
+            "could not be replayed, so they were left in place rather than discarded."
+        )
+    elif waiting:
+        message = (
+            f"Nothing to retire yet. {waiting} snapshot{' is' if waiting == 1 else 's are'} still held by the "
+            "worker that made them; they become reclaimable once they age out of its replay window."
+        )
+    elif remaining:
+        message = f"Nothing to retire yet. {remaining} snapshot(s) are still scheduled for a retry."
+    else:
+        message = "The deferred queue-sync backlog is empty."
+    watch_log(
+        "inkdrop_deferred_queue_sync_reconcile",
+        {"reconciled": reconciled, "replayedAttempts": replayed, "failed": failed, "waiting": waiting},
+    )
+    return {
+        "ok": True,
+        "message": message,
+        "reconciled": reconciled,
+        "replayed_attempts": replayed,
+        "failed": failed,
+        "not_actionable_now": waiting,
+        "remaining_pending": remaining,
+        "reclaim_failed_ids": result.get("reclaim_failed_ids") or [],
+        "reclaim_notes": result.get("reclaim_notes") or [],
+        "audit_event_id": result.get("audit_event_id"),
+        "count_by_reason": result.get("count_by_reason") or {},
+    }
 
 
 def operator_contract_payload():
@@ -50476,13 +49968,31 @@ def inkdrop_series_cover_refresh_candidate_id(row):
     return match.group(1) if match else ""
 
 
+# The row source this sweep reads is itself capped at SERIES_COVER_REFRESH_ROW_SCAN
+# rows, so the eligible population can never exceed it. That cap is the only
+# absolute bound on a sweep; there is deliberately no smaller default, because a
+# default below the population is how this stopped short in silence.
+SERIES_COVER_REFRESH_ROW_SCAN = 5000
+
+
 def refresh_inkdrop_series_cover_metadata(payload):
+    """Repair series whose cover or display metadata never landed.
+
+    `limit` is honoured when a caller names one and is otherwise ABSENT, not
+    defaulted. It used to default to 8 and clamp to 20; the eligible population
+    was 13, so a sweep that named no limit repaired 8, reported `candidates: 8`,
+    and gave no indication the list had been cut. The response now always
+    carries `eligible` and `truncated`, so a short run cannot read as a complete
+    one whether the shortfall came from a default or from an operator's choice.
+    """
     payload = payload if isinstance(payload, dict) else {}
-    try:
-        limit = int(payload.get("limit") or 8)
-    except (TypeError, ValueError):
-        limit = 8
-    limit = max(1, min(limit, 20))
+    limit_given = payload.get("limit")
+    limit = None
+    if limit_given not in (None, ""):
+        try:
+            limit = max(1, int(limit_given))
+        except (TypeError, ValueError):
+            limit = None
     requested_ids = {
         str(value or "").strip()
         for value in (
@@ -50493,8 +50003,16 @@ def refresh_inkdrop_series_cover_metadata(payload):
         )
         if str(value or "").strip()
     }
-    rows = inkdrop_state.series_rows(INKDROP_STATE_DB, 5000, series_filter="all")
-    candidates = []
+    # A caller that names ids has stated its intent more precisely than a limit
+    # can: it must get every id it named. The series-detail refresh sends
+    # limit:1 alongside one id, so this only ever widens a batch to match the
+    # list the caller already sent.
+    effective_limit = limit
+    if requested_ids:
+        effective_limit = max(limit or 0, len(requested_ids)) or None
+
+    rows = inkdrop_state.series_rows(INKDROP_STATE_DB, SERIES_COVER_REFRESH_ROW_SCAN, series_filter="all")
+    eligible = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -50505,9 +50023,10 @@ def refresh_inkdrop_series_cover_metadata(payload):
         has_display_metadata = bool(row.get("description") or row.get("deck") or row.get("site_url") or row.get("issue_count"))
         if (row.get("image") and has_display_metadata) or not cv_id:
             continue
-        candidates.append((row, cv_id))
-        if len(candidates) >= limit:
-            break
+        eligible.append((row, cv_id))
+    # The eligible set is counted in full BEFORE any cut, so `truncated` is a
+    # measured comparison rather than an inference from the batch size.
+    candidates = eligible if effective_limit is None else eligible[:effective_limit]
 
     results = []
     refreshed = 0
@@ -50548,16 +50067,23 @@ def refresh_inkdrop_series_cover_metadata(payload):
                 "reason": f"{type(exc).__name__}: {exc}",
             })
     manga = repair_mangadex_series_front_covers(
-        payload, rows=rows, requested_ids=requested_ids, limit=limit
+        payload, rows=rows, requested_ids=requested_ids, limit=effective_limit
     )
     results.extend(manga.get("results") or [])
     refreshed += int(manga.get("repaired") or 0)
     skipped += int(manga.get("skipped") or 0)
     errors += int(manga.get("errors") or 0)
+    eligible_total = len(eligible) + int(manga.get("eligible") or 0)
+    considered = len(candidates) + int(manga.get("candidates") or 0)
     return {
         "ok": errors == 0 or refreshed > 0 or skipped > 0,
         "requested": len(requested_ids),
-        "candidates": len(candidates) + int(manga.get("candidates") or 0),
+        "candidates": considered,
+        "eligible": eligible_total,
+        # A short run says so. Silence here is what made the old cap read as a
+        # complete sweep.
+        "truncated": considered < eligible_total,
+        "limit": effective_limit,
         "refreshed": refreshed,
         "skipped": skipped,
         "errors": errors,
@@ -50575,7 +50101,7 @@ def inkdrop_series_mangadex_metadata_id(row):
     return match.group(1).strip() if match else ""
 
 
-def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, limit=8):
+def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, limit=None):
     """Re-point MangaDex series at the first volume's cover art.
 
     Fixing the selection only helps series added afterwards, because the cover
@@ -50594,7 +50120,7 @@ def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, 
     sweep = inkdrop_bool_value(payload.get("repairFrontCovers") or payload.get("repair_front_covers"), False)
     dry_run = inkdrop_bool_value(payload.get("dryRun") or payload.get("dry_run"), False)
     if not requested_ids and not sweep:
-        return {"candidates": 0, "repaired": 0, "skipped": 0, "errors": 0, "results": []}
+        return {"candidates": 0, "eligible": 0, "truncated": False, "repaired": 0, "skipped": 0, "errors": 0, "results": []}
     if rows is None:
         rows = inkdrop_state.series_rows(INKDROP_STATE_DB, 5000, series_filter="all")
     try:
@@ -50603,7 +50129,7 @@ def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, 
         settings = {}
     preferred_locales = settings.get("translated_languages") if isinstance(settings, dict) else None
 
-    candidates = []
+    eligible = []
     for row in rows or []:
         if not isinstance(row, dict):
             continue
@@ -50613,9 +50139,12 @@ def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, 
         row_id = str(row.get("id") or row.get("series_id") or "").strip()
         if requested_ids and row_id not in requested_ids and manga_id not in requested_ids and f"mangadex:{manga_id}" not in requested_ids:
             continue
-        candidates.append((row, manga_id))
-        if len(candidates) >= limit:
-            break
+        eligible.append((row, manga_id))
+    # This used to truncate a second time, independently of the caller's limit
+    # and with its own default of 8, so a sweep could be cut twice over. `limit`
+    # is now whatever the caller actually asked for, and None means the whole
+    # eligible set.
+    candidates = eligible if limit is None else eligible[: max(1, int(limit))]
 
     results = []
     repaired = 0
@@ -50663,6 +50192,8 @@ def repair_mangadex_series_front_covers(payload, rows=None, requested_ids=None, 
             })
     return {
         "candidates": len(candidates),
+        "eligible": len(eligible),
+        "truncated": len(candidates) < len(eligible),
         "repaired": repaired,
         "skipped": skipped,
         "errors": errors,
@@ -54214,26 +53745,6 @@ def runtime_provider_settings():
         },
     )
     provider(
-        "wetransfer",
-        "direct_download",
-        "WeTransfer",
-        enabled=False,
-        base_url="https://wetransfer.com/",
-        settings_payload={
-            "editable_fields": [],
-        },
-    )
-    provider(
-        "buzzheavier",
-        "direct_download",
-        "Buzzheavier",
-        enabled=False,
-        base_url="https://buzzheavier.com/",
-        settings_payload={
-            "editable_fields": [],
-        },
-    )
-    provider(
         "slskd",
         "download_source",
         "SLSKD",
@@ -54590,6 +54101,14 @@ def runtime_provider_settings():
                 "label": "SLSKD Concurrent Transfer Cap",
                 "value": inkdrop_state.SLSKD_CONCURRENT_TRANSFER_CAP_DEFAULT,
                 "description": "The most SLSKD transfers InkDrop will have open with the Soulseek network at the same time. This isn't about being polite to other Soulseek users -- their own client already manages that on their end. It's a safety valve on InkDrop's side: it smooths out a big backlog-catch-up burst (like adding a whole series at once) into a steady stream instead of firing off dozens of downloads in one go, and it limits the damage if a bug ever tries to grab far more than intended. New candidates past the cap wait and retry automatically once a slot frees up. Range: 1–100; default: 20.",
+                "source": "runtime",
+            },
+            {
+                "key": "automation.slskd_stale_slot_release_minutes",
+                "scope": "automation",
+                "label": "SLSKD Stalled Handoff Slot Release",
+                "value": inkdrop_state.SLSKD_SLOT_RELEASE_MINUTES_DEFAULT,
+                "description": "When InkDrop hands a download to Soulseek and the transfer never starts, the request still counts against the Concurrent Transfer Cap above. After this many minutes with no sign of life, it stops counting and the slot goes back to the pool so other comics can be grabbed. The stalled download itself is left alone -- it can still start on its own, and the Queue Watchdog retires and retries it on the thresholds above if it never does. Raise this if you want InkDrop to keep more room reserved for slow peers. Range: 1–1440 minutes; default: 15.",
                 "source": "runtime",
             },
             {
@@ -55239,22 +54758,6 @@ PROVIDER_SETTINGS_META = {
         "description": "Resolves Pixeldrain share links found by other sources to a real downloadable file. Turning this off stops those sources (currently GetComics) from completing Pixeldrain-hosted grabs.",
         "next_action": "No configuration needed -- this only controls whether Pixeldrain links other sources find can be resolved.",
         "applied_by": ["RSS/GetComics discovery worker"],
-        "ownership": "native",
-    },
-    "wetransfer": {
-        "settings_group": "download_clients",
-        "automation_role": "Shared-file host resolver",
-        "description": "Resolves WeTransfer share links to a real downloadable file when a source surfaces one. No InkDrop source currently searches WeTransfer or routes downloads through it.",
-        "next_action": "Leave off until a source that surfaces WeTransfer links is wired to use it.",
-        "applied_by": [],
-        "ownership": "native",
-    },
-    "buzzheavier": {
-        "settings_group": "download_clients",
-        "automation_role": "Shared-file host resolver",
-        "description": "Resolves Buzzheavier share links to a real downloadable file when a source surfaces one. No InkDrop source currently searches Buzzheavier or routes downloads through it.",
-        "next_action": "Leave off until a source that surfaces Buzzheavier links is wired to use it.",
-        "applied_by": [],
         "ownership": "native",
     },
     "slskd": {
@@ -55944,8 +55447,6 @@ def settings_provider_group_public(provider):
         # Grouped with the other download-facing toggles for the same
         # reachability reason as RSS/ComicsCodes above.
         "pixeldrain": "download_clients",
-        "wetransfer": "download_clients",
-        "buzzheavier": "download_clients",
     }
     if provider_id in provider_groups:
         return provider_groups[provider_id]
@@ -57775,10 +57276,15 @@ def notification_deliveries_public(query):
         before = float(before) if before else None
     except (TypeError, ValueError):
         before = None
+    # Both halves of the cursor. created_at ties across every delivery a single
+    # dispatch pass writes, so paging on the timestamp alone silently skips the
+    # rest of a tie group that straddles a page boundary.
+    before_id = (_param("before_id") or "").strip() or None
     deliveries = inkdrop_notification_store.list_deliveries(
         INKDROP_STATE_DB,
         limit=limit,
         before=before,
+        before_id=before_id,
         event_type=_param("event_type") or None,
         channel_id=_param("channel_id") or None,
         status=_param("status") or None,
@@ -58412,14 +57918,23 @@ def enqueue_comic_series_watch(watch, reason="comic_series_sync"):
 def review_id_for(item):
     if item.get("review_id"):
         return item["review_id"]
+    # `series`/`issue`/`query`/`candidate` are the shape a queue-decision row
+    # carries. Rows `append_manual_review()` writes from the import path carry
+    # `matched_series` instead, and no issue/query/candidate at all -- without
+    # `matched_series`/`source`/`dest` in the hash, every import-produced row
+    # sharing a reason (across unrelated series) degrades to the same id, so
+    # deciding one silently hides every other row with that reason, including
+    # ones for a series nobody has looked at yet.
     raw = "|".join(
         str(value or "").lower()
         for value in (
             item.get("reason"),
-            item.get("series"),
+            item.get("series") or item.get("matched_series"),
             item.get("issue"),
             item.get("query"),
             (item.get("candidate") or {}).get("title"),
+            item.get("source"),
+            item.get("dest"),
         )
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -60311,12 +59826,20 @@ def load_manual_review_raw(limit=300):
             continue
         if verification_ok and item.get("reason") == "import_verification_failed":
             continue
+        # `matched_series`/`source`/`dest` are the shape an import-produced
+        # row carries (no series/issue/query/folder, and manual_review_
+        # identity_key() falls back to "" with no native series/volume id
+        # to key on) -- without them here, every import-produced row sharing
+        # a reason collapses to one key on this very read, before review_id_for()
+        # ever gets a chance to differentiate the survivor.
         key = (
             item.get("reason"),
-            item.get("series"),
+            item.get("series") or item.get("matched_series"),
             item.get("issue"),
             item.get("query"),
             item.get("folder"),
+            item.get("source"),
+            item.get("dest"),
             manual_review_identity_key(item),
         )
         if key in seen:
@@ -66900,6 +66423,9 @@ def manual_search_grab_runner(public_candidate, raw_candidate):
         with inkdrop_state.connect_read(INKDROP_STATE_DB) as slot_con:
             transfer_slot_cap = inkdrop_state.slskd_concurrent_transfer_cap(slot_con)
             active_transfer_slot_count = inkdrop_state.slskd_active_transfer_slot_count(slot_con)
+        # A never-started handoff that already gave its slot back is not
+        # counted here, so a manual grab is no longer blocked by transfers
+        # that stopped being real hours ago.
         if active_transfer_slot_count >= transfer_slot_cap:
             return {
                 "ok": False,
@@ -68737,7 +68263,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/inkdrop-state/import/mark-wrong":
                 self.send_json({"ok": True, "result": mark_inkdrop_import_wrong(data)})
             elif path == "/api/inkdrop-state/source-attempts/clear":
-                self.send_json({"ok": True, "result": clear_inkdrop_source_attempts(data)})
+                result = clear_inkdrop_source_attempts(data)
+                self.send_json({"ok": bool(result.get("ok")), "result": result}, status=200 if result.get("ok") else 400)
             elif path == "/api/inkdrop-state/series/library/migrate":
                 result = migrate_inkdrop_series_library(data)
                 self.send_json(
@@ -68926,6 +68453,12 @@ class Handler(BaseHTTPRequestHandler):
                     state["sync_job"] = sync_job
                     state["auto_sync_reason"] = "background_manual_sync"
                 self.send_json({"ok": bool(sync_job.get("ok", True)), "state": state, "sync_job": sync_job})
+            elif path == "/api/inkdrop-maintenance/deferred-queue-sync/reconcile":
+                result = run_deferred_queue_sync_reconcile(data)
+                self.send_json(
+                    {"ok": bool(result.get("ok")), "result": result},
+                    status=200 if result.get("ok") else 500,
+                )
             elif path == "/api/inkdrop-settings/sync":
                 area = data.get("area") or data.get("settings_area") or data.get("group") or data.get("tab")
                 self.send_json({"ok": True, "settings": inkdrop_settings_public(sync=True, area=area)})
@@ -69039,7 +68572,9 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Cache-Control": "no-store"},
                 )
             elif path == "/api/system/logs/download":
-                payload, manifest = inkdrop_log_export.build_log_archive_bytes()
+                payload, manifest = inkdrop_log_export.build_log_archive_bytes(
+                    state_db=INKDROP_STATE_DB,
+                )
                 filename = inkdrop_log_export.log_archive_filename(manifest["generated_at"])
                 self.send_json({
                     "ok": True,

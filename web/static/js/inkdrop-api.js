@@ -225,4 +225,52 @@
     contentDispositionFilename,
     refreshAuthContract: () => loadMutationContract(true),
   };
+
+  // -- source naming ---------------------------------------------------------
+  //
+  // The one client-side source-naming function. It lives here because this
+  // file is the only script both documents load -- the desktop shell and the
+  // mobile page -- and the series-detail React bundle runs inside the desktop
+  // one, so all three surfaces can reach it.
+  //
+  // There is no table below. core/inkdrop_state.SOURCE_DISPLAY_LABELS is
+  // rendered into window.__INKDROP_SOURCE_DISPLAY__ by the server, and this
+  // applies the same rule to it that core/inkdrop_display_labels.display_label()
+  // applies on the server. Three clients used to keep their own tables, sharing
+  // 14 of the server's 22 keys, and they had already drifted: the same
+  // download-client row read "Download client" from the server and "Download
+  // Client" on the desktop page.
+
+  // A key is lowercase alphanumerics with single underscore or hyphen
+  // separators and nothing else -- the same shape ENUM_KEY_RE matches on the
+  // server. Anything carrying a slash, a dot, a space or a capital is not a
+  // key: the `source` column holds a filesystem path on staged-file rows, and
+  // title-casing one hands the operator a path that does not exist.
+  const SOURCE_KEY_RE = /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/;
+
+  // Python's str.title() capitalises a letter that follows any non-letter, so
+  // "s3rver" is "S3Rver" there. charAt(0).toUpperCase() would make it
+  // "S3rver" here, which is the drift this whole change exists to remove.
+  function titleWord(word) {
+    return word.replace(/(^|[^a-zA-Z])([a-z])/g, (_match, before, letter) => before + letter.toUpperCase());
+  }
+
+  function sourceDisplayLabel(value) {
+    const vocabulary = window.__INKDROP_SOURCE_DISPLAY__ || {};
+    const labels = vocabulary.labels || {};
+    const acronyms = new Set(vocabulary.acronyms || []);
+    const raw = value === undefined || value === null ? "" : String(value);
+    const text = raw.trim();
+    if (!text) return "";
+    const mapped = labels[text.toLowerCase()];
+    if (mapped) return mapped;
+    if (!SOURCE_KEY_RE.test(text)) return raw;
+    return text
+      .split(/[_-]/)
+      .filter(Boolean)
+      .map((word) => (acronyms.has(word) ? word.toUpperCase() : titleWord(word)))
+      .join(" ");
+  }
+
+  window.InkDropSourceLabel = sourceDisplayLabel;
 })();

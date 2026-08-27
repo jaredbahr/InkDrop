@@ -125,6 +125,21 @@
     return text.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
+  // Shared with the Home rail's cover card: a book-shaped placeholder holding
+  // the item's initial, with the actual cover (when the server sent an
+  // image_thumb) painted over it via normal box stacking -- no image means
+  // the letter just keeps showing, never an empty grey box. image_thumb is a
+  // small sized image the server already picked (ComicVine thumb_url/
+  // small_url, or MangaDex's .256.jpg), never a full-resolution one scaled
+  // down here.
+  function itemCoverHtml(title, imageThumb) {
+    const letter = String(title || "").trim().slice(0, 1).toUpperCase() || "?";
+    const img = imageThumb
+      ? `<img class="m-item-cover-img" src="${escapeHtml(imageThumb)}" alt="" loading="lazy" decoding="async">`
+      : "";
+    return `<span class="m-item-cover" data-letter="${escapeHtml(letter)}">${img}</span>`;
+  }
+
   function fmtMinutes(minutes) {
     const n = Number(minutes);
     if (!isFinite(n) || n < 0) return null;
@@ -429,14 +444,6 @@
 
   // --- Home screen --------------------------------------------------------
 
-  function statusDotClass(status) {
-    const s = String(status || "").toLowerCase();
-    if (s.includes("problem") || s.includes("fail") || s.includes("error")) return "m-status-problem";
-    if (s.includes("warn") || s.includes("attention") || s.includes("degraded")) return "m-status-warn";
-    if (s.includes("ok") || s.includes("healthy") || s.includes("good") || s.includes("idle") || s.includes("running")) return "m-status-ok";
-    return "";
-  }
-
   function tile(value, label, attention) {
     return `<div class="m-tile">
       <div class="m-tile-value${attention ? " m-tile-attn" : ""}">${escapeHtml(value)}</div>
@@ -484,7 +491,6 @@
 
   function renderHome(status, activity) {
     status = status || {};
-    const dotClass = statusDotClass(status.status);
     // status.detail is NOT rendered here any more. It is the desktop status
     // bar's diagnostic line: up to four of nine heterogeneous bits joined
     // with semicolons (core/inkdrop_web.py, `"; ".join(detail_bits[:4])`),
@@ -512,7 +518,23 @@
       // fallback keeps an older payload rendering a number rather than a dash.
       tile(status.inkdrop_state_series_live_count ?? status.inkdrop_state_series_count ?? "-", "Series"),
       tile(status.inkdrop_state_wanted_count ?? "-", "Wanted"),
-      tile(activity && activity.active_total != null ? activity.active_total : (status.inkdrop_state_queue_count ?? "-"), "Active downloads"),
+      // "Active", not "Active downloads". activity.active_total is a
+      // SEVEN-STATE aggregate -- queued, searching, downloading, importing,
+      // needs-attention, failed and blocked -- which is why this tile reads
+      // 2354 while desktop's "Downloading" chip reads 4. Both are correct
+      // about different things. docs/inkdrop/releases/v0.1.13.md:31 already
+      // records the old label as a claim that did not hold up.
+      //
+      // The number is right; the label was wrong. "Active" is what desktop
+      // calls this exact field (inkdrop-activity-ui.js renders
+      // ["Active", ...active_total]), so this makes the two screens agree
+      // rather than inventing a third name for one value.
+      //
+      // The old fallback to status.inkdrop_state_queue_count is dropped
+      // rather than relabelled: it counts queue rows, a different population
+      // again, so it would put a third wrong number under the same word. A
+      // dash says "not loaded yet", which is true; a number would not be.
+      tile(activity && activity.active_total != null ? activity.active_total : "-", "Active"),
       tile(status.manual_review_actionable_count ?? status.manual_review_count ?? "-", "Needs attention", (status.manual_review_actionable_count || 0) > 0),
       tile((status.failed_download_count || 0) + (status.failed_import_count || 0), "Failed", ((status.failed_download_count || 0) + (status.failed_import_count || 0)) > 0),
       tile(activity && activity.ready_to_import != null ? activity.ready_to_import : "-", "Ready to import"),
@@ -523,10 +545,6 @@
       : "";
 
     els.homeContent.innerHTML = `
-      <div class="m-status-banner">
-        <span class="m-status-dot ${dotClass}"></span>
-        <span class="m-status-text">${escapeHtml(status.status ? humanizeToken(status.status) : "Status unavailable")}</span>
-      </div>
       ${activityHtml}
       <div class="m-home-actions">
         <button type="button" class="m-btn-primary" data-mobile-goto="add">Add a series</button>
@@ -983,6 +1001,21 @@
     };
   }
 
+  function seriesResultSourceHtml(item, providerLabel) {
+    // Same one-tap reach as desktop. The URL already rides in the search
+    // payload; mobile never read it.
+    const href = String((item && item.siteUrl) || "").trim();
+    if (!/^https:\/\//i.test(href)) return "";
+    const constructed = String((item && item.siteUrlSource) || "") === "constructed";
+    // A link built from an id is labelled as such. MangaDex returns no page
+    // URL at all and Metron's search payload carries none; presenting either
+    // as the provider's own would be the guess this feature exists to avoid.
+    const note = constructed ? ' <span class="m-item-source">(built from the id)</span>' : "";
+    return `<div class="m-item-row m-item-source-link">`
+      + `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">`
+      + `Open ${escapeHtml(providerLabel)} page</a>${note}</div>`;
+  }
+
   function renderSearchResults(outcome) {
     if (!searchResults.length) {
       const state = outcome || {
@@ -1009,21 +1042,30 @@
         const warning = item.editionWarning
           ? `<div class="m-item-warning">${escapeHtml(item.editionWarning)}</div>`
           : "";
+        // "mangadex" and "comicvine" through humanizeToken() came back
+        // "Mangadex" and "Comicvine" -- the metadata provider named one
+        // way on this screen and another everywhere else. One vocabulary.
+        const providerLabel = window.InkDropSourceLabel(provider);
+        const source = seriesResultSourceHtml(item, providerLabel);
         const blocked = item.canMonitor === false;
-        return `<div class="m-item-card" data-result-index="${index}">
-          <div class="m-item-title">${escapeHtml(item.name || "Untitled series")}</div>
-          ${meta ? `<div class="m-item-reason">${escapeHtml(meta)}</div>` : ""}
-          <div class="m-item-row">
-            <span class="m-pill">${escapeHtml(humanizeToken(provider))}</span>
-            ${item.matchNote ? `<span class="m-item-source">${escapeHtml(item.matchNote)}</span>` : ""}
+        return `<div class="m-item-card m-item-card-cover" data-result-index="${index}">
+          ${itemCoverHtml(item.name, item.image_thumb)}
+          <div class="m-item-body">
+            <div class="m-item-title">${escapeHtml(item.name || "Untitled series")}</div>
+            ${meta ? `<div class="m-item-reason">${escapeHtml(meta)}</div>` : ""}
+            <div class="m-item-row">
+              <span class="m-pill">${escapeHtml(providerLabel)}</span>
+              ${item.matchNote ? `<span class="m-item-source">${escapeHtml(item.matchNote)}</span>` : ""}
+            </div>
+            ${warning}
+            ${source}
+            <div class="m-actions">
+              <button type="button" class="m-btn-primary" data-add-index="${index}"${blocked ? " disabled" : ""}>
+                ${blocked ? "Can't monitor" : "Add series"}
+              </button>
+            </div>
+            <p class="m-action-status" data-add-status="${index}" hidden></p>
           </div>
-          ${warning}
-          <div class="m-actions">
-            <button type="button" class="m-btn-primary" data-add-index="${index}"${blocked ? " disabled" : ""}>
-              ${blocked ? "Can't monitor" : "Add series"}
-            </button>
-          </div>
-          <p class="m-action-status" data-add-status="${index}" hidden></p>
         </div>`;
       })
       .join("");
@@ -1087,9 +1129,35 @@
   }
 
   function reviewRowState(row) {
-    // state_label is server-supplied alongside reason_label. The remaining
-    // fallbacks are for payloads that predate it; none of them is title-cased.
-    return row.state_label || row.display_state_label || row.display_state || row.state || row.status || "";
+    // state_label is server-supplied alongside reason_label
+    // (inkdrop_state.py sentence-cases an unmapped state, so `needs_you`
+    // arrives as "Needs you"). The remaining fallbacks are for payloads that
+    // predate it -- and they were reached raw: `row.state` IS the internal
+    // token, so a row without a server label rendered `needs_you` into a pill
+    // as though it were a word.
+    //
+    // reviewRowReasonFallback(), the function directly below this one, already
+    // refuses exactly this and says why: "an identifier is refused rather than
+    // title-cased into something that reads like a sentence InkDrop wrote on
+    // purpose." That judgement was never applied here. Same predicate, so the
+    // two cannot diverge on what counts as an identifier.
+    //
+    // Refused, not humanised. Turning `needs_you` into "Needs You" here would
+    // be a SECOND naming rule competing with the server's, and the two would
+    // drift. No pill is honest -- the server did not say what this state is
+    // called -- where an invented label is a guess wearing InkDrop's voice.
+    const labelled = row.state_label || row.display_state_label || "";
+    if (labelled) return labelled;
+    const raw = String(row.display_state || row.state || row.status || "").trim();
+    return isInternalToken(raw) ? "" : raw;
+  }
+
+  // `needs_you`, `provider_wait`, `stale_source_absent` -- lower-case words
+  // joined by underscores, with no spaces. Shared by reviewRowState() and
+  // reviewRowReasonFallback() so one definition decides what an identifier is.
+  function isInternalToken(value) {
+    const text = String(value || "").trim().toLowerCase();
+    return /^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(text);
   }
 
   // Only reached when the server did not supply reason_label -- an older
@@ -1101,7 +1169,7 @@
     for (const value of candidates) {
       const text = String(value || "").trim();
       if (!text) continue;
-      if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(text.toLowerCase())) continue;
+      if (isInternalToken(text)) continue;
       return text;
     }
     return "";
@@ -1287,9 +1355,17 @@
                   // the path. Consulting it ahead of the separator check would
                   // hand a mutated path straight back. Ordered this way mobile
                   // keeps #814's naming without reopening #820's defect.
+                  //
+                  // The last resort used to be humanizeToken(), a title-caser
+                  // that knows no source names at all -- so a row arriving
+                  // without source_label read "Mangadex" and "Slskd" here
+                  // while every other surface said "MangaDex" and "SLSKD".
+                  // window.InkDropSourceLabel applies the server's own
+                  // vocabulary, and refuses free text for the same reason the
+                  // path check above exists.
                   (/[\/]/.test(rawSource)
                     ? rawSource
-                    : (row.source_label || evidence.source_name || humanizeToken(rawSource)))
+                    : (row.source_label || evidence.source_name || window.InkDropSourceLabel(rawSource)))
                 )}</span>`
               : "");
         const approveEndpoint = approveEndpointFor(row);
@@ -1308,18 +1384,21 @@
             : "",
         ].filter(Boolean).join("");
         const done = reviewNotes.get(row.review_id) || "";
-        return `<div class="m-item-card" data-review-card="${index}">
-          <div class="m-item-title">${escapeHtml(reviewRowTitle(row))}</div>
-          ${reasonLabel ? `<div class="m-item-reason m-tone-${escapeHtml(row.reason_tone || "warn")}">${escapeHtml(reasonLabel)}</div>` : ""}
-          ${reasonDetail ? `<div class="m-item-reason-detail">${escapeHtml(reasonDetail)}</div>` : ""}
-          ${reviewEvidenceHtml(row.decision_evidence)}
-          <div class="m-item-row">
-            ${state ? `<span class="m-pill">${escapeHtml(state)}</span>` : ""}
-            ${sourceHtml}
+        return `<div class="m-item-card m-item-card-cover" data-review-card="${index}">
+          ${itemCoverHtml(reviewRowTitle(row), row.image_thumb)}
+          <div class="m-item-body">
+            <div class="m-item-title">${escapeHtml(reviewRowTitle(row))}</div>
+            ${reasonLabel ? `<div class="m-item-reason m-tone-${escapeHtml(row.reason_tone || "warn")}">${escapeHtml(reasonLabel)}</div>` : ""}
+            ${reasonDetail ? `<div class="m-item-reason-detail">${escapeHtml(reasonDetail)}</div>` : ""}
+            ${reviewEvidenceHtml(row.decision_evidence)}
+            <div class="m-item-row">
+              ${state ? `<span class="m-pill">${escapeHtml(state)}</span>` : ""}
+              ${sourceHtml}
+            </div>
+            <div class="m-actions">${approveBtn}${secondary}</div>
+            ${approveNote}
+            <p class="m-action-status${done ? " m-tone-good" : ""}" data-review-status="${index}"${done ? "" : " hidden"}>${escapeHtml(done)}</p>
           </div>
-          <div class="m-actions">${approveBtn}${secondary}</div>
-          ${approveNote}
-          <p class="m-action-status${done ? " m-tone-good" : ""}" data-review-status="${index}"${done ? "" : " hidden"}>${escapeHtml(done)}</p>
         </div>`;
       })
       .join("");

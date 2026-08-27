@@ -58,7 +58,7 @@ TERMINAL_OR_PROBLEM_HANDOFF_STATUSES = {
     # attempt that never left InkDrop" for duplicate-row cleanup. It was
     # absent here, so a completed row in this shape (state='queued', a
     # legitimately-active handoff state) never stopped counting as an
-    # active handoff -- confirmed live 2026-08-18 (Prompt121 audit) for
+    # active handoff -- confirmed live 2026-08-18 for
     # The Wicked + The Divine: 1831 #1, blocking both the autopilot due-
     # series path and this module's own _classify_queue_plan() with no
     # claim, no client, nothing left to wait for.
@@ -697,8 +697,8 @@ def active_handoff_tasks(
     are two different columns that do not always move together. Without this
     guard a completed task with an unrecognized terminal status blocks
     _classify_queue_plan() forever, since nothing about "done" was ever
-    checked, only the status vocabulary. Confirmed live 2026-08-18 (Prompt121
-    audit): a `staged_filename_mismatch` task completed 2+ weeks earlier kept
+    checked, only the status vocabulary. Confirmed live 2026-08-18: a
+    `staged_filename_mismatch` task completed 2+ weeks earlier kept
     reading as an active handoff on every pass.
     """
     queue_id = str(queue_id or "").strip()

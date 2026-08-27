@@ -21,6 +21,8 @@
 !/web/static/img/inkdrop-auth-backdrop.webp
 !/web/static/js/
 !/web/static/js/*.js
+!/web/templates/
+!/web/templates/inkdrop-shell.html
 # Browser regressions remain in Git/CI but are not production runtime inputs.
 /web/tests/
 # Frontend source only -- the frontend-builder Docker stage compiles this
@@ -54,7 +56,7 @@
 !/inkdrop-docker-entrypoint.sh
 !/scripts/inkdrop-import-ready-worker.sh
 !/scripts/inkdrop-series-autopilot-cron.sh
-!/scripts/inkdrop-source-worker-mangadex-cron.sh
+!/scripts/inkdrop-source-worker-cron.sh
 !/scripts/inkdrop-source-worker-suwayomi-cron.sh
 !/scripts/inkdrop-source-worker.sh
 !/scripts/inkdrop-state-path-contract-sync-regression-alert.sh

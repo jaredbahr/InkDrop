@@ -127,7 +127,7 @@ const CAN_SEARCH_NOW = new Set<ReliabilityBucketKey>([
 ]);
 // active_unconfirmed with queue_state 'downloading' or 'source_wait' is
 // withheld from Search Now even though the bucket is otherwise eligible: the
-// Prompt121 audit found no claim or task evidence proving these two states
+// A live audit found no claim or task evidence proving these two states
 // are live, but that is not proof a real external client transfer has
 // stopped either -- searching/importing carry no such risk, since retrying
 // them cannot duplicate a download that was never dispatched.

@@ -583,7 +583,12 @@
     .series-poster-shelf-full .series-poster-body {
       padding: 6px 7px 4px;
       min-height: 65px;
-      grid-template-rows: 30px 25px;
+      /* The title row's own two-line clamp renders taller than a flat 30px in
+         practice (font metrics vary by platform), so a fixed track clipped
+         long titles into the meta row below them. minmax keeps the same
+         30px floor for the common case but lets the row grow to whatever a
+         genuine two-line title actually needs. */
+      grid-template-rows: minmax(30px, auto) minmax(0, auto);
       align-content: start;
     }
     .series-poster-title {

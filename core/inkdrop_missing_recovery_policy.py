@@ -149,14 +149,24 @@ def _worker_healthy(env, now):
         return False
     problem_jobs = failed_jobs + [row for row in late_jobs if row not in failed_jobs]
     problem_counts_match = len(failed_jobs) == failure_count and len(late_jobs) == late_job_count
-    only_noncritical_problems = bool(problem_jobs) and problem_counts_match and all(
-        row.get("critical") is False for row in problem_jobs
+    # Criticality is a SEVERITY; failed-versus-late is a KIND, and the two are
+    # independent. These used to be merged into problem_jobs and asked a single
+    # question, so a critical job that was merely running behind -- zero
+    # failures -- gated every acquisition handoff exactly as hard as one that
+    # had actually failed. Only failed_jobs is judged here; lateness on its own
+    # never makes the worker unhealthy, which is what the System page already
+    # tells the operator ("Behind schedule ... will catch up on its own", as
+    # against "Failing"). Every reconciliation guard below is untouched: a
+    # payload whose counts contradict its rows, or that claims `healthy` while
+    # carrying a problem row, still fails closed.
+    tolerable_degradation = bool(problem_jobs) and problem_counts_match and all(
+        row.get("critical") is False for row in failed_jobs
     )
     return bool(
         payload.get("ok") is True
         and state in {"healthy", "degraded"}
         and problem_counts_match
-        and (state == "healthy" or only_noncritical_problems)
+        and (state == "healthy" or tolerable_degradation)
         and (state != "healthy" or (failure_count == 0 and late_job_count == 0 and not problem_jobs))
         and max_age > 0
         and 0 <= heartbeat_age <= max_age

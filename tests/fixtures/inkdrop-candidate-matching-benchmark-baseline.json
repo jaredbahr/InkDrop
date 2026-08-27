@@ -1,0 +1,10 @@
+{
+  "schema": "inkdrop.candidate-matching-benchmark-baseline",
+  "schema_version": 1,
+  "benchmark_id": "adversarial-candidate-matching",
+  "benchmark_version": "1.0.0",
+  "passed": 50,
+  "total": 50,
+  "score_percent": 100.0,
+  "note": "Explicit floor for tests/inkdrop-candidate-matching-benchmark-smoke.py, the CI gate: it fails only if the corpus scores below score_percent here, never merely for scoring under 100%. Bump this file by hand, in the same PR as the change that causes the move: raise it when closing a gap actually lifts the true score (locks in the improvement), or lower it when adding a new corpus case that is not yet solved (an explicit, reviewed regression rather than a silently red or silently skipped gate). Never edit an existing case's expected verdict to make the score match this file -- fix the matcher or move this floor, not the gold."
+}

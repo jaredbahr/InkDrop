@@ -241,6 +241,51 @@ def wrapper_fixtures():
         serialized = json.dumps(evidence)
         require("private" not in serialized and "offline" not in serialized and "late" not in serialized, "failure evidence must be count-only and privacy-safe")
 
+    # tracker #312a: a zero reached after a query's response set hit
+    # Soulseek's own 250-peer ceiling must not read the same as a genuine
+    # exhaustive zero -- only the fastest-answering 250 peers were ever
+    # examined, sorted by nothing to do with content, and a real supply
+    # could sit entirely outside that set.
+    ceiling_response = [
+        {"username": f"ceiling-peer-{i}", "hasFreeUploadSlot": True, "files": []}
+        for i in range(slskd.SOULSEEK_RESPONSE_CEILING)
+    ]
+    with (
+        mock.patch.object(slskd, "slskd_search", return_value=ceiling_response),
+        mock.patch.object(slskd, "candidates_from_responses", return_value=([], {"rejected_file_count": 0})),
+    ):
+        saturated_zero = slskd.manual_search_discovery(item, ["private ceiling query"], max_queries=1)
+    require(
+        saturated_zero["completed"] and saturated_zero["status"] == "zero_results_ceiling_reached",
+        f"a zero reached after hitting the response ceiling must be distinguishable from a genuine zero, got {saturated_zero['status']!r}",
+    )
+    require(
+        saturated_zero["evidence"]["response_ceiling_reached"] is True,
+        f"evidence must carry the same signal the status encodes: {saturated_zero['evidence']}",
+    )
+    require(
+        saturated_zero["evidence"]["attempts"][0]["response_ceiling_reached"] is True,
+        "the per-attempt record must carry the signal too, not only the aggregate",
+    )
+
+    # Negative control: one peer under the ceiling must still be plainly
+    # zero_results -- proves the new status only fires on a real ceiling hit,
+    # not on every zero.
+    below_ceiling_response = [
+        {"username": f"peer-{i}", "hasFreeUploadSlot": True, "files": []}
+        for i in range(slskd.SOULSEEK_RESPONSE_CEILING - 1)
+    ]
+    with (
+        mock.patch.object(slskd, "slskd_search", return_value=below_ceiling_response),
+        mock.patch.object(slskd, "candidates_from_responses", return_value=([], {"rejected_file_count": 0})),
+    ):
+        genuine_zero = slskd.manual_search_discovery(item, ["private below-ceiling query"], max_queries=1)
+    require(
+        genuine_zero["completed"] and genuine_zero["status"] == "zero_results",
+        f"one peer under the ceiling must not be misreported as ceiling-reached: {genuine_zero['status']!r}",
+    )
+    require(genuine_zero["evidence"]["response_ceiling_reached"] is False, "evidence must not claim a ceiling hit that did not happen")
+
     descender_item = {
         "series": "Descender",
         "issue": "25",

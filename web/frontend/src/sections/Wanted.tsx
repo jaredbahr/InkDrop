@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { request, InkDropApiError } from "../api";
 import { useRowActions } from "../rowActions";
 import type { WantedRow, WantedViewPayload, WantedRunResult } from "./wantedTypes";
+import { rowStateLabel } from "./stateLabel";
 
 const PAGE_SIZE = 80;
 
@@ -10,10 +11,7 @@ function rowTitle(row: WantedRow): string {
   return `${row.series || "Unknown"}${issue}`;
 }
 
-function stageLabel(row: WantedRow): string {
-  const raw = row.display_state_label || row.display_state || row.status || "wanted";
-  return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
+const stageLabel = (row: WantedRow): string => rowStateLabel(row, "wanted");
 
 // Mirrors operationalRowSourceLabel's fallback chain (inkdrop_web.py) closely
 // enough for a table cell -- the full version also reaches into download-task

@@ -59,6 +59,8 @@ import zipfile
 from pathlib import Path
 
 from core import inkdrop_runtime_config
+from core import inkdrop_comicinfo_identity
+from core import inkdrop_artifact_acceptance
 
 
 ARCHIVE_CONVERSION_SCHEMA = "inkdrop.archive_conversion.v1"
@@ -587,6 +589,7 @@ def build_cbz(source, dest_tmp, workdir):
     extracted = _extracted_files(workdir)
     pages = []
     comicinfo_file = None
+    comicinfo_candidates = {}
     dropped = []
     for item in extracted:
         relative = item.relative_to(workdir).as_posix()
@@ -597,16 +600,20 @@ def build_cbz(source, dest_tmp, workdir):
             pages.append(item)
         elif kind == "comicinfo":
             # Nested ComicInfo.xml files happen; the shallowest, shortest path
-            # is the one readers treat as the archive's own.
-            if comicinfo_file is None or (relative.count("/"), len(relative)) < (
-                comicinfo_file.relative_to(workdir).as_posix().count("/"),
-                len(comicinfo_file.relative_to(workdir).as_posix()),
-            ):
-                comicinfo_file = item
+            # is the one readers treat as the archive's own. That rule now lives
+            # in inkdrop_comicinfo_identity and is resolved after this loop --
+            # the acceptance gate needs the identical answer, and two copies of
+            # "which ComicInfo is the archive's own" is exactly the shape that
+            # let the two modules disagree in the first place.
+            comicinfo_candidates[relative] = item
         elif kind == "nested_archive":
             raise ConversionRefused("nested_archive_member", relative)
         else:
             dropped.append(relative)
+
+    own_comicinfo = inkdrop_comicinfo_identity.own_comicinfo_name(comicinfo_candidates)
+    if own_comicinfo is not None:
+        comicinfo_file = comicinfo_candidates[own_comicinfo]
 
     if not pages:
         raise ConversionRefused("no_readable_pages")
@@ -857,6 +864,18 @@ def convert_page_directory(
     if not validation["ok"]:
         tmp_dest.unlink(missing_ok=True)
         return {**result, "reason": validation["reason"], "detail": validation.get("detail")}
+    # validate_cbz() proves we wrote what we MEANT to write -- CRC, page count,
+    # per-page sha256. It does not ask whether those pages can be decoded, and
+    # a faithfully-written corrupt page passes it. That second question has one
+    # answer in this codebase and it lives in inkdrop_artifact_acceptance;
+    # inkdrop_completed_import's repacker asks the same function. Two private
+    # opinions about whether an archive is sound is what lets a book with
+    # undecodable pages into a library.
+    soundness = inkdrop_artifact_acceptance.archive_output_refusal(tmp_dest)
+    if soundness is not None:
+        tmp_dest.unlink(missing_ok=True)
+        return {**result, "reason": soundness["reason"], "detail": soundness.get("detail"),
+                "outcome": soundness.get("outcome")}
     if len(manifest) != inspection["image_count"]:
         tmp_dest.unlink(missing_ok=True)
         return {

@@ -146,8 +146,24 @@ def load_rows(series_filter=None, max_total=10, force=False):
                 join series s on s.id = q.series_id
                 left join wanted_items w on w.id = q.wanted_id
                 left join issues i on i.id = q.issue_id
+                left join (
+                    select wanted_id, max(started_at) as last_dispatch_at
+                      from download_tasks
+                     group by wanted_id
+                ) d on d.wanted_id = q.wanted_id
                 where {" and ".join(clauses)}
-                order by coalesce(q.updated_at, q.created_at, 0) asc, q.id asc
+                -- ORDER BY TIME SINCE DELIVERY, NOT TIME SINCE ACTIVITY.
+                -- `q.updated_at` is a pure touch clock: 48 of 57 `update
+                -- queue_items` statements refresh it, including slskd probes
+                -- that have nothing to do with MangaDex. Ordering by it meant
+                -- activity on ANOTHER PROVIDER pushed a row below this lane's
+                -- six-row window -- measured 2026-08-23 on build ea7da309 as
+                -- 563 eligible rows with 557 permanently outside it.
+                -- `download_tasks.started_at` cannot be refreshed by a probe.
+                -- Rows never delivered fall back to queue creation, so an old
+                -- never-delivered row outranks a new one instead of both
+                -- colliding, and a freshly created row cannot jump the backlog.
+                order by coalesce(d.last_dispatch_at, q.created_at, 0) asc, q.id asc
                 limit ?
                 """,
                 (*params, max(1, min(int(max_total or 10), 100))),

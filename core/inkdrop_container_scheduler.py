@@ -47,6 +47,10 @@ class ScheduledJob:
     env: dict[str, str] = dataclasses.field(default_factory=dict)
     url: str = ""
     critical: bool = True
+    # Whether this job runs unless an operator says otherwise. False marks a
+    # job SHELVED: the code stays and the schedule does not. See
+    # job_enabled() for the per-job override and the reasoning.
+    enabled_by_default: bool = True
 
 
 def bool_env(name: str, default: bool = False) -> bool:
@@ -54,6 +58,31 @@ def bool_env(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in {"1", "true", "yes", "on", "enabled"}
+
+
+def job_enabled_env_name(job_name: str) -> str:
+    """The environment variable that decides one job, derived from its name."""
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(job_name)).strip("_").upper()
+    return f"INKDROP_SCHEDULER_JOB_{normalized}_ENABLED"
+
+
+def job_enabled(job: "ScheduledJob") -> bool:
+    """Is this one job scheduled?
+
+    Until 2026-08-22 the only gate was process-wide
+    INKDROP_CONTAINER_SCHEDULER_ENABLED: all 29 jobs or none. That is why the
+    2026-08-02 decision to shelve ebooks was recorded in a ledger and enforced
+    nowhere -- there was no mechanism to enforce it with, so both ebook jobs
+    kept running successfully in production for three weeks after the feature
+    was shelved. Tracker #599: a shelved decision must name the mechanism that
+    enforces it, or be marked advisory.
+
+    A job's own `enabled_by_default` is the recorded decision. The environment
+    variable overrides it in either direction, so shelving is reversible
+    without a code change -- which matters because the point of shelving is
+    that the code is kept.
+    """
+    return bool_env(job_enabled_env_name(job.name), bool(job.enabled_by_default))
 
 
 def int_env(name: str, default: int) -> int:
@@ -167,6 +196,29 @@ def run_job(job: ScheduledJob) -> int:
 
 
 def build_jobs() -> list[ScheduledJob]:
+    """The jobs the scheduler will actually run.
+
+    Filtered by job_enabled(). A shelved job is absent from here, and
+    therefore absent from job_states, from the status file, and from the run
+    loop -- one filter rather than a check at each of the three. Callers
+    wanting the whole table, shelved entries included, use all_jobs().
+    """
+    return [job for job in all_jobs() if job_enabled(job)]
+
+
+def shelved_job_names() -> list[str]:
+    """Jobs that exist and are deliberately not scheduled.
+
+    Reported in the status file so the running process states this
+    positively. Absence alone would be indistinguishable from a job that was
+    deleted, renamed, or never existed -- and the whole of #599 is that a
+    recorded decision and a running process disagreed with nobody able to see
+    it.
+    """
+    return sorted(job.name for job in all_jobs() if not job_enabled(job))
+
+
+def all_jobs() -> list[ScheduledJob]:
     py = os.environ.get("PYTHON_BIN") or sys.executable or "python"
     state_dir = str(inkdrop_runtime_config.state_dir())
     log_dir = Path(os.environ.get("INKDROP_LOG_DIR") or f"{state_dir}/logs")
@@ -444,6 +496,12 @@ def build_jobs() -> list[ScheduledJob]:
             initial_delay_seconds=210,
             timeout_seconds=1200,
             critical=False,
+            # SHELVED 2026-08-02; enforced here 2026-08-22. Ebooks are on the
+            # radar, not in development -- the code is kept deliberately, the
+            # schedule is not. It ran every 600s with rc=0 for three weeks
+            # after the decision, spending worker slots in the same pipeline
+            # the acquisition backlog competes for.
+            enabled_by_default=False,
         ),
         ScheduledJob(
             "manual-source-autoresolve",
@@ -470,9 +528,17 @@ def build_jobs() -> list[ScheduledJob]:
             timeout_seconds=1900,
         ),
         ScheduledJob(
-            "source-worker-mangadex",
+            # The GENERAL source-worker pass. It was called
+            # "source-worker-mangadex" while its wrapper ran twelve providers
+            # -- prowlarr, rss, mangadex, suwayomi, comicscodes and seven
+            # Prowlarr indexers -- and read the general interval knob below,
+            # which is what gave it away. An operator reading that name to
+            # find out why acquisition stalled was sent to one provider out
+            # of twelve. source-worker-suwayomi below is the genuinely
+            # manga-scoped job and keeps its provider name.
+            "source-worker",
             int_env("INKDROP_SCHEDULER_SOURCE_WORKER_INTERVAL_SECONDS", 1800),
-            ("/app/inkdrop-source-worker-mangadex-cron.sh",),
+            ("/app/inkdrop-source-worker-cron.sh",),
             initial_delay_seconds=360,
             timeout_seconds=900,
             critical=False,
@@ -596,6 +662,9 @@ def build_jobs() -> list[ScheduledJob]:
             initial_delay_seconds=1020,
             timeout_seconds=1800,
             critical=False,
+            # SHELVED 2026-08-02; enforced here 2026-08-22. Sibling of
+            # manual-ebooks-inbox above; same reasoning.
+            enabled_by_default=False,
         ),
         ScheduledJob(
             "state-retention",
@@ -817,7 +886,7 @@ def _restored_job_state(job: ScheduledJob, previous: dict, started_at: float) ->
     }
 
 
-def scheduler_status_payload(*, started_at, heartbeat_at, job_states, active, max_concurrency, stopping=False):
+def scheduler_status_payload(*, started_at, heartbeat_at, job_states, active, max_concurrency, stopping=False, shelved=None):
     rows = []
     now = float(heartbeat_at)
     for name in sorted(job_states):
@@ -838,6 +907,11 @@ def scheduler_status_payload(*, started_at, heartbeat_at, job_states, active, ma
         "max_concurrency": int(max_concurrency),
         "active_jobs": [dict(active[name]) for name in sorted(active)],
         "jobs": rows,
+        # Named, not merely missing. A reader comparing a shelving decision
+        # against the running process needs the process to say what it is
+        # deliberately not running; an absent row cannot distinguish "shelved"
+        # from "deleted", "renamed", or "never existed".
+        "shelved_jobs": sorted(shelved or []),
         "failure_count": len(failures),
         "late_job_count": len(late),
     }
@@ -859,6 +933,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
 
     jobs = build_jobs()
+    shelved = shelved_job_names()
     jobs_by_name = {job.name: job for job in jobs}
     status_path = worker_status_path()
     previous = read_previous_status(status_path)
@@ -872,6 +947,7 @@ def main() -> int:
     log(
         "container scheduler started "
         f"max_concurrency={max_concurrency} status_file={status_path} jobs=" + ",".join(job.name for job in jobs)
+        + (" shelved=" + ",".join(shelved) if shelved else "")
     )
     while not stop:
         # The scheduler is PID 1 in the worker container. Wrapper descendants
@@ -927,6 +1003,7 @@ def main() -> int:
             write_status(
                 status_path,
                 scheduler_status_payload(
+                    shelved=shelved,
                     started_at=started_at,
                     heartbeat_at=now,
                     job_states=job_states,
@@ -941,6 +1018,7 @@ def main() -> int:
     write_status(
         status_path,
         scheduler_status_payload(
+            shelved=shelved,
             started_at=started_at,
             heartbeat_at=time.time(),
             job_states=job_states,

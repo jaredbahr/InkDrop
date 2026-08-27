@@ -82,6 +82,7 @@ COPY web/static/img/inkdrop-auth-backdrop.webp ./web/static/img/inkdrop-auth-bac
 COPY web/static/js/ ./web/static/js/
 COPY --from=frontend-builder /app/web/static/dist ./web/static/dist
 COPY core/ ./core/
+COPY web/templates/ ./web/templates/
 COPY docs/inkdrop-source-candidate-catalog-20260702.json ./docs/inkdrop-source-candidate-catalog-20260702.json
 COPY tools/inkdrop_install_support_summary.py ./tools/inkdrop_install_support_summary.py
 COPY \
@@ -90,7 +91,7 @@ COPY \
     inkdrop-docker-entrypoint.sh \
     scripts/inkdrop-import-ready-worker.sh \
     scripts/inkdrop-series-autopilot-cron.sh \
-    scripts/inkdrop-source-worker-mangadex-cron.sh \
+    scripts/inkdrop-source-worker-cron.sh \
     scripts/inkdrop-source-worker-suwayomi-cron.sh \
     scripts/inkdrop-source-worker.sh \
     scripts/inkdrop-state-path-contract-sync-regression-alert.sh \

@@ -82,7 +82,8 @@ def add_series(con, *, comicvine_id, title, library_path, root):
 
 
 def main():
-    web_text = WEB_PATH.read_text(encoding="utf-8")
+    # The series-remove modal markup now lives in the shell template.
+    web_text = (ROOT / "web" / "templates" / "inkdrop-shell.html").read_text(encoding="utf-8") + WEB_PATH.read_text(encoding="utf-8")
     require('id="seriesRemoveDeleteFiles" type="checkbox"' in web_text, "remove-files checkbox is missing from the modal")
     require('id="seriesRemoveKeepFiles" type="hidden" value="true"' in web_text, "keep-files compatibility field is missing")
     require("Files stay on disk unless this is enabled." in web_text, "remove-files modal copy is not explicit")

@@ -41,6 +41,8 @@ import time
 import uuid
 from pathlib import Path
 
+from core.inkdrop_display_labels import display_label
+
 
 EVENT_TYPES = (
     "grabbed",
@@ -366,7 +368,10 @@ def create_connector(db_path, *, type, name=None, connector_id=None, settings=No
     now = time.time()
     next_events = sorted({str(e).strip() for e in (events or []) if str(e).strip() in EVENT_TYPES})
     next_filter = [str(s).strip() for s in (series_filter or []) if str(s).strip()]
-    display_name = str(name or "").strip() or connector_type.title()
+    # From `type`, not `connector_type`: the latter is lower-cased for storage,
+    # and a name is not a key. A connector type this build does not know is
+    # shown as it was given rather than re-cased into something else.
+    display_name = str(name or "").strip() or display_label(type)
     with _connection(db_path) as con:
         if con.execute("select 1 from notification_connectors where id=?", (connector_id,)).fetchone():
             raise ValueError(f"connector already exists: {connector_id}")
@@ -865,13 +870,34 @@ def claim_next_due_delivery(db_path, *, now=None, max_per_hour=0, lease_seconds=
         return None
 
 
-def list_deliveries(db_path, *, limit=100, before=None, event_type=None, channel_id=None, status=None):
+def list_deliveries(db_path, *, limit=100, before=None, before_id=None, event_type=None, channel_id=None, status=None):
+    """Newest-first page of delivery history.
+
+    The cursor is the composite `(created_at, id)`, not `created_at` alone.
+    created_at is not unique -- every delivery a single dispatch pass writes
+    carries the same stamp -- so a strict `created_at < ?` cursor against a
+    `created_at`-only ORDER BY skips the remainder of any tie group that
+    straddles a page boundary. It only loses rows when the boundary happens to
+    land mid-tie, which is why it read as intermittent rather than as a bug.
+
+    `before_id` is optional so an older caller still pages the old way rather
+    than erroring; without it a tie at the boundary is still lossy, so any
+    caller that pages must send both halves of the cursor it was handed.
+    """
     limit = max(1, min(500, int(limit or 100)))
     clauses = []
     params = []
     if before is not None:
-        clauses.append("created_at < ?")
-        params.append(before)
+        if before_id:
+            # id is the tiebreak, and it only has to be a deterministic total
+            # order alongside created_at -- it is a uuid and carries no time
+            # information of its own, which is fine and is why ORDER BY must
+            # name it too.
+            clauses.append("(created_at < ? or (created_at = ? and id < ?))")
+            params.extend([before, before, before_id])
+        else:
+            clauses.append("created_at < ?")
+            params.append(before)
     if event_type:
         clauses.append("event_type = ?")
         params.append(event_type)
@@ -884,7 +910,7 @@ def list_deliveries(db_path, *, limit=100, before=None, event_type=None, channel
     where = f"where {' and '.join(clauses)}" if clauses else ""
     with _connection(db_path) as con:
         rows = con.execute(
-            f"select * from notification_deliveries {where} order by created_at desc limit ?",
+            f"select * from notification_deliveries {where} order by created_at desc, id desc limit ?",
             [*params, limit],
         ).fetchall()
         return [_delivery_row(row) for row in rows]

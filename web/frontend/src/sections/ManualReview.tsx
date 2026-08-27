@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { request, InkDropApiError } from "../api";
 import { useRowActions } from "../rowActions";
 import type { ManualReviewRow, ManualReviewViewPayload } from "./manualReviewTypes";
+import { rowStateLabel } from "./stateLabel";
 
 // 10 per page: each row is a decision, not a log line -- a short page
 // keeps the docked decision panel beside the rows it belongs to.
@@ -61,10 +62,7 @@ function rowTitle(row: ManualReviewRow): string {
   return `${row.series || "Unknown"}${issue}`;
 }
 
-function stageLabel(row: ManualReviewRow): string {
-  const raw = row.display_state_label || row.display_state || row.state || "";
-  return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
+const stageLabel = (row: ManualReviewRow): string => rowStateLabel(row);
 
 // A machine identifier, e.g. `qbit_torrent_completed_outside_expected_save_path`
 // or `weak_filename_unit_evidence`. Lowercase words joined by underscores and

@@ -29,7 +29,8 @@ def function_body(text: str, name: str) -> str:
 
 
 def main() -> int:
-    text = WEB.read_text(encoding="utf-8")
+    # The Settings "managed-folder import" labels now live in the shell template.
+    text = (ROOT / "web" / "templates" / "inkdrop-shell.html").read_text(encoding="utf-8") + WEB.read_text(encoding="utf-8")
     series_first_paint_body = function_body(text, "inkdropSeriesFirstPaintLimit")
     first_paint_body = function_body(text, "inkdropSectionFirstPaintLimit")
     endpoint_body = function_body(text, "inkdropSectionEndpoint")

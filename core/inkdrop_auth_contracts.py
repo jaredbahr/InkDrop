@@ -203,6 +203,14 @@ _add("POST", {
     "/api/inkdrop-state/series-merge/apply", "/api/inkdrop-state/series_merge/apply",
 }, "destructive_maintenance", "admin", admin=True, destructive=True, high_impact=True)
 
+# Retires deferred queue-sync snapshots, but only after replaying the writes
+# they still hold (see inkdrop_deferred_sync.reclaim_expired_replays), and a
+# snapshot whose replay fails is left in place. Nothing is discarded on a
+# failure path, so this is admin maintenance rather than a destructive apply.
+_add("POST", {
+    "/api/inkdrop-maintenance/deferred-queue-sync/reconcile",
+}, "deferred_queue_sync_reconcile", "admin", admin=True, idempotent=True)
+
 _add("POST", {
     "/api/inkdrop-state/duplicate-series-ref-merge/preview", "/api/inkdrop-state/duplicate_series_ref_merge/preview",
     "/api/inkdrop-state/series-shadow-ref-merge/preview", "/api/inkdrop-state/series_shadow_ref_merge/preview",

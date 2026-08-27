@@ -28,7 +28,7 @@ def valid_large_png():
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "inkdrop-import-ready-worker.sh"
+WORKER = ROOT / "scripts/inkdrop-import-ready-worker.sh"
 RECONCILE = ROOT / "core" / "inkdrop_reconcile_imports.py"
 COMPLETED_IMPORT = ROOT / "core" / "inkdrop_completed_import.py"
 STATE = ROOT / "core" / "inkdrop_state.py"

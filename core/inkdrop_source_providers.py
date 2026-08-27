@@ -8,6 +8,7 @@ import json
 import re
 import unicodedata
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 from pathlib import PurePosixPath
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
@@ -194,7 +195,17 @@ def normalize_extension(value):
         return ""
     if text.startswith(".") and "/" not in text and "\\" not in text:
         return text
-    path = unquote(urlparse(text).path or text)
+    # Only strip a query/fragment when this really is a URL. "#" is a legal
+    # character in a filename and comic issues are named with it -- so
+    # URL-parsing a local path put the extension inside the "fragment" and
+    # returned nothing at all. That is how "Series #4 (2025).cbz" reached the
+    # downloader with no derivable extension and got refused as
+    # missing_allowed_extensions before a single byte was requested, which is
+    # very nearly every single issue.
+    if "://" in text:
+        path = unquote(urlparse(text).path or text)
+    else:
+        path = text
     suffix = PurePosixPath(path.replace("\\", "/")).suffix.lower()
     return suffix if suffix.startswith(".") else ""
 
@@ -835,7 +846,7 @@ def indexer_nzb_file_entries(data, limit=1000):
         text = str(data or "")
     entries = []
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
         for elem in root.iter():
             tag = _indexer_xml_tag_name(elem.tag)
             if tag == "file":
@@ -2007,7 +2018,7 @@ def _wanted_series_title_keys(wanted_item=None):
     return out
 
 
-def _series_query_aliases(wanted_item=None, *, policy=None):
+def _series_query_aliases(wanted_item=None, *, policy=None, include_subtitle_only_aliases=True):
     wanted_keys = _wanted_series_title_keys(wanted_item)
     if not wanted_keys:
         return []
@@ -2019,9 +2030,18 @@ def _series_query_aliases(wanted_item=None, *, policy=None):
         (wanted_item or {}).get("manga_title"),
         (wanted_item or {}).get("title"),
     )
+    collected_aliases = inkdrop_sources.collected_title_aliases(series_title)
+    if not include_subtitle_only_aliases:
+        # collected_title_aliases()'s second entry is the bare subtitle alone
+        # (for example "The Court of Owls"), with no series identity attached.
+        # That is fine as a search-query term, but it is not proof of series
+        # identity: a generic story-arc subtitle can belong to many different
+        # series. Keep only the qualified "identity subtitle" form here so an
+        # identity match still requires the series name to also be present.
+        collected_aliases = collected_aliases[:1]
     for value in [
         series_title,
-        *inkdrop_sources.collected_title_aliases(series_title),
+        *collected_aliases,
         *inkdrop_sources.contributor_title_aliases(series_title),
     ]:
         alias = normalized_query(value)
@@ -2063,10 +2083,15 @@ def _series_query_aliases(wanted_item=None, *, policy=None):
 
 
 def series_identity_aliases(wanted_item=None, *, policy=None):
-    """Return only canonical or explicitly supplied titles safe for exact work identity."""
+    """Return only canonical or explicitly supplied titles safe for exact work identity.
+
+    Subtitle-only aliases are excluded: a bare subtitle is not corroborating
+    evidence of series identity on its own, so callers that use this list to
+    accept or reject a candidate never see one.
+    """
     identity_item = dict(wanted_item or {})
     identity_item["manual_search"] = True
-    return _series_query_aliases(identity_item, policy=policy)
+    return _series_query_aliases(identity_item, policy=policy, include_subtitle_only_aliases=False)
 
 
 def indexer_outer_work_identity_matches(candidate, wanted_item=None, policy=None):
@@ -2871,7 +2896,7 @@ def _torznab_rows_from_xml(text, registry_row=None):
     if not text:
         return []
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
     except ET.ParseError:
         return []
     rows = []
@@ -3541,7 +3566,13 @@ def indexer_candidate_attempt_seed(candidate, registry_row=None, status=None, re
                 indexer_candidate_identity(candidate),
             )
             identity_digest = url_hash(exact_candidate_identity)
-            save_path = f"{str(configured_root).rstrip('/\\')}/auto-inspect/{identity_digest[:20]}"
+            # rstrip's argument is bound to a name rather than written inline: a
+            # backslash inside an f-string replacement field is PEP 701, so this
+            # line is a SyntaxError before 3.12. This module is imported by 67 of
+            # the core package, so on 3.10 that one error stops 575 of 693 test
+            # files from importing anything at all. Same two characters, same call.
+            trimmed_root = str(configured_root).rstrip("/\\")
+            save_path = f"{trimmed_root}/auto-inspect/{identity_digest[:20]}"
             marker = {
                 "contract_version": 1,
                 "outcome": "auto_inspect",
@@ -4092,7 +4123,7 @@ def _rss_rows_from_xml(text):
     if not text:
         return []
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
     except ET.ParseError:
         return []
     rows = []
@@ -4265,7 +4296,7 @@ def _direct_rss_rows_from_xml(text, source_url=""):
     if not text:
         return []
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
     except ET.ParseError:
         return []
     rows = []
@@ -4341,7 +4372,7 @@ def _opds_rows_from_xml(text, source_url=""):
     if not text:
         return []
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
     except ET.ParseError:
         return []
     rows = []
@@ -5046,6 +5077,44 @@ GENERIC_DIRECT_FILE_LINK_TITLES = {
     "epub",
 }
 GENERIC_SHARED_FILE_HOSTS = ("pixeldrain",)
+GETCOMICS_SITE_HOSTS = ("getcomics.org", "www.getcomics.org")
+
+
+def uses_getcomics_transport_profile(registry_row):
+    """True when this provider's discovery actually points at GetComics.
+
+    GetComics needs a specific transport profile -- comic archive extensions
+    only, the Pixeldrain shared-file resolver, and a Pixeldrain-capped
+    transport allowlist -- because its detail pages publish an extensionless
+    /dls/<token> redirector rather than a plain file URL, and the bare mirror
+    links that do carry a visible extension go stale.
+
+    That profile used to be selected by testing `provider_id == "rss_getcomics"`
+    in eight separate places. Keying a *site's* transport rules to one row's
+    name meant a second row pointed at the very same feed silently got none of
+    them: `rss` (which the operator had already allowed to download
+    automatically) walked getcomics.org detail pages with no redirector
+    resolution and no shared-file rewrite, so the only candidate it could ever
+    build was the stale mirror link -- and it had never once produced a
+    download task. Match on the site the row is configured to poll instead, so
+    the rules follow the site rather than the row that happens to be named
+    after it.
+    """
+
+    registry_row = registry_row if isinstance(registry_row, dict) else {}
+    if str(registry_row.get("provider_id") or "").strip().lower() == "rss_getcomics":
+        return True
+    policy = provider_policy(registry_row)
+    for value in (
+        registry_row.get("base_url"),
+        registry_row.get("feed_url"),
+        policy.get("feed_url"),
+        policy.get("base_url"),
+    ):
+        host = str(urlparse(str(value or "").strip()).hostname or "").strip().lower()
+        if host in GETCOMICS_SITE_HOSTS:
+            return True
+    return False
 GENERIC_DIRECT_FILE_REDIRECT_QUERY_KEYS = {
     "download",
     "file",
@@ -5239,82 +5308,6 @@ def _pixeldrain_direct_download_url(url):
     if not file_id or not PIXELDRAIN_FILE_ID_RE.fullmatch(file_id):
         return ""
     return f"https://pixeldrain.com/api/file/{quote(file_id, safe='')}?download"
-
-
-WETRANSFER_SEGMENT_RE = re.compile(r"^[a-zA-Z0-9_-]{6,64}$")
-
-
-def _wetransfer_transfer_id_and_hash(url):
-    """Parse a wetransfer.com/downloads/<transfer_id>/<security_hash> share
-    URL into its two API parameters. Returns ("", "") for anything else,
-    including the we.tl/t-<code> shortened form -- that form 302-redirects
-    to the full downloads/ URL and isn't resolved here."""
-    parsed = urlparse(str(url or "").strip())
-    host = str(parsed.netloc or "").split(":", 1)[0].lower()
-    if host not in {"wetransfer.com", "www.wetransfer.com"}:
-        return "", ""
-    parts = [unquote(part).strip() for part in str(parsed.path or "").split("/") if part]
-    if len(parts) < 3 or parts[0].lower() != "downloads":
-        return "", ""
-    transfer_id, security_hash = parts[1], parts[2]
-    if not WETRANSFER_SEGMENT_RE.fullmatch(transfer_id) or not WETRANSFER_SEGMENT_RE.fullmatch(security_hash):
-        return "", ""
-    return transfer_id, security_hash
-
-
-def _wetransfer_direct_link_from_response(payload):
-    """Parse a wetransfer.com transfer-download API response body for the
-    real file URL. Rejects anything that isn't a well-formed http(s) URL so
-    an unexpected response shape fails closed rather than handing back a
-    garbage download target."""
-    if isinstance(payload, (str, bytes)):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            return ""
-    if not isinstance(payload, dict):
-        return ""
-    direct_link = first_text(payload.get("direct_link"), payload.get("directLink"), payload.get("url"))
-    if not direct_link:
-        return ""
-    parsed = urlparse(direct_link)
-    if str(parsed.scheme or "").lower() not in {"http", "https"} or not parsed.netloc:
-        return ""
-    return direct_link
-
-
-BUZZHEAVIER_FILE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{3,64}$")
-
-
-def _buzzheavier_file_id(url):
-    """Parse a buzzheavier.com/<file_id> (or already-suffixed .../download)
-    share URL into its bare file_id. Returns "" for anything else.
-
-    Unlike Pixeldrain, resolving the file_id into a real download is not a
-    plain URL rewrite -- buzzheavier.com/<file_id>/download only serves the
-    file for a request that looks like it came from a page load of the
-    share URL itself (htmx-style headers + a matching referer), so the
-    caller still needs buzzheavier_download_request()'s headers, not just
-    this URL. A cold, header-less request to the bare share path returns a
-    Cloudflare bot challenge; the same path with those headers reaches the
-    application layer (confirmed via a nonexistent file_id returning a
-    clean 404, not a challenge) -- but this has not been exercised against
-    a real, valid Buzzheavier share, since none was available to test
-    against.
-    """
-    parsed = urlparse(str(url or "").strip())
-    host = str(parsed.netloc or "").split(":", 1)[0].lower()
-    if host not in {"buzzheavier.com", "www.buzzheavier.com"}:
-        return ""
-    parts = [unquote(part).strip() for part in str(parsed.path or "").split("/") if part]
-    if not parts:
-        return ""
-    file_id = parts[0]
-    if len(parts) >= 2 and parts[1].lower() != "download":
-        return ""
-    if not BUZZHEAVIER_FILE_ID_RE.fullmatch(file_id):
-        return ""
-    return file_id
 
 
 def _shared_file_host_rule_match(url, shared_file_host_rules=None):
@@ -6660,9 +6653,10 @@ def direct_file_probe_candidates_from_payload(payload, registry_row=None, wanted
     # restriction" everywhere else in this function -- the opposite of what
     # disabling the resolver should do -- so bail out with zero candidates
     # outright instead of trying to express "disabled" as an empty allowlist.
-    if provider_id == "rss_getcomics" and not registry_row.get("pixeldrain_resolver_enabled", True):
+    getcomics_profile = uses_getcomics_transport_profile(registry_row)
+    if getcomics_profile and not registry_row.get("pixeldrain_resolver_enabled", True):
         return []
-    if provider_id == "rss_getcomics":
+    if getcomics_profile:
         allowed_extensions = [".cbz", ".cbr", ".zip"]
         shared_file_hosts = ["pixeldrain"]
         shared_file_host_rules = None
@@ -6676,15 +6670,15 @@ def direct_file_probe_candidates_from_payload(payload, registry_row=None, wanted
         )
         if str(value or "").strip()
     }
-    if provider_id == "rss_getcomics":
+    if getcomics_profile:
         transport_allowed_hosts = {"pixeldrain.com", "www.pixeldrain.com"}
     discovery_allowed_hosts = {
         str(urlparse(str(value or "")).hostname or value or "").strip().lower().strip("[]")
         for value in text_values(policy.get("feed_detail_allowed_hosts") or [])
         if str(value or "").strip()
     }
-    if provider_id == "rss_getcomics":
-        discovery_allowed_hosts = {"getcomics.org", "www.getcomics.org"}
+    if getcomics_profile:
+        discovery_allowed_hosts = set(GETCOMICS_SITE_HOSTS)
     source_site = first_text(policy.get("source_site_label"), registry_row.get("display_name"), registry_row.get("provider_id"), "Direct file probe source")
     resolved_redirect_urls = payload.get("resolved_redirect_urls") if isinstance(payload, dict) and isinstance(payload.get("resolved_redirect_urls"), dict) else {}
     pages = []
@@ -6786,7 +6780,7 @@ def direct_file_probe_candidates_from_payload(payload, registry_row=None, wanted
                 or policy.get("direct_allowed_hosts")
                 or []
             )
-            if provider_id == "rss_getcomics":
+            if getcomics_profile:
                 transport_hosts = ["pixeldrain.com", "www.pixeldrain.com"]
             candidate["transport_allowed_hosts"] = [
                 str(value or "").strip().lower()
@@ -6794,7 +6788,7 @@ def direct_file_probe_candidates_from_payload(payload, registry_row=None, wanted
                 if str(value or "").strip()
             ]
             candidate["max_redirects"] = max(0, min(int_value(policy.get("max_redirects"), 5), 20))
-            candidate["enforce_probe_size_match"] = provider_id == "rss_getcomics"
+            candidate["enforce_probe_size_match"] = getcomics_profile
             candidate["match_confidence"] = "candidate"
             candidate["pack"] = looks_pack_like(title)
             out.append(candidate)
@@ -9689,7 +9683,7 @@ def standard_ebooks_candidates_from_opds(opds_xml, registry_row=None, wanted_ite
     policy = provider_policy(registry_row)
     allowed = set(normalized_extensions(policy.get("allowed_extensions") or [".epub"]))
     try:
-        root = ET.fromstring(str(opds_xml or ""))
+        root = inkdrop_safe_xml.fromstring(str(opds_xml or ""))
     except ET.ParseError:
         return []
     namespace = {"atom": "http://www.w3.org/2005/Atom"}

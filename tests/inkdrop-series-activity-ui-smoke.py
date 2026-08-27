@@ -3,7 +3,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
+# The visible Activity Blocklist nav link lives in the shell template.
+WEB = (ROOT / "web" / "templates" / "inkdrop-shell.html").read_text(encoding="utf-8") + (ROOT / "core" / "inkdrop_web.py").read_text(encoding="utf-8")
 CSS = (ROOT / "web" / "static" / "css" / "inkdrop.css").read_text(encoding="utf-8")
 SERIES_DETAIL_TSX = (ROOT / "web" / "frontend" / "src" / "sections" / "SeriesDetail.tsx").read_text(encoding="utf-8")
 

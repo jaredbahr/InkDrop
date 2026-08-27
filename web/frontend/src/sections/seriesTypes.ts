@@ -76,7 +76,7 @@ const n = (value: unknown): number => Number(value || 0);
 export function seriesStatus(row: SeriesRow): SeriesStatus {
   const issues = (count: number) => `${count} issue${count === 1 ? "" : "s"}`;
   if (n(row.needs_you_count)) {
-    return { label: "Needs Review", tone: "bad", detail: `${issues(n(row.needs_you_count))} waiting on a decision.` };
+    return { label: "Needs you", tone: "bad", detail: `${issues(n(row.needs_you_count))} waiting on a decision.` };
   }
   if (n(row.active_queue_count)) {
     return { label: "Queued", tone: "warn", detail: `${issues(n(row.active_queue_count))} moving through the queue.` };

@@ -445,6 +445,19 @@ SCRIPT_SEARCH_DIRS = ("", "tests", "scripts")
 #
 # Nothing goes on this list to make a red check green. Every entry is a check
 # whose subject is not part of what the public repo contains.
+#
+# Most entries name the file their check actually reads. A few checks are not
+# about any single file -- they inspect or rebuild the export itself, and so
+# have nothing to say when run from inside one. Those use the constant below as
+# an explicit "am I in an export" sentinel rather than naming a dependency they
+# do not have. Saying so in the data matters: an entry that names a file the
+# check never touches excuses it on a false premise, and one of these did
+# exactly that for months, keeping a shipped script unvalidated on every public
+# release. tests/inkdrop-export-skip-policy-honesty-smoke.py enforces the
+# distinction, so the sentinel cannot spread to entries that should name a real
+# dependency.
+IN_EXPORT_SENTINEL = "docs/inkdrop/beta-readme-approved-20260730.md"
+
 EXPORT_SKIPPED_CHECKS = {
     # Assert against internal design documents. Exporting those docs to satisfy
     # the check would publish internal planning material.
@@ -462,8 +475,15 @@ EXPORT_SKIPPED_CHECKS = {
     # there is a real signal instead of something silenced on a wrong premise.
     # Exercises an internal audit tool.
     "inkdrop-duplicate-live-task-audit-smoke.py": ("exercises an internal audit tool", "tools/inkdrop_duplicate_live_task_audit.py"),
-    # Needs this project's own host layout, not a generic checkout.
-    "inkdrop-series-autopilot-cron-lock-smoke.py": ("needs the maintainer host's cron layout", "inkdrop-source-worker.sh"),
+    # Deliberately absent: inkdrop-series-autopilot-cron-lock-smoke.py. It was
+    # listed here as needing inkdrop-source-worker.sh, which it does not
+    # reference at all -- its only subject is inkdrop-series-autopilot-cron.sh,
+    # and that script does ship, under scripts/. So the entry excused the test
+    # on a dependency it never had, and the wrapper it exists to check went
+    # unvalidated on every public release while the skip read as deliberate.
+    # The real reason it failed there was that the export rewrote the script's
+    # location for files it moved but not for tests that merely name them;
+    # fixed in inkdrop_public_repo_export.py, so this now runs publicly.
     # Asserts against absolute maintainer paths (/home/<user>, /mnt/...), so it
     # is deliberately kept out of the export rather than published with them.
     "inkdrop-source-worker-service-smoke.py": ("asserts on maintainer host paths", "inkdrop-source-worker.sh"),
@@ -471,6 +491,7 @@ EXPORT_SKIPPED_CHECKS = {
     # from inside one. inkdrop-public-export-runnable-smoke.py covers this
     # ground from the outside, which is the only place the answer is meaningful.
     "inkdrop-public-repo-export-smoke.py": ("re-exports the repo; meaningless inside an export", "docs/inkdrop/beta-readme-approved-20260730.md"),
+    "inkdrop-public-export-runnable-smoke.py": ("builds an export to run it; meaningless inside one", "docs/inkdrop/beta-readme-approved-20260730.md"),
     "inkdrop-public-docker-runtime-smoke.py": ("checks the pre-export tree", "docs/inkdrop/beta-readme-approved-20260730.md"),
     "inkdrop-public-release-safety-audit.py": ("audits the pre-export tree", "docs/inkdrop/beta-readme-approved-20260730.md"),
     "inkdrop-planned-path-live-inspection.py": ("live inspection tool, not a self-contained check", "docs/inkdrop/beta-readme-approved-20260730.md"),

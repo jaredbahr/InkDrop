@@ -177,15 +177,22 @@ def resolve(wanted_item=None, settings=None, series=None):
     An explicit ``settings=`` always wins over the carried snapshot: a caller
     that knows its settings is more specific than a producer's projection.
     """
+    settings_source = "explicit" if isinstance(settings, dict) and settings else "default"
     if settings is None and isinstance(wanted_item, dict):
         carried = wanted_item.get(SETTINGS_SNAPSHOT_KEY)
         if isinstance(carried, dict) and carried:
             # Third position: instance settings. Not first -- see the note on
             # SETTINGS_SNAPSHOT_KEY.
             settings = carried
+            settings_source = "snapshot"
     sources = [wanted_item, series, settings]
     policy = {
         "acquisition_policy_version": ACQUISITION_POLICY_VERSION,
+        # Not one of POLICY_KEYS: never required, never validated, purely a
+        # diagnostic so a caller passing settings=None with no snapshot on the
+        # row is visible in the output instead of indistinguishable from a
+        # caller that deliberately wants the shipped default. See tracker #588.
+        "settings_source": settings_source,
         "unit_preference": _unit_preference(
             _first_present(sources, "unit_preference", SETTING_UNIT_PREFERENCE, "manga_unit_preference"),
             DEFAULTS["unit_preference"],

@@ -1057,6 +1057,21 @@ def fake_http_get(request):
             </body></html>""",
             "headers": {"Content-Type": "text/html"},
         }
+    if url == "https://files.example/detail-feed/example-book-001.cbz":
+        # The native "rss" aggregate now shares the bounded probe payload mode,
+        # so the detail page's file link gets a real HEAD before it can be
+        # graded -- the same proof the purpose-built GetComics row already
+        # required. The generic detail-direct row above still reaches this URL
+        # without probing, so this stub serves both.
+        assert_equal(request.get("method"), "HEAD", "native RSS aggregate probes the detail-page file link with HEAD")
+        return {
+            "headers": {
+                "Content-Type": "application/zip",
+                "Content-Disposition": 'attachment; filename="Example Book 001.cbz"',
+                "Content-Length": "204800",
+            },
+            "status_code": 200,
+        }
     if url == "https://pixeldrain.com/api/file/pdjobs001?download":
         assert_equal(request.get("method"), "HEAD", "direct file probe job uses HEAD")
         return {
@@ -3251,7 +3266,16 @@ def main():
         native_rss = jobs_by_id["rss"]
         assert_equal(native_rss["job_status"], "ready", "native RSS aggregate job is ready")
         assert_true(native_rss["emits_download_task"], "native RSS aggregate job can emit a task")
-        assert_equal(native_rss["fetch_plan"]["payload_mode"], "rss_feed_then_direct_file_pages", "native RSS aggregate uses bounded detail-page payload mode")
+        # The native aggregate polls getcomics.org, whose detail pages publish an
+        # extensionless /dls/ redirector rather than a plain file URL. The
+        # detail-page mode reads an extension off the link text, so it could only
+        # ever build a candidate from the stale mirror link and never produced a
+        # single download task; it now shares the bounded probe mode the
+        # purpose-built GetComics row above already uses, which follows the
+        # redirector and grades the artifact from a real probe response. Covered
+        # end to end, with negative controls, by
+        # inkdrop-getcomics-direct-transport-profile-smoke.py.
+        assert_equal(native_rss["fetch_plan"]["payload_mode"], "rss_feed_then_direct_file_probes", "native RSS aggregate uses bounded detail/probe payload mode")
         assert_equal(native_rss["fetch_plan"]["requests"][0]["url"], "https://feeds.example/detail.xml", "native RSS aggregate uses configured feed URL")
 
         current_year = time.localtime().tm_year

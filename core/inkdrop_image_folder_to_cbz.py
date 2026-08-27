@@ -22,6 +22,7 @@ import sys
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
+from core import inkdrop_safe_xml
 
 from PIL import Image, UnidentifiedImageError
 
@@ -113,7 +114,7 @@ def _validate_xml(data, *, source):
     if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
         raise ImageFolderError("comicinfo_unsafe_declaration", str(source))
     try:
-        root = ElementTree.fromstring(data)
+        root = inkdrop_safe_xml.fromstring(data)
     except ElementTree.ParseError as exc:
         raise ImageFolderError("comicinfo_invalid_xml", str(exc)) from exc
     root_name = str(root.tag).rsplit("}", 1)[-1]

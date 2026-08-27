@@ -815,6 +815,7 @@ def ensure_reconciliation_table():
               matched_kapowarr_volume_id integer,
               unit_model text,
               truth_model text,
+              volume_page_pack_reason text,
               first_sent_at real,
               last_seen_in_client_at real,
               completed_seen_at real,
@@ -839,6 +840,18 @@ def ensure_reconciliation_table():
             conn.execute("alter table download_reconciliation add column inkdrop_queue_id text")
         if "inkdrop_download_task_id" not in columns:
             conn.execute("alter table download_reconciliation add column inkdrop_download_task_id text")
+        if "volume_page_pack_reason" not in columns:
+            # THE NUMBER TRAVELLED AND ITS PROVENANCE DID NOT, and that is what
+            # made the destination guard circular. classify_inkdrop_client_file()
+            # writes both `trusted_issue` (the volume number a page-pack resolves
+            # its covered chapters to) and `volume_page_pack_reason` (the marker
+            # saying that number is a COVERAGE ASSERTION, not a reading of the
+            # file) onto the same detail dict -- then the row projection kept the
+            # number and dropped the marker. Downstream, every import payload
+            # carried a bare number indistinguishable from one the importer read
+            # off the artifact it is being graded against. Carrying the marker
+            # the same distance as the number is the whole repair.
+            conn.execute("alter table download_reconciliation add column volume_page_pack_reason text")
         conn.execute("create index if not exists idx_download_reconciliation_state on download_reconciliation (lifecycle_state)")
         conn.execute("create index if not exists idx_download_reconciliation_client on download_reconciliation (client, client_id)")
         conn.execute("create index if not exists idx_download_reconciliation_url_hash on download_reconciliation (download_url_hash)")
@@ -1299,6 +1312,7 @@ def upsert_reconciliation_records(records, updated_at=None):
                 "matched_kapowarr_volume_id": record.get("matched_kapowarr_volume_id"),
                 "unit_model": record.get("unit_model"),
                 "truth_model": record.get("truth_model"),
+                "volume_page_pack_reason": record.get("volume_page_pack_reason"),
                 "first_sent_at": record.get("first_sent_at"),
                 "last_seen_in_client_at": stamps["last_seen_in_client_at"],
                 "completed_seen_at": stamps["completed_seen_at"],
@@ -1317,13 +1331,13 @@ def upsert_reconciliation_records(records, updated_at=None):
               pending_key, title, query, protocol, client, client_id, client_hash, nzo_id, download_url_hash,
               trusted_series_id, trusted_issue, inkdrop_queue_id, inkdrop_download_task_id,
               lifecycle_state, reason, matched_local_path, matched_local_size, matched_local_mtime, matched_series,
-              matched_kapowarr_volume_id, unit_model, truth_model, first_sent_at,
+              matched_kapowarr_volume_id, unit_model, truth_model, volume_page_pack_reason, first_sent_at,
               last_seen_in_client_at, completed_seen_at, imported_at, verified_at, updated_at
             ) values (
               :pending_key, :title, :query, :protocol, :client, :client_id, :client_hash, :nzo_id, :download_url_hash,
               :trusted_series_id, :trusted_issue, :inkdrop_queue_id, :inkdrop_download_task_id,
               :lifecycle_state, :reason, :matched_local_path, :matched_local_size, :matched_local_mtime, :matched_series,
-              :matched_kapowarr_volume_id, :unit_model, :truth_model, :first_sent_at,
+              :matched_kapowarr_volume_id, :unit_model, :truth_model, :volume_page_pack_reason, :first_sent_at,
               :last_seen_in_client_at, :completed_seen_at, :imported_at, :verified_at, :updated_at
             )
             on conflict(pending_key) do update set
@@ -1348,6 +1362,7 @@ def upsert_reconciliation_records(records, updated_at=None):
               matched_kapowarr_volume_id=excluded.matched_kapowarr_volume_id,
               unit_model=excluded.unit_model,
               truth_model=excluded.truth_model,
+              volume_page_pack_reason=coalesce(excluded.volume_page_pack_reason, download_reconciliation.volume_page_pack_reason),
               first_sent_at=coalesce(download_reconciliation.first_sent_at, excluded.first_sent_at),
               last_seen_in_client_at=coalesce(excluded.last_seen_in_client_at, download_reconciliation.last_seen_in_client_at),
               completed_seen_at=coalesce(excluded.completed_seen_at, download_reconciliation.completed_seen_at),
@@ -5571,6 +5586,11 @@ def sync_inkdrop_import_ready_records(max_records=300, budget_seconds=None):
                 "matched_kapowarr_volume_id": chosen.get("matched_kapowarr_volume_id"),
                 "unit_model": chosen.get("unit_model"),
                 "truth_model": chosen.get("truth_model"),
+                # Carried beside `trusted_issue` below, deliberately: that number
+                # is a page-pack's coverage assertion rather than a filename
+                # reading, and the destination guard cannot tell the two apart
+                # once this marker is dropped.
+                "volume_page_pack_reason": chosen.get("volume_page_pack_reason"),
                 "first_sent_at": row.get("started_at") or row.get("queue_updated_at"),
                 "trusted_series_id": row.get("series_id"),
                 "trusted_issue": chosen.get("trusted_issue") or row.get("issue_number") or row.get("normalized_number"),
@@ -6870,7 +6890,7 @@ def ready_import_records(max_files):
             """
             select pending_key, matched_local_path, trusted_series_id, trusted_issue,
                    inkdrop_queue_id, inkdrop_download_task_id, matched_series, title, query, client,
-                   updated_at, completed_seen_at
+                   updated_at, completed_seen_at, volume_page_pack_reason
             from download_reconciliation
             where lifecycle_state = 'ready_to_import'
               and matched_local_path is not null
@@ -7001,6 +7021,10 @@ def ready_import_records(max_files):
                 "title": row[7],
                 "query": row[8],
                 "client": row[9],
+                # Travels with row[3]. Without it the number below is just a
+                # number, and the destination guard has to either trust every
+                # payload (circular) or none (refuses every page-pack).
+                "volume_page_pack_reason": row[12],
             }
             authority_row = eligible_inkdrop_by_task.get((queue_id, str(row[5] or ""))) or {}
             if authority_row:
@@ -8100,6 +8124,14 @@ def recover_active_import_ready_from_imported_files(limit=300):
 def sync_inkdrop_from_reconciled_imports(limit=INKDROP_RECONCILED_IMPORT_SYNC_LIMIT):
     if inkdrop_state is None or not (DB_PATH.exists() and INKDROP_STATE_DB.exists()):
         return {"ok": False, "reason": "db_missing", "updated": 0}
+    # The select below now names volume_page_pack_reason, which a database
+    # written before that column existed does not have -- and this function is
+    # reachable on a freshly deployed build before anything else has run
+    # persist_reconciliation(). Same call the other readers of this table
+    # already make first (ready_import_records(),
+    # recover_import_ready_timeouts_from_imported_files()); idempotent, and it
+    # is what applies the additive migration.
+    ensure_reconciliation_table()
     started = time.monotonic()
     max_rows = max(1, min(int(limit or INKDROP_RECONCILED_IMPORT_SYNC_LIMIT), INKDROP_RECONCILED_IMPORT_SYNC_LIMIT))
     conn = connect_db()
@@ -8108,7 +8140,7 @@ def sync_inkdrop_from_reconciled_imports(limit=INKDROP_RECONCILED_IMPORT_SYNC_LI
             """
             select pending_key, lifecycle_state, reason, matched_local_path, matched_series,
                    trusted_series_id, trusted_issue, inkdrop_queue_id, inkdrop_download_task_id, client, imported_at,
-                   verified_at, updated_at, title, query, unit_model, truth_model
+                   verified_at, updated_at, title, query, unit_model, truth_model, volume_page_pack_reason
             from download_reconciliation
             where inkdrop_queue_id is not null
               and length(trim(inkdrop_queue_id)) > 0
@@ -8149,6 +8181,7 @@ def sync_inkdrop_from_reconciled_imports(limit=INKDROP_RECONCILED_IMPORT_SYNC_LI
             query,
             unit_model,
             truth_model,
+            volume_page_pack_reason,
         ) = row
         queue_id = str(inkdrop_queue_id or "").strip()
         if not queue_id:
@@ -8243,6 +8276,7 @@ def sync_inkdrop_from_reconciled_imports(limit=INKDROP_RECONCILED_IMPORT_SYNC_LI
             "matched_series": matched_series,
             "trusted_series_id": trusted_series_id,
             "trusted_issue": trusted_issue,
+            "volume_page_pack_reason": volume_page_pack_reason or None,
             "reconciliation_state": state,
             "reconciliation_updated_at": updated_at,
             "imported_file_source_path": imported_source_path,
@@ -8914,6 +8948,7 @@ def record_inkdrop_import_attempt(record, parsed, returncode=0):
         "import_ready_bridge": True,
         "trusted_series_id": record.get("trusted_series_id"),
         "trusted_issue": record.get("trusted_issue"),
+        "volume_page_pack_reason": record.get("volume_page_pack_reason") or None,
         "pending_key": record.get("pending_key"),
         "returncode": int(returncode or 0),
         "download_task_id": record.get("inkdrop_download_task_id"),

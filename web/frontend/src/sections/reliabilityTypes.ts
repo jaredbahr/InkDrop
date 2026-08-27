@@ -28,7 +28,7 @@ export type ReliabilityBucketKey =
   // queue_state claims searching/downloading/importing/source_wait but no
   // live claim, unexpired lease, or fresh task evidence backs it up --
   // demoted here from actively_processing by
-  // demote_unconfirmed_active_rows() (core/inkdrop_state.py). Prompt121:
+  // demote_unconfirmed_active_rows() (core/inkdrop_state.py). Measured live 2026-08-18:
   // 39-40 wanted|in_progress rows carried "Working right now" with zero
   // claims and zero mapped owners, live 2026-08-18.
   | "active_unconfirmed"
@@ -37,7 +37,7 @@ export type ReliabilityBucketKey =
   // candidate_awaiting_pick demoted here when the row's own triggering
   // evidence is a phrase, a count, or an older attempt with no retained
   // candidate identity/hash -- see current_pickable_candidate_reference()
-  // (core/inkdrop_state.py). Prompt122: 228/282 carried the old bucket on
+  // (core/inkdrop_state.py). 228/282 carried the old bucket on
   // prose alone, live 2026-08-18.
   | "candidate_unconfirmed"
   | "candidates_rejected"

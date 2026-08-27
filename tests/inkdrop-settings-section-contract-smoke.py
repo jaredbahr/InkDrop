@@ -21,7 +21,7 @@ SETTINGS_SECTIONS = {
     "media_management": {"min_items": 1, "provider_ids": {"media_management"}},
     "language": {"min_items": 1, "provider_ids": {"quality_language_rules"}},
     "indexers": {"min_items": 1, "provider_ids": {"prowlarr"}},
-    "download_clients": {"min_items": 1, "provider_ids": {"sabnzbd", "qbittorrent", "slskd", "comicscodes", "pixeldrain", "wetransfer"}},
+    "download_clients": {"min_items": 1, "provider_ids": {"sabnzbd", "qbittorrent", "slskd", "comicscodes", "pixeldrain"}},
     "import_lists": {"min_items": 1, "setting_prefixes": ("import_lists.",)},
     "connect": {"min_items": 1, "provider_ids": {"kavita", "komga"}},
     "metadata_files": {"min_items": 1, "setting_prefixes": ("metadata_files.",)},
@@ -155,12 +155,12 @@ def main():
             dc_payload_after = web.inkdrop_settings_public(sync=False, area="download_clients")
             dc_ids_after = {str(row.get("id") or "").strip().lower() for row in payload_items(dc_payload_after)[0]}
             require(
-                {"comicscodes", "slskd", "sabnzbd", "qbittorrent", "pixeldrain", "wetransfer"}.issubset(dc_ids_after)
+                {"comicscodes", "slskd", "sabnzbd", "qbittorrent", "pixeldrain"}.issubset(dc_ids_after)
                 and ("rss" in dc_ids_after or "rss_direct" in dc_ids_after),
                 f"saving one provider must not hide its untouched siblings, got {sorted(dc_ids_after)}",
             )
 
-            # Pixeldrain and WeTransfer are shared-file-host resolvers, not
+            # Pixeldrain is a shared-file-host resolver, not a discovery source --
             # discovery sources -- their enable toggle must still persist
             # like any other Download Clients row.
             pixeldrain_before = next(row for row in payload_items(dc_payload_after)[0] if row.get("id") == "pixeldrain")
@@ -171,8 +171,6 @@ def main():
             pixeldrain_after = next(row for row in payload_items(dc_payload_final)[0] if row.get("id") == "pixeldrain")
             require(pixeldrain_after.get("enabled") is False, "disabling Pixeldrain must actually persist")
 
-            wetransfer_before = next(row for row in payload_items(dc_payload_after)[0] if row.get("id") == "wetransfer")
-            require(wetransfer_before.get("enabled") is False, "WeTransfer defaults to disabled -- no source is wired to use it yet")
         finally:
             web.INKDROP_STATE_DB = old_db
 

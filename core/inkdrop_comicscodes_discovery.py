@@ -22,6 +22,7 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 from pathlib import Path
 
 import requests
@@ -321,7 +322,7 @@ class LinkExtractor(html.parser.HTMLParser):
 
 def parse_xml_items(text, source_url):
     try:
-        root = ET.fromstring(text)
+        root = inkdrop_safe_xml.fromstring(text)
     except ET.ParseError:
         return []
     items = []

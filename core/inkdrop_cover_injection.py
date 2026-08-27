@@ -83,6 +83,7 @@ import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
+from core import inkdrop_safe_xml
 
 from core import inkdrop_archive_conversion as conversion
 from core import inkdrop_runtime_config
@@ -253,7 +254,7 @@ def rewrite_comicinfo(data, page_count):
         return None
     _validate_xml(data, source="source ComicInfo.xml")
     try:
-        root = ElementTree.fromstring(data)
+        root = inkdrop_safe_xml.fromstring(data)
     except ElementTree.ParseError as exc:
         raise InjectionRefused("comicinfo_unparseable", str(exc))
 
@@ -331,6 +332,70 @@ def mangadex_full_size_cover_url(manga_id, filename):
     if not manga_id or not filename:
         return ""
     return f"{MANGADEX_COVER_URL}/{manga_id}/{filename}"
+
+
+# ComicVine serves every size of an upload from one path with a single segment
+# swapped: ``/a/uploads/<size>/<a>/<b>/<file>``. ``original`` is the untouched
+# upload, the analogue of dropping MangaDex's ``.256.jpg`` suffix.
+#
+# Measured across ALL 355 stored ComicVine cover URLs, 2026-08-26 snapshot
+# ``20260826T222706Z``: 341 are stored as ``scale_large`` and 14 as
+# ``scale_small``. Rewriting only ``scale_large`` would silently skip fourteen
+# series, so the segment is replaced whatever it is.
+COMICVINE_UPLOAD_RE = re.compile(r"^(https?://[^/]+/a/uploads/)([^/]+)(/.+)$", re.I)
+
+# Filenames that are certainly not a front cover.
+#
+# The resolver's docstring used to assert ComicVine volume art is "frequently an
+# interior page or a screenshot". Measured over all 355: SEVEN are (2.0%) --
+# five ``-page1`` scans and a ``screen_shot_2013_...``. So "frequently" was
+# wrong, but the kind of failure is real, and ``validate_cover_bytes()`` cannot
+# catch it: a page-one scan is a large, well-formed, high-resolution JPEG and
+# passes every check there. Only the filename gives it away.
+#
+# Deliberately NARROW. A broad pattern rejects good covers, and a refused good
+# cover is invisible while a wrong injected cover is not. Verified against
+# eleven cover-shaped stems including the adversarial ``page-turner-cover``,
+# ``x-page`` and ``01-page-one-cover``: none is rejected.
+COMICVINE_NOT_A_COVER_RE = re.compile(
+    r"(screen[\s_-]?shot|screenshot)|[._-]page\s*\d+\b", re.I
+)
+
+
+def comicvine_full_size_cover_url(url):
+    """The original upload behind a ComicVine image URL, or "" if it is not one."""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    match = COMICVINE_UPLOAD_RE.match(text)
+    if not match:
+        return ""
+    prefix, size, tail = match.groups()
+    if size.lower() == "original":
+        return text
+    return f"{prefix}original{tail}"
+
+
+def comicvine_cover_refusal(url):
+    """Why this ComicVine image cannot be a front cover, or "" if it can.
+
+    Judged on the filename because that is the only thing that distinguishes a
+    cover from an interior page before the bytes are fetched, and the bytes do
+    not distinguish them at all.
+    """
+    from urllib.parse import unquote
+
+    text = str(url or "").strip()
+    if not text:
+        return "no_cover_available"
+    if not COMICVINE_UPLOAD_RE.match(text):
+        # Not an upload URL, so the size segment cannot be rewritten and the
+        # host is not the one the proxy allowlist was widened for.
+        return "cover_url_unresolved"
+    stem = unquote(text.rsplit("/", 1)[-1]).rsplit(".", 1)[0]
+    if COMICVINE_NOT_A_COVER_RE.search(stem):
+        return "cover_is_not_front_cover"
+    return ""
 
 
 def fetch_cover(url, fetcher=None):
@@ -873,7 +938,7 @@ def reconcile_imported_files(old_path, new_path, *, db_path=None, dry_run=False)
 # ---------------------------------------------------------------------------
 
 
-SUPPORTED_PROVIDERS = {"mangadex"}
+SUPPORTED_PROVIDERS = {"mangadex", "comicvine"}
 
 # Outcomes that mean "there is nothing to do here", not "something went wrong".
 # A library-wide sweep hits these constantly -- series with no files yet, series
@@ -902,10 +967,14 @@ def resolve_series_cover_url(series, *, cover_records=None, select_cover=None, s
     differs -- the shelf asks for a 256px thumbnail, and a page needs the
     original upload.
 
-    Providers other than MangaDex are refused on purpose. ComicVine volume art
-    is frequently an interior page or a screenshot and has no volume field to
-    sort on, and Metron returns no cover at all, so injecting from either would
-    confidently write the wrong picture into the library.
+    MangaDex and ComicVine resolve by different routes because they store
+    different things. MangaDex has a cover list with volume numbers, so the
+    volume-one selection above picks the art. ComicVine has no volume field to
+    sort on and stores exactly one image per series, so there is nothing to
+    select -- the work is turning that one URL into the full-size upload and
+    refusing it when it is not a cover.
+
+    Metron is still refused: it returns no cover at all.
     """
     series = series if isinstance(series, dict) else {}
     provider = str(series.get("metadata_provider") or "").strip().lower()
@@ -914,6 +983,9 @@ def resolve_series_cover_url(series, *, cover_records=None, select_cover=None, s
         return {"ok": False, "reason": "provider_unsupported", "provider": provider or "none"}
     if not metadata_id:
         return {"ok": False, "reason": "series_missing_metadata_id", "provider": provider}
+
+    if provider == "comicvine":
+        return _resolve_comicvine_cover(series, provider)
 
     if cover_records is None or select_cover is None or settings is None:
         from core import inkdrop_web
@@ -948,6 +1020,49 @@ def resolve_series_cover_url(series, *, cover_records=None, select_cover=None, s
     if not url:
         return {"ok": False, "reason": "cover_url_unresolved", "provider": provider}
     return {"ok": True, "url": url, "filename": filename, "provider": provider}
+
+
+def _resolve_comicvine_cover(series, provider):
+    """Resolve the full-size ComicVine cover for one series.
+
+    Reads ``raw_json`` rather than a ``cover_url`` key because that is what the
+    real path provides: ``series_candidates()`` selects
+    ``id, title, media_type, metadata_provider, metadata_id, library_path,
+    raw_json`` and adds only ``original_language``. A fixture handing this a
+    tidy ``cover_url`` would be more generous than production and would prove
+    nothing.
+
+    Extraction goes through ``series_image_from_raw()`` -- the same function the
+    rest of the product uses to find a series image -- rather than a second
+    reader that could disagree with it about where the image lives.
+    """
+    from core.inkdrop_state import series_image_from_raw
+
+    raw = series.get("raw_json")
+    if isinstance(raw, (str, bytes, bytearray)):
+        try:
+            raw = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = raw if isinstance(raw, dict) else {}
+
+    stored = str(series_image_from_raw(raw) or "").strip()
+    refusal = comicvine_cover_refusal(stored)
+    if refusal:
+        return {"ok": False, "reason": refusal, "provider": provider}
+
+    url = comicvine_full_size_cover_url(stored)
+    if not url:
+        return {"ok": False, "reason": "cover_url_unresolved", "provider": provider}
+
+    # The stored URL is a real fallback, not belt-and-braces: of 230 series with
+    # a usable cover, 228 validate at ``/original/`` and TWO validate only at
+    # the stored size. A resolver that returned the rewritten URL alone would
+    # lose those two.
+    fallbacks = [stored] if stored and stored != url else []
+    return {"ok": True, "url": url, "fallback_urls": fallbacks,
+            "filename": url.rsplit("/", 1)[-1], "provider": provider}
 
 
 def apply_series(
@@ -1032,10 +1147,39 @@ def apply_series(
         # network work at all.
         outcome["existing_marker"] = existing
 
-    try:
-        cover_bytes = fetch_cover(resolved["url"], fetcher=fetcher)
-    except InjectionRefused as exc:
-        return {**outcome, "reason": exc.reason, "detail": exc.detail}
+    candidates = [resolved["url"]]
+    candidates += [str(u) for u in (resolved.get("fallback_urls") or []) if str(u or "").strip()]
+
+    if len(candidates) == 1:
+        # The single-candidate path is left exactly as it was. MangaDex never
+        # sets fallbacks, so it fetches once and validation stays where it was,
+        # inside inject_archive() -- including which layer reports a refusal.
+        try:
+            cover_bytes = fetch_cover(resolved["url"], fetcher=fetcher)
+        except InjectionRefused as exc:
+            return {**outcome, "reason": exc.reason, "detail": exc.detail}
+    else:
+        # More than one candidate means the caller has said a later URL is worth
+        # trying when an earlier one is unusable, so each is fetched AND
+        # validated and the first that satisfies both wins. Validating here is
+        # what makes the fallback real: a URL that fetches happily but decodes
+        # to a 334x500 thumbnail has to fall through, not win.
+        cover_bytes = None
+        last = None
+        for candidate in candidates:
+            try:
+                attempt = fetch_cover(candidate, fetcher=fetcher)
+                validate_cover_bytes(attempt)
+            except InjectionRefused as exc:
+                last = exc
+                continue
+            cover_bytes = attempt
+            outcome["cover_url"] = candidate
+            resolved = {**resolved, "url": candidate}
+            break
+        if cover_bytes is None:
+            exc = last or InjectionRefused("cover_fetch_failed", {"url": candidates[0]})
+            return {**outcome, "reason": exc.reason, "detail": exc.detail}
 
     if dry_run:
         planned = "retarget" if stale else ("refresh" if existing else "inject")
@@ -1133,16 +1277,28 @@ def apply_series(
 # ---------------------------------------------------------------------------
 
 
-def injectable_series(db_path=None, series_ids=None):
-    """Series that could carry an injected cover, newest naming aside.
+def series_candidates(db_path=None, series_ids=None):
+    """Every series the sweep considered, split into what it can act on and what it cannot.
 
-    Reads the state database directly and read-only. Only rows with a library
-    folder and a supported metadata provider come back; everything else would
-    be refused one row later anyway and would only pad the report.
+    The provider filter used to live inside the row loop and simply ``continue``
+    past anything it could not read a cover for. That was invisible: the rows
+    never reached the sweep, so they were absent from its considered count, from
+    its skip reasons, and from its results -- a backfill across a library that
+    is 92% ComicVine looked at 37 series out of 484 and printed a clean run.
+
+    So the exclusion is returned rather than swallowed. The eligible list is
+    exactly what it was; the excluded list is what the caller has to account for
+    if it wants to claim it swept a library.
+
+    The reason is decided here, from the row alone, and deliberately *not* by
+    letting the row fall through to ``apply_series``. A ComicVine series whose
+    folder is also missing would come back ``library_folder_missing`` from
+    there, and the provider gap -- the thing that actually stops it -- would be
+    undercounted by every series that has a second problem as well.
     """
     db_path = Path(db_path) if db_path else default_state_db_path()
     if not db_path.exists():
-        return []
+        return {"eligible": [], "excluded": []}
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=15)
     con.row_factory = sqlite3.Row
     try:
@@ -1155,7 +1311,7 @@ def injectable_series(db_path=None, series_ids=None):
         if series_ids:
             ids = [str(value) for value in series_ids if str(value or "").strip()]
             if not ids:
-                return []
+                return {"eligible": [], "excluded": []}
             query += f" and id in ({','.join('?' for _ in ids)})"
             params = ids
         query += " order by coalesce(sort_title, title) collate nocase"
@@ -1164,9 +1320,21 @@ def injectable_series(db_path=None, series_ids=None):
         con.close()
 
     out = []
+    excluded = []
     for row in rows:
         provider = str(row.get("metadata_provider") or "").strip().lower()
         if provider not in SUPPORTED_PROVIDERS:
+            excluded.append(
+                {
+                    "series_id": row.get("id"),
+                    "title": row.get("title"),
+                    "folder": str(row.get("library_path") or ""),
+                    "provider": provider or "none",
+                    "reason": "provider_unsupported",
+                    "considered": False,
+                    "changed": False,
+                }
+            )
             continue
         raw = {}
         try:
@@ -1176,7 +1344,16 @@ def injectable_series(db_path=None, series_ids=None):
         if isinstance(raw, dict):
             row["original_language"] = raw.get("originalLanguage") or raw.get("original_language")
         out.append(row)
-    return out
+    return {"eligible": out, "excluded": excluded}
+
+
+def injectable_series(db_path=None, series_ids=None):
+    """The rows the injector can act on. The automatic paths want only these.
+
+    A sweep wants ``series_candidates()`` instead: it has to report the rows
+    this drops, and this signature has nowhere to put them.
+    """
+    return series_candidates(db_path=db_path, series_ids=series_ids)["eligible"]
 
 
 def sweep_library(
@@ -1198,11 +1375,18 @@ def sweep_library(
     because this rewrites archive files across the entire library and a bare
     "done" would be the wrong amount of information to hand someone afterwards.
     """
-    series = injectable_series(db_path=db_path, series_ids=series_ids)
+    candidates = series_candidates(db_path=db_path, series_ids=series_ids)
+    series = candidates["eligible"]
+    excluded = candidates["excluded"]
     summary = {
         "schema": COVER_INJECTION_SCHEMA,
         "dry_run": bool(dry_run),
+        # Three numbers, not one. "considered" alone reads as the whole library
+        # to anyone who does not already know a provider filter ran first.
+        "series_in_library": len(series) + len(excluded),
         "series_considered": len(series),
+        "not_considered": len(excluded),
+        "not_considered_reasons": {},
         "injected": 0,
         "would_change": 0,
         "already_current": 0,
@@ -1282,6 +1466,14 @@ def sweep_library(
         if progress:
             progress({"event": "done", "index": index, "total": len(series), **result})
 
+    # The rows the provider filter dropped are reported here rather than left
+    # out, keyed by reason and provider so the gap is a number someone can act
+    # on instead of an absence they have to notice.
+    for row in excluded:
+        key = f"{row['reason']}:{row['provider']}"
+        summary["not_considered_reasons"][key] = summary["not_considered_reasons"].get(key, 0) + 1
+        summary["results"].append(row)
+
     summary["attempted"] = attempted
     summary["changed_folders"] = sorted(set(summary["changed_folders"]))
     summary["renamed_folders"] = sorted(set(summary["renamed_folders"]))
@@ -1290,6 +1482,10 @@ def sweep_library(
             summary["changed_folders"], renamed_folders=summary["renamed_folders"]
         )
     summary["ok"] = summary["failed"] == 0
+    # Distinct from "ok" on purpose. Nothing failed *and* the run only looked at
+    # part of the library are both true at once, and a caller that wants to
+    # close a backfill out needs the second one, which "ok" cannot carry.
+    summary["complete"] = summary["not_considered"] == 0
     return summary
 
 
@@ -1336,12 +1532,30 @@ def maybe_inject_for_folders(folders, *, db_path=None, reason="import", refresh=
         return {**result, "reason": "cover_injection_disabled", "ok": True}
 
     wanted = {str(Path(folder)) for folder in folders}
+    candidates = series_candidates(db_path=db_path)
     rows = [
         row
-        for row in injectable_series(db_path=db_path)
+        for row in candidates["eligible"]
         if str(Path(str(row.get("library_path") or ""))) in wanted
     ]
     if not rows:
+        # "No injectable series" and "this series' provider is not supported"
+        # are different facts, and the import path only ever saw the first.
+        # Naming the second is what stops a folder that will *never* get a
+        # cover from looking like one that simply had no series row yet.
+        blocked = [
+            row
+            for row in candidates["excluded"]
+            if str(Path(str(row.get("folder") or ""))) in wanted
+        ]
+        if blocked:
+            return {
+                **result,
+                "reason": "provider_unsupported",
+                "unsupported_providers": sorted({row["provider"] for row in blocked}),
+                "unsupported_series": [row["series_id"] for row in blocked],
+                "ok": True,
+            }
         return {**result, "reason": "no_injectable_series_for_folders", "ok": True}
 
     for row in rows:
@@ -1399,8 +1613,13 @@ def maybe_inject_for_series(series_id, *, db_path=None, reason="import", **kwarg
     result = {"series_id": series_id, "trigger": reason, "changed": False}
     if not automatic_injection_enabled(db_path=db_path):
         return {**result, "reason": "cover_injection_disabled", "ok": True}
-    rows = injectable_series(db_path=db_path, series_ids=[series_id])
+    candidates = series_candidates(db_path=db_path, series_ids=[series_id])
+    rows = candidates["eligible"]
     if not rows:
+        blocked = candidates["excluded"]
+        if blocked:
+            return {**result, "reason": "provider_unsupported",
+                    "provider": blocked[0]["provider"], "ok": True}
         return {**result, "reason": "series_not_injectable", "ok": True}
     outcome = apply_series(rows[0], dry_run=False, **kwargs)
     if outcome.get("changed") and outcome.get("folder"):
@@ -1524,6 +1743,8 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=None, help="Touch at most this many series during a sweep.")
     parser.add_argument("--no-refresh", action="store_true",
                         help="Skip asking Kavita and Komga to re-derive covers afterwards.")
+    parser.add_argument("--require-complete", action="store_true",
+                        help="Exit non-zero if a sweep could not examine every series in the library.")
     args = parser.parse_args(argv)
 
     if args.sweep:
@@ -1619,12 +1840,17 @@ def _run_sweep(args):
         progress=progress,
     )
 
+    incomplete = not summary.get("complete", True)
+
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True, default=str))
-        return 0 if summary.get("ok") else 1
+        if not summary.get("ok"):
+            return 1
+        return 2 if (incomplete and args.require_complete) else 0
 
     mode = "would change" if summary["dry_run"] else "injected"
     print()
+    print(f"series in library: {summary.get('series_in_library', summary['series_considered'])}")
     print(f"series considered: {summary['series_considered']} (attempted {summary.get('attempted', 0)})")
     print(f"{mode}: {summary['would_change'] if summary['dry_run'] else summary['injected']}")
     print(f"already correct: {summary['already_current']}")
@@ -1634,6 +1860,9 @@ def _run_sweep(args):
     print(f"failed: {summary['failed']}")
     for reason, count in sorted(summary["failed_reasons"].items(), key=lambda kv: -kv[1]):
         print(f"    {count:>4}  {reason}")
+    print(f"not considered: {summary.get('not_considered', 0)}")
+    for reason, count in sorted(summary.get("not_considered_reasons", {}).items(), key=lambda kv: -kv[1]):
+        print(f"    {count:>4}  {reason}")
     if summary.get("reader_refresh"):
         errors = summary["reader_refresh"].get("errors") or []
         print(f"reader refresh: {len(summary['changed_folders'])} folders, {len(errors)} errors")
@@ -1641,7 +1870,23 @@ def _run_sweep(args):
             print(f"    {error}")
     if summary["dry_run"]:
         print("\nnothing was modified. re-run with --apply to write.")
-    return 0 if summary.get("ok") else 1
+
+    # The line this whole report exists for. A sweep that never looked at most
+    # of the library must not be readable as a library-wide pass, because the
+    # next thing that happens is someone closing the backfill out on the
+    # strength of a clean run.
+    if incomplete:
+        considered = summary["series_considered"]
+        total = summary.get("series_in_library", considered)
+        print(
+            f"\nINCOMPLETE: this pass covered {considered} of {total} series. "
+            f"{summary['not_considered']} were never examined -- see 'not considered' above. "
+            "Do not read this run as a whole-library result."
+        )
+
+    if not summary.get("ok"):
+        return 1
+    return 2 if (incomplete and args.require_complete) else 0
 
 
 def _report(results, args, verb):

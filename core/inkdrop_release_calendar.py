@@ -43,6 +43,7 @@ from pathlib import Path
 
 from core import inkdrop_runtime_config
 from core import inkdrop_state
+from core.inkdrop_display_labels import display_label
 
 
 CALENDAR_SCHEMA = "inkdrop.release_calendar.v1"
@@ -305,7 +306,7 @@ def build_entry(row, today):
         "release_date": day,
         "released": released,
         "status": status,
-        "status_label": STATUS_LABELS.get(status, status.replace("_", " ").title()),
+        "status_label": display_label(status, STATUS_LABELS),
         "series_monitored": _as_bool(row["series_monitored"]),
         "issue_monitored": _as_bool(row["issue_monitored"]),
         "in_library": status == "owned",

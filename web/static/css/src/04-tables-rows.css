@@ -1553,10 +1553,29 @@
     body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-flags {
       display: none;
     }
+    /* Manual Review was the only operational table declaring a multi-track row
+       grid WITHOUT the min-width + overflow-x pair every sibling declares --
+       queue, wanted, history, source_memory, issues, source_attempts,
+       download_tasks and imports all pin a row min-width (940-1040px) and give
+       their container `overflow-x: auto`. Without the pair there is nothing to
+       scroll, so once the row exceeds its container the right-hand tracks are
+       simply unreachable: the Review Decision button was measured at x1332-1436
+       against a 1224px client width, and again at x2050-2130 against 1393px.
+       Those are the primary controls on this view, so they were invisible
+       rather than inert.
+       The tracks below sum to 880px, plus 3x8px gaps and the row's 20px
+       horizontal padding = 924px, so 940px is the honest floor for this grid
+       and sits inside the 940-1040 range its siblings already use. */
     body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-head,
     body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row {
+      min-width: 940px;
       grid-template-columns: minmax(290px, 1.28fr) minmax(112px, .42fr) minmax(258px, .84fr) minmax(220px, .72fr);
       gap: 8px;
+    }
+    body[data-inkdrop-view="manual_review"] .section-table-manual_review {
+      overflow-x: auto;
+      overflow-y: visible;
+      scrollbar-width: thin;
     }
     body[data-inkdrop-view="manual_review"] .section-table-manual_review .section-table-row {
       align-items: center;

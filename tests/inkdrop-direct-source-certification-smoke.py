@@ -291,78 +291,6 @@ def assert_pixeldrain_resolver_toggle_gates_getcomics():
     assert_equal(len(default_candidates), 1, "an absent resolver-enabled flag defaults to enabled, matching pre-toggle behavior")
 
 
-def assert_wetransfer_resolver_parsing():
-    """WeTransfer resolution needs a live API call (transfer_id + security_hash
-    -> POST -> direct_link), so unlike Pixeldrain it can't be expressed as a
-    pure URL rewrite. No InkDrop source surfaces WeTransfer links yet, so
-    this only exercises the parsing/request-shape layer -- not a live
-    round-trip against a real share, which nothing here can provide."""
-    share_url = "https://wetransfer.com/downloads/abc123def456ghi789/jkl012mno345pqr678"
-    transfer_id, security_hash = source_providers._wetransfer_transfer_id_and_hash(share_url)
-    assert_equal(transfer_id, "abc123def456ghi789", "transfer_id parses out of a real-shaped share URL")
-    assert_equal(security_hash, "jkl012mno345pqr678", "security_hash parses out of a real-shaped share URL")
-
-    non_wetransfer = source_providers._wetransfer_transfer_id_and_hash("https://pixeldrain.com/u/abc123")
-    assert_equal(non_wetransfer, ("", ""), "a non-WeTransfer URL parses to nothing")
-
-    shortened = source_providers._wetransfer_transfer_id_and_hash("https://we.tl/t-abc123")
-    assert_equal(shortened, ("", ""), "the we.tl shortened form is not resolved here -- it needs a redirect hop first")
-
-    request = source_adapters.wetransfer_resolve_request(share_url)
-    assert_true(request is not None, "a valid WeTransfer share URL builds a resolve request")
-    assert_equal(request["method"], "POST", "the resolve request is a POST, not a GET")
-    assert_equal(request["url"], "https://wetransfer.com/api/v4/transfers/abc123def456ghi789/download", "the resolve request targets the transfer-specific download endpoint")
-    assert_equal(request.get("json", {}).get("security_hash"), "jkl012mno345pqr678", "the security_hash is carried in the request body")
-    assert_equal(request.get("allowed_hosts"), list(source_adapters.WETRANSFER_TRANSPORT_HOSTS), "the resolve request is scoped to wetransfer.com only")
-
-    no_request = source_adapters.wetransfer_resolve_request("https://example.test/not-wetransfer")
-    assert_true(no_request is None, "a non-WeTransfer URL builds no resolve request at all")
-
-    valid_response = source_providers._wetransfer_direct_link_from_response(
-        {"direct_link": "https://download.wetransfer.com/eugv/abc123?token=xyz"}
-    )
-    assert_equal(valid_response, "https://download.wetransfer.com/eugv/abc123?token=xyz", "a well-formed API response yields the real direct link")
-
-    assert_equal(source_providers._wetransfer_direct_link_from_response({}), "", "a response with no direct_link resolves to nothing")
-    assert_equal(source_providers._wetransfer_direct_link_from_response({"direct_link": "not a url"}), "", "a malformed direct_link is rejected, not passed through")
-    assert_equal(source_providers._wetransfer_direct_link_from_response(None), "", "a non-dict response resolves to nothing")
-
-
-def assert_buzzheavier_resolver_parsing():
-    """Buzzheavier has no documented "resolve a share link" API -- its
-    official API covers uploading/managing your own files. The real
-    download path (reverse-engineered from a real client, not ported --
-    see the PR description for the license note) is a GET to
-    <file_id>/download carrying htmx-style headers and a matching referer;
-    a bare/header-less request to that same path draws a Cloudflare bot
-    challenge. This exercises the parsing/request-shape layer only -- not
-    a live round-trip against a real share, since none was available to
-    test against."""
-    share_url = "https://buzzheavier.com/abc123XYZ"
-    file_id = source_providers._buzzheavier_file_id(share_url)
-    assert_equal(file_id, "abc123XYZ", "file_id parses out of a real-shaped share URL")
-
-    with_download_suffix = source_providers._buzzheavier_file_id("https://buzzheavier.com/abc123XYZ/download")
-    assert_equal(with_download_suffix, "abc123XYZ", "an already-suffixed /download URL parses the same file_id")
-
-    non_buzzheavier = source_providers._buzzheavier_file_id("https://pixeldrain.com/u/abc123")
-    assert_equal(non_buzzheavier, "", "a non-Buzzheavier URL parses to nothing")
-
-    wrong_suffix = source_providers._buzzheavier_file_id("https://buzzheavier.com/abc123XYZ/preview")
-    assert_equal(wrong_suffix, "", "a share URL with an unrecognized second path segment parses to nothing")
-
-    request = source_adapters.buzzheavier_download_request(share_url)
-    assert_true(request is not None, "a valid Buzzheavier share URL builds a download request")
-    assert_equal(request["method"], "GET", "the download request is a GET, not a POST")
-    assert_equal(request["url"], "https://buzzheavier.com/abc123XYZ/download", "the download request targets the file-specific download endpoint")
-    assert_equal(request.get("headers", {}).get("hx-request"), "true", "the download request carries the htmx request marker")
-    assert_equal(request.get("headers", {}).get("referer"), "https://buzzheavier.com/abc123XYZ", "the download request's referer matches the share page, not the download endpoint")
-    assert_equal(request.get("allowed_hosts"), list(source_adapters.BUZZHEAVIER_TRANSPORT_HOSTS), "the download request is scoped to buzzheavier.com only")
-
-    no_request = source_adapters.buzzheavier_download_request("https://example.test/not-buzzheavier")
-    assert_true(no_request is None, "a non-Buzzheavier URL builds no download request at all")
-
-
 def assert_getcomics_dls_shortener_resolution():
     """GetComics wraps every mirror link -- including Pixeldrain -- behind a
     same-site /dls/ redirect shortener. The raw href never carries an
@@ -508,8 +436,6 @@ def assert_rar_content_type_accepts_vnd_rar():
 def main():
     assert_direct_redirect_caps()
     assert_pixeldrain_resolver_toggle_gates_getcomics()
-    assert_wetransfer_resolver_parsing()
-    assert_buzzheavier_resolver_parsing()
     assert_getcomics_dls_shortener_resolution()
     assert_rar_content_type_accepts_vnd_rar()
     providers = by_id(catalog.provider_candidates())

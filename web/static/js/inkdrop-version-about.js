@@ -49,6 +49,20 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.15",
+      slug: "v0-1-15",
+      released_at: "2026-08-27",
+      title: "Deciding whether a file is the thing you asked for",
+      summary: "Mostly correctness work in the part of the pipeline that decides whether a downloaded file really is the thing you asked for.",
+      highlights: [
+        "A rejected candidate no longer blocks the good ones behind it",
+        "A file naming a different series can no longer satisfy a want",
+        "Counters on the same screen agree",
+        "Deleting a series sticks",
+        "ComicVine series can supply a cover",
+      ],
+    }),
+    publicRelease({
       version: "v0.1.14",
       slug: "v0-1-14",
       released_at: "2026-08-22",
@@ -198,23 +212,6 @@
         "The \"item imported\" notification no longer repeats for the same file on every re-check.",
         "Provider API keys and webhook tokens no longer show up in error messages or diagnostic output.",
         "Recover Missing's tiles no longer overlap, Search All's scope is clearer, and SLSKD's default per-user transfer cap was raised."
-      ]
-    }),
-    publicRelease({
-      version: "v0.1.05",
-      slug: "v0-1-05",
-      released_at: "2026-08-02",
-      title: "Comic one-shots stop getting rejected, and series can move library folders",
-      summary: "A large batch of acquisition and UI fixes. Comic one-shots and graphic novels no longer get rejected at import, oversized packs go to Manual Review instead of auto-grabbing, and a series content type and library folder can now be changed after creation.",
-      highlights: [
-        "Packs over a configurable size limit now go to Manual Review instead of being auto-grabbed.",
-        "Fixed comic one-shots and graphic novels getting permanently rejected at import.",
-        "Fixed a ComicsCodes health-check bug that could get the source stuck instead of simply marking it unhealthy.",
-        "You can now change a series' content type and library root folder after it's created.",
-        "SLSKD searches no longer waste early attempts on a redundant qualifier, and no longer leak filename text into queries through series aliases.",
-        "SLSKD can now recognize and convert raw page-image folders into a CBZ during import.",
-        "The History page supports searching by series title and no longer repeats duplicate entries.",
-        "Recover Missing, Attempts, and the SLSKD/download-client Settings cards all got clarity and usability fixes this build."
       ]
     })
   ]);

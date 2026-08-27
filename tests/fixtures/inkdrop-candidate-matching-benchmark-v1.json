@@ -1,0 +1,2072 @@
+{
+  "schema": "inkdrop.candidate-matching-benchmark",
+  "schema_version": 1,
+  "benchmark_id": "adversarial-candidate-matching",
+  "benchmark_version": "1.4.0",
+  "normalization_pipelines": [
+    "direct",
+    "prowlarr",
+    "mangadex"
+  ],
+  "matcher_contract_version": 2,
+  "case_count": 89,
+  "cases": [
+    {
+      "id": "pack-001-issue-range-is-not-one-issue",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "An issues 1-6 pack cannot satisfy wanted issue 3 without member proof.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga Issues 001-006 Digital Pack.cbz",
+        "filename": "Saga Issues 001-006 Digital Pack.cbz",
+        "pack": true,
+        "match_confidence": "title_match"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "coverage_not_unit_number"
+      }
+    },
+    {
+      "id": "pack-002-chapter-range-is-not-one-chapter",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "A chapter range cannot satisfy one manga chapter without member proof.",
+      "wanted": {
+        "series": "Dandadan",
+        "series_title": "Dandadan",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "14"
+      },
+      "candidate": {
+        "title": "Dandadan Chapters 012-018 Pack.cbz",
+        "filename": "Dandadan Chapters 012-018 Pack.cbz",
+        "pack": true
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "coverage_not_unit_number"
+      }
+    },
+    {
+      "id": "pack-003-volume-range-is-not-one-volume",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "A multi-volume archive cannot stand in for volume 2.",
+      "wanted": {
+        "series": "Berserk",
+        "series_title": "Berserk",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "volume_number": "2"
+      },
+      "candidate": {
+        "title": "Berserk Volumes 01-03 Collection.cbz",
+        "filename": "Berserk Volumes 01-03 Collection.cbz",
+        "pack": true
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "coverage_not_unit_number"
+      }
+    },
+    {
+      "id": "pack-004-exact-issue-manifest-member",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "Exact member proof can select wanted issue 3 from a larger pack.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga 001-006 Pack",
+        "pack": true,
+        "pack_contents_match": {
+          "coverage_source": "pack_contents_filename",
+          "entry": "Saga 003.cbz"
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "pack-005-pack-without-unit-needs-review",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "A generic pack label has no exact issue identity.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga Digital Release Pack.cbz",
+        "filename": "Saga Digital Release Pack.cbz",
+        "pack": true
+      },
+      "expected": {
+        "status": "review",
+        "code": "missing_required_unit_number"
+      }
+    },
+    {
+      "id": "pack-006-title-filename-unit-conflict",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "Title issue 3 and filename issue 4 are conflicting source identities.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga 003",
+        "filename": "Saga 004.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "ambiguous_unit_identity"
+      }
+    },
+    {
+      "id": "pack-007-hierarchical-volume-chapter",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "Volume 2 chapter 15 is a single hierarchical chapter identity.",
+      "wanted": {
+        "series": "Frieren",
+        "series_title": "Frieren",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "15",
+        "volume_number": "2"
+      },
+      "candidate": {
+        "title": "Frieren Vol 02 Ch 015.cbz",
+        "filename": "Frieren Vol 02 Ch 015.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "pack-008-sample-member-stays-blocked",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "Exact numbering cannot make a sample safe.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga 003 Preview Sample.cbz",
+        "filename": "Saga 003 Preview Sample.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "preview_or_sample"
+      }
+    },
+    {
+      "id": "pack-009-exact-chapter-manifest-member",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "Exact member proof can select chapter 14 from a chapter pack.",
+      "wanted": {
+        "series": "Dandadan",
+        "series_title": "Dandadan",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "14"
+      },
+      "candidate": {
+        "title": "Dandadan Chapters 012-018",
+        "pack": true,
+        "pack_contents_match": {
+          "coverage_source": "pack_contents_filename",
+          "entry": "Dandadan Chapter 014.cbz"
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "pack-010-explicit-unit-conflicts-with-title",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "Provider issue 4 cannot overwrite title evidence for issue 3 silently.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga 003.cbz",
+        "source_issue_number": "4"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "ambiguous_unit_identity"
+      }
+    },
+    {
+      "id": "title-001-batman-beyond-is-related",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "Batman Beyond is not Batman despite the shared franchise word.",
+      "wanted": {
+        "series": "Batman",
+        "series_title": "Batman",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "Batman Beyond 001.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "title-002-x-men-red-is-spinoff",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "X-Men Red must not satisfy the base X-Men series.",
+      "wanted": {
+        "series": "X-Men",
+        "series_title": "X-Men",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "2"
+      },
+      "candidate": {
+        "title": "X-Men Red 002.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "title-003-ascender-is-not-descender",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "Ascender is a related sequel, not Descender issue 7.",
+      "wanted": {
+        "series": "Descender",
+        "series_title": "Descender",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "7"
+      },
+      "candidate": {
+        "title": "Ascender 007.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "candidate_title_mismatch"
+      }
+    },
+    {
+      "id": "title-004-venom-spinoff",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "A named Venom spinoff remains a distinct series.",
+      "wanted": {
+        "series": "Venom",
+        "series_title": "Venom",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "Venom Lethal Protector 001.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "title-005-superman-son-is-distinct",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "Superman: Son of Kal-El is not the base Superman run.",
+      "wanted": {
+        "series": "Superman",
+        "series_title": "Superman",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5"
+      },
+      "candidate": {
+        "title": "Superman Son of Kal-El 005.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "title-006-exact-title-and-issue",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "The exact base title and issue remains compatible.",
+      "wanted": {
+        "series": "Descender",
+        "series_title": "Descender",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "7"
+      },
+      "candidate": {
+        "title": "Descender 007.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "title-007-unrelated-series-mismatch",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "An unrelated exact issue number does not rescue a title mismatch.",
+      "wanted": {
+        "series": "Descender",
+        "series_title": "Descender",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "7"
+      },
+      "candidate": {
+        "title": "Black Science 007.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "candidate_title_mismatch"
+      }
+    },
+    {
+      "id": "title-008-proven-localized-alias",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "An adapter-proven localized alias with exact chapter identity is compatible.",
+      "wanted": {
+        "series": "Frieren: Beyond Journey's End",
+        "series_title": "Frieren: Beyond Journey's End",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "12",
+        "manual_search": true,
+        "aliases": [
+          "Sousou no Frieren"
+        ]
+      },
+      "candidate": {
+        "title": "Sousou no Frieren Chapter 012.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "title-009-creator-conflict",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "Conflicting asserted creators block a near-title candidate.",
+      "wanted": {
+        "series": "Swamp Thing",
+        "series_title": "Swamp Thing",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "creators": [
+          "Alan Moore"
+        ]
+      },
+      "candidate": {
+        "title": "Swamp Thing by Scott Snyder 001.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity",
+        "required_codes": [
+          "creator_identity_conflict"
+        ]
+      }
+    },
+    {
+      "id": "title-010-specific-unit-reason-precedes-mismatch",
+      "pipeline": "prowlarr",
+      "category": "sequel_spinoff_near_titles",
+      "description": "Wrong issue is the primary reason when title confidence also says mismatch.",
+      "wanted": {
+        "series": "Seven To Eternity",
+        "series_title": "Seven To Eternity",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "Seven To Eternity 017.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_issue_number"
+      }
+    },
+    {
+      "id": "unit-001-volume-cannot-satisfy-chapter",
+      "category": "volume_chapter_collisions",
+      "description": "Volume 7 alone cannot satisfy chapter 7.",
+      "wanted": {
+        "series": "Berserk",
+        "series_title": "Berserk",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "7"
+      },
+      "candidate": {
+        "title": "Berserk Vol 07.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_unit_type"
+      }
+    },
+    {
+      "id": "unit-002-chapter-cannot-satisfy-volume",
+      "category": "volume_chapter_collisions",
+      "description": "Chapter 7 alone cannot satisfy volume 7.",
+      "wanted": {
+        "series": "Berserk",
+        "series_title": "Berserk",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "volume_number": "7"
+      },
+      "candidate": {
+        "title": "Berserk Chapter 007.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_unit_type"
+      }
+    },
+    {
+      "id": "unit-003-manga-chapter-cannot-satisfy-comic-issue",
+      "category": "volume_chapter_collisions",
+      "description": "Explicit manga chapter identity cannot satisfy a western comic issue.",
+      "wanted": {
+        "series": "ODY-C",
+        "series_title": "ODY-C",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "11"
+      },
+      "candidate": {
+        "title": "ODY-C Chapter 011.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_unit_type"
+      }
+    },
+    {
+      "id": "unit-004-exact-manga-chapter",
+      "category": "volume_chapter_collisions",
+      "description": "An exact explicit manga chapter is compatible.",
+      "wanted": {
+        "series": "Dandadan",
+        "series_title": "Dandadan",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "7"
+      },
+      "candidate": {
+        "title": "Dandadan Chapter 007.cbz",
+        "provider_id": "mangadex"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "unit-005-matching-volume-and-chapter-hierarchy",
+      "category": "volume_chapter_collisions",
+      "description": "Matching volume context plus exact chapter is compatible.",
+      "wanted": {
+        "series": "Dandadan",
+        "series_title": "Dandadan",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "7",
+        "volume_number": "2"
+      },
+      "candidate": {
+        "title": "Dandadan Vol 02 Ch 007.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "unit-006-wrong-volume-same-chapter",
+      "category": "volume_chapter_collisions",
+      "description": "The same chapter number in the wrong asserted volume must block.",
+      "wanted": {
+        "series": "Dandadan",
+        "series_title": "Dandadan",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "7",
+        "volume_number": "2"
+      },
+      "candidate": {
+        "title": "Dandadan Vol 03 Ch 007.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_volume_number"
+      }
+    },
+    {
+      "id": "unit-007-exact-volume",
+      "category": "volume_chapter_collisions",
+      "description": "An exact volume number is compatible.",
+      "wanted": {
+        "series": "Fullmetal Alchemist",
+        "series_title": "Fullmetal Alchemist",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "volume_number": "7"
+      },
+      "candidate": {
+        "title": "Fullmetal Alchemist Vol 07 Digital.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "unit-008-wrong-volume",
+      "category": "volume_chapter_collisions",
+      "description": "Volume 8 cannot satisfy volume 7.",
+      "wanted": {
+        "series": "Fullmetal Alchemist",
+        "series_title": "Fullmetal Alchemist",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "volume_number": "7"
+      },
+      "candidate": {
+        "title": "Fullmetal Alchemist Vol 08 Digital.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_volume_number"
+      }
+    },
+    {
+      "id": "unit-009-wrong-chapter",
+      "category": "volume_chapter_collisions",
+      "description": "Chapter 8 cannot satisfy chapter 7.",
+      "wanted": {
+        "series": "Dandadan",
+        "series_title": "Dandadan",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "7"
+      },
+      "candidate": {
+        "title": "Dandadan Chapter 008.cbz",
+        "provider_id": "mangadex"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_chapter_number"
+      }
+    },
+    {
+      "id": "unit-010-book-cannot-satisfy-issue",
+      "category": "volume_chapter_collisions",
+      "description": "Book 11 is a collected unit, not western comic issue 11.",
+      "wanted": {
+        "series": "ODY-C",
+        "series_title": "ODY-C",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "11"
+      },
+      "candidate": {
+        "title": "ODY-C Book 11.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_unit_type"
+      }
+    },
+    {
+      "id": "edition-001-omnibus-disallowed-for-issue",
+      "category": "editions_reprints",
+      "description": "An omnibus cannot replace one exact issue when collected editions are explicitly disallowed for that row.",
+      "wanted": {
+        "series": "Hawkeye",
+        "series_title": "Hawkeye",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5",
+        "allow_collected_edition": false
+      },
+      "candidate": {
+        "title": "Hawkeye Omnibus Issue 005.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "collected_edition_disallowed"
+      }
+    },
+    {
+      "id": "edition-002-omnibus-allowed-with-exact-issue",
+      "category": "editions_reprints",
+      "description": "Explicit policy may allow a collected edition carrying the exact issue identity.",
+      "wanted": {
+        "series": "Hawkeye",
+        "series_title": "Hawkeye",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5",
+        "allow_collected_edition": true
+      },
+      "candidate": {
+        "title": "Hawkeye Omnibus Issue 005.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "edition-003-preview-never-compatible",
+      "category": "editions_reprints",
+      "description": "A preview is blocked even with exact title and issue.",
+      "wanted": {
+        "series": "Hawkeye",
+        "series_title": "Hawkeye",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5"
+      },
+      "candidate": {
+        "title": "Hawkeye 005 Preview.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "preview_or_sample"
+      }
+    },
+    {
+      "id": "edition-004-omnibus-reviewed-for-issue-by-default",
+      "category": "editions_reprints",
+      "description": "With no explicit policy, an omnibus carrying the exact wanted issue is surfaced for review rather than silently refused. Edition alone is not a refusal reason; the shipped default is review.",
+      "wanted": {
+        "series": "Hawkeye",
+        "series_title": "Hawkeye",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5"
+      },
+      "candidate": {
+        "title": "Hawkeye Omnibus Issue 005.cbz"
+      },
+      "expected": {
+        "status": "review",
+        "code": "collected_edition_disallowed"
+      }
+    },
+    {
+      "id": "edition-004-sample-never-compatible",
+      "category": "editions_reprints",
+      "description": "A sample is blocked even with exact volume identity.",
+      "wanted": {
+        "series": "Berserk",
+        "series_title": "Berserk",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "volume_number": "4"
+      },
+      "candidate": {
+        "title": "Berserk Vol 04 Sample.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "preview_or_sample"
+      }
+    },
+    {
+      "id": "edition-005-reprint-year-does-not-change-issue",
+      "category": "editions_reprints",
+      "description": "Publication year on a reprint does not change exact issue identity.",
+      "wanted": {
+        "series": "The Sandman",
+        "series_title": "The Sandman",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": 1989
+      },
+      "candidate": {
+        "title": "The Sandman 001 (2023 Reprint).cbz",
+        "year": 2023
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "edition-006-second-printing-exact-issue",
+      "category": "editions_reprints",
+      "description": "Second printing text does not manufacture a second unit.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "Saga 001 2nd Printing.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "edition-007-variant-cover-exact-issue",
+      "category": "editions_reprints",
+      "description": "Variant-cover labeling preserves the exact issue identity.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "Saga 001 Variant Cover B.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "edition-008-wrong-edition-title-mismatch",
+      "category": "editions_reprints",
+      "description": "A base-series volume cannot satisfy a distinct Absolute-edition target.",
+      "wanted": {
+        "series": "Absolute Batman: The Court of Owls",
+        "series_title": "Absolute Batman: The Court of Owls",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": 2015
+      },
+      "candidate": {
+        "title": "Batman v01 The Court of Owls (2012).cbr",
+        "match_confidence": "mismatch"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_unit_type",
+        "required_codes": [
+          "candidate_title_mismatch"
+        ]
+      }
+    },
+    {
+      "id": "legacy-001-matching-print-run",
+      "category": "legacy_relaunch_numbering",
+      "description": "Love and Rockets v1 issue 19 matches a v1 target.",
+      "wanted": {
+        "series": "Love and Rockets",
+        "series_title": "Love and Rockets",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "19",
+        "volume_number": "1"
+      },
+      "candidate": {
+        "title": "Love and Rockets v1 #019.cbr"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "legacy-002-wrong-print-run",
+      "category": "legacy_relaunch_numbering",
+      "description": "Love and Rockets v2 issue 19 cannot satisfy the v1 issue.",
+      "wanted": {
+        "series": "Love and Rockets",
+        "series_title": "Love and Rockets",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "19",
+        "volume_number": "1"
+      },
+      "candidate": {
+        "title": "Love and Rockets v2 #019.cbr"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_volume_number"
+      }
+    },
+    {
+      "id": "legacy-003-unconfirmed-print-run",
+      "category": "legacy_relaunch_numbering",
+      "description": "A candidate asserting v1 needs review when target run identity is absent.",
+      "wanted": {
+        "series": "Love and Rockets",
+        "series_title": "Love and Rockets",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "19"
+      },
+      "candidate": {
+        "title": "Love and Rockets v1 #019.cbr"
+      },
+      "expected": {
+        "status": "review",
+        "code": "print_run_not_confirmed"
+      }
+    },
+    {
+      "id": "legacy-004-vyear-run-exact-issue",
+      "category": "legacy_relaunch_numbering",
+      "description": "V1992 is a run year and trailing 277 is the exact issue.",
+      "wanted": {
+        "series": "2000 AD",
+        "series_title": "2000 AD",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "277"
+      },
+      "candidate": {
+        "title": "2000 AD V1992 277.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "legacy-005-vyear-run-wrong-issue",
+      "category": "legacy_relaunch_numbering",
+      "description": "V1992 issue 278 cannot satisfy issue 277.",
+      "wanted": {
+        "series": "2000 AD",
+        "series_title": "2000 AD",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "277"
+      },
+      "candidate": {
+        "title": "2000 AD V1992 278.cbz"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_issue_number"
+      }
+    },
+    {
+      "id": "legacy-006-relaunch-year-exact-number",
+      "pipeline": "prowlarr",
+      "category": "legacy_relaunch_numbering",
+      "description": "A 2018 relaunch result is a related series, not Uncanny X-Men's 1963 issue 1.",
+      "wanted": {
+        "series": "Uncanny X-Men",
+        "series_title": "Uncanny X-Men",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": 1963
+      },
+      "candidate": {
+        "title": "Uncanny X-Men 001 (2018).cbz",
+        "year": 2018
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "legacy-007-relaunch-pack-needs-member-proof",
+      "category": "legacy_relaunch_numbering",
+      "description": "A relaunch issues 1-3 pack cannot satisfy legacy issue 1 by number alone.",
+      "wanted": {
+        "series": "Uncanny X-Men",
+        "series_title": "Uncanny X-Men",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": 1963
+      },
+      "candidate": {
+        "title": "Uncanny X-Men (2018) Issues 001-003 Pack.cbz",
+        "match_confidence": "related_series_identity",
+        "pack": true
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity",
+        "required_codes": [
+          "coverage_not_unit_number"
+        ]
+      }
+    },
+    {
+      "id": "companion-001-original-year-exact-chapter",
+      "pipeline": "mangadex",
+      "category": "mangadex_comicvine_companion_years",
+      "description": "A canonical ComicVine/MangaDex companion link allows the MangaDex 2021 serialization to satisfy the 2023 catalog chapter.",
+      "wanted": {
+        "series": "Choujin X",
+        "series_title": "Choujin X",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "12",
+        "year": 2023,
+        "metadata_provider": "comicvine",
+        "issue_metadata_provider": "mangadex",
+        "comicvine_id": "cv-choujin-x",
+        "mangadex_id": "md-choujin-x"
+      },
+      "registry_row": {
+        "provider_id": "mangadex",
+        "provider_type": "metadata_source",
+        "source_kind": "mangadex"
+      },
+      "candidate": {
+        "manga": {
+          "id": "md-choujin-x",
+          "attributes": {
+            "title": {
+              "en": "Choujin X"
+            },
+            "year": 2021
+          }
+        },
+        "feed": {
+          "data": [
+            {
+              "id": "md-choujin-x-ch12",
+              "type": "chapter",
+              "attributes": {
+                "chapter": "12",
+                "volume": "2",
+                "translatedLanguage": "en",
+                "title": "Chapter Twelve"
+              }
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "companion-002-original-year-exact-chapter-volume",
+      "pipeline": "mangadex",
+      "category": "mangadex_comicvine_companion_years",
+      "description": "Exact chapter and volume identity survive the linked catalog/serialization year mismatch.",
+      "wanted": {
+        "series": "Frieren: Beyond Journey's End",
+        "series_title": "Frieren: Beyond Journey's End",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "40",
+        "volume_number": "3",
+        "year": 2021,
+        "metadata_provider": "comicvine",
+        "issue_metadata_provider": "mangadex",
+        "comicvine_id": "cv-frieren",
+        "mangadex_id": "md-frieren"
+      },
+      "registry_row": {
+        "provider_id": "mangadex",
+        "provider_type": "metadata_source",
+        "source_kind": "mangadex"
+      },
+      "candidate": {
+        "manga": {
+          "id": "md-frieren",
+          "attributes": {
+            "title": {
+              "en": "Frieren: Beyond Journey's End"
+            },
+            "year": 2020
+          }
+        },
+        "feed": {
+          "data": [
+            {
+              "id": "md-frieren-ch40",
+              "type": "chapter",
+              "attributes": {
+                "chapter": "40",
+                "volume": "3",
+                "translatedLanguage": "en",
+                "title": "A Long Journey"
+              }
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "companion-003-canonical-title-not-transliteration",
+      "pipeline": "mangadex",
+      "category": "mangadex_comicvine_companion_years",
+      "description": "The adapter uses MangaDex's canonical English title; alternate transliterations are not asserted as matcher proof.",
+      "wanted": {
+        "series": "Frieren: Beyond Journey's End",
+        "series_title": "Frieren: Beyond Journey's End",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "41",
+        "year": 2021,
+        "metadata_provider": "comicvine",
+        "issue_metadata_provider": "mangadex",
+        "comicvine_id": "cv-frieren",
+        "mangadex_id": "md-frieren"
+      },
+      "registry_row": {
+        "provider_id": "mangadex",
+        "provider_type": "metadata_source",
+        "source_kind": "mangadex"
+      },
+      "candidate": {
+        "manga": {
+          "id": "md-frieren",
+          "attributes": {
+            "title": {
+              "en": "Frieren: Beyond Journey's End"
+            },
+            "altTitles": [
+              {
+                "ja-ro": "Sousou no Frieren"
+              }
+            ],
+            "year": 2020
+          }
+        },
+        "feed": {
+          "data": [
+            {
+              "id": "md-frieren-ch41",
+              "type": "chapter",
+              "attributes": {
+                "chapter": "41",
+                "volume": "3",
+                "translatedLanguage": "en",
+                "title": "The Village"
+              }
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "companion-004-exact-linked-volume-context",
+      "pipeline": "mangadex",
+      "category": "mangadex_comicvine_companion_years",
+      "description": "The real adapter retains exact chapter and volume context for a linked companion pair with different years.",
+      "wanted": {
+        "series": "Choujin X",
+        "series_title": "Choujin X",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "13",
+        "volume_number": "2",
+        "year": 2023,
+        "metadata_provider": "comicvine",
+        "issue_metadata_provider": "mangadex",
+        "comicvine_id": "cv-choujin-x",
+        "mangadex_id": "md-choujin-x"
+      },
+      "registry_row": {
+        "provider_id": "mangadex",
+        "provider_type": "metadata_source",
+        "source_kind": "mangadex"
+      },
+      "candidate": {
+        "manga": {
+          "id": "md-choujin-x",
+          "attributes": {
+            "title": {
+              "en": "Choujin X"
+            },
+            "year": 2021
+          }
+        },
+        "feed": {
+          "data": [
+            {
+              "id": "md-choujin-x-ch13",
+              "type": "chapter",
+              "attributes": {
+                "chapter": "13",
+                "volume": "2",
+                "translatedLanguage": "en",
+                "title": "Chapter Thirteen"
+              }
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "companion-005-vinland-catalog-year-mismatch",
+      "pipeline": "mangadex",
+      "category": "mangadex_comicvine_companion_years",
+      "description": "A second canonical companion pair exercises a one-year catalog/serialization offset without fabricated confidence.",
+      "wanted": {
+        "series": "Vinland Saga",
+        "series_title": "Vinland Saga",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "chapter_number": "50",
+        "year": 2005,
+        "metadata_provider": "comicvine",
+        "issue_metadata_provider": "mangadex",
+        "comicvine_id": "cv-vinland-saga",
+        "mangadex_id": "md-vinland-saga"
+      },
+      "registry_row": {
+        "provider_id": "mangadex",
+        "provider_type": "metadata_source",
+        "source_kind": "mangadex"
+      },
+      "candidate": {
+        "manga": {
+          "id": "md-vinland-saga",
+          "attributes": {
+            "title": {
+              "en": "Vinland Saga"
+            },
+            "year": 2004
+          }
+        },
+        "feed": {
+          "data": [
+            {
+              "id": "md-vinland-saga-ch50",
+              "type": "chapter",
+              "attributes": {
+                "chapter": "50",
+                "volume": "8",
+                "translatedLanguage": "en",
+                "title": "The First Method"
+              }
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "gt-slskd-001-white-knight-of-8-total-count",
+      "category": "slskd_ground_truth",
+      "description": "'#03 of 8' parses as issue 3, not issue 8. Real slskd share, 2026-08-15. NOTE: Runs the real slskd pipeline. This is the POSITIVE arm that makes the two negatives below meaningful: break slskd parsing so it refuses everything and this case goes red, exactly as breaking it in the accepting direction turns gt-slskd-015/016 red. Without a positive, refusing every peer file would score perfectly.",
+      "wanted": {
+        "series": "Batman - White Knight",
+        "series_title": "Batman - White Knight",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Batman - White Knight #03 of 8 (2018).cbr",
+        "filename": "Batman - White Knight #03 of 8 (2018).cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "compatible"
+      },
+      "pipeline": "slskd"
+    },
+    {
+      "id": "gt-slskd-002-white-knight-issue-one-prior-year",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Issue 1 shipped 2017 for a 2018 series; an adjacent year must not reject on its own.",
+      "wanted": {
+        "series": "Batman - White Knight",
+        "series_title": "Batman - White Knight",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "Batman - White Knight #01 of 8 (2017).cbr",
+        "filename": "Batman - White Knight #01 of 8 (2017).cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-003-death-in-family-story-arc-title",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Batman #426 IS 'A Death in the Family' Book 1; the arc name must not read as a different series. Held for review on print run, not rejected.",
+      "wanted": {
+        "series": "Batman",
+        "series_title": "Batman",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "426"
+      },
+      "candidate": {
+        "title": "#426 - Batman - A Death in the Family - Book 1.pdf",
+        "filename": "#426 - Batman - A Death in the Family - Book 1.pdf",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "review",
+        "code": "print_run_not_confirmed"
+      }
+    },
+    {
+      "id": "gt-slskd-004-death-in-family-leading-hash-number",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "A leading '#429' is the issue number and the trailing 'Book 4' is not.",
+      "wanted": {
+        "series": "Batman",
+        "series_title": "Batman",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "429"
+      },
+      "candidate": {
+        "title": "#429 - Batman - A Death in the Family - Book 4.pdf",
+        "filename": "#429 - Batman - A Death in the Family - Book 4.pdf",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "review",
+        "code": "print_run_not_confirmed"
+      }
+    },
+    {
+      "id": "gt-slskd-005-prose-philosophy-book-false-positive",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Prose book matching on author surname 'White' + 'Batman' + 'knight'. Must stay refused however much the cases above relax.",
+      "wanted": {
+        "series": "Batman - White Knight",
+        "series_title": "Batman - White Knight",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Batman and philosophy_ the dark knight o (6963)",
+        "filename": "Batman and philosophy_ the dark knight o (6963)",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_issue_number"
+      }
+    },
+    {
+      "id": "gt-slskd-006-wicdiv-1923-a-date-prefix",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Byte-identical 77.73 MB artifact from three peers, differing only in scene decoration. All three must reach the SAME verdict; divergence here means a threshold accident decides acquisition.",
+      "wanted": {
+        "series": "The Wicked + The Divine 1923",
+        "series_title": "The Wicked + The Divine 1923",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": "2018"
+      },
+      "candidate": {
+        "title": "2018-02 The Wicked + The Divine 1923 (2018).cbr",
+        "filename": "2018-02 The Wicked + The Divine 1923 (2018).cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "review",
+        "code": "missing_required_unit_number"
+      }
+    },
+    {
+      "id": "gt-slskd-007-wicdiv-1923-b-group-tag",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Byte-identical 77.73 MB artifact from three peers, differing only in scene decoration. All three must reach the SAME verdict; divergence here means a threshold accident decides acquisition.",
+      "wanted": {
+        "series": "The Wicked + The Divine 1923",
+        "series_title": "The Wicked + The Divine 1923",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": "2018"
+      },
+      "candidate": {
+        "title": "The Wicked + The Divine - 1923 (2018) (Digital) (Zone-Empire).cbr",
+        "filename": "The Wicked + The Divine - 1923 (2018) (Digital) (Zone-Empire).cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "review",
+        "code": "missing_required_unit_number"
+      }
+    },
+    {
+      "id": "gt-slskd-008-wicdiv-1923-c-site-tag",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Byte-identical 77.73 MB artifact from three peers, differing only in scene decoration. All three must reach the SAME verdict; divergence here means a threshold accident decides acquisition.",
+      "wanted": {
+        "series": "The Wicked + The Divine 1923",
+        "series_title": "The Wicked + The Divine 1923",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": "2018"
+      },
+      "candidate": {
+        "title": "The Wicked + The Divine 1923 (2018) GetComics.INFO.cbr",
+        "filename": "The Wicked + The Divine 1923 (2018) GetComics.INFO.cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "review",
+        "code": "missing_required_unit_number"
+      }
+    },
+    {
+      "id": "gt-slskd-009-swamp-thing-volume-want-matches",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "A collected volume file satisfies a VOLUME want regardless of the 2012 reprint year against a 1987 series.",
+      "wanted": {
+        "series": "Saga of the Swamp Thing",
+        "series_title": "Saga of the Swamp Thing",
+        "media_type": "comic",
+        "unit_type": "volume",
+        "issue_number": "1",
+        "volume_number": "1",
+        "year": "1987"
+      },
+      "candidate": {
+        "title": "Saga of the Swamp Thing vol 01 (2012) (digital-Empire).cbz",
+        "filename": "Saga of the Swamp Thing vol 01 (2012) (digital-Empire).cbz",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-010-swamp-thing-issue-want-refuses-volume",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "The same file against an ISSUE want is refused. This is the live failure: the want is stored as issue #1 because its issue TITLE is 'Vol. 1', and comics have no volume inference. Codes are related_series_identity + wrong_unit_type; drop the 1987 series year and wrong_unit_type is the sole refusal. Setting unit_type=volume makes this identical file compatible.",
+      "wanted": {
+        "series": "Saga of the Swamp Thing",
+        "series_title": "Saga of the Swamp Thing",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "year": "1987"
+      },
+      "candidate": {
+        "title": "Saga of the Swamp Thing vol 01 (2012) (digital-Empire).cbz",
+        "filename": "Saga of the Swamp Thing vol 01 (2012) (digital-Empire).cbz",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "gt-slskd-011-swamp-thing-lowercase-unpadded-vol-token",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "'vol 01' lowercase and zero-padded normalises to the same unit as 'Vol. 1'.",
+      "wanted": {
+        "series": "Saga of the Swamp Thing",
+        "series_title": "Saga of the Swamp Thing",
+        "media_type": "comic",
+        "unit_type": "volume",
+        "issue_number": "1",
+        "volume_number": "1"
+      },
+      "candidate": {
+        "title": "Saga of the Swamp Thing vol 1 (2012).cbz",
+        "filename": "Saga of the Swamp Thing vol 1 (2012).cbz",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-012-swamp-thing-reprint-year-not-a-rejection",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "A 2012 collected edition of 1987 material is not refused on year.",
+      "wanted": {
+        "series": "Saga of the Swamp Thing",
+        "series_title": "Saga of the Swamp Thing",
+        "media_type": "comic",
+        "unit_type": "volume",
+        "issue_number": "1",
+        "volume_number": "1",
+        "year": "1987"
+      },
+      "candidate": {
+        "title": "Saga of the Swamp Thing Volume 1 (2013).cbz",
+        "filename": "Saga of the Swamp Thing Volume 1 (2013).cbz",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-013-swamp-thing-collected-volume-size",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "308 MB is an ordinary collected-volume size and must not trip a single-issue ceiling.",
+      "wanted": {
+        "series": "Saga of the Swamp Thing",
+        "series_title": "Saga of the Swamp Thing",
+        "media_type": "comic",
+        "unit_type": "volume",
+        "issue_number": "1",
+        "volume_number": "1"
+      },
+      "candidate": {
+        "title": "Saga of the Swamp Thing vol 01 (2012) (digital-Empire).cbz",
+        "filename": "Saga of the Swamp Thing vol 01 (2012) (digital-Empire).cbz",
+        "source": "slskd",
+        "provider_id": "slskd",
+        "size_bytes": 322961408
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-014-punpun-C-author-suffix-volume",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Peer FourTwenty: author appended to filename and directory. The author must not be read as part of the title.",
+      "wanted": {
+        "series": "Oyasumi Punpun",
+        "series_title": "Oyasumi Punpun",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "issue_number": "11",
+        "volume_number": "11"
+      },
+      "candidate": {
+        "title": "Oyasumi Punpun Vol. 11 - Asano Inio.cbz",
+        "filename": "Oyasumi Punpun Vol. 11 - Asano Inio.cbz",
+        "source": "slskd",
+        "provider_id": "slskd",
+        "size_bytes": 74448896
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-015-punpun-D-filename-carries-no-series",
+      "category": "slskd_ground_truth",
+      "description": "Peer faceman2k23: filename is 'Vol.01 Ch.001.cbz' with NO series name. Identity lives only in the directory, which the matcher does not currently read -- so this is compatible with ANY series. Locked as evidence of the unbounded-match defect, not as desired behaviour. NOTE: Corrected 2026-08-18. This case previously demanded `compatible` for a series-less 'Vol.01 Ch.001.cbz', with its own description admitting that was 'evidence of the unbounded-match defect, not desired behaviour' -- so the gate enforced the opposite of what the text said, and a correct wrong-series fix would have turned the corpus red. The gold was measuring the generic matcher, which has no series authority. Through the pipeline slskd actually takes, the file is refused for carrying no ordered series phrase, which is both the real behaviour and the safe one.",
+      "wanted": {
+        "series": "Oyasumi Punpun",
+        "series_title": "Oyasumi Punpun",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "issue_number": "1",
+        "chapter_number": "1"
+      },
+      "candidate": {
+        "title": "Vol.01 Ch.001.cbz",
+        "filename": "Vol.01 Ch.001.cbz",
+        "source": "slskd",
+        "provider_id": "slskd",
+        "size_bytes": 2097152
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "series title words are not an ordered phrase"
+      },
+      "pipeline": "slskd"
+    },
+    {
+      "id": "gt-slskd-016-punpun-D-bare-filename-matches-wrong-series",
+      "category": "slskd_ground_truth",
+      "description": "The same bare filename against an unrelated series. It currently passes; when directory-aware identity lands this MUST become a rejection. NOTE: Corrected 2026-08-18, and this is the one that mattered: the identical bare file was pinned as compatible with BOTH Oyasumi Punpun and unrelated Berserk. One file cannot be two works. Through the slskd pipeline it is refused because the wanted single-word title never appears in the filename.",
+      "wanted": {
+        "series": "Berserk",
+        "series_title": "Berserk",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "issue_number": "1",
+        "chapter_number": "1"
+      },
+      "candidate": {
+        "title": "Vol.01 Ch.001.cbz",
+        "filename": "Vol.01 Ch.001.cbz",
+        "source": "slskd",
+        "provider_id": "slskd",
+        "size_bytes": 2097152
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "single-word title missing from filename"
+      },
+      "pipeline": "slskd"
+    },
+    {
+      "id": "gt-slskd-017-punpun-A-directory-states-vol-and-chapter",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Peer gamepak: '118 - Vol.11 Chapter 118' states BOTH units in one string. Chapter want resolves.",
+      "wanted": {
+        "series": "Oyasumi Punpun",
+        "series_title": "Oyasumi Punpun",
+        "media_type": "manga",
+        "unit_type": "chapter",
+        "issue_number": "118",
+        "chapter_number": "118"
+      },
+      "candidate": {
+        "title": "118 - Vol.11 Chapter 118",
+        "filename": "118 - Vol.11 Chapter 118",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "gt-slskd-018-punpun-A-same-text-volume-want",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "The same text against a VOLUME want is refused: a chapter-scoped directory is not the volume artifact.",
+      "wanted": {
+        "series": "Oyasumi Punpun",
+        "series_title": "Oyasumi Punpun",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "issue_number": "11",
+        "volume_number": "11"
+      },
+      "candidate": {
+        "title": "118 - Vol.11 Chapter 118",
+        "filename": "118 - Vol.11 Chapter 118",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_unit_type"
+      }
+    },
+    {
+      "id": "gt-slskd-019-punpun-title-variant-comma-hyphen",
+      "category": "slskd_sourced_titles_generic_matcher",
+      "description": "Directory title variant 'Oyasumi, Pun-Pun' must normalise to the canonical series.",
+      "wanted": {
+        "series": "Oyasumi Punpun",
+        "series_title": "Oyasumi Punpun",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "issue_number": "1",
+        "volume_number": "1"
+      },
+      "candidate": {
+        "title": "Oyasumi, Pun-Pun Vol. 01.cbz",
+        "filename": "Oyasumi, Pun-Pun Vol. 01.cbz",
+        "source": "slskd",
+        "provider_id": "slskd",
+        "size_bytes": 53477376
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "cover-001-cover-count-is-not-the-unit",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "Spawn 352 packed with two variant covers still declares issue 352.",
+      "wanted": {
+        "series": "Spawn",
+        "series_title": "Spawn",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "352"
+      },
+      "candidate": {
+        "title": "Spawn.352.2024.2.covers.Digital-Empire"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "cover-002-six-cover-count-is-not-the-unit",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "A six-cover count must not outvote the issue number it sits beside.",
+      "wanted": {
+        "series": "Spawn",
+        "series_title": "Spawn",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "350"
+      },
+      "candidate": {
+        "title": "Spawn.350.2024.6.covers.Digital-Empire"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "cover-003-same-release-shape-without-a-count",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "The identical release shape without a cover count is the control.",
+      "wanted": {
+        "series": "Spawn",
+        "series_title": "Spawn",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "280"
+      },
+      "candidate": {
+        "title": "Spawn.280.2017.Digital-Empire"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "cover-004-cover-count-does-not-excuse-a-child-series",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "King Spawn carries the same cover count and is still a different work.",
+      "wanted": {
+        "series": "Spawn",
+        "series_title": "Spawn",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "352"
+      },
+      "candidate": {
+        "title": "King.Spawn.038.2024.2.covers.Digital-Empire"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "cover-005-cover-count-does-not-excuse-a-wrong-issue",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "Issue 357 offered for wanted 352 stays a numeric refusal.",
+      "wanted": {
+        "series": "Spawn",
+        "series_title": "Spawn",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "352"
+      },
+      "candidate": {
+        "title": "Spawn.357.2024.2.covers.Digital-Empire"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_issue_number"
+      }
+    },
+    {
+      "id": "cover-006-resolved-count-must-not-manufacture-a-match",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "Heavy Metal 300 is not the series 300; settling its count changes nothing.",
+      "wanted": {
+        "series": "300",
+        "series_title": "300",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "4"
+      },
+      "candidate": {
+        "title": "Heavy.Metal.300.2020.3.covers.Digital.Mephisto-Empire"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "cover-007-a-work-named-covers-keeps-its-number",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "Only a count before the word is metadata; Covers 003 names the work.",
+      "wanted": {
+        "series": "Covers",
+        "series_title": "Covers",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Covers 003 (2020) (Digital) (Zone-Empire)"
+      },
+      "expected": {
+        "status": "compatible"
+      }
+    },
+    {
+      "id": "cover-008-dropping-the-count-must-not-invent-a-unit",
+      "pipeline": "prowlarr",
+      "category": "cover_count_release_metadata",
+      "description": "With the count discarded and nothing else numbered, the unit is unproven.",
+      "wanted": {
+        "series": "Spawn",
+        "series_title": "Spawn",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "352"
+      },
+      "candidate": {
+        "title": "Spawn.2.covers.Digital-Empire"
+      },
+      "expected": {
+        "status": "review",
+        "code": "missing_required_unit_number"
+      }
+    },
+    {
+      "id": "media-001-ashes-mp3",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "A 1974 Renaissance track shares 'ashes' and nothing else. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Nickelodeon Avatar: The Last Airbender - Ashes of the Academy",
+        "series_title": "Nickelodeon Avatar: The Last Airbender - Ashes of the Academy",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Nickelodeon Avatar: The Last Airbender - Ashes of the Academy 1"
+      },
+      "candidate": {
+        "title": "Music\\Renaissance\\01-Ashes Are Burning.mp3",
+        "filename": "Music\\Renaissance\\01-Ashes Are Burning.mp3",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "candidate_title_mismatch"
+      }
+    },
+    {
+      "id": "media-002-ashes-mp3-academy-of-music",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "'Academy' here is a concert venue; both search words land in a live bootleg. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Nickelodeon Avatar: The Last Airbender - Ashes of the Academy",
+        "series_title": "Nickelodeon Avatar: The Last Airbender - Ashes of the Academy",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Nickelodeon Avatar: The Last Airbender - Ashes of the Academy 1"
+      },
+      "candidate": {
+        "title": "Music\\Live\\301 Ashes Are Burning [Academy of Music 5-17-74].mp3",
+        "filename": "Music\\Live\\301 Ashes Are Burning [Academy of Music 5-17-74].mp3",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "coverage_not_unit_number"
+      }
+    },
+    {
+      "id": "media-003-suki-opus",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "'suki' and 'alone' as unrelated fragments of a track name. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone",
+        "series_title": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone 1"
+      },
+      "candidate": {
+        "title": "Music\\dancing alone (suki).opus",
+        "filename": "Music\\dancing alone (suki).opus",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "candidate_title_mismatch"
+      }
+    },
+    {
+      "id": "media-004-suki-mp3-fragments",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "Suki Yaki is not Suki, Alone; the date fragments must not read as coverage. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone",
+        "series_title": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone 1"
+      },
+      "candidate": {
+        "title": "Music\\Rivers Cuomo - Suki Yaki Cuomo Ideas 2-15-2013 10h2.mp3",
+        "filename": "Music\\Rivers Cuomo - Suki Yaki Cuomo Ideas 2-15-2013 10h2.mp3",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "coverage_not_unit_number"
+      }
+    },
+    {
+      "id": "media-005-search-flac",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "A track called The Search For Truth against Avatar's The Search. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Nickelodeon Avatar: The Last Airbender - The Search",
+        "series_title": "Nickelodeon Avatar: The Last Airbender - The Search",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Nickelodeon Avatar: The Last Airbender - The Search 1"
+      },
+      "candidate": {
+        "title": "Music\\02 - Horror Place - The Search For Truth.flac",
+        "filename": "Music\\02 - Horror Place - The Search For Truth.flac",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "wrong_issue_number"
+      }
+    },
+    {
+      "id": "media-006-long-halloween-mkv-film",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "The animated film, not the comic. 1.7 GB Bluray rip on a comic want. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Batman: The Long Halloween",
+        "series_title": "Batman: The Long Halloween",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Batman: The Long Halloween 1"
+      },
+      "candidate": {
+        "title": "Movies\\Batman The Long Halloween Deluxe Edition (2022) [imdb-tt21445686] - [Bluray-1080p][AC3 5.1][h265].mkv",
+        "filename": "Movies\\Batman The Long Halloween Deluxe Edition (2022) [imdb-tt21445686] - [Bluray-1080p][AC3 5.1][h265].mkv",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "media-007-long-halloween-mkv-part-two",
+      "pipeline": "prowlarr",
+      "category": "wrong_media_type_peer_shares",
+      "description": "Part Two of the animated film adaptation. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Batman: The Long Halloween",
+        "series_title": "Batman: The Long Halloween",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1",
+        "query": "Batman: The Long Halloween 1"
+      },
+      "candidate": {
+        "title": "Movies\\Batman The Long Halloween Part Two 2021 WEBRip-1080p.mkv",
+        "filename": "Movies\\Batman The Long Halloween Part Two 2021 WEBRip-1080p.mkv",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "collide-001-last-halloween-is-not-long-halloween",
+      "pipeline": "prowlarr",
+      "category": "prefix_collision_series",
+      "description": "The 2025 Last Halloween is a different series whose title contains the 1996 one. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Batman: The Long Halloween",
+        "series_title": "Batman: The Long Halloween",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "4",
+        "query": "Batman: The Long Halloween 4"
+      },
+      "candidate": {
+        "title": "Comics\\DC\\Batman - The Long Halloween - The Last Halloween 004 (2025) (Webrip).cbr",
+        "filename": "Comics\\DC\\Batman - The Long Halloween - The Last Halloween 004 (2025) (Webrip).cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "collide-002-last-halloween-wrong-unit-too",
+      "pipeline": "prowlarr",
+      "category": "prefix_collision_series",
+      "description": "Same collision with a non-matching unit; identity must refuse before the number does. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Batman: The Long Halloween",
+        "series_title": "Batman: The Long Halloween",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "4",
+        "query": "Batman: The Long Halloween 4"
+      },
+      "candidate": {
+        "title": "Comics\\DC\\Batman The Long Halloween - The Last Halloween 005 (2025) (Digital).cbr",
+        "filename": "Comics\\DC\\Batman The Long Halloween - The Last Halloween 005 (2025) (Digital).cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "related_series_identity"
+      }
+    },
+    {
+      "id": "collide-003-long-halloween-is-not-last-halloween",
+      "pipeline": "prowlarr",
+      "category": "prefix_collision_series",
+      "description": "The reverse direction: the 1996 issue must not satisfy the 2025 series. Real slskd peer share, 2026-08-16.",
+      "wanted": {
+        "series": "Batman: The Long Halloween - The Last Halloween",
+        "series_title": "Batman: The Long Halloween - The Last Halloween",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "4",
+        "query": "Batman: The Long Halloween - The Last Halloween 4"
+      },
+      "candidate": {
+        "title": "Comics\\DC\\Batman - The Long Halloween 04.cbr",
+        "filename": "Comics\\DC\\Batman - The Long Halloween 04.cbr",
+        "source": "slskd",
+        "provider_id": "slskd"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "candidate_title_mismatch"
+      }
+    },
+    {
+      "id": "brand-001-branding-prefix-alias-reaches-the-provider-path",
+      "category": "editions_reprints",
+      "description": "ComicVine names this work with a 'Nickelodeon' branding prefix that no release carries. The prefix is represented as an explicit per-series alias, so the real artifact is recognised as the wanted work and reviewed for its unproven unit rather than terminally refused as a title mismatch. Promoted from the peer-share ledger 2026-08-18.",
+      "wanted": {
+        "series": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone",
+        "series_title": "Nickelodeon Avatar: The Last Airbender -- Suki, Alone",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "1"
+      },
+      "candidate": {
+        "title": "@@sgwyt\\Ebooks\\Books Not In Kavita\\ATLA\\Avatar Last Airbender Suki Alone (2021) (Digital) (1r0n).cbz"
+      },
+      "expected": {
+        "status": "review",
+        "code": "missing_required_unit_number"
+      }
+    }
+  ]
+}

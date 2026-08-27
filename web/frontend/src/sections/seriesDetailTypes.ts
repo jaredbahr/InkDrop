@@ -156,7 +156,7 @@ const LIFECYCLE_ALIASES: Record<string, string> = {
   folder_complete: "Complete", folder_verified: "Complete", library_visible: "Complete",
   failed: "Failed", error: "Failed", library_scan_timeout: "Failed", scan_timeout: "Failed", kavita_scan_timeout: "Failed",
   blocked: "Blocked", policy_block: "Blocked", language_blocked: "Blocked",
-  needs_you: "Needs Review", needs_user: "Needs Review", manual_exception: "Needs Review", manual_review: "Needs Review",
+  needs_you: "Needs you", needs_user: "Needs you", manual_exception: "Needs you", manual_review: "Needs you",
 };
 
 const OTHER_LABELS: Record<string, string> = {
@@ -197,25 +197,28 @@ export function coreStateTone(value: unknown): StatusTone {
   return "";
 }
 
-const NON_LABEL_PROVIDERS: Record<string, string> = {
-  slskd: "SLSKD",
-  prowlarr: "Prowlarr",
-  rss: "RSS",
-  comicscodes: "ComicsCodes",
-  comicvine: "ComicVine",
-  mangadex: "MangaDex",
-  metron: "Metron",
-  sab: "SABnzbd",
-  sabnzbd: "SABnzbd",
-  qb: "qBittorrent",
-  qbit: "qBittorrent",
-  qbittorrent: "qBittorrent",
-};
+// This island used to carry its own twelve-key source-name table, one of three
+// in the browser against the server's own. window.InkDropSourceLabel
+// (web/static/js/inkdrop-api.js) applies the server's vocabulary, and this
+// bundle runs inside the desktop shell, which loads that file first.
+//
+// Read off `window` at call time rather than captured at module load: the
+// island is mounted by the shell after both scripts have run, but a captured
+// reference would make the order a silent dependency instead of a checked one.
+declare global {
+  interface Window {
+    InkDropSourceLabel?: (value: unknown) => string;
+  }
+}
 
 export function sourceBucketLabel(value: unknown): string {
   const key = String(value || "").trim().toLowerCase();
   if (!key) return "";
-  return NON_LABEL_PROVIDERS[key] || coreStateLabel(key);
+  const shared = typeof window !== "undefined" ? window.InkDropSourceLabel : undefined;
+  // coreStateLabel() is the fallback the table always had behind it. It names
+  // a source no better than it ever did -- it is here so a bundle loaded
+  // without the shell still renders a word rather than throwing.
+  return shared ? shared(key) : coreStateLabel(key);
 }
 
 // -- overview / facts --------------------------------------------------------

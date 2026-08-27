@@ -78,7 +78,9 @@ def provider_entries(con):
                 "provider_type": row["provider_type"],
                 "display_name": row["display_name"],
                 "enabled": _as_bool(row["enabled"]),
-                "base_url": str(row["base_url"] or ""),
+                # The URL is the shareable part; anything a caller buried
+                # inside it is not. See sanitize_url_credentials().
+                "base_url": inkdrop_backup_restore.sanitize_url_credentials(row["base_url"] or ""),
                 "secret_ref": str(row["secret_ref"] or ""),
                 "settings_group": str(row["settings_group"] or ""),
                 "automation_role": str(row["automation_role"] or ""),
@@ -161,7 +163,7 @@ def download_client_entries(db_path, *, secret_root=None):
                 "client_type": item.get("client_type"),
                 "enabled": _as_bool(item.get("enabled")),
                 "priority": int(item.get("priority") or 100),
-                "base_url": str(item.get("base_url") or ""),
+                "base_url": inkdrop_backup_restore.sanitize_url_credentials(item.get("base_url") or ""),
                 "category": str(item.get("category") or ""),
                 "categories": dict(item.get("categories") or {}),
                 "provider_mappings": list(item.get("provider_mappings") or []),

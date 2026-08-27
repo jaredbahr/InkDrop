@@ -3322,6 +3322,37 @@ def same_file_in_target(importer, target_dir, path, digest, dry_run):
     return existing
 
 
+def partition_verified_pack_imports(importer, imported, verification):
+    """How many of `imported` verify_imported_items_for_library() actually confirmed.
+
+    `imported` here is a placement/ledger claim exactly like
+    inkdrop_completed_import.import_files()'s: every entry was copied and
+    ledgered before verify_imported_items_for_library() asked whether it
+    landed. record_native_pack_import_results() -> inkdrop_state.record_pack_import_results()
+    already re-derives a per-item verdict from `verification` and defers
+    (rather than completes) anything unverified, so `result["imported"]`
+    itself is deliberately left untouched here -- narrowing it would drop
+    that function's own deferred-bookkeeping row for a failed item, not fix
+    anything. This only exists to give a caller an honest count instead of
+    `len(result["imported"])`, which -- like import_files() before its own
+    fix -- counted the claim, not the verdict.
+
+    Defers to the importer module's own partition_verified_imports(), the one
+    place that knows verify_imported_items()'s checked-status vocabulary,
+    rather than re-deriving it here. Falls back to "everything counts" if the
+    importer object does not carry it, the same compatibility fallback
+    canonical_comic_dest()'s TypeError catch above uses for older importer
+    modules used by standalone pack-repair tooling.
+    """
+    partitioner = getattr(importer, "partition_verified_imports", None)
+    if not callable(partitioner):
+        return list(imported), []
+    try:
+        return partitioner(imported, verification)
+    except Exception:
+        return list(imported), []
+
+
 def verify_imported_items_for_library(importer, imported, wait_for_library_scan):
     verifier = getattr(importer, "verify_imported_items", None)
     if not callable(verifier):
@@ -3572,7 +3603,14 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
                 "state": "manual_review_required" if acceptance.get("decision") == "manual_review_required" else "suppressed_bad_artifact",
                 "action_needed": "manual_review" if acceptance.get("decision") == "manual_review_required" else "retry_another_source",
             }
-            if not dry_run and hasattr(importer, "record_artifact_bad_content_memory"):
+            if (
+                not dry_run
+                and hasattr(importer, "record_artifact_bad_content_memory")
+                # Third writer into the same durable store, so it asks the same
+                # predicate. Three copies of this judgement is what produced the
+                # disagreement in the first place.
+                and inkdrop_artifact_acceptance.decision_is_content_verdict(acceptance)
+            ):
                 file_sha = importer.sha256(path) if hasattr(importer, "sha256") else None
                 bad_conn = importer.connect()
                 try:
@@ -3667,6 +3705,14 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
         if imported and not dry_run
         else {}
     )
+    # `imported` is a placement/ledger claim, not the verdict -- see
+    # partition_verified_imports()'s docstring in the importer module.
+    # record_native_pack_import_results() re-derives its own per-item verdict
+    # from `verification` and must keep seeing every claimed item (including
+    # unverified ones, which it defers rather than completes), so `imported`
+    # itself stays the full list. This partition exists only so a caller
+    # wants an honest count instead of len(result["imported"]).
+    verified_imported, unverified_imported = partition_verified_pack_imports(importer, imported, verification)
     if verification.get("failure_count"):
         append_manual_review(
             "pack_import_verification_failed",
@@ -3679,6 +3725,9 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
         pass
     return {
         "imported": imported,
+        "imported_count": len(verified_imported),
+        "unverified_imported": unverified_imported,
+        "unverified_count": len(unverified_imported),
         "skipped_existing": skipped_existing,
         "bad_archives": bad_archives,
         "bad_archive_count": len(bad_archives),
@@ -4369,7 +4418,7 @@ def run(args):
             status,
             {
                 "pack_path": str(pack_path),
-                "imported_count": len(result.get("imported") or []),
+                "imported_count": result.get("imported_count", 0),
                 "inkdrop_state_ok": native_state.get("ok"),
                 "inkdrop_state_reason": native_state.get("reason"),
                 "inkdrop_state_error": native_state.get("error"),
@@ -4383,7 +4432,8 @@ def run(args):
             "selected_path": str(pack_path),
             "source": "pack_import_worker",
             "result_status": status,
-            "imported_count": len(result.get("imported") or []),
+            "imported_count": result.get("imported_count", 0),
+            "unverified_count": result.get("unverified_count", 0),
             "bad_archive_count": len(result.get("bad_archives") or []),
             "skipped_existing_count": len(result.get("skipped_existing") or []),
             "inkdrop_state_ok": native_state.get("ok"),

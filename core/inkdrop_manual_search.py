@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from core import inkdrop_candidate_matching
 from core import inkdrop_manga_unit_policy
+from core.inkdrop_display_labels import display_label
 from core import inkdrop_source_providers as source_providers
 from core import inkdrop_sources
 
@@ -819,23 +820,32 @@ def _age_seconds(candidate: dict[str, Any], provider_id: str) -> int | None:
     return None
 
 
+PROVIDER_DISPLAY_NAMES = {
+    "prowlarr": "Prowlarr",
+    "slskd": "SLSKD",
+    "suwayomi": "Suwayomi",
+    "mangadex": "MangaDex",
+    "rss": "RSS",
+    "rss_getcomics": "GetComics",
+    "getcomics": "GetComics",
+    "generic_http": "HTTP",
+    "local_manual_inbox": "Manual Inbox",
+}
+
+
 def provider_display_name(provider_id: Any, candidate: dict[str, Any] | None = None) -> str:
+    """The provider's friendly name, or the id back untouched.
+
+    `provider_id` falls back to the candidate's `source`, which on staged-file
+    rows is a filesystem path rather than a provider id. Title-casing that
+    produced a path that does not exist, so the decision about what may be
+    dressed up lives in core/inkdrop_display_labels.py.
+    """
     candidate = candidate if isinstance(candidate, dict) else {}
     explicit = _text(_first(candidate.get("provider_display_name"), candidate.get("provider_name")))
     if explicit:
         return explicit
-    key = _text(provider_id).lower()
-    return {
-        "prowlarr": "Prowlarr",
-        "slskd": "SLSKD",
-        "suwayomi": "Suwayomi",
-        "mangadex": "MangaDex",
-        "rss": "RSS",
-        "rss_getcomics": "GetComics",
-        "getcomics": "GetComics",
-        "generic_http": "HTTP",
-        "local_manual_inbox": "Manual Inbox",
-    }.get(key, _text(provider_id).replace("_", " ").title())
+    return display_label(_text(provider_id), PROVIDER_DISPLAY_NAMES)
 
 
 def child_source(candidate: dict[str, Any] | None) -> tuple[str, str]:
@@ -1196,7 +1206,12 @@ def normalize_candidate(
 
     candidate = candidate if isinstance(candidate, dict) else {}
     context = structured_search_input(search_input)
-    provider_id = _text(_first(provider_id, candidate.get("provider_id"), candidate.get("source"))).lower()
+    # Lower-cased for every lookup that follows, because a provider id is a
+    # key. Kept verbatim for display, because this same field falls back to
+    # `source`, which on staged-file rows is a path -- and a lower-cased path
+    # is no more the original file than a title-cased one.
+    provider_id_raw = _text(_first(provider_id, candidate.get("provider_id"), candidate.get("source")))
+    provider_id = provider_id_raw.lower()
     original_title = _text(
         _first(candidate.get("original_result_title"), candidate.get("title"), candidate.get("releaseTitle"), candidate.get("name"))
     )
@@ -1310,7 +1325,7 @@ def normalize_candidate(
         else:
             rejection_codes = ["not_accepted_reason_unrecorded"]
     rejection_explanations = [
-        REJECTION_EXPLANATIONS.get(code, _text(code).replace("_", " ").capitalize() + ".")
+        display_label(_text(code), REJECTION_EXPLANATIONS, style="sentence", suffix=".")
         for code in rejection_codes
     ]
     return {
@@ -1323,12 +1338,12 @@ def normalize_candidate(
         "search_run_id": _text(search_run_id),
         "request_id": _text(_first(query_evidence.get("request_id"), candidate.get("request_id"))),
         "provider_id": provider_id,
-        "provider_display_name": provider_display_name(provider_id, candidate),
+        "provider_display_name": provider_display_name(provider_id_raw, candidate),
         "child_source_id": child_id,
         "child_source_name": child_name,
         "indexer_or_extension": child_name or child_id,
         "provider_result_label": " · ".join(
-            item for item in (provider_display_name(provider_id, candidate), child_name) if item
+            item for item in (provider_display_name(provider_id_raw, candidate), child_name) if item
         ),
         "protocol": protocol,
         "original_title": original_title,

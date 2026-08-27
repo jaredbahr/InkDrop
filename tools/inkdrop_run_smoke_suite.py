@@ -145,11 +145,82 @@ def _playwright_available():
     return probe.returncode == 0
 
 
+def _read_denial_effective():
+    """True when chmod 0 on our own file actually stops us reading it.
+
+    A test that needs an EACCES has to be able to cause one. It cannot here in
+    two common environments, and in BOTH of them the failure is silent and
+    looks like a real defect: on Windows os.chmod only moves the read-only
+    bit, and as root on Linux the permission check is bypassed outright. In
+    each case the file stays readable, the fault under test never happens, and
+    the assertion fails while reporting the wrong reason. So the environment is
+    asked directly rather than inferred from os.name or geteuid.
+    """
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory(prefix="inkdrop-read-denial-") as tmp:
+            probe = os.path.join(tmp, "probe")
+            with open(probe, "wb") as handle:
+                handle.write(b"x")
+            os.chmod(probe, 0o000)
+            try:
+                with open(probe, "rb"):
+                    return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+            finally:
+                try:
+                    os.chmod(probe, 0o600)
+                except OSError:
+                    pass
+    except OSError:
+        return False
+
+
+def _export_skip_reason(basename):
+    """Why this test has no subject in the tree it is running from, or None.
+
+    The policy itself lives in tools/inkdrop_public_release_check.py and is
+    read from there rather than restated here. Two consumers with two copies is
+    what produced the split this closes: the release-check tool consulted
+    EXPORT_SKIPPED_CHECKS and correctly declined eleven checks whose subject the
+    public export does not carry, while this runner knew nothing about it and
+    ran the same eleven as ordinary tests. They failed on missing files in every
+    public run -- 13 red out of 135 -- so the public suite could never be green
+    and its verdict stopped being read at all.
+
+    The predicate is the shared one: a check is declined only when the specific
+    dependency it names is genuinely absent. In this repo those files exist, so
+    nothing is declined here and every one of them runs for real.
+    """
+    try:
+        import importlib.util
+
+        path = Path(__file__).resolve().with_name("inkdrop_public_release_check.py")
+        spec = importlib.util.spec_from_file_location("_inkdrop_release_check", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.export_skip_reason(basename)
+    except Exception:
+        # A policy this runner cannot read must not silently become "skip
+        # nothing" *or* "skip everything". Returning None runs the test, which
+        # is the direction that can only produce a loud failure, never a
+        # false pass.
+        return None
+
+
 # requirement key -> (predicate, human explanation). Evaluated once per run.
 REQUIREMENTS = {
     "playwright": (
         _playwright_available,
         "needs playwright plus a browser binary, which this environment does not provide",
+    ),
+    "read_denial": (
+        _read_denial_effective,
+        "needs an environment where chmod 0 actually denies a read -- Windows cannot, "
+        "and root on Linux bypasses the check, so the EACCES under test cannot be caused here",
     ),
 }
 
@@ -176,6 +247,23 @@ REQUIRES = {
     "inkdrop-settings-opds-browser-smoke.py": "playwright",
     "inkdrop-settings-setup-prowlarr-browser-smoke.py": "playwright",
     "inkdrop-wanted-react-island-browser-smoke.py": "playwright",
+    # Drivers added when the JavaScript smokes were given runners -- see
+    # tests/inkdrop-js-smoke-runner-coverage-smoke.py, which fails when a
+    # web/tests/*.js has nothing that runs it. Each shells out to a playwright
+    # smoke, so it runs for real wherever playwright is present.
+    "inkdrop-archive-read-undetermined-not-a-content-verdict-smoke.py": "read_denial",
+    "inkdrop-activity-backend-contract-browser-smoke.py": "playwright",
+    "inkdrop-arr-table-menu-browser-smoke.py": "playwright",
+    "inkdrop-hidden-attribute-leak-browser-smoke.py": "playwright",
+    "inkdrop-manual-review-truth-browser-smoke.py": "playwright",
+    "inkdrop-missing-recovery-browser-smoke.py": "playwright",
+    "inkdrop-mobile-sheet-focus-browser-smoke.py": "playwright",
+    "inkdrop-sampled-history-facet-browser-smoke.py": "playwright",
+    "inkdrop-settings-form-responsive-browser-smoke.py": "playwright",
+    "inkdrop-system-area-load-browser-smoke.py": "playwright",
+    "inkdrop-system-copy-value-browser-smoke.py": "playwright",
+    "inkdrop-system-mobile-browser-smoke.py": "playwright",
+    "inkdrop-series-poster-title-overflow-smoke.py": "playwright",
 }
 
 # Explicitly non-qualifying: the test still RUNS and its result is still
@@ -196,6 +284,35 @@ NON_QUALIFYING = {
         "owner": "acquisition",
         "expires": "2026-09-15",
         "issue": "https://github.com/jaredbahr/inkdrop-dev/issues/413",
+    },
+    # Wiring these three up is what proved they had been dead for weeks. Each
+    # needs a judgement this wiring pass deliberately did not make, so each runs
+    # and prints its red rather than being hidden. Owner and expiry assigned by
+    # the wiring pass, not by the tracker row -- NON_QUALIFYING requires both.
+    "inkdrop-activity-queue-blocklist-contract-smoke.py": {
+        "reason": (
+            "pins the Blocklist column list as [\"Series / Issue\", \"Blocked "
+            "reason\", \"Source title / provider\", \"Actions\"]; the shipped view "
+            "is \"Series / Issue\", \"Blocked reason\", \"Source\", \"Release "
+            "candidate\", \"Actions\". UN-SUPPRESSES WHEN: the test asserts the "
+            "five-column shipped literal -- which is exactly what open PR #722 "
+            "does, so landing #722 requalifies this entry"
+        ),
+        "owner": "web",
+        "expires": "2026-09-15",
+        "issue": "tracker row #158",
+    },
+    "inkdrop-closed-alpha-user-journey-contract-smoke.py": {
+        "reason": (
+            "38 copy assertions pinned to wording that has since been rewritten "
+            "(it wants /Monitor future releases/; core/inkdrop_web.py ships "
+            "'Monitoring future releases'). UN-SUPPRESSES WHEN: all 38 "
+            "assertions are re-pinned against current shipped copy -- a re-pin "
+            "pass, not a one-line edit"
+        ),
+        "owner": "web",
+        "expires": "2026-09-15",
+        "issue": "tracker row #159",
     },
 }
 
@@ -238,8 +355,21 @@ def tracked_smokes():
     # inkdrop_download_client_ownership_smoke.py (underscore) landed there and
     # stopped matching a hyphen-only glob -- it ran in development and silently
     # vanished from the public tree.
+    # tools/ was never covered either, and two smokes there were executed by
+    # nothing at all: inkdrop_blocklist_allow_retry_smoke.py is referenced
+    # nowhere in the repo, and inkdrop_prowlarr_indexer_health_smoke.py appears
+    # only inside a COMMENT in tests/inkdrop-source-worker-jobs-smoke.py, which
+    # mentions it without running it. The other two tools smokes
+    # (inkdrop_public_http_smoke, inkdrop_settings_sync_smoke) are invoked by the
+    # release workflows, so they were already covered there and are simply
+    # covered here too.
+    #
+    # The pattern ends in `_smoke.py` ON PURPOSE. A looser `tools/inkdrop*smoke*.py`
+    # also matches THIS FILE -- inkdrop_run_smoke_suite.py -- and the suite would
+    # discover and execute itself. Checked before widening rather than after.
     out = subprocess.run(
-        ["git", "ls-files", "tests/inkdrop*smoke*.py", "inkdrop*smoke*.py"],
+        ["git", "ls-files", "tests/inkdrop*smoke*.py", "inkdrop*smoke*.py",
+         "tools/inkdrop*_smoke.py"],
         capture_output=True,
         text=True,
         check=True,
@@ -293,6 +423,16 @@ def main():
         if requirement is not None and not satisfied.get(requirement, False):
             unrunnable.append((name, requirement))
             print(f"{label}: UNRUNNABLE (requires {requirement}) -- not executed")
+            continue
+
+        # Same treatment for a test whose subject this tree does not contain.
+        # Reported as unrunnable, never as passing, on exactly the same terms:
+        # the export policy names the file each one needs, and only an actually
+        # missing file declines it.
+        export_reason = _export_skip_reason(base)
+        if export_reason is not None:
+            unrunnable.append((name, export_reason))
+            print(f"{label}: UNRUNNABLE ({export_reason}) -- not executed")
             continue
 
         t0 = time.time()

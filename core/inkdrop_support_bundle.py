@@ -15,6 +15,7 @@ import sqlite3
 import stat as stat_module
 import time
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 import zipfile
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, quote_plus, urlsplit
@@ -393,7 +394,7 @@ def _collect_fallback_files(environ, inventory, deadline=None):
                 inventory.errors.append(f"{kind}:Unavailable")
                 continue
             if kind == "prowlarr":
-                inventory.add(ET.fromstring(text).findtext("ApiKey"))
+                inventory.add(inkdrop_safe_xml.fromstring(text).findtext("ApiKey"))
             elif kind == "mylar":
                 parser = configparser.ConfigParser(interpolation=None)
                 parser.read_string(text)
@@ -894,6 +895,18 @@ def _json_member(value):
     return payload
 
 
+# What counts as a runtime log, in one place. inkdrop_log_retention rotates
+# both ``.log`` and ``.jsonl`` files and appends a ``.r-<ns>-<token>`` suffix
+# when it does, so matching only "*.log*" silently dropped every structured
+# ``.jsonl`` audit log from support exports -- retention was aging them out of
+# a directory nothing could capture them from.
+LOG_NAME_PATTERNS = ("*.log*", "*.jsonl*")
+
+
+def is_log_name(name):
+    return any(fnmatch.fnmatch(str(name or ""), pattern) for pattern in LOG_NAME_PATTERNS)
+
+
 def collect_log_files(log_dir=None, *, deadline=None):
     root = Path(log_dir or inkdrop_runtime_config.log_dir())
     rows = []
@@ -911,7 +924,7 @@ def collect_log_files(log_dir=None, *, deadline=None):
             if scanned > HARD_MAX_SCAN_ENTRIES:
                 skipped.append({"name": "additional-entries", "reason": "scan_limit_reached"})
                 break
-            if not fnmatch.fnmatch(entry.name, "*.log*"):
+            if not is_log_name(entry.name):
                 continue
             if entry.is_symlink():
                 skipped.append({"name": "unsafe-log", "reason": "symlink_rejected"})
@@ -933,6 +946,7 @@ def collect_log_files(log_dir=None, *, deadline=None):
                 continue
             rows.append({
                 "path": resolved,
+                "name": entry.name,
                 "size_bytes": int(stat.st_size),
                 "modified_at": int(stat.st_mtime),
                 "device": int(stat.st_dev),
@@ -970,6 +984,12 @@ def _tail_with_context(row, cap_bytes):
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+# Shared with inkdrop_log_export, which builds the logs-only archive from the
+# same collector, redactor and verification pass.
+tail_with_context = _tail_with_context
+contains_secret = _contains_secret
 
 
 def support_bundle_filename(now=None):

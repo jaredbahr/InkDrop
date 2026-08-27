@@ -5,11 +5,13 @@ import re
 import warnings
 import zipfile
 import xml.etree.ElementTree as ET
+from core import inkdrop_safe_xml
 from collections import OrderedDict
 from pathlib import Path
 from PIL import Image, ImageFile
 
 from core import inkdrop_library_identity
+from core import inkdrop_comicinfo_identity
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 SENTINEL_TEXT_VALUES = {"-100000", "-100000.0", "1-01-01", "0001", "0001-01-01"}
@@ -653,6 +655,137 @@ def archive_central_directory_light_signature(path):
         return None
 
 
+# ---------------------------------------------------------------------------
+# THE SINGLE AUTHORITY ON "IS THIS OUR FAILURE, OR THE FILE'S?"
+#
+# Four sites in this module used to answer that question separately and did not
+# agree: the not-a-file early return recorded nothing, the stat() handler
+# recorded nothing, the outer read handler stored the exception and left
+# archive_integrity unset, and the per-member handler flattened OSError and
+# ValueError into one "unreadable_image" string with the discriminating type
+# interpolated into it and never parsed. Every one of those paths ended at
+# decide_acceptance()'s `not cbz_verified` branch, which calls the file
+# invalid -- so an EACCES, a vanished file or a blown internal budget was
+# written into DURABLE seven-day content-identity memory as a judgement about
+# the bytes.
+#
+# The parallel answers were the defect, not any single one of them. This is one
+# helper the readers call; it is deliberately not four corrected copies.
+#
+# THE VOCABULARY IS NOT NEW. validate_comic_archive() in
+# inkdrop_completed_import.py already established it -- "Three outcomes, not
+# two", with `undetermined` meaning the check could not be completed, and its
+# own note that "reporting an undetermined result as corruption is reporting
+# our own failure as the file's". That convention was never extended to the
+# acceptance gate, which is the one consumer that persists a verdict. This
+# extends it rather than inventing a second spelling of the same idea.
+
+
+class ArchiveReadDeclined(Exception):
+    """We stopped reading by our own choice or our own limit.
+
+    Raised where the code declines to finish -- a member over the bounded
+    verifier's ceiling, for instance. It is never a statement about the
+    archive, and separating it from ValueError is what stops a budget from
+    being recorded as a corrupt page.
+    """
+
+
+ARCHIVE_INTEGRITY_UNDETERMINED = "undetermined"
+
+
+def archive_read_fault_is_ours(exc):
+    """True when this exception describes our ability to read, not the file.
+
+    Ordered most-specific first. BadZipFile is checked BEFORE OSError on
+    purpose: it is a real verdict about the bytes and must keep producing one.
+    """
+    if isinstance(exc, ArchiveReadDeclined):
+        return True
+    if isinstance(exc, zipfile.BadZipFile):
+        return False
+    if isinstance(exc, (OSError, MemoryError, RecursionError)):
+        return True
+    return False
+
+
+def archive_integrity_verdict(exc):
+    """The value archive_integrity takes for a read that ended in `exc`."""
+    return ARCHIVE_INTEGRITY_UNDETERMINED if archive_read_fault_is_ours(exc) else "failed"
+
+
+def archive_read_undetermined(semantics):
+    """True when the archive read did not finish for a reason that is ours.
+
+    The one predicate consumers use. `decide_acceptance()` reads it to avoid
+    minting a content verdict, and the durable bad-content writers read it --
+    through `decision_is_content_verdict()` -- to refuse to persist one.
+    """
+    semantics = semantics if isinstance(semantics, dict) else {}
+    return str(semantics.get("archive_integrity") or "") == ARCHIVE_INTEGRITY_UNDETERMINED
+
+
+def archive_output_refusal(path):
+    """THE one answer to "is this archive sound enough to put in the library".
+
+    Both CBR-to-CBZ converters end here rather than each keeping an opinion.
+    `inkdrop_completed_import.repack_cbr_to_cbz()` had none at all -- its only
+    refusal was zero images, so a source whose own RAR checksums failed produced
+    a .cbz with three undecodable pages and nothing looked -- while
+    `inkdrop_archive_conversion` had its own private set. Two implementations of
+    one judgement, one careful and one a hole, is the shape that let a corrupt
+    book into the library; this is the single implementation they now share.
+
+    Deliberately narrow. It judges the archive it is HANDED, after conversion,
+    and says nothing about how it was produced. The extractor's own tolerances
+    -- `cbr_partial_extract_is_usable()` and its missing-page allowance -- are a
+    separate, deliberate product decision and are not second-guessed here: a
+    slightly lossy extraction of a sound archive still passes, because the pages
+    that arrived are readable. What this catches is the different thing that was
+    never checked, which is pages that arrived and cannot be decoded.
+
+    Returns None when the archive is sound, otherwise a dict carrying `outcome`.
+    `outcome` respects the split this module already draws: "invalid" is a
+    statement about the bytes, "undetermined" means the check could not be
+    completed and must never be recorded as a verdict about the file -- the
+    lesson that produced the retraction of eight false blocks on 2026-08-23.
+    """
+    semantics = archive_member_semantics(Path(path), fresh=True)
+    if archive_read_undetermined(semantics):
+        return {
+            "outcome": "undetermined",
+            "reason": "archive_output_read_undetermined",
+            "detail": (semantics.get("image_validation_errors") or [None])[0],
+            "archive_integrity": semantics.get("archive_integrity"),
+        }
+    if str(semantics.get("archive_integrity") or "") == "failed":
+        errors = [
+            error for error in (semantics.get("image_validation_errors") or [])
+            if str(error).startswith("unreadable_image:")
+        ]
+        return {
+            "outcome": "invalid",
+            "reason": "archive_output_pages_unreadable",
+            "unreadable_pages": len(errors),
+            "detail": errors[:5],
+            "archive_integrity": semantics.get("archive_integrity"),
+        }
+    return None
+
+
+def decision_is_content_verdict(decision):
+    """True only when the gate actually judged the file.
+
+    `record_artifact_bad_content_memory()` is called unconditionally on any
+    non-eligible decision, by design -- that is how a bad file stops being
+    retried. This is the one thing that may make it conditional, and it is
+    deliberately narrow: it withholds the durable write ONLY when the gate
+    never formed an opinion. A genuine rejection is unaffected.
+    """
+    decision = decision if isinstance(decision, dict) else {}
+    return not bool(decision.get("read_undetermined"))
+
+
 def archive_member_semantics(path, *, fresh=False):
     path = Path(path)
     result = {
@@ -665,6 +798,8 @@ def archive_member_semantics(path, *, fresh=False):
         "credible_image_count": 0,
         "credible_image_payload_bytes": 0,
         "image_validation_errors": [],
+        "image_read_declined_count": 0,
+        "image_content_error_count": 0,
         "chapter_marker_count": 0,
         "chapter_marker_coverage": 0.0,
         "volume_marker_count": 0,
@@ -683,12 +818,27 @@ def archive_member_semantics(path, *, fresh=False):
         },
         "evidence": [],
     }
-    if comic_archive_suffix(path) != ".cbz" or not path.is_file():
+    if comic_archive_suffix(path) != ".cbz":
+        # Not a format this function checks. Saying nothing is the correct
+        # answer and must stay distinguishable from failing to look.
+        return result
+    if not path.is_file():
+        # The file is not there to be read. This used to return with NOTHING
+        # recorded, so decide_acceptance() saw archive_integrity=None, took it
+        # for a failed image check, and minted a content verdict about a file
+        # that was absent -- a stronger claim than any other branch makes, on
+        # the least evidence. Name it instead.
+        result["archive_integrity"] = ARCHIVE_INTEGRITY_UNDETERMINED
+        result["error"] = "FileNotFoundError: archive is not a readable file"
         return result
     try:
         stat = path.stat()
         cache_key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
-    except OSError:
+    except OSError as exc:
+        # Same shape as the branch above: a stat() we could not perform says
+        # nothing about the archive's contents.
+        result["archive_integrity"] = archive_integrity_verdict(exc)
+        result["error"] = f"{type(exc).__name__}: {exc}"
         return result
     cached = None if fresh else ARCHIVE_MEMBER_SEMANTICS_CACHE.get(cache_key)
     if isinstance(cached, dict):
@@ -722,7 +872,11 @@ def archive_member_semantics(path, *, fresh=False):
             for info in entries_to_check:
                 try:
                     if info.file_size > MAX_VERIFIED_IMAGE_BYTES:
-                        raise ValueError("image_exceeds_bounded_verifier_limit")
+                        # OUR ceiling, not their page. Raised as
+                        # ArchiveReadDeclined so archive_read_fault_is_ours()
+                        # can tell it from a genuinely implausible image
+                        # without parsing a message string.
+                        raise ArchiveReadDeclined("image_exceeds_bounded_verifier_limit")
                     with archive.open(info) as member:
                         data = member.read(MAX_VERIFIED_IMAGE_BYTES + 1)
                     if len(data) != info.file_size:
@@ -735,7 +889,17 @@ def archive_member_semantics(path, *, fresh=False):
                     credible_payload += int(info.file_size)
                     verified_pages.append((info.filename, hashlib.sha256(data).hexdigest()))
                 except Exception as exc:
-                    result["image_validation_errors"].append(f"unreadable_image:{info.filename}:{type(exc).__name__}")
+                    # The discriminating value was ALREADY here -- the type was
+                    # interpolated into this string and never read back. It is
+                    # now recorded as its own field instead of as a substring.
+                    ours = archive_read_fault_is_ours(exc)
+                    result["image_validation_errors"].append(
+                        f"{'undetermined_image' if ours else 'unreadable_image'}:{info.filename}:{type(exc).__name__}"
+                    )
+                    if ours:
+                        result["image_read_declined_count"] = int(result.get("image_read_declined_count") or 0) + 1
+                    else:
+                        result["image_content_error_count"] = int(result.get("image_content_error_count") or 0) + 1
             all_valid = bool(entries_to_check) and not result["image_validation_errors"] and fully_read == len(entries_to_check)
             # A clean sample earns the archive its credibility, but not a claim
             # that every page was read: archive_integrity says "sampled_ok"
@@ -752,7 +916,13 @@ def archive_member_semantics(path, *, fresh=False):
             result["image_validation_sampled_bytes"] = sampled_bytes if over_budget else 0
             if all_valid:
                 result["archive_integrity"] = "sampled_ok" if over_budget else "fully_checked"
+            elif not int(result.get("image_content_error_count") or 0):
+                # Every member that failed, failed on US. There is no content
+                # verdict available here and "failed" would be asserting one.
+                result["archive_integrity"] = ARCHIVE_INTEGRITY_UNDETERMINED
             else:
+                # At least one real content fault. A dirty sample stays a
+                # rejection -- unchanged, and deliberately so.
                 result["archive_integrity"] = "failed"
             if all_valid and not over_budget:
                 page_digest = hashlib.sha256()
@@ -770,19 +940,78 @@ def archive_member_semantics(path, *, fresh=False):
             comicinfo = dict(result["comicinfo"])
             if comicinfo_names:
                 comicinfo["present"] = True
-                if len(comicinfo_names) > 1:
-                    comicinfo["semantic_unit"] = "conflicting"
-                    comicinfo["evidence"].append("multiple_comicinfo_documents")
-                else:
+                # Nested ComicInfo.xml documents are ordinary -- a tagger writes
+                # one at the root, a scanner leaves one in the release folder.
+                # This used to refuse on the COUNT, without opening either, so
+                # two documents that agreed were recorded as the archive
+                # contradicting itself. Resolve which one is the archive's own
+                # by the rule inkdrop_archive_conversion already used, then
+                # COMPARE them: a disagreement is a real verdict and must still
+                # refuse, and it is now reached by having read them.
+                own_name = (
+                    inkdrop_comicinfo_identity.own_comicinfo_name(comicinfo_names)
+                    or comicinfo_names[0]
+                )
+                parsed_roots = {}
+                unit_claims = []
+                for candidate in comicinfo_names:
                     try:
-                        root = ET.fromstring(
+                        candidate_root = inkdrop_safe_xml.fromstring(
                             read_bounded_archive_member(
-                                archive, comicinfo_names[0], MAX_COMICINFO_BYTES
+                                archive, candidate, MAX_COMICINFO_BYTES
                             )
                         )
+                    except Exception:
+                        # An unreadable sibling says nothing about the unit.
+                        # Manufacturing a conflict out of our own parse failure
+                        # is the defect this file just removed elsewhere.
+                        continue
+                    parsed_roots[candidate] = candidate_root
+                    unit_claims.append(
+                        inkdrop_comicinfo_identity.unit_identity(
+                            candidate_root.findtext("Series"),
+                            candidate_root.findtext("Number"),
+                            candidate_root.findtext("Volume"),
+                        )
+                    )
+                if len(comicinfo_names) > 1:
+                    comicinfo["evidence"].append("multiple_comicinfo_documents_resolved")
+                if inkdrop_comicinfo_identity.unit_identities_disagree(unit_claims):
+                    comicinfo["semantic_unit"] = "conflicting"
+                    comicinfo["evidence"].append("comicinfo_documents_disagree_on_unit")
+                else:
+                    try:
+                        root = parsed_roots.get(own_name)
+                        if root is None:
+                            root = inkdrop_safe_xml.fromstring(
+                                read_bounded_archive_member(
+                                    archive, own_name, MAX_COMICINFO_BYTES
+                                )
+                            )
                         for tag, key in (("Series", "series"), ("Title", "title"), ("Number", "number"), ("Volume", "volume"), ("Format", "format")):
                             node = root.find(tag)
                             comicinfo[key] = node.text.strip() if node is not None and node.text else None
+                            if comicinfo[key]:
+                                continue
+                            # The resolved document is authoritative, not
+                            # exclusive. Depth decides WHICH document speaks for
+                            # the archive; it does not make a field the resolved
+                            # document leaves EMPTY into a field the archive does
+                            # not have. Reaching here means the documents were
+                            # already compared and do not contradict, so a
+                            # sibling's stated value cannot conflict with this
+                            # one -- it can only be the answer the resolved
+                            # document declined to give. Dropping it would
+                            # refuse the archive for a missing number that was
+                            # written down two members away.
+                            for other_name, other_root in parsed_roots.items():
+                                if other_name == own_name:
+                                    continue
+                                other_node = other_root.find(tag)
+                                if other_node is not None and other_node.text and other_node.text.strip():
+                                    comicinfo[key] = other_node.text.strip()
+                                    comicinfo["evidence"].append(f"comicinfo_{key}_from_sibling_document")
+                                    break
                         chapter_hint = "chapter" in _norm(comicinfo.get("format")) or bool(
                             re.search(r"\b(?:chapter|ch)[\s._-]*\d+", _norm(comicinfo.get("title")), re.I)
                         )
@@ -804,7 +1033,12 @@ def archive_member_semantics(path, *, fresh=False):
                         comicinfo["evidence"].append("comicinfo_parse_failed")
             result["comicinfo"] = comicinfo
     except Exception as exc:
+        # This handler used to set `error` and leave archive_integrity unset,
+        # so every caller read None and decide_acceptance() treated it as a
+        # failed image check. BadZipFile still lands on "failed"; an OSError
+        # no longer does.
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["archive_integrity"] = archive_integrity_verdict(exc)
         return result
     chapter_counts = {}
     volume_counts = {}
@@ -1056,9 +1290,31 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
     quarantine = False
     retry = True
     completion = True
-    if artifact_type == "corrupt_archive" or not archive_check.get("ok", True):
+    # validate_comic_archive() already reports three outcomes, not two, and
+    # already distinguishes "we could not finish" from "this file is broken".
+    # This gate used to collapse both into rejected_corrupt_archive by reading
+    # only `ok`. Reading `outcome` is what connects the two halves.
+    archive_check_undetermined = (
+        str(archive_check.get("outcome") or "") == ARCHIVE_INTEGRITY_UNDETERMINED
+    )
+    read_undetermined = False
+    if archive_check_undetermined:
+        decision = "undetermined_archive_read"
+        reasons.append(archive_check.get("reason") or "archive_check_incomplete")
+        read_undetermined = True
+    elif artifact_type == "corrupt_archive" or not archive_check.get("ok", True):
         decision = "rejected_corrupt_archive"
         reasons.append(archive_check.get("reason") or "corrupt_archive")
+    elif archive_read_undetermined(member_semantics):
+        # The read never finished, and it failed on us. Nothing is imported --
+        # completion_eligible stays False below, exactly as before -- but the
+        # gate does not get to call the file bad, and nothing durable is
+        # written about its content.
+        decision = "undetermined_archive_read"
+        reasons.append(f"archive_read_{ARCHIVE_INTEGRITY_UNDETERMINED}")
+        if member_semantics.get("error"):
+            reasons.append(str(member_semantics.get("error")).split(":", 1)[0])
+        read_undetermined = True
     elif not cbz_verified:
         decision = "rejected_invalid_image_payload"
         reasons.append(f"archive_image_validation_{member_semantics.get('archive_integrity') or 'failed'}")
@@ -1127,7 +1383,11 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
         decision = "rejected_partial_artifact"
         reasons.extend(completeness["completeness_reasons"])
     if decision != "accepted":
-        quarantine = decision not in {"manual_review_required"}
+        # An unfinished read is not eligible for completion -- nothing imports
+        # on the strength of a check that never ran, which is unchanged. What
+        # changes is that it no longer quarantines, because quarantining is an
+        # assertion about the file.
+        quarantine = decision not in {"manual_review_required", "undetermined_archive_read"}
         completion = False
     # Content identity is target-independent evidence.  Preserve it for rejected
     # artifacts too so durable bad-content memory survives path/provider changes.
@@ -1165,6 +1425,10 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
         "quarantine_required": quarantine,
         "retry_eligible": retry,
         "completion_eligible": completion,
+        # Read by decision_is_content_verdict(). The durable bad-content store
+        # consults that before persisting anything, so a read we could not
+        # finish cannot become a seven-day block on the file's identity.
+        "read_undetermined": read_undetermined,
         **completeness,
     }
 
@@ -1189,6 +1453,11 @@ def sanitized_decision(decision):
         "quarantine_required",
         "retry_eligible",
         "completion_eligible",
+        # Kept in the sanitized shape on purpose: the event log is where an
+        # operator or a later audit asks "did the gate actually judge this
+        # file", and a flag that is stripped before it is written cannot
+        # answer that.
+        "read_undetermined",
     ):
         out[key] = decision.get(key)
     return out
