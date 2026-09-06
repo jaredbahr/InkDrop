@@ -387,7 +387,18 @@ def build_update_manifest(candidate_path, validation_path, contract, repository,
         "version": contract["version"],
         "prerelease": True,
         "validated": True,
-        "release_url": f"https://github.com/{repository}/releases/tag/{contract['tag']}",
+        # NOT `repository`. This manifest is what an install reads to learn an
+        # update exists, and it reads it from the PUBLIC release --
+        # _approved_update_url() admits only
+        # https://github.com/<update_release_repositories()>/releases/... So the
+        # release it names has to be one the reader can actually open, whichever
+        # repository built the manifest. The job that builds it runs on the
+        # private repository, so taking `repository` here produced a private URL
+        # that validate_update_manifest() then refused, failing every dispatch.
+        "release_url": (
+            f"https://github.com/{inkdrop_version.update_release_repositories()[0]}"
+            f"/releases/tag/{contract['tag']}"
+        ),
         "commit_sha": commit,
         "image_repository": resolve_image_repository(repository, image_repository),
         "image_digest": evidence["image_digest"],

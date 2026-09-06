@@ -327,6 +327,33 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     require(generated["published_at"] == expected_published, generated["published_at"])
     require(generated["database_migration"] is False, generated)
 
+    # PRODUCTION PASSES THE PRIVATE REPOSITORY HERE, NOT THIS ONE. The release
+    # workflow calls the tool with --repository "$GITHUB_REPOSITORY", and the
+    # job that builds this manifest runs on jaredbahr/InkDrop. Passing REPO
+    # (the public release repository) exercises a call the consumer never
+    # makes: release_url was built from whatever repository was handed in, and
+    # validate_update_manifest() only accepts update_release_repositories(), so
+    # the real call raised "release_url must identify the exact InkDrop
+    # release" on every dispatch while this arm stayed green.
+    #
+    # The manifest is fetched by installs from the PUBLIC release
+    # (_approved_update_url only admits that path), so the release_url it
+    # carries has to name the public release no matter which repository built
+    # it. Pass the private repository -- what production passes -- and require
+    # both that it validates and that it points somewhere an install can reach.
+    private_repo = "jaredbahr/" + "inkdrop" + "-dev"
+    from_private = release_tool.build_update_manifest(
+        candidate_path, validation_path, contract, private_repo, COMMIT, "177",
+        updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW,
+    )
+    require(from_private["release_url"] == generated["release_url"],
+            "the manifest an install reads must name the same release whichever "
+            "repository built it: %r vs %r"
+            % (from_private["release_url"], generated["release_url"]))
+    require(private_repo not in from_private["release_url"],
+            "release_url points at the private repository, which no install can "
+            "read: %r" % (from_private["release_url"],))
+
     # The fixture's evidence is frozen at NOW, and validate_update_manifest()
     # refuses a manifest older than UPDATE_MANIFEST_MAX_AGE_SECONDS. Without a
     # pinned clock this call inherits a shelf life equal to that limit and

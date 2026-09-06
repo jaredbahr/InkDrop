@@ -1508,8 +1508,8 @@
     },
     {
       "path": "tests/inkdrop-update-awareness-smoke.py",
-      "sha256": "c4e19fc5d828bb08aa4b6e193e2b95e8576344cb621bf0b7c9bb76283c7ee0f6",
-      "size_bytes": 23743
+      "sha256": "9b352788f2eb86c4b4140a829ceeec6151c971bf2b20ed8f5e948b8da417fae0",
+      "size_bytes": 25445
     },
     {
       "path": "tests/inkdrop-utorrent-rtorrent-smoke.py",
@@ -1573,8 +1573,8 @@
     },
     {
       "path": "tools/inkdrop_github_release.py",
-      "sha256": "39b21618a835e9413f4c6a8ccbf103cc67555b30c0a0ca7ee58d65a50fcb314d",
-      "size_bytes": 30505
+      "sha256": "d2b9c5712401052f218fd573a13fb50619d47921c87dda5ac6bf956aefe54381",
+      "size_bytes": 31174
     },
     {
       "path": "tools/inkdrop_install_support_summary.py",
@@ -2014,5 +2014,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "total_size_bytes": 21238741
+  "source_commit": "a1771b89c6ffc8dede7e5f1d8ca69e3264997b07",
+  "total_size_bytes": 21241112
 }
