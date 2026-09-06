@@ -25012,6 +25012,7 @@ def sync_download_reconciliation(con, state_dir, now):
     reverified_count = 0
     reverify_examined = 0
     reverify_attempted = 0
+    reverify_deferred = 0
     match_candidates = None
     for record in reverify_fair_order(reconciliation_records(state_dir)):
         queue_state = reconciliation_queue_state(record.get("lifecycle_state"))
@@ -25135,6 +25136,15 @@ def sync_download_reconciliation(con, state_dir, now):
                 if reverify_stats.get("attempted"):
                     reverify_attempted += 1
                     reverify_budget -= 1
+            else:
+                # The room ran out and this unit still wants looking at.
+                # reverify_examined cannot count it -- that counter lives inside the
+                # branch above and stops the moment the budget does -- so without
+                # this the tail is invisible and an exhausted pass has no
+                # denominator. "42 examined" then means 42 units were reached before
+                # the budget went and an unknown number after, which cannot say
+                # whether a backlog shrank or a pass simply gave up earlier.
+                reverify_deferred += 1
             if reverified:
                 reverified_count += 1
                 message = "Found this issue's file still in the library; import re-verified."
@@ -25172,40 +25182,87 @@ def sync_download_reconciliation(con, state_dir, now):
                 site="sync_download_reconciliation",
             )
         count += 1
-    if reverify_budget <= 0:
+    # Every pass says what the re-verify arm did, not only the passes that ran out
+    # of room. Emitting solely on exhaustion left three different outcomes looking
+    # identical from outside the process -- the arm never ran, it ran and had nothing
+    # to do, it ran and recovered files -- and that is the judgement a post-deploy
+    # check has to make, so a deployed fix to this path could not be shown to have
+    # done anything. It is not hypothetical: the exhaustion event fired 22-27 times a
+    # day from 2026-08-24 to 2026-09-03 and then 8, 0 and 3 times over the next three
+    # days, with a deploy inside that window, and nothing in the record says whether
+    # the arm got faster or stopped running.
+    #
+    # The cost is small and was measured rather than assumed: on the 2026-09-06
+    # 16:27:07Z snapshot the instance wrote ~54,000 history_events a day, and the
+    # pass rate that newly emits here is of the order of 100 a day -- well under 1%.
+    #
+    # The exhausted branch keeps its event type and its `stable_id` kind. That series
+    # is 967 rows deep and is the only record anyone can read backwards, so renaming
+    # it to unify the two branches would buy tidiness with the history.
+    # A pass with no re-verify candidates writes nothing. Emitting there would make
+    # this a heartbeat rather than a measurement, and history_events is already at
+    # 2.4M rows -- the volume then grows with uptime instead of with work, which is
+    # backwards: it should fall to zero as the backlog drains. Silence still
+    # answers the question it needs to, because the arm's population is
+    # independently readable (import_results with verified=0): silence against a
+    # known backlog means the pass is not running, silence against a drained one
+    # means there was nothing to do.
+    reverify_exhausted = reverify_budget <= 0
+    if not (reverify_examined or reverify_deferred):
+        return count
+    if reverify_exhausted:
         # Never let a bounded pass read as "nothing left to recover".
-        con.execute(
-            """
-            insert or ignore into history_events(
-                id, entity_type, entity_id, series_id, issue_id, event_type,
-                source, message, outcome, display_phase, created_at, raw_json
-            ) values(?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                stable_id("import_reverify_budget_exhausted", int(now)),
-                "import_ledger",
-                "import_reverify",
-                None,
-                None,
-                "import_reverify_budget_exhausted",
-                "importer",
-                f"Re-verified {reverified_count} import(s) from files already in the library and hit this pass's"
-                f" limit of {REVERIFY_ATTEMPTS_PER_PASS}; the rest are retried next pass.",
-                "neutral",
-                "observed",
-                now,
-                json_dumps({
-                    "reverified": reverified_count,
-                    "attempt_budget": REVERIFY_ATTEMPTS_PER_PASS,
-                    # examined counts units the budget arm looked at; attempted counts the
-                    # ones that reached the archive gates and so actually cost a slot. The
-                    # gap between them is the no-op spend this event used to hide -- 942 of
-                    # 959 firings reported reverified=0 with no way to tell why.
-                    "examined": reverify_examined,
-                    "attempted": reverify_attempted,
-                }),
-            ),
+        reverify_event = "import_reverify_budget_exhausted"
+        reverify_message = (
+            f"Re-verified {reverified_count} import(s) from files already in the library and hit this pass's"
+            f" limit of {REVERIFY_ATTEMPTS_PER_PASS}; {reverify_deferred} more are retried next pass."
         )
+    else:
+        reverify_event = "import_reverify_pass"
+        reverify_message = (
+            f"Re-verified {reverified_count} import(s) from files already in the library;"
+            f" {reverify_examined} candidate(s) examined and"
+            f" {reverify_attempted} of {REVERIFY_ATTEMPTS_PER_PASS} slot(s) spent."
+        )
+    con.execute(
+        """
+        insert or ignore into history_events(
+            id, entity_type, entity_id, series_id, issue_id, event_type,
+            source, message, outcome, display_phase, created_at, raw_json
+        ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            # `int(now)` is the pass clock, so this is one row per pass rather than
+            # per unit, and a replay of the same pass is a no-op rather than a double
+            # count. It also means a count of these events is a floor on the number of
+            # passes, never a rate.
+            stable_id(reverify_event, int(now)),
+            "import_ledger",
+            "import_reverify",
+            None,
+            None,
+            reverify_event,
+            "importer",
+            reverify_message,
+            "neutral",
+            "observed",
+            now,
+            json_dumps({
+                "reverified": reverified_count,
+                "attempt_budget": REVERIFY_ATTEMPTS_PER_PASS,
+                # examined counts units the budget arm looked at; attempted counts the
+                # ones that reached the archive gates and so actually cost a slot. The
+                # gap between them is the no-op spend this event used to hide -- 942 of
+                # 959 firings reported reverified=0 with no way to tell why. deferred
+                # counts the units reached after the budget was gone, which examined
+                # cannot see; examined + deferred is the arm's population this pass.
+                "examined": reverify_examined,
+                "attempted": reverify_attempted,
+                "deferred": reverify_deferred,
+                "budget_exhausted": reverify_exhausted,
+            }),
+        ),
+    )
     return count
 
 
