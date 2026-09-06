@@ -50,7 +50,7 @@ class FakeApi:
         if path.startswith("/releases/tags/"):
             return self.release
         if method == "POST" and path == "/releases":
-            self.release = {"id": 42, "upload_url": "https://uploads.github.com/repos/jaredbahr/inkdrop-dev/releases/42/assets{?name,label}", "assets": [], **payload}
+            self.release = {"id": 42, "upload_url": "https://uploads.github.com/repos/jaredbahr/InkDrop/releases/42/assets{?name,label}", "assets": [], **payload}
             return self.release
         if method == "PATCH" and path == "/releases/42":
             self.release.update(payload)
@@ -248,7 +248,7 @@ def main():
         }
         validation_path.write_text(json.dumps(validation, sort_keys=True) + "\n", encoding="utf-8")
         evidence = release_tool.load_verified_evidence(
-            candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", commit, "177"
+            candidate_path, validation_path, contract, "jaredbahr/InkDrop", commit, "177"
         )
         require(release_tool.VERIFIED_START in evidence["body"] and release_tool.VERIFIED_END in evidence["body"], evidence)
         require(commit in evidence["body"] and f"inkdrop@{digest}" in evidence["body"], evidence)
@@ -275,7 +275,7 @@ def main():
             bad_validation[field] = bad_value
             validation_path.write_text(json.dumps(bad_validation), encoding="utf-8")
             try:
-                release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", commit, "177")
+                release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/InkDrop", commit, "177")
             except RuntimeError as exc:
                 require("evidence mismatch" in str(exc), exc)
             else:
@@ -285,7 +285,7 @@ def main():
         incomplete_runtime["platform_runtime"] = validation["platform_runtime"][:1]
         validation_path.write_text(json.dumps(incomplete_runtime), encoding="utf-8")
         try:
-            release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", commit, "177")
+            release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/InkDrop", commit, "177")
         except RuntimeError as exc:
             require("incomplete platform runtime" in str(exc), exc)
         else:

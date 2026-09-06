@@ -6,6 +6,8 @@ if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
 import base64
+import contextlib
+import functools
 import calendar
 import faulthandler
 import gzip
@@ -23,6 +25,7 @@ from core import inkdrop_library_reconcile
 from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
 from core import inkdrop_state
+from core import inkdrop_import_evidence
 from core import inkdrop_operator_contracts
 from core import inkdrop_release_identity
 from core import inkdrop_version
@@ -34,6 +37,7 @@ from core import inkdrop_download_client_api
 from core import inkdrop_auth
 from core import inkdrop_auth_contracts
 from core import inkdrop_backup_restore
+from core import inkdrop_restore_quiescence
 from core import inkdrop_db_maintenance
 from core import inkdrop_portability_export
 from core import inkdrop_log_export
@@ -8883,7 +8887,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
         await loadInkdropSettings(false, settingsArea);
         if (!requestedArea) {
           scrollInkdropShellTop(true);
-          if (await waitForSettingsGroup(settingsArea, 3500)) {
+          if (await waitForSettingsGroup(settingsArea)) {
             openSettingsGroup(settingsArea, {updateRoute: false, scroll: false, highlight: false});
           }
         }
@@ -24754,29 +24758,52 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       return true;
     }
 
-    function waitForSettingsGroup(groupKey, timeoutMs=2500) {
+    // A DEADLINE HERE IS A RACE, NOT A TIMEOUT, AND LOSING IT SHOWED AN EMPTY
+    // PAGE. Every settings group is display:none until the shell carries
+    // data-settings-active-group, and on this path the only thing that sets it
+    // is openSettingsGroup(), which runs only when this resolves true. What a
+    // fixed deadline was racing is hydration, which walks the groups through
+    // requestIdleCallback -- so its duration is set by how busy the main thread
+    // is, not by how much there is to render. On a busy first load the wait
+    // expired, nothing was made visible, and the operator got a toast blaming a
+    // load that was merely slow.
+    //
+    // So wait for the group to appear, or for hydration to SAY it has finished
+    // and the group is therefore never coming. ceilingMs is the backstop for
+    // hydration that never finishes at all; it is not a budget, and passing a
+    // plausible hydration time for it makes this a stopwatch again.
+    function waitForSettingsGroup(groupKey, ceilingMs=30000) {
       const key = String(groupKey || "");
       if (!key) return Promise.resolve(false);
+      const grid = $("inkdropSettingsGrid") || document.body;
       const exists = () => Array.from(document.querySelectorAll("details.settings-group"))
         .some(group => String(group.dataset.settingsGroupKey || "") === key);
+      // Hydration is over when the state is neither of the two in-flight ones.
+      // Anything else -- ready, empty_valid, request_failed -- means the group
+      // list is final, so an absent group is a real absence and saying so is
+      // honest rather than premature.
+      const settled = () => {
+        const state = String(grid.dataset?.settingsDetailsState || "");
+        return !!state && state !== "hydrating" && state !== "loading";
+      };
       if (exists()) return Promise.resolve(true);
       return new Promise(resolve => {
-        const started = Date.now();
-        const grid = $("inkdropSettingsGrid") || document.body;
-        const observer = new MutationObserver(() => {
-          if (exists()) {
-            observer.disconnect();
-            resolve(true);
-          } else if (Date.now() - started >= timeoutMs) {
-            observer.disconnect();
-            resolve(false);
-          }
-        });
-        observer.observe(grid, {childList: true, subtree: true});
-        window.setTimeout(() => {
+        let done = false;
+        const finish = (value) => {
+          if (done) return;
+          done = true;
           observer.disconnect();
-          resolve(exists());
-        }, timeoutMs);
+          window.clearTimeout(ceiling);
+          resolve(value);
+        };
+        const settle = () => {
+          if (exists()) finish(true);
+          else if (settled()) finish(false);
+        };
+        const observer = new MutationObserver(settle);
+        observer.observe(grid, {childList: true, subtree: true, attributes: true, attributeFilter: ["data-settings-details-state"]});
+        const ceiling = window.setTimeout(() => finish(exists()), ceilingMs);
+        settle();
       });
     }
 
@@ -24820,7 +24847,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       if (superseded()) return;
       const drawer = $("inkdropSettings");
       if (drawer) drawer.open = true;
-      const ready = await waitForSettingsGroup(groupKey, 3500);
+      const ready = await waitForSettingsGroup(groupKey);
       if (superseded()) return;
       if (ready) {
         openSettingsGroup(groupKey, {updateRoute: false, scroll: true, highlight: false, toast: false});
@@ -28318,7 +28345,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       mergePreviewIntro.textContent = "Bringing in a backup from a different InkDrop instance? \"Preview merge\" on any backup below compares its series and issues against your library and shows what's new, what you already have, and anything that needs a human to look at it -- by exact metadata ID only, never by title. This is a preview only: nothing is added, changed, or removed. Actually importing is not available yet.";
       const restoreDisabledNotice = document.createElement("p");
       restoreDisabledNotice.className = "settings-backup-restore-disabled-notice";
-      restoreDisabledNotice.textContent = "Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed. Creating, downloading, and importing backups still work normally -- the archives below are safe to keep.";
+      restoreDisabledNotice.textContent = "Restoring replaces this install's databases with a backup's. It refuses while the worker is still running, so stop the worker container first; \"Restore…\" on any backup below shows what you will have to set up again before you commit to it. Provider credentials are never stored in a backup and must be re-entered afterwards.";
       const retention = document.createElement("div");
       retention.dataset.backupRetention = "true";
       const actions = document.createElement("div");
@@ -28339,8 +28366,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       preserveAuthRow.className = "settings-backup-preserve-auth";
       const preserveAuthCheckbox = document.createElement("input");
       preserveAuthCheckbox.type = "checkbox";
-      preserveAuthCheckbox.disabled = true;
-      preserveAuthCheckbox.title = "Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed.";
+      preserveAuthCheckbox.title = "Keep the logins and API keys this install has right now, instead of the ones from the moment the backup was taken.";
       preserveAuthRow.append(
         preserveAuthCheckbox,
         document.createTextNode(" Keep today's logins and API keys instead of the backup's, when restoring"),
@@ -28370,11 +28396,34 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
           const downloadLink = document.createElement("a");
           downloadLink.href = `/api/inkdrop-settings/backup/archives/download?name=${encodeURIComponent(archive.name)}`;
           downloadLink.textContent = "Download";
+          const restoreDetail = document.createElement("div");
+          restoreDetail.className = "settings-backup-merge-preview";
+          restoreDetail.hidden = true;
           const restoreButton = document.createElement("button");
           restoreButton.type = "button";
-          restoreButton.textContent = "Restore (disabled)";
-          restoreButton.disabled = true;
-          restoreButton.title = "Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed.";
+          restoreButton.textContent = "Restore…";
+          restoreButton.title = "Replace this install's databases with the ones in this backup. Shows what you will have to set up again before you commit, and refuses while anything is still writing.";
+          restoreButton.onclick = async () => {
+            restoreButton.disabled = true;
+            restoreDetail.hidden = false;
+            restoreDetail.replaceChildren();
+            const loading = document.createElement("p");
+            loading.className = "mini";
+            loading.textContent = "Checking this backup, and whether anything is still writing…";
+            restoreDetail.appendChild(loading);
+            try {
+              const data = await api("/api/inkdrop-settings/backup/archives/restore/preview", {name: archive.name}, {timeoutMs: 300000});
+              renderRestorePlan(restoreDetail, data?.result, archive, status, preserveAuthCheckbox.checked);
+            } catch (error) {
+              restoreDetail.replaceChildren();
+              const failed = document.createElement("p");
+              failed.className = "settings-backup-verify-failed";
+              failed.textContent = `Could not read this backup: ${error?.message || error}`;
+              restoreDetail.appendChild(failed);
+            } finally {
+              restoreButton.disabled = false;
+            }
+          };
           const mergePreviewDetail = document.createElement("div");
           mergePreviewDetail.className = "settings-backup-merge-preview";
           mergePreviewDetail.hidden = true;
@@ -28408,7 +28457,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
           const verifyButton = document.createElement("button");
           verifyButton.type = "button";
           verifyButton.textContent = "Verify backup";
-          verifyButton.title = "Check that this backup's databases are intact and would restore cleanly. Read-only -- nothing is changed, and this works even while restoring is disabled.";
+          verifyButton.title = "Check that this backup's databases are intact and would restore cleanly. Read-only -- nothing is changed, and it does not require stopping anything.";
           verifyButton.onclick = async () => {
             verifyButton.disabled = true;
             verifyDetail.hidden = false;
@@ -28447,9 +28496,125 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
             }
           };
           row.append(label, downloadLink, restoreButton, verifyButton, mergePreviewButton, deleteButton);
-          rowWrap.append(row, verifyDetail, mergePreviewDetail);
+          rowWrap.append(row, restoreDetail, verifyDetail, mergePreviewDetail);
           list.appendChild(rowWrap);
         }
+      }
+
+      function renderRestorePlan(container, result, archive, status, preserveCurrentAuth) {
+        container.replaceChildren();
+        if (!result) {
+          const empty = document.createElement("p");
+          empty.textContent = "No restore information was returned.";
+          container.appendChild(empty);
+          return;
+        }
+        const manifest = result.manifest || {};
+        const headline = document.createElement("p");
+        headline.textContent = `Restoring the backup from ${manifest.created_at || "an unknown time"} replaces this install's databases with the ones inside it. Everything below happens whether or not the restore succeeds, so read it first.`;
+        container.appendChild(headline);
+
+        // What the operator will have to set up again. Credentials are
+        // stripped from every backup by design; what was missing was being
+        // TOLD, early enough that it changes whether you click.
+        const credentials = result.credentials_needing_reentry || {};
+        const providers = credentials.providers || [];
+        const connectors = credentials.notification_connectors || [];
+        const credentialHeading = document.createElement("p");
+        credentialHeading.className = "settings-backup-verify-failed";
+        if (providers.length || connectors.length) {
+          credentialHeading.textContent = `You will have to re-enter ${providers.length + connectors.length} credential(s) by hand afterwards -- they are deliberately not stored in any backup. Until you do, these are unauthenticated:`;
+          container.appendChild(credentialHeading);
+          const credentialList = document.createElement("ul");
+          for (const provider of providers) {
+            const item = document.createElement("li");
+            item.textContent = `${provider.display_name || provider.provider_type} -- ${provider.credential || "credential"}`;
+            credentialList.appendChild(item);
+          }
+          for (const connector of connectors) {
+            const item = document.createElement("li");
+            item.textContent = `${connector.name || connector.type} (notifications)`;
+            credentialList.appendChild(item);
+          }
+          container.appendChild(credentialList);
+        } else {
+          credentialHeading.textContent = "This backup records no provider credentials to re-enter.";
+          container.appendChild(credentialHeading);
+        }
+
+        // What the archive never carried. `omits` is absent on archives made
+        // before it existed -- say so rather than rendering an empty list,
+        // which would read as "nothing is missing".
+        const omits = manifest.omits;
+        const omitsHeading = document.createElement("p");
+        if (omits && Array.isArray(omits.files)) {
+          omitsHeading.textContent = `This backup also does not contain ${omits.files_examined} other file(s) from the state folder. A restore does not bring these back:`;
+          container.appendChild(omitsHeading);
+          const omitsList = document.createElement("ul");
+          for (const file of omits.files.slice(0, 8)) {
+            const item = document.createElement("li");
+            item.textContent = `${file.name} -- ${file.matters}`;
+            omitsList.appendChild(item);
+          }
+          if (omits.files.length > 8) {
+            const more = document.createElement("li");
+            more.textContent = `…and ${omits.files.length - 8} more, listed in the backup's manifest.`;
+            omitsList.appendChild(more);
+          }
+          container.appendChild(omitsList);
+        } else {
+          omitsHeading.textContent = "This backup predates the record of what it leaves behind, so it cannot say which other state files it omits. Newer backups list them.";
+          container.appendChild(omitsHeading);
+        }
+
+        // Quiescence. If something is still writing, there is no confirm
+        // button at all -- an operator should not be one misclick from a
+        // restore the server is going to refuse anyway.
+        const quiescence = result.quiescence || {};
+        if (quiescence.quiescent === false) {
+          const blocked = document.createElement("p");
+          blocked.className = "settings-backup-verify-failed";
+          blocked.textContent = "Restoring is blocked right now, because something is still writing to the database:";
+          container.appendChild(blocked);
+          const blockerList = document.createElement("ul");
+          for (const blocker of quiescence.blockers || []) {
+            const item = document.createElement("li");
+            item.textContent = `${blocker.detail} -- ${blocker.next_action}`;
+            blockerList.appendChild(item);
+          }
+          container.appendChild(blockerList);
+          const retry = document.createElement("p");
+          retry.className = "mini";
+          retry.textContent = "Do that, then click Restore again.";
+          container.appendChild(retry);
+          return;
+        }
+
+        const ready = document.createElement("p");
+        ready.textContent = "Nothing else is writing to the database, so this restore can proceed.";
+        container.appendChild(ready);
+        const confirmButton = document.createElement("button");
+        confirmButton.type = "button";
+        confirmButton.className = "danger";
+        confirmButton.textContent = "Replace my data with this backup";
+        confirmButton.onclick = async () => {
+          if (!confirm(`Replace this install's databases with the backup from ${manifest.created_at || "an unknown time"}?\n\nWhat is on disk now is copied aside first, but everything since this backup was taken will be gone.`)) return;
+          confirmButton.disabled = true;
+          status.textContent = "Restoring… this takes several minutes on a large database.";
+          try {
+            const data = await api("/api/inkdrop-settings/backup/archives/restore/apply", {name: archive.name, preserve_current_auth: !!preserveCurrentAuth}, {timeoutMs: 3600000});
+            container.replaceChildren();
+            const done = document.createElement("p");
+            const snapshots = (data?.result?.pre_restore_snapshots || []).length;
+            done.textContent = `Restore finished. What was here before was copied aside first (${snapshots} file(s)). Re-enter the credentials listed above, then restart InkDrop.`;
+            container.appendChild(done);
+            status.textContent = "Backup restored.";
+          } catch (error) {
+            confirmButton.disabled = false;
+            status.textContent = `Restore did not run: ${error?.message || error}`;
+          }
+        };
+        container.appendChild(confirmButton);
       }
 
       function renderRestoreVerifyDetail(container, result) {
@@ -28491,7 +28656,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
         }
         const note = document.createElement("p");
         note.className = "mini";
-        note.textContent = "This is a check only -- nothing has been changed. Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed; see the notice above.";
+        note.textContent = "This is a check only -- nothing has been changed. To actually restore this backup, use \"Restore…\", which shows what the restore costs before it runs.";
         container.appendChild(note);
       }
 
@@ -42426,6 +42591,7 @@ def run_manga_companion_add_bounded(*, seed_provider, seed_series_id, title, can
         heartbeat = threading.Thread(
             target=_manga_companion_lease_heartbeat,
             args=(job_id, lease_token, heartbeat_stop),
+            name=f"inkdrop-companion-heartbeat-{str(job_id)[-8:]}",
             daemon=True,
         )
         heartbeat.start()
@@ -42519,6 +42685,7 @@ def launch_pending_manga_companion_jobs(limit=1, job_id=None):
     for job in jobs:
         threading.Thread(
             target=_run_manga_companion_add_job,
+            name=f"inkdrop-companion-add-{str(job['id'])[-8:]}",
             kwargs={
                 "job_id": job["id"],
                 "seed_provider": job["seed_provider"],
@@ -46177,7 +46344,72 @@ def inkdrop_bool_setting(key, default=False):
     return inkdrop_bool_value(inkdrop_app_setting_value(key, default), default)
 
 
+def _with_runtime_paths_scope(fn):
+    """Run `fn` inside one runtime-paths scope.
+
+    Applied to load_manual_review because that is where the cost was: it
+    accounted for 193.4s of a 194.3s status computation, through 10,335
+    per-row calls that each rebuilt the same eleven paths.
+    """
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with runtime_paths_scope():
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+# ONE PASS, ONE BUILD. inkdrop_runtime_paths() reads eleven application
+# settings, and every read takes the database lock and re-checks that the
+# settings table exists. Profiled on the deployed image, one status
+# computation called this 10,473 times -- once per completion row -- for
+# 115,205 setting reads and 576,653 sqlite executes, 139.8s of self time. The
+# eleven values are identical on every one of those calls.
+#
+# The cache is deliberately SCOPED rather than global-with-a-TTL. These
+# settings are user-editable from the UI, and a cache that outlives the work
+# it was built for is a different defect: an operator changes a path and the
+# product keeps using the old one for however long the TTL runs. A scope ends,
+# so the next pass reads the settings again.
+#
+# It is thread-local because the web process runs three of these passes
+# concurrently. A shared cache would let one pass serve another pass's values.
+_RUNTIME_PATHS_CACHE = threading.local()
+
+
+@contextlib.contextmanager
+def runtime_paths_scope():
+    """Within this block, build the runtime paths once and reuse them.
+
+    Re-entrant: nested scopes share the outermost build and only the outermost
+    exit clears it, so a caller does not have to know whether something above
+    it already opened one.
+    """
+    depth = getattr(_RUNTIME_PATHS_CACHE, "depth", 0)
+    _RUNTIME_PATHS_CACHE.depth = depth + 1
+    if depth == 0:
+        _RUNTIME_PATHS_CACHE.paths = None
+    try:
+        yield
+    finally:
+        _RUNTIME_PATHS_CACHE.depth = depth
+        if depth == 0:
+            _RUNTIME_PATHS_CACHE.paths = None
+
+
 def inkdrop_runtime_paths():
+    if getattr(_RUNTIME_PATHS_CACHE, "depth", 0):
+        cached = getattr(_RUNTIME_PATHS_CACHE, "paths", None)
+        if cached is None:
+            cached = _build_runtime_paths()
+            _RUNTIME_PATHS_CACHE.paths = cached
+        # A copy, not the cached object: callers received a fresh dict before
+        # this change and some may mutate what they get. Copying eleven keys is
+        # not what this function was costing.
+        return dict(cached)
+    return _build_runtime_paths()
+
+
+def _build_runtime_paths():
     return {
         "comic_root": inkdrop_path_setting("path.comic_root", COMIC_ROOT),
         "manga_root": inkdrop_path_setting("path.manga_root", MANGA_ROOT),
@@ -59950,6 +60182,7 @@ def manual_source_waiting_review_rows(actions, limit=80):
     return rows[:limit]
 
 
+@_with_runtime_paths_scope
 def load_manual_review(limit=80):
     actions = load_manual_review_actions()
     hidden = set(actions.get("ignored", [])) | set(actions.get("approved", [])) | set(actions.get("bad", []))
@@ -62063,10 +62296,69 @@ def manual_review_reconciler_loop():
         time.sleep(MANUAL_REVIEW_RECONCILE_INTERVAL_SECONDS)
 
 
+def write_web_thread_roster():
+    """Publish the live thread roster to the host filesystem. Observation only.
+
+    Same payload as /api/inkdrop-debug/background-threads, minus the
+    per-request field, written where a diagnostic session can read it without
+    a credential. native_id is the point: it is the TID that /proc, top and
+    docker stats show, so a thread seen burning CPU from outside the container
+    can be named without guessing.
+
+    This rides on auto_pack_import_loop rather than the queue runner on
+    purpose. An instrument that depends on the thing under investigation stops
+    reporting exactly when it is needed: queue_runner_once() was measured at
+    685-954s per cycle on 2026-08-28 while the unidentified consumer it was
+    meant to expose rotated every ~9 minutes, so a roster written from there
+    would sample slower than its target changes. auto_pack_import_loop holds
+    its configured 120s interval (measured: repeated ~118s idle windows) at
+    0.3% of a core, which samples a nine-minute thread several times over.
+
+    It must never break the loop it rides on, so failures are trapped -- but
+    they are recorded IN the file, because a stale or missing roster read as
+    "no threads" is the silent-failure mode this whole investigation kept
+    hitting.
+    """
+    ts = time.time()
+    try:
+        threads = sorted(
+            (
+                {
+                    "name": thread.name,
+                    "daemon": bool(thread.daemon),
+                    "alive": bool(thread.is_alive()),
+                    "native_id": getattr(thread, "native_id", None),
+                }
+                for thread in threading.enumerate()
+            ),
+            key=lambda item: str(item.get("name") or ""),
+        )
+        write_json_file(WEB_THREAD_ROSTER_FILE, {
+            "ok": True,
+            "generated_at": ts,
+            "generated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+            "pid": os.getpid(),
+            "count": len(threads),
+            "threads": threads,
+        })
+    except Exception as exc:
+        try:
+            write_json_file(WEB_THREAD_ROSTER_FILE, {
+                "ok": False,
+                "generated_at": ts,
+                "generated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+                "pid": os.getpid(),
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            })
+        except Exception:
+            pass
+
+
 def auto_pack_import_loop():
     global PACK_AUTO_IMPORT_LOOP_FAILURES
     time.sleep(15)
     while True:
+        write_web_thread_roster()
         try:
             result = auto_import_ready_pack_once()
             if isinstance(result, dict):
@@ -62108,8 +62400,37 @@ def ignore_manual_review(payload):
     return {"review_id": review_id, "status": "ignored"}
 
 
+# `manual_review_legacy_row()` and `sync_review_exceptions()` both fall back to
+# the literal string "Unknown" when a row's producer recorded no identity, and
+# that literal is stored in `review_exceptions.series`. It is truthy, and the
+# only test the retry applies is truthiness.
+MANUAL_REVIEW_PLACEHOLDER_SERIES = {"unknown", "unknown series", "untitled series"}
+
+
 def _manual_review_retry_series(item):
-    return str(item.get("series") or item.get("matched_series") or "").strip()
+    """The series a rejected review row should re-search, or "" for none.
+
+    A placeholder is not a series. 16 rows on the badge today carry
+    `series="Unknown"` with `series_id` and `issue_id` both NULL -- their
+    producer (the qBittorrent save-path check) records `source`/`kind`/`detail`
+    and no identity at all. `run_manual_review_retry_background()` is called
+    `if series`, so returning that literal launches a forced, retryNeedsYou
+    autopilot pass for a series that does not exist.
+
+    It does not fire today only because `find_manual_review()` reads the
+    500-line JSONL tail first, where those rows carry no series at all. The
+    fourth fallback, `review_exception_by_id()`, returns the stored row -- so
+    the moment a row's JSONL line ages out of that window, the literal is what
+    answers. Measured 2026-08-29: `review_exception_by_id("c0a031ef0413eed0")`
+    returns `series="Unknown"`.
+
+    Matched whole and case-insensitively, so a real series that merely contains
+    the word ("The Unknown Soldier") is untouched.
+    """
+    series = str(item.get("series") or item.get("matched_series") or "").strip()
+    if series.casefold() in MANUAL_REVIEW_PLACEHOLDER_SERIES:
+        return ""
+    return series
 
 
 def _reject_manual_review_candidate(item):
@@ -62563,7 +62884,22 @@ def manual_review_legacy_row(item, slskd_probe_status=None):
     return {
         "legacy_manual_review": True,
         "review_id": item.get("review_id") or review_id_for(item),
-        "series": item.get("series") or item.get("matched_series") or item.get("query") or "Unknown",
+        # `source` before the literal. A row produced by the import or
+        # torrent-routing stages carries no series, matched_series or query at
+        # all -- its identity is the file or pack name, and that is sitting in
+        # `source`. Falling straight to "Unknown" rendered a card titled
+        # `Unknown` for an item called `Berserk_Vol.42.cbz` on the same row.
+        # The leaf, not the whole path, because a staging path is mostly the
+        # download client's structure and only its last segment is identity
+        # (same rule as source_identity_path_text()).
+        "series": (
+            item.get("series")
+            or item.get("matched_series")
+            or item.get("query")
+            or inkdrop_import_evidence.path_leaf(item.get("source"))
+            or item.get("source")
+            or "Unknown"
+        ),
         "issue_number": issue,
         "state": state,
         "review_reason": item.get("reason") or item.get("review_group") or state,
@@ -67361,6 +67697,34 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             requests.sort(key=lambda item: float(item.get("age_seconds") or 0), reverse=True)
             self.send_json({"ok": True, "requests": requests, "count": len(requests)})
+        elif path == "/api/inkdrop-debug/background-threads":
+            # Deliberately not behind INKDROP_DEBUG_ACTIVE_REQUESTS, unlike the
+            # endpoint above. That one has to be armed before the fact because
+            # it costs per-request bookkeeping; this one just enumerates live
+            # threads on demand and costs nothing until it is called. Needing a
+            # redeploy to see what the web process is busy with is exactly the
+            # dead end that stalled two CPU investigations, on 2026-08-14 and
+            # again on 2026-08-28: every background thread reads "python" in
+            # /proc/<pid>/task/*/comm, and ptrace is blocked from the host into
+            # the container, so nothing outside the process could name them.
+            current = threading.current_thread()
+            threads = sorted(
+                (
+                    {
+                        "name": thread.name,
+                        "daemon": bool(thread.daemon),
+                        "alive": bool(thread.is_alive()),
+                        # native_id is the TID that /proc, top and docker stats
+                        # show, so a hot thread seen from outside the container
+                        # can be matched to a name in here without guessing.
+                        "native_id": getattr(thread, "native_id", None),
+                        "serving_request": thread is current,
+                    }
+                    for thread in threading.enumerate()
+                ),
+                key=lambda item: str(item.get("name") or ""),
+            )
+            self.send_json({"ok": True, "threads": threads, "count": len(threads)})
         elif path == "/inkdrop-logo-mark.png":
             self.send_logo_mark()
         elif path == "/inkdrop-logo-mark-mobile.png":
@@ -68554,23 +68918,50 @@ class Handler(BaseHTTPRequestHandler):
                     except (ValueError, OSError, zipfile.BadZipFile) as exc:
                         self.send_json({"ok": False, "error": "invalid_backup_archive", "detail": str(exc)}, status=400, headers={"Cache-Control": "no-store"})
             elif path == "/api/inkdrop-settings/backup/archives/restore/apply":
-                # Applying a restore in-process replaces the live state DB,
-                # auth DB, and config/secret files with no web/worker
-                # quiescence, no maintenance lease, and no rollback if a
-                # later step fails -- a failure partway through leaves the
-                # install split across state/auth/config epochs with no
-                # recovery path (SIXH-20260812-RESTORE-P0-01). Disabled here
-                # until that path gets real coordination; preview, create,
-                # list, download, and upload are untouched.
-                self.send_json(
-                    {
-                        "ok": False,
-                        "error": "restore_apply_disabled",
-                        "detail": "Restoring a full backup is temporarily disabled while a data-safety issue in the restore path is fixed. Creating, previewing, downloading, and importing backups still work normally.",
-                    },
-                    status=503,
-                    headers={"Cache-Control": "no-store"},
-                )
+                # This used to answer 503 unconditionally
+                # (SIXH-20260812-RESTORE-P0-01): applying a restore replaces
+                # the live state DB with no worker quiescence and no rollback.
+                # The hazard is real, but a permanent 503 did not remove it --
+                # it removed the only route an operator had. A restore of the
+                # real archive is measured at ~515 s, so the 503 was the
+                # difference between that and never recovering from the UI.
+                #
+                # The concern is now a precondition instead of a locked door:
+                # the restore refuses while the worker is alive or any job lock
+                # is held, and proceeds once the worker is actually stopped.
+                # The same gate is enforced inside restore_backup_archive(), so
+                # the CLI route -- which had no gate at all, and which a real
+                # disaster recovery would use -- cannot bypass it either.
+                name = str((data or {}).get("name") or "").strip()
+                archive_path = backup_archive_path_by_name(name)
+                if archive_path is None:
+                    self.send_json({"ok": False, "error": "unknown backup archive"}, status=404, headers={"Cache-Control": "no-store"})
+                else:
+                    try:
+                        result = inkdrop_backup_restore.restore_backup_archive(
+                            archive_path,
+                            apply=True,
+                            preserve_current_auth=bool((data or {}).get("preserve_current_auth")),
+                        )
+                        self.send_json({"ok": True, "result": result}, headers={"Cache-Control": "no-store"})
+                    except inkdrop_restore_quiescence.RestoreNotQuiescent as exc:
+                        # 409, not 503: nothing is broken and retrying the same
+                        # request unchanged will not help. The operator has a
+                        # specific action to take, so name it and the writer
+                        # that is in the way.
+                        self.send_json(
+                            {
+                                "ok": False,
+                                "error": "restore_blocked_by_live_writers",
+                                "detail": str(exc),
+                                "blockers": (exc.probe or {}).get("blockers") or [],
+                                "next_action": "Stop the worker container (docker stop inkdrop-worker), then apply the restore again.",
+                            },
+                            status=409,
+                            headers={"Cache-Control": "no-store"},
+                        )
+                    except (ValueError, OSError, zipfile.BadZipFile) as exc:
+                        self.send_json({"ok": False, "error": "invalid_backup_archive", "detail": str(exc)}, status=400, headers={"Cache-Control": "no-store"})
             elif path == "/api/system/logs/download":
                 payload, manifest = inkdrop_log_export.build_log_archive_bytes(
                     state_db=INKDROP_STATE_DB,
@@ -69158,9 +69549,17 @@ def _web_background_bootstrap():
         launch_pending_manga_companion_jobs(limit=2)
     except Exception as exc:
         print(f"Warning: failed to resume manga companion setup: {exc}", flush=True)
-    threading.Thread(target=manual_review_reconciler_loop, daemon=True).start()
-    threading.Thread(target=auto_pack_import_loop, daemon=True).start()
-    threading.Thread(target=series_queue_runner_loop, daemon=True).start()
+    # Named on purpose. These are the web process's only long-lived background
+    # threads, and while they were anonymous a real production CPU problem in
+    # the web tier could not be attributed at all: /proc/<pid>/task/*/comm reads
+    # "python" for every one of them, and ptrace is blocked from the host into
+    # the container, so neither py-spy nor strace could name them either. On
+    # 2026-08-28 three of six threads were each burning ~65% of a core and the
+    # only way to tell which loop was which was to predict a sleep signature
+    # from this file and match it against /proc sampling from the host.
+    threading.Thread(target=manual_review_reconciler_loop, name="inkdrop-manual-review-reconciler", daemon=True).start()
+    threading.Thread(target=auto_pack_import_loop, name="inkdrop-auto-pack-import", daemon=True).start()
+    threading.Thread(target=series_queue_runner_loop, name="inkdrop-series-queue-runner", daemon=True).start()
 
 
 class InkDropThreadingHTTPServer(ThreadingHTTPServer):
@@ -69178,7 +69577,7 @@ def main():
         raise SystemExit(2) from exc
     inkdrop_runtime_config.ensure_runtime_roots()
     server = InkDropThreadingHTTPServer((HOST, PORT), Handler)
-    threading.Thread(target=_web_background_bootstrap, daemon=True).start()
+    threading.Thread(target=_web_background_bootstrap, name="inkdrop-web-bootstrap", daemon=True).start()
     print(f"InkDrop web UI listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()
 

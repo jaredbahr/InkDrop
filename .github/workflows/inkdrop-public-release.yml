@@ -34,6 +34,7 @@ on:
       - "tools/inkdrop_docker_context_manifest.py"
       - "tools/inkdrop_install_support_summary.py"
       - "tools/inkdrop_github_release.py"
+      - "tools/inkdrop_public_release_gate.py"
       - "tools/inkdrop_public_http_smoke.py"
       - "tools/inkdrop_qa_candidate_manifest.py"
       - "tools/inkdrop_public_release_check.py"
@@ -74,6 +75,7 @@ on:
       - "tools/inkdrop_docker_context_manifest.py"
       - "tools/inkdrop_install_support_summary.py"
       - "tools/inkdrop_github_release.py"
+      - "tools/inkdrop_public_release_gate.py"
       - "tools/inkdrop_public_http_smoke.py"
       - "tools/inkdrop_qa_candidate_manifest.py"
       - "tools/inkdrop_public_release_check.py"
@@ -161,7 +163,7 @@ jobs:
       # not. Keep the contract gate on the private PR path where all four
       # inputs exist; the public workflow retains its existing smoke behavior.
       - name: Verify Full-smoke trigger and runbook truth
-        if: github.repository == 'jaredbahr/inkdrop-dev'
+        if: github.repository == 'jaredbahr/InkDrop'
         timeout-minutes: 1
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -174,7 +176,7 @@ jobs:
       # Same repository condition as the runbook check above, for the same
       # reason: the private repo is where all of this check's inputs exist.
       - name: Verify the staged public export actually runs
-        if: github.repository == 'jaredbahr/inkdrop-dev'
+        if: github.repository == 'jaredbahr/InkDrop'
         timeout-minutes: 10
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -939,3 +941,71 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+
+  # Publication, moved inside the job graph so it cannot happen before
+  # validation. Today the public Release is created by hand after the export is
+  # pushed, and nothing connects the two: v0.1.14's Release object existed four
+  # seconds BEFORE its validation run started and was public 281 seconds before
+  # that run finished failing. `needs` is what makes that ordering impossible --
+  # this job cannot start until both gating jobs and the release gate have
+  # concluded success, and GitHub enforces that, not a runbook step.
+  #
+  # OFF BY DEFAULT, DELIBERATELY. The repository variable below must be set to
+  # `on` before this job does anything, and until then the hand-cut path in
+  # docs/inkdrop/public-release-process.md remains the live one. The reason is
+  # sequencing, not caution for its own sake: `Full smoke suite` has never once
+  # passed on the public repo -- 19 runs, all failed -- and gating publication
+  # on a job that has never succeeded there would leave nobody able to ship.
+  # Turn this on only after one green public run exists.
+  #
+  # A skipped job here does NOT mean "validated". It means no automated publish
+  # was attempted, which is exactly today's behaviour. That is a different claim
+  # from the one `release_gate` makes above, and the two must not be read alike.
+  #
+  # The `environment:` is what keeps the decision human. Its protection rules
+  # hold the run in `waiting` until a required reviewer approves, so the graph
+  # enforces the ordering while a person still chooses whether to ship.
+  public_github_release:
+    name: Publish public release
+    if: >-
+      github.event_name != 'pull_request'
+      && github.ref == 'refs/heads/main'
+      && github.repository != 'jaredbahr/InkDrop'
+      && vars.INKDROP_PUBLIC_RELEASE_AUTOMATION == 'on'
+    needs: [public_release, full_smoke_suite, release_gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: public-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tool re-asks whether this commit passed rather than trusting the
+      # `needs` edges above. Inside the workflow that is redundant; run from a
+      # laptop it is the whole safety property, and a publisher that only
+      # refuses in one of the two places it can be invoked is the hand-cut path
+      # with extra steps. It refuses BEFORE any write: with the check disabled
+      # its first action is `POST /git/refs`, which creates the tag, and there
+      # is no retraction path for anything it gets wrong after that.
+      - name: Publish the public Release, if a passing run backs this commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -B tools/inkdrop_github_release.py \
+            --public-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" | tee inkdrop-public-release-publish.json
+          {
+            echo "## Public Release"
+            echo
+            echo '```json'
+            cat inkdrop-public-release-publish.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

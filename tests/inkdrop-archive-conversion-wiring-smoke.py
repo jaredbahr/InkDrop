@@ -24,10 +24,16 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+# A real 16x16 page. The constant this replaces was a 67-byte PNG whose IDAT
+# chunk failed its own CRC -- IHDR and IEND were intact, so it looked like a
+# valid pixel and PIL refused it with "broken data stream". It was also 1x1,
+# and the soundness gate calls anything under 8px on a side implausible, so a
+# regenerated VALID 1x1 would still be refused. Both causes are fixed here by
+# being a real page: 16x16 and CRC-clean.
 PIXEL = bytes.fromhex(
-    "89504e470d0a1a0a0000000d494844520000000100000001080600000"
-    "01f15c4890000000a49444154789c6360000002000100fdff03fa0000"
-    "000049454e44ae426082"
+    "89504e470d0a1a0a0000000d49484452000000100000001008020000"
+    "00909168360000001a4944415478da638cca5bc0400a606220118c6a"
+    "18d530743400007fb601884ad57f360000000049454e44ae426082"
 )
 
 

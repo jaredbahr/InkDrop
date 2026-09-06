@@ -328,7 +328,15 @@ def load_verified_evidence(candidate_path, validation_path, contract, repository
         if not update_bytes or len(update_bytes) > inkdrop_version.UPDATE_MANIFEST_MAX_BYTES:
             raise RuntimeError("update manifest asset is empty or exceeds 64 KiB")
         try:
-            update = inkdrop_version.validate_update_manifest(json.loads(update_bytes.decode("utf-8")), now=now)
+            # The manifest this release publishes names THIS repository, which is
+            # not necessarily the public default the validator ships with -- so tell
+            # it which repository is publishing rather than leaving it to the
+            # environment of whatever runner happens to execute the release.
+            update = inkdrop_version.validate_update_manifest(
+                json.loads(update_bytes.decode("utf-8")),
+                now=now,
+                env={inkdrop_version.UPDATE_RELEASE_REPOSITORY_ENV: repository},
+            )
         except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"update manifest asset is invalid: {exc}") from exc
         expected_update = {
@@ -488,11 +496,61 @@ def append_github_output(path, contract):
         handle.write(f"image_tags_json={json.dumps(contract['image_tags'], separators=(',', ':'))}\n")
 
 
+def gate_fetch(api, repository):
+    """Adapt GitHubApi to the release gate's fetch(path, repository) contract.
+
+    One auth path rather than two: the gate's own CLI shells out to `gh`, which
+    is right for an operator at a terminal and wrong inside a job that already
+    holds a scoped token. The gate takes its fetcher as an argument precisely so
+    the judgement can be reused without the transport coming along.
+    """
+    def fetch(path, repo=None):
+        if repo is not None and repo != repository:
+            raise RuntimeError(
+                "release gate asked about " + str(repo) + " but this API is bound to " + repository
+            )
+        return api.request("GET", "/" + str(path).lstrip("/"), allow_missing=True)
+
+    return fetch
+
+
+def publish_public_release(contract, api, repository, commit, gate):
+    """Publish the public Release for `contract`, but only if `commit` passed.
+
+    The public repo has no QA candidate or image-validation evidence to carry --
+    those are private artifacts of a pipeline it is downstream of. Its evidence
+    is the validating run itself, so that is what is required here instead. The
+    invariant is unchanged and deliberately so: this tool has never published
+    anything without evidence and still does not.
+
+    The workflow already orders this behind the gating jobs, so re-asking looks
+    redundant. It is not. A tool that publishes whatever it is pointed at is
+    exactly the hand-cut path this replaces, and it would still be one when run
+    from a laptop. Refusing here is what makes the tool safe outside the job
+    graph as well as inside it.
+    """
+    ok, checks = gate.commit_is_validated(gate_fetch(api, repository), repository, commit)
+    if not ok:
+        blockers = [item for item in checks if item["status"] != "passed"]
+        detail = "; ".join(item["name"] + ": " + item["detail"] for item in blockers)
+        raise RuntimeError(
+            "refusing to publish " + contract["tag"] + " at " + commit
+            + " -- no passing validation run backs it: " + (detail or "no checks were produced")
+        )
+    result, skip = publish_release_or_skip(contract, api, commit, None)
+    return result, skip, checks
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--contract", default=str(DEFAULT_CONTRACT))
     parser.add_argument("--github-output")
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument(
+        "--public-release", action="store_true",
+        help="Publish the public Release from the contract, refusing unless a passing "
+             "validation run backs --commit. Carries no QA evidence; the run is the evidence.",
+    )
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--commit", default=os.environ.get("GITHUB_SHA", ""))
     parser.add_argument("--candidate")
@@ -531,6 +589,39 @@ def main(argv=None):
             write_text_lf(output, json.dumps(update_payload, indent=2, sort_keys=True) + "\n")
     elif args.generate_update_manifest_output:
         raise ValueError("verified candidate and validation evidence are required to generate update metadata")
+    if args.public_release:
+        # The public path. Distinct flag rather than a relaxation of --publish,
+        # so nothing can reach the private publish branch without its evidence
+        # by omitting an argument.
+        if evidence is not None:
+            raise ValueError("--public-release publishes from the contract; it takes no QA evidence")
+        if not args.commit:
+            raise ValueError("--commit is required to publish a public release")
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_inkdrop_release_gate",
+            Path(__file__).resolve().with_name("inkdrop_public_release_gate.py"),
+        )
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        api = GitHubApi(args.repository, os.environ.get("GITHUB_TOKEN", ""))
+        result, skip, checks = publish_public_release(
+            contract, api, args.repository, args.commit, gate
+        )
+        payload = {
+            "ok": True,
+            "version": contract["version"],
+            "tag": contract["tag"],
+            "published": bool(result) and not skip,
+            "validation": [
+                {"name": item["name"], "status": item["status"]} for item in checks
+            ],
+        }
+        if skip:
+            payload.update({"published": False, "skipped": True, **skip})
+        print(json.dumps(payload, sort_keys=True))
+        return 0
     if args.publish:
         if evidence is None:
             raise ValueError("verified candidate and validation evidence are required for publication")

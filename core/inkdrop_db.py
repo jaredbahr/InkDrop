@@ -49,6 +49,40 @@ def _configure_new_database_auto_vacuum(con) -> bool:
         return False
 
 
+def open_snapshot(db_path, *, timeout_seconds=30.0, busy_timeout_ms=30000):
+    """Open a state snapshot for reading without writing a byte to it.
+
+    A snapshot comes from `VACUUM INTO`, so it is a plain rollback-journal
+    file. `open_connection()` defaults to `readonly=False, configure_wal=True`
+    and runs `pragma journal_mode=wal` on anything that is not already WAL,
+    which rewrites the header of the file it was asked to read. That is how
+    inkdrop-state-20260830T102707Z was corrupted -- change counter 2, both
+    sidecars present.
+
+    `mode=ro` is what stops the write; `immutable=1` is belt and braces and is
+    NOT claimed to be load-bearing here. Measured: dropping it and keeping
+    plain `mode=ro` passes every arm of the accompanying test, including one
+    built specifically to separate them with a stale `-wal` sidecar. It is
+    kept because it is true of a snapshot by construction -- the file cannot
+    change, so SQLite may skip locking and ignore sidecars -- and because the
+    promise must NOT be made about the live database, which is why this is a
+    separate function rather than another default on the shared one. If a case
+    ever does distinguish the two, that case is the missing arm.
+
+    The observable a caller can check is header bytes 24-27, the change
+    counter: it is unchanged after this, and bumped after `open_connection()`.
+    Sidecars are not the tell -- a clean close removes them either way.
+    """
+    timeout = max(0.1, float(timeout_seconds or 30.0))
+    busy_timeout = max(100, int(busy_timeout_ms or 30000))
+    uri = f"file:{Path(db_path).resolve().as_posix()}?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True, timeout=timeout, isolation_level="DEFERRED")
+    con.row_factory = sqlite3.Row
+    con.execute(f"pragma busy_timeout={busy_timeout}")
+    con.execute("pragma query_only=1")
+    return con
+
+
 def open_connection(
     db_path,
     *,

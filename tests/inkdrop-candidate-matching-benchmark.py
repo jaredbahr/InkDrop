@@ -40,7 +40,7 @@ def load_corpus(path: Path) -> dict:
     cases = payload.get("cases")
     # The upper bound was 60 when this corpus was purely hand-authored
     # adversarial cases. It now also carries ground-truth pairs taken from
-    # real production rejections, and Jared is supplying more by hand, so the
+    # real production rejections, and more are added by hand over time, so the
     # ceiling is raised rather than forcing a second corpus file that would
     # need its own loader, scorer and gate. The lower bound still guards
     # against a truncated or partially-written corpus.

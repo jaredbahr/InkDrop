@@ -15,6 +15,7 @@ from pathlib import PurePath, PurePosixPath
 
 from core import inkdrop_acquisition_policy
 from core import inkdrop_artifact_acceptance
+from core import inkdrop_release_credits
 from core import inkdrop_title_identity
 
 
@@ -193,6 +194,22 @@ COVER_COUNT_SUFFIX_RE = re.compile(r"(?i)^[\s._\-]*covers?(?![A-Za-z])")
 # only when some other bare number survives to be the unit. So "Book of 5"
 # keeps its 5, while "Y The Last Man 003 of 60" keeps the 3 and drops the 60.
 OF_TOTAL_PREFIX_RE = re.compile(r"(?i)(?:^|[\s._\-\(\[])of\s*$")
+# Which unit a parsed coverage range counts in, read off the word the uploader
+# put in front of it. Deliberately wider than UNIT_PREFIX_TOKENS -- "vols. 1-35"
+# names volumes just as plainly as "vol 1-35" does -- but kept as its own map so
+# widening it cannot move the publication-date guard that UNIT_PREFIX_TOKENS
+# feeds. A prefix this map does not know leaves the range unlabeled, which is
+# the conservative answer, not an error.
+COVERAGE_UNIT_BY_PREFIX = {
+    "bk": "volume", "bks": "volume", "book": "volume", "books": "volume",
+    "tome": "volume", "tomes": "volume",
+    "v": "volume", "vol": "volume", "vols": "volume",
+    "volume": "volume", "volumes": "volume",
+    "c": "chapter", "ch": "chapter", "chap": "chapter", "chaps": "chapter",
+    "chapter": "chapter", "chapters": "chapter", "chs": "chapter",
+    "iss": "issue", "issue": "issue", "issues": "issue",
+    "no": "issue", "nos": "issue", "number": "issue", "numbers": "issue",
+}
 CREATOR_BYLINE_RE = re.compile(
     r"(?i)\bby\s+([A-Z][A-Za-z.'\u2019-]*(?:\s+[A-Z][A-Za-z.'\u2019-]*){1,4})"
     r"(?=\s+(?:#?\d|v(?:ol(?:ume)?)?\.?\s*\d|issues?\b|chapters?\b|"
@@ -299,15 +316,14 @@ SINGLETON_NEUTRAL_SUFFIX_TOKENS = {
 # Trailing tokens that name the RIPPER, not the work. "(digital) (Son of
 # Ultron-Empire)" says who scanned a file; it makes no claim about which book
 # is inside, so it cannot disqualify a release whose title already matched
-# exactly. Kept as a closed set of whole tuples rather than a token soup: any
-# unknown trailing word stays identity-bearing and still fails the match.
-TRUSTED_RELEASE_GROUP_SUFFIXES = {
-    ("empire",),
-    ("f", "son", "of", "ultron", "empire"),
-    ("minutemen", "phd"),
-    ("son", "of", "ultron", "empire"),
-    ("zone", "empire"),
-}
+# exactly. A closed set of whole tuples rather than a token soup: any unknown
+# trailing word stays identity-bearing and still fails the match. The list
+# itself lives in inkdrop_release_credits, where the indexer classifier and the
+# artifact acceptor read the same one -- this path used to carry five tuples of
+# its own and parked in review the very one-shots the classifier had cleared.
+TRUSTED_RELEASE_GROUP_SUFFIXES = frozenset(
+    inkdrop_release_credits.RELEASE_GROUP_PHRASES | inkdrop_release_credits.TRAILING_RELEASE_CREDITS
+)
 def release_group_suffix_only(suffix_tokens, target_year=""):
     """Whether these trailing tokens are nothing but a known release-group tag.
 
@@ -471,21 +487,40 @@ def _year(value):
     return match.group(0) if match else ""
 
 
-def has_unit_prefix_before_number(value, number_offset):
+def _unit_prefix_before_number(value, number_offset):
+    """Return the ``("#", "")`` or ``("", word)`` immediately before a number."""
     text = str(value or "")
     offset = max(0, min(int(number_offset or 0), len(text)))
     preceding = text[:offset].rstrip()
     if not preceding:
-        return False
+        return ("", "")
     if preceding.endswith((":", ".")):
         preceding = preceding[:-1].rstrip()
     if preceding.endswith("#"):
-        return True
+        return ("#", "")
     end = len(preceding)
     start = end
     while start > 0 and preceding[start - 1].isalpha():
         start -= 1
-    return preceding[start:end].lower() in UNIT_PREFIX_TOKENS
+    return ("", preceding[start:end].lower())
+
+
+def has_unit_prefix_before_number(value, number_offset):
+    hash_marker, word = _unit_prefix_before_number(value, number_offset)
+    return bool(hash_marker) or word in UNIT_PREFIX_TOKENS
+
+
+def coverage_unit_before_number(value, number_offset):
+    """Name the unit a coverage range counts in, or "" when it is unlabeled.
+
+    A bare ``(001-040)`` says nothing about whether it collects issues,
+    chapters or volumes, and guessing is how a volume batch gets grabbed for a
+    wanted chapter. ``#`` is no better: it fronts issue and chapter numbers
+    alike. Both stay unlabeled here and are handled by the stricter unlabeled
+    rules in pack_title_range_membership().
+    """
+    _hash_marker, word = _unit_prefix_before_number(value, number_offset)
+    return COVERAGE_UNIT_BY_PREFIX.get(word, "")
 
 
 def publication_date_evidence(value):
@@ -592,6 +627,13 @@ def parse_release_title(value):
     ):
         coverage_start = ""
         coverage_end = ""
+    coverage_unit = ""
+    if coverage_start and coverage_end:
+        coverage_unit = (
+            "volume"
+            if volume_range_match
+            else coverage_unit_before_number(unit_text, coverage_number_offset)
+        )
     bare_number = ""
     if not any((volume, book, chapter, issue, coverage_start, coverage_end)):
         bare_values = []
@@ -663,6 +705,7 @@ def parse_release_title(value):
         "book_number": book,
         "coverage_start": coverage_start,
         "coverage_end": coverage_end,
+        "coverage_unit": coverage_unit,
         "edition_marker": edition,
         "edition_markers": edition_markers,
         "pack_marker": pack,
@@ -770,6 +813,18 @@ def target_context(wanted_item=None, *, settings):
     title_evidence = parse_release_title(
         _first(wanted.get("issue_title"), wanted.get("issueTitle"), wanted.get("title"), wanted.get("query"))
     )
+    # An issue title carried by more than one issue of the series is an ARC
+    # name, and an arc name is not a statement about any single unit. Wynd
+    # issues 1-5 all read "Book One: The Flight of the Prince", so adopting its
+    # book number made five different issue rows into volume targets and every
+    # correctly-numbered single issue was refused wrong_unit_type. A real
+    # collected-edition record gives each unit its own title, so requiring
+    # uniqueness costs the volume arm nothing.
+    #
+    # The producer decides; an absent flag means "not computed" and leaves the
+    # previous behaviour exactly as it was, so no caller is forced to supply it.
+    if _strict_bool_flag(wanted.get("issue_title_shared_by_sibling_units")):
+        title_evidence = {}
     if not volume and title_evidence.get("volume_number"):
         volume = title_evidence["volume_number"]
     if not volume and title_evidence.get("book_number"):
@@ -1346,6 +1401,40 @@ def _names_the_wanted_series(text, series_tokens):
     return False
 
 
+def _group_restates_the_wanted_unit(body, wanted_item):
+    """Does this group's unit token equal the unit we are already looking for?
+
+    The parent-slot case and the self-describing case are otherwise identical:
+    both name a contiguous run of the wanted series title, both end in a unit
+    token, and both can be the only unit in the name. `Ashes of the Academy
+    (2025) (Avatar - The Last Airbender V11).cbz` is a titled one-shot whose
+    V11 is the FRANCHISE's slot; `The Tea Dragon Festival (2019) (Tea Dragon
+    V02).cbz` is book two of three and its V02 is the file's own unit. Whether
+    anything else in the name carries a unit does not separate them -- neither
+    does.
+
+    What separates them is agreement with the target. A group restating the
+    unit we already want cannot cause a wrong match: the only verdict it can
+    turn into is an exact match on the very value being sought. A group naming
+    some other number is a foreign slot and is dropped exactly as before.
+    """
+    wanted = wanted_item if isinstance(wanted_item, dict) else {}
+    if not wanted:
+        return False
+    try:
+        target = target_context(wanted, settings=None)
+    except Exception:
+        return False
+    claimed = parse_release_title(str(body or ""))
+    for key in ("volume_number", "issue_number", "chapter_number"):
+        value = str(claimed.get(key) or "").strip()
+        if not value:
+            continue
+        if value == str(target.get(key) or "").strip():
+            return True
+    return False
+
+
 def strip_series_position_group(value, wanted_item=None):
     """Drop a bracketed group that states the parent series' volume slot.
 
@@ -1364,6 +1453,8 @@ def strip_series_position_group(value, wanted_item=None):
         if not tail:
             continue
         if not _names_the_wanted_series(body[: tail.start()], series_tokens):
+            continue
+        if _group_restates_the_wanted_unit(body, wanted_item):
             continue
         out = out.replace(match.group(0), " ", 1)
     return re.sub(r"\s{2,}", " ", out).strip() or text
@@ -1696,6 +1787,170 @@ def collected_singleton_alias_exact_title_match(candidate, wanted_item=None, *, 
     )
 
 
+# A pack that names its own range is only trusted inside these bounds. An
+# unlabeled range has told us less, so it gets the tighter pair: a run of more
+# than 400 units, or an end above 1500, is far more likely to be shelf noise
+# ("AA-LL 11-2025") than a real collected run. A labeled range ("chapters
+# 1-1100") has said what it counts, so it is allowed to be genuinely long.
+PACK_RANGE_BOUNDS = {
+    "labeled": {"max_span": 1200, "max_number": 3000},
+    "unlabeled": {"max_span": 400, "max_number": 1500},
+}
+PACK_RANGE_UNIT_MARKER_FIELDS = (
+    "volume_number",
+    "book_number",
+    "chapter_number",
+    "issue_number",
+)
+
+
+def _candidate_declares_pack_contents(candidate):
+    """True when the release told us what is actually inside it."""
+    if not isinstance(candidate, dict):
+        return False
+    sources = [candidate]
+    raw = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else {}
+    if isinstance(raw.get("result"), dict):
+        sources.append(raw["result"])
+    for source in sources:
+        for key in ("files", "pack_detail_entries"):
+            value = source.get(key)
+            if isinstance(value, (list, tuple, set)):
+                if any(str(item or "").strip() for item in value):
+                    return True
+            elif str(value or "").strip():
+                return True
+    return False
+
+
+def _range_number(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _pack_title_range_membership(candidate, target, evidence):
+    """Prove a pack collects the wanted unit from the range in its own title.
+
+    A range-titled pack is the only way a lot of back catalogue is published --
+    no single-issue release of "Injustice: Gods Among Us Year Five" #4 exists
+    anywhere, but "(001-040)" does -- and the range is parsed already. What was
+    missing is permission to read it as membership evidence, so every one of
+    those packs was rejected with coverage_not_unit_number no matter how
+    plainly its title said it contained the wanted number.
+
+    The proof is deliberately narrow. The range must name the same unit the
+    target counts in, because a volume batch does not satisfy a wanted chapter
+    even when the digits overlap; an unlabeled range is read only for issue
+    targets, and only when the title makes no other unit claim that the range
+    could be contradicting.
+
+    This answers "grabbing this would get me the wanted unit", which is only a
+    question the acquisition side asks. The same verdict function also decides
+    whether a physical file on disk *is* the wanted unit, and there the answer
+    for a container is still no -- ``All Star Superman 001-012.zip`` is not
+    issue #7's artifact. The provider layer's ``pack`` flag is what separates
+    the two, so a candidate that was never marked as a pack acquisition
+    candidate gets no proof here.
+    """
+    if not isinstance(target, dict) or not isinstance(evidence, dict):
+        return None
+    if not (isinstance(candidate, dict) and candidate.get("pack")):
+        return None
+    # A range is a fallback for releases that never say what is inside them.
+    # When a file list did arrive, that list is the better evidence in both
+    # directions: a match is already handled as the stronger manifest proof,
+    # and a non-match means the contents were read and the wanted unit is not
+    # among them. Letting the title argue with the file list is how a pack
+    # that says "001-010" and holds another series entirely gets grabbed.
+    if _candidate_declares_pack_contents(candidate):
+        return None
+    # The wanted work is a single unit in its own right, so a numbered run of
+    # several units is describing some other publication, not collecting this
+    # one. Believing otherwise turns "Batman Year One 001-004" into a match
+    # for the one-issue work InkDrop actually tracks.
+    if target.get("singleton_issue_proof") or _range_number(target.get("canonical_issue_count")) == 1:
+        return None
+    # Coverage only means something once the release is agreed to be this
+    # series. A range inside a related or wrong-series pack proves nothing.
+    match_confidence = str(candidate.get("match_confidence") or "").strip().lower().replace("-", "_")
+    if match_confidence == "mismatch" or match_confidence.startswith("related_series") or match_confidence in {
+        "subseries",
+        "related_title",
+    }:
+        return None
+    start_text = str(evidence.get("coverage_start") or "")
+    end_text = str(evidence.get("coverage_end") or "")
+    if not start_text.isdigit() or not end_text.isdigit():
+        return None
+    start = int(start_text)
+    end = int(end_text)
+    if start < 1 or end <= start:
+        return None
+    if evidence.get("preview_or_sample") or evidence.get("ambiguous") or evidence.get("conflicts"):
+        return None
+
+    coverage_unit = str(evidence.get("coverage_unit") or "")
+    target_unit = str(target.get("unit_type") or "")
+    if target_unit in VOLUME_UNITS:
+        wanted_unit, wanted_number = "volume", target.get("volume_number")
+    elif target_unit in CHAPTER_UNITS:
+        wanted_unit, wanted_number = "chapter", target.get("chapter_number")
+    elif target_unit in ISSUE_UNITS:
+        wanted_unit, wanted_number = "issue", target.get("issue_number")
+    else:
+        return None
+
+    if coverage_unit:
+        if coverage_unit != wanted_unit:
+            return None
+    else:
+        # Nothing labeled this range. Volumes and chapters share the same small
+        # digits far too often for that to be safe -- "Naruto 1-72" is volumes,
+        # "Vagabond 304-308" is chapters -- so an unlabeled range is read only
+        # for issue targets, and only when the title asserts no competing unit
+        # number the range would be talking over.
+        if wanted_unit != "issue":
+            return None
+        if any(evidence.get(field) for field in PACK_RANGE_UNIT_MARKER_FIELDS):
+            return None
+        if 1900 <= end <= 2099:
+            return None
+
+    bounds = PACK_RANGE_BOUNDS["labeled" if coverage_unit else "unlabeled"]
+    if end > bounds["max_number"] or (end - start + 1) > bounds["max_span"]:
+        return None
+
+    number = _range_number(wanted_number)
+    if number is None or not (start <= number <= end):
+        return None
+    return {
+        "coverage_source": "pack_title_range",
+        "coverage_unit": coverage_unit or wanted_unit,
+        "coverage_unit_declared": bool(coverage_unit),
+        "coverage_start": str(start),
+        "coverage_end": str(end),
+        "unit_number": str(wanted_number),
+        "entry": str(evidence.get("unit_identity_title") or evidence.get("original_title") or ""),
+    }
+
+
+def pack_title_range_membership(candidate, wanted_item=None, *, settings=None):
+    """Public form of the range proof, for callers outside this module.
+
+    ``wanted_item`` is optional because indexer candidates already carry the
+    wanted unit's own numbers -- the same convention
+    ``indexer_manifest_entry_matches_candidate`` reads them under.
+    """
+    normalized = normalize_candidate(candidate, wanted_item)
+    target = target_context(wanted_item if wanted_item is not None else normalized, settings=settings)
+    return _pack_title_range_membership(normalized, target, normalized["source_unit_evidence"])
+
+
 def candidate_compatibility(candidate, wanted_item=None, settings=None):
     candidate = normalize_candidate(candidate, wanted_item)
     target = target_context(wanted_item, settings=settings)
@@ -1718,6 +1973,12 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
         "pack_contents_filename",
         "pack_contents_volume_filename",
     }
+    # A real per-file manifest is the stronger proof and names the exact
+    # member, so it keeps its own evidence code; the range is the fallback for
+    # the many indexers that ship no file list at all.
+    range_exact_member = not manifest_exact_member and bool(
+        _pack_title_range_membership(candidate, target, evidence)
+    )
     manifest_entry = (
         manifest_match.get("entry")
         or manifest_match.get("member")
@@ -1936,9 +2197,17 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
     if target_unit in VOLUME_UNITS:
         wanted = target.get("volume_number")
         found = evidence.get("volume_number") or evidence.get("book_number")
-        if (evidence.get("coverage_start") or evidence.get("coverage_end")) and not manifest_exact_member:
-            blocked.append("coverage_not_unit_number")
         if (
+            (evidence.get("coverage_start") or evidence.get("coverage_end"))
+            and not manifest_exact_member
+            and not range_exact_member
+        ):
+            blocked.append("coverage_not_unit_number")
+        if range_exact_member:
+            # The range is the unit evidence here, so its own start number is
+            # not a competing volume claim to be rejected below.
+            positive.append("exact_pack_range_member")
+        elif (
             wanted
             and evidence.get("issue_number") == wanted
             and evidence.get("bare_number") == wanted
@@ -1961,7 +2230,9 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
             review.append("missing_required_unit_number")
     elif target_unit in ISSUE_UNITS:
         wanted = target.get("issue_number")
-        if (evidence.get("coverage_start") or evidence.get("coverage_end")) and not manifest_exact_member:
+        if range_exact_member:
+            positive.append("exact_pack_range_member")
+        elif (evidence.get("coverage_start") or evidence.get("coverage_end")) and not manifest_exact_member:
             blocked.append("coverage_not_unit_number")
         elif collected_singleton_alias_volume_match:
             positive.append("collected_singleton_alias_volume")
@@ -2017,7 +2288,9 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
     elif target_unit in CHAPTER_UNITS:
         wanted = target.get("chapter_number")
         target_volume = target.get("volume_number")
-        if (evidence.get("coverage_start") or evidence.get("coverage_end")) and not manifest_exact_member:
+        if range_exact_member:
+            positive.append("exact_pack_range_member")
+        elif (evidence.get("coverage_start") or evidence.get("coverage_end")) and not manifest_exact_member:
             blocked.append("coverage_not_unit_number")
         elif (
             target_volume
@@ -2033,6 +2306,47 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
             # release that collects the wanted chapter satisfies it; it is
             # not a different unit type.
             positive.append("exact_volume_containing_wanted_chapter")
+        elif (
+            wanted
+            and evidence.get("bare_number") == wanted
+            and evidence.get("issue_number") == wanted
+            and not evidence.get("chapter_number")
+            and not evidence.get("volume_number")
+            and not evidence.get("book_number")
+            # An edition marker is an asserted kind even when it carries no
+            # number of its own. "Deluxe Edition/Volume_02.cbz" parses with an
+            # empty volume_number and a bare 2, so the three checks above let
+            # it through and it read as chapter 2. It is volume 2. Caught by
+            # re-measuring the A-EXPLICIT control after the change rather than
+            # by the unit test, which is the argument for requiring the
+            # re-measure and not just a green suite.
+            and not evidence.get("edition_marker")
+        ):
+            # An unmarked number is not a claim about unit kind. The parser
+            # files a bare number under issue_number because it has to put it
+            # somewhere, and against a chapter target that guess was read as a
+            # competing identity: "Hunter x Hunter 394 (2022) (Digital)
+            # (LuCaZ).cbz" clears the slskd match gate at score 71 with reason
+            # "issue/part token 394" and no penalties, then refuses here.
+            # Nothing in the filename says issue.
+            #
+            # Deliberately narrow, because the volume ranking is the inverse of
+            # the cost ranking. Measured 2026-09-02 over 2,061 wrong_unit_type
+            # refusals across 424 units: the parser taking a DIFFERENT number
+            # than the match gate saw is 1,298 refusals over 239 units and
+            # starves only 12, because siblings name the issue plainly. This
+            # shape is 98 refusals over 46 units and starves 42 of them -- a
+            # file whose only number is bare has no better-named sibling to
+            # fall back on. Only the chapter half is taken here: 35 refusals,
+            # 23 starved units.
+            #
+            # The volume branch above already admits a bare number as its own
+            # unit kind (singleton_exact_bare_volume_number); this is that idea
+            # on the chapter branch. It requires the bare number to BE the
+            # wanted chapter and refuses to fire when the candidate asserts any
+            # kind of its own, so a stated volume or book still refuses -- 366
+            # refusals over 162 units that are correct and must stay.
+            positive.append("bare_number_is_the_wanted_chapter")
         elif (evidence.get("volume_number") or evidence.get("book_number") or evidence.get("issue_number")) and not evidence.get("chapter_number"):
             blocked.append("wrong_unit_type")
         elif evidence.get("chapter_number") and wanted and evidence.get("chapter_number") != wanted:

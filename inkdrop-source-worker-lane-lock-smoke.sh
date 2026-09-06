@@ -11,6 +11,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The public export relocates inkdrop-source-worker.sh into scripts/ while this
+# smoke stays at the repository root, so "$(dirname "$0")/inkdrop-source-worker.sh"
+# resolves in the dev tree and not in the exported one. That is why this smoke
+# passed on dev and failed on public against identical content, emitting nothing:
+# bash exited non-zero on a missing file under `set -e`, with no message of its
+# own. Resolve both layouts, and say so loudly if neither is there.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WORKER=""
+for candidate in "$HERE/inkdrop-source-worker.sh" "$HERE/scripts/inkdrop-source-worker.sh"; do
+  if [ -f "$candidate" ]; then
+    WORKER="$candidate"
+    break
+  fi
+done
+if [ -z "$WORKER" ]; then
+  echo "lane lock smoke: cannot find inkdrop-source-worker.sh in $HERE or $HERE/scripts" >&2
+  exit 1
+fi
+
 LOCK_DIR="$ROOT/locks"
 STATE_DIR="$ROOT/state"
 LOG="$ROOT/source-worker.log"
@@ -56,7 +75,7 @@ INKDROP_SOURCE_WORKER_LOCK_WAIT_SECONDS=1 \
 INKDROP_SOURCE_WORKER_COMMAND_TIMEOUT_SECONDS=5 \
 INKDROP_SOURCE_WORKER_MAX_RUN_SECONDS=5 \
 INKDROP_SOURCE_WORKER_SLOT_DEADLINE_MINUTES= \
-bash "$(dirname "$0")/inkdrop-source-worker.sh"
+bash "$WORKER"
 elapsed=$(( $(date +%s) - started ))
 
 [ -f "$MARKER" ] || { echo "lane lock smoke: Suwayomi service was not admitted" >&2; exit 1; }
@@ -95,7 +114,7 @@ INKDROP_SOURCE_WORKER_LOCK_SCOPE=suwayomi \
 INKDROP_SOURCE_WORKER_REQUIRES_AUTOPILOT_LOCK=0 \
 INKDROP_SOURCE_WORKER_OPTIONAL_LOCKS=none \
 INKDROP_SOURCE_WORKER_LOCK_WAIT_SECONDS=1 \
-bash "$(dirname "$0")/inkdrop-source-worker.sh"
+bash "$WORKER"
 same_lane_rc=$?
 set -e
 kill "$LANE_BLOCKER_PID" 2>/dev/null || true

@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 
 from core import inkdrop_bencode
 from core import inkdrop_candidate_matching
+from core import inkdrop_release_credits
 from core import inkdrop_title_identity
 from core import inkdrop_sources
 
@@ -2168,9 +2169,49 @@ def _candidate_source_is_single_part_without_collection(candidate):
     return bool(SINGLE_PART_SOURCE_RE.search(source_norm)) and not COLLECTION_TARGET_RE.search(source_text)
 
 
+def _indexer_declared_range_holds_wanted_unit(candidate, wanted_item=None, policy=None):
+    """A range-titled pack whose declared span holds the wanted unit, by the one
+    proof that already reads declared ranges.
+
+    THE GAP THIS CLOSES. _query_matches_result() demands every query token of
+    two or more digits appear literally in the release title (_query_tokens
+    drops single digits). A pack that names its range never carries the wanted
+    number literally, so "Berserk 13" against "Berserk v01-40" was a mismatch
+    before any containment proof could run. Replaying every outstanding unit
+    whose latest blocked verdict named coverage_not_unit_number through
+    prowlarr_candidate_from_result -> candidate_compatibility on the
+    2026-09-04T22:27Z snapshot: 317 of 362 were stopped here, and the proof
+    PR #655 ships freed 7.
+
+    WHAT IT STILL REQUIRES. The series must match with the number set aside
+    (_series_only_query_matches), because a range says nothing about whose
+    issues those are. Then pack_title_range_membership() decides under every
+    one of its own limits: the candidate is a pack, the range counts in the
+    unit the target counts in, an unlabeled range is read only for issue
+    targets, open-ended, year-shaped and out-of-bounds spans are declined, a
+    singleton work is declined, and a manifest, if one arrived, wins. The
+    caller judges series identity again after this returns, so a related
+    series stays related. One judgement, read from one place: the provider
+    cannot admit a range the matcher would then refuse.
+    """
+    if not isinstance(candidate, dict) or not candidate.get("pack"):
+        return False
+    if not _series_only_query_matches(candidate, wanted_item, policy=policy):
+        return False
+    probe = dict(candidate)
+    probe.pop("match_confidence", None)
+    try:
+        return bool(inkdrop_candidate_matching.pack_title_range_membership(probe, wanted_item, settings=None))
+    except Exception:
+        return False
+
+
 def _indexer_match_confidence(candidate, wanted_item=None, policy=None):
     if not _query_matches_result(candidate, wanted_item, policy=policy):
-        return "mismatch"
+        # A declared range that holds the wanted unit is the one thing the
+        # literal-token query cannot see; ask before calling it a mismatch.
+        if not _indexer_declared_range_holds_wanted_unit(candidate, wanted_item, policy=policy):
+            return "mismatch"
     if _indexer_has_related_series_extension(candidate, wanted_item, policy=policy):
         return "related_series_identity"
     if _indexer_title_has_wanted_number((candidate or {}).get("title"), wanted_item):
@@ -2201,32 +2242,25 @@ INDEXER_RELEASE_METADATA_TOKENS = {
     "scan",
     "web",
 }
+# The credits themselves live in inkdrop_release_credits, read by the matcher's
+# singleton path and the artifact acceptor as well; this classifier adds the
+# publisher names it meets as metadata. Longest phrase first, so a phrase that
+# extends another ("F Son of Ultron-Empire") is consumed whole.
 INDEXER_RELEASE_GROUP_PHRASES = tuple(
     sorted(
-        {
-            ("f", "son", "of", "ultron", "empire"),
-            ("son", "of", "ultron", "empire"),
-            ("f", "archangel", "zone", "empire"),
-            ("archangel", "zone", "empire"),
-            ("zone", "empire"),
-            ("zerodaze", "dcp", "hd"),
-            ("minutemen", "phd"),
-            ("dc", "comics"),
-            ("marvel", "comics"),
-            ("image", "comics"),
-            ("lostnerevarine", "empire"),
-        },
+        inkdrop_release_credits.RELEASE_GROUP_PHRASES | inkdrop_release_credits.PUBLISHER_PHRASES,
         key=len,
         reverse=True,
     )
 )
-INDEXER_PARENTHESIZED_RELEASE_GROUPS = {
-    ("1r0n",),
-    ("jko",),
-    ("lucaz",),
-    ("oda",),
-    ("rillant",),
-}
+INDEXER_PARENTHESIZED_RELEASE_GROUPS = frozenset(
+    (handle,) for handle in inkdrop_release_credits.RELEASE_GROUP_HANDLES
+)
+# What may close a release name and nothing else: the one-word handles, which
+# only the safe-suffix stripper used to read and which that stripper cannot
+# reach when the unit is a range ("v01-13 (Digital) (1r0n)"), and a bare
+# "Empire". Read at the end of the title only.
+INDEXER_TRAILING_RELEASE_CREDITS = inkdrop_release_credits.TRAILING_RELEASE_CREDITS
 # Words that name an *edition* of the wanted work rather than another work,
 # drawn from the same vocabulary EDITION_PATTERNS uses in
 # inkdrop_candidate_matching. "Berserk Deluxe Edition Vol 01" is Berserk; what
@@ -2385,7 +2419,8 @@ def _indexer_has_related_series_extension(candidate, wanted_item=None, policy=No
     Broad discovery is intentional, so containment alone is insufficient for
     unattended handoff. Only recognized release metadata may precede the
     longest matching alias. After it, supported unit/year/release syntax is
-    consumed and any remaining word is treated as a related identity.
+    consumed, a scanner's credit closing the name is consumed, and any
+    remaining word is treated as a related identity.
     """
     identity_title = _indexer_title_without_leading_release_group(
         _indexer_title_without_safe_parenthesized_release_suffix(candidate, wanted_item)
@@ -2443,6 +2478,12 @@ def _indexer_has_related_series_extension(candidate, wanted_item=None, policy=No
     tail = title_tokens[alias_end:]
     index = 0
     while index < len(tail):
+        if index and tuple(tail[index:]) in INDEXER_TRAILING_RELEASE_CREDITS:
+            # Whatever is left is exactly a scanner's handle, it is the last
+            # thing in the name, and something -- a unit, a year, a format --
+            # already stood between the title and it. Nothing after it can
+            # name a series; and "Star Wars Empire" on its own still does.
+            break
         phrase_end = _indexer_release_phrase_end(tail, index)
         if phrase_end > index:
             index = phrase_end
@@ -3360,6 +3401,16 @@ def indexer_candidate_verdict(candidate, registry_row=None):
     packs_allowed = bool(policy.get("packs_allowed") or policy.get("allow_packs") or policy.get("pack_auto_allowed"))
     manifest_pack_match = candidate.get("pack_contents_match") if isinstance(candidate.get("pack_contents_match"), dict) else {}
     manifest_pack_safe = manifest_pack_match.get("coverage_source") in PACK_CONTENTS_SAFE_COVERAGE_SOURCES
+    # A pack whose own title names the range it collects proves membership the
+    # same way a file manifest does, and many indexers never expose a manifest
+    # at all -- no file list, empty description -- so without this the entire
+    # range-titled back catalogue was unreachable. Kept separate from
+    # PACK_CONTENTS_SAFE_COVERAGE_SOURCES, which cross-queue fanout reads as a
+    # promise of real per-file entries to iterate.
+    # settings=None on purpose: the range proof reads unit fields and evidence,
+    # never the acquisition policy, and the wiring guard wants that recorded.
+    range_pack_match = inkdrop_candidate_matching.pack_title_range_membership(candidate, settings=None)
+    pack_membership_proven = bool(manifest_pack_safe or range_pack_match)
     wanted_has_number = bool(
         first_text(
             candidate.get("issue_number"),
@@ -3367,9 +3418,9 @@ def indexer_candidate_verdict(candidate, registry_row=None):
             candidate.get("volume_number"),
         )
     )
-    if wanted_has_number and match_confidence == "series_title_only" and not manifest_pack_safe:
+    if wanted_has_number and match_confidence == "series_title_only" and not pack_membership_proven:
         review_reasons.append("issue_number_not_confirmed")
-    if candidate.get("pack") and not packs_allowed and not manifest_pack_safe:
+    if candidate.get("pack") and not packs_allowed and not pack_membership_proven:
         review_reasons.append("pack_requires_review")
     if (
         not manifest_pack_safe
@@ -3405,6 +3456,12 @@ def indexer_candidate_verdict(candidate, registry_row=None):
         candidate["pack_contents_coverage_source"] = manifest_pack_match.get("coverage_source")
         candidate["pack_contents_matching_entry"] = manifest_pack_match.get("entry")
         candidate["pack_contents_entry_count"] = manifest_pack_match.get("content_entry_count")
+    elif range_pack_match:
+        candidate["pack_range_match"] = range_pack_match
+        candidate["pack_range_coverage_source"] = range_pack_match.get("coverage_source")
+        candidate["pack_range_coverage_start"] = range_pack_match.get("coverage_start")
+        candidate["pack_range_coverage_end"] = range_pack_match.get("coverage_end")
+        candidate["pack_range_coverage_unit"] = range_pack_match.get("coverage_unit")
     candidate["candidate_safe"] = not block_reasons and not review_reasons
     if block_reasons:
         candidate["auto_grab_verdict"] = "blocked"
@@ -3469,6 +3526,11 @@ def indexer_candidate_attempt_seed(candidate, registry_row=None, status=None, re
         "pack_contents_coverage_source": candidate.get("pack_contents_coverage_source"),
         "pack_contents_matching_entry": candidate.get("pack_contents_matching_entry"),
         "pack_contents_entry_count": candidate.get("pack_contents_entry_count"),
+        "pack_range_match": candidate.get("pack_range_match"),
+        "pack_range_coverage_source": candidate.get("pack_range_coverage_source"),
+        "pack_range_coverage_start": candidate.get("pack_range_coverage_start"),
+        "pack_range_coverage_end": candidate.get("pack_range_coverage_end"),
+        "pack_range_coverage_unit": candidate.get("pack_range_coverage_unit"),
         "candidate_key": candidate.get("indexer_candidate_key") or indexer_candidate_key(candidate),
         "suppression_key": candidate.get("indexer_suppression_key") or candidate.get("indexer_candidate_key") or indexer_candidate_key(candidate),
     }
@@ -3515,6 +3577,11 @@ def indexer_candidate_attempt_seed(candidate, registry_row=None, status=None, re
         "quality_status": candidate.get("quality_status"),
         "pack_contents_coverage_source": candidate.get("pack_contents_coverage_source"),
         "pack_contents_matching_entry": candidate.get("pack_contents_matching_entry"),
+        "pack_range_match": candidate.get("pack_range_match"),
+        "pack_range_coverage_source": candidate.get("pack_range_coverage_source"),
+        "pack_range_coverage_start": candidate.get("pack_range_coverage_start"),
+        "pack_range_coverage_end": candidate.get("pack_range_coverage_end"),
+        "pack_range_coverage_unit": candidate.get("pack_range_coverage_unit"),
         "retry_scope": retry_scope,
         "import_handoff_expectation": import_expectation,
         "candidate_safe": safe,
@@ -6390,6 +6457,19 @@ def _candidate_result_relevant(result, wanted_item=None, policy=None):
                 and (not edition_alias or "absolute" in haystack or (collection and franchise_match))
             ):
                 return True
+    return _series_only_query_matches(result, wanted_item, policy=policy)
+
+
+def _series_only_query_matches(result, wanted_item=None, policy=None):
+    """Does the wanted SERIES match this result, with the unit number set aside?
+
+    One question, asked from two places: _candidate_result_relevant() keeps a
+    same-series numeric mismatch so the strict gate can explain it, and
+    _indexer_declared_range_holds_wanted_unit() will not let a declared range
+    stand in for the number until the series itself has matched -- a range says
+    nothing about whose issues those are.
+    """
+    wanted_item = wanted_item if isinstance(wanted_item, dict) else {}
     series = normalized_query(
         first_text(
             wanted_item.get("series_title"),

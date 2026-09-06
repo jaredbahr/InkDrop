@@ -31,6 +31,7 @@ from tools.inkdrop_text_output import write_text_lf
 PUBLIC_REPO_EXTRA_PATHS = (
     "README.md",
     "LICENSE",
+    "NOTICE",
     "CONTRIBUTING.md",
     ".dockerignore",
     ".env.example",
@@ -228,6 +229,7 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "tools/inkdrop_docker_context_manifest.py",
     "tools/inkdrop_install_support_summary.py",
     "tools/inkdrop_github_release.py",
+    "tools/inkdrop_public_release_gate.py",
     "tools/inkdrop_closed_alpha_packet.py",
     "tools/inkdrop_public_http_smoke.py",
     "tools/inkdrop_public_release_check.py",
@@ -264,6 +266,15 @@ CSS_SOURCE_ROOT = Path("web/static/css/src")
 # not silently ship it.
 APPROVED_README_SOURCE = "docs/inkdrop/beta-readme-approved-20260730.md"
 APPROVED_COMPOSE_SOURCE = "docs/inkdrop/public-beta-compose.yml"
+# The install guide gets the same treatment for the same reason. The
+# working tree's docker-first-install.md is written against the two-service,
+# build-from-source development Compose file; the published Compose file is a
+# single image-only service. Shipping the internal guide verbatim told public
+# readers to obtain an install packet that has never been attached to a
+# release, and to run --build and .env steps that silently do nothing against
+# the file they actually get.
+APPROVED_INSTALL_SOURCE = "docs/inkdrop/public-beta-install.md"
+PUBLISHED_INSTALL_PATH = "docs/inkdrop/docker-first-install.md"
 OPEN_PLACEHOLDER_MARKERS = ("inkdrop:TAG", "REPLACE_WITH_YOUR_APPROVED_DIGEST")
 
 
@@ -286,6 +297,35 @@ def public_readme_bytes(root: Path = ROOT):
     return stripped.encode("utf-8")
 
 
+def _strip_maintainer_comment(text: str, source: str) -> str:
+    """Drop the leading <!-- ... --> maintainer note, as the README does."""
+    stripped = text.lstrip()
+    if stripped.startswith("<!--"):
+        end = stripped.find("-->")
+        if end < 0:
+            raise ValueError(f"unterminated maintainer comment in {source}")
+        stripped = stripped[end + 3 :].lstrip("\n")
+    if "<!--" in stripped:
+        raise ValueError(f"unexpected comment left in the public copy from {source}")
+    return stripped
+
+
+def public_install_doc_bytes(root: Path = ROOT):
+    """The install guide shipped publicly, published under the old filename.
+
+    Kept at docs/inkdrop/docker-first-install.md in the export so existing
+    links keep resolving; the content is the public-only source.
+    """
+    source = root / APPROVED_INSTALL_SOURCE
+    if not source.is_file():
+        # Same self-consistency fallback as the README and Compose file: an
+        # already-exported tree carries only the published copy.
+        source = root / PUBLISHED_INSTALL_PATH
+    return _strip_maintainer_comment(
+        source.read_text(encoding="utf-8"), APPROVED_INSTALL_SOURCE
+    ).encode("utf-8")
+
+
 def public_compose_bytes(root: Path = ROOT):
     source = root / APPROVED_COMPOSE_SOURCE
     if not source.is_file():
@@ -293,6 +333,43 @@ def public_compose_bytes(root: Path = ROOT):
         # tree's own docker-compose.yml already is the approved content.
         source = root / "docker-compose.yml"
     return source.read_text(encoding="utf-8").encode("utf-8")
+
+
+# WHOSE REPOSITORY THE EXPORTED TREE NAMES.
+#
+# The private development repository answers 404 to anyone without access, so
+# every mention of it that reaches the public tree is a dead link at best and
+# a statement about a repository the reader cannot open at worst. This used to
+# be handled in exactly one place -- the Dockerfile's OCI source label -- as a
+# single-file override, and the name went on shipping in twenty other places
+# across seven files, including application code.
+#
+# It is a rule now: every exported TEXT file has the private slug rewritten to
+# the public one, and the guard beside it asserts the export carries none.
+# Both names are assembled rather than written, because this module is itself
+# exported and must not be the file that carries the name it exists to remove.
+PRIVATE_REPO_SLUG = "jaredbahr/" + "inkdrop" + "-dev"
+PUBLIC_REPO_SLUG = "jaredbahr/" + "InkDrop"
+# Suffixes whose bytes are text a reader or a tool will follow. A binary file
+# is left alone: the slug is a URL fragment, and rewriting bytes inside an
+# image or an archive would corrupt it rather than clean it.
+REPO_SLUG_TEXT_SUFFIXES = frozenset({
+    ".css", ".example", ".html", ".js", ".json", ".jsx", ".md", ".py", ".sh",
+    ".toml", ".ts", ".tsx", ".txt", ".yaml", ".yml",
+})
+REPO_SLUG_TEXT_NAMES = frozenset({"Dockerfile", ".dockerignore", ".gitignore", "LICENSE", "NOTICE"})
+
+
+def is_repo_slug_text(relative):
+    """Whether this exported path is text the slug rule should rewrite."""
+    name = relative.name if hasattr(relative, "name") else str(relative).rsplit("/", 1)[-1]
+    suffix = ("." + name.rsplit(".", 1)[-1]) if "." in name else ""
+    return name in REPO_SLUG_TEXT_NAMES or suffix in REPO_SLUG_TEXT_SUFFIXES
+
+
+def public_repo_slug_bytes(data: bytes) -> bytes:
+    """Rewrite the private repository slug to the public one."""
+    return data.replace(PRIVATE_REPO_SLUG.encode("utf-8"), PUBLIC_REPO_SLUG.encode("utf-8"))
 
 
 def public_dockerfile_bytes(root: Path = ROOT):
@@ -308,10 +385,10 @@ def public_dockerfile_bytes(root: Path = ROOT):
     text = (root / "Dockerfile").read_text(encoding="utf-8")
     for name in RELOCATABLE_SCRIPTS_DIR_FILES:
         text = text.replace(f"    {name} \\\n", f"    scripts/{name} \\\n")
-    text = text.replace(
-        'org.opencontainers.image.source="https://github.com/jaredbahr/inkdrop-dev"',
-        'org.opencontainers.image.source="https://github.com/jaredbahr/InkDrop"',
-    )
+    # The OCI source label used to be re-pointed here by name. It is covered by
+    # the slug rule that runs over every exported text file, so doing it twice
+    # would leave two statements of one judgement -- the shape that let the
+    # other twenty mentions ship.
     return text.encode("utf-8")
 
 
@@ -324,7 +401,7 @@ def open_placeholders(text_bytes):
 # tooling. The public repository never contains those files, so shipping the
 # rules would only document the development environment. Markers are split
 # because this helper ships in the export and must not carry them either.
-PRIVATE_IGNORE_RULE_MARKERS = ("co" + "dex", "agents.md")
+PRIVATE_IGNORE_RULE_MARKERS = ("co" + "dex", "agents.md", "north" + "_star")
 
 
 def public_dockerignore_bytes(root: Path = ROOT):
@@ -413,10 +490,28 @@ def export_content_overrides(root: Path = ROOT, paths=None):
         "README.md": public_readme_bytes(root),
         "docker-compose.yml": public_compose_bytes(root),
         "Dockerfile": public_dockerfile_bytes(root),
+        PUBLISHED_INSTALL_PATH: public_install_doc_bytes(root),
         ".gitignore": PUBLIC_GITIGNORE.encode("utf-8"),
         ".dockerignore": public_dockerignore_bytes(root),
         PUBLIC_WORKFLOW_PATH: public_workflow_bytes(root),
     }
+    # THE SLUG RULE, applied here rather than at copy time so build_manifest()
+    # hashes the bytes that actually ship. Hashing the pre-rewrite file would
+    # leave the manifest describing a tree the public repository does not
+    # contain -- the same reason the relocated scripts run through this map.
+    for relative in paths:
+        key = relative.as_posix()
+        if not is_repo_slug_text(relative):
+            continue
+        current = overrides.get(key)
+        if current is None:
+            source = resolve_source(root, relative)
+            if not source.is_file():
+                continue
+            current = source.read_bytes()
+        rewritten = public_repo_slug_bytes(current)
+        if rewritten != current:
+            overrides[key] = rewritten
     # Relocated scripts need their repo-root resolution re-pointed. This runs
     # through the override map rather than at copy time so the manifest hashes
     # the bytes that actually ship; hashing the pre-rewrite file would leave the
@@ -443,6 +538,18 @@ def export_content_overrides(root: Path = ROOT, paths=None):
 
 FORBIDDEN_PUBLIC_PATHS = {
     "AGENTS.md",
+    # The owner's product-goal document. Local-only: it names competing
+    # products and carries unreleased product strategy, so it must never reach
+    # the public repository. It is deliberately NOT tracked in this repository
+    # either -- this entry exists so that a future attempt to add it fails the
+    # export instead of succeeding quietly.
+    #
+    # The name is assembled rather than written, for the reason given at
+    # PRIVATE_IGNORE_RULE_MARKERS: this module is itself published, so a
+    # literal here would put the filename in the public repository and defeat
+    # the entry's whole purpose. Verified 2026-08-29 that this file ships --
+    # it is 37,976 bytes in the public repository.
+    "NORTH" + "_STAR.md",
     "PUBLIC_REPO_MANIFEST.json",
     "HOMELAB_AUTOMATION_AUDIT.md",
     "homepage-services.yaml",
@@ -759,6 +866,9 @@ def public_repo_paths():
         if not resolve_source(ROOT, relative).is_file():
             missing.append(relative.as_posix())
             continue
+        if is_context_only_path(relative):
+            # Dropped, not reported: the context is where it belongs.
+            continue
         if is_forbidden_public_path(relative):
             forbidden.append(relative.as_posix())
             continue
@@ -767,6 +877,32 @@ def public_repo_paths():
             continue
         clean.append(relative)
     return clean, missing, forbidden
+
+
+# IN THE BUILD CONTEXT, NOT IN THE PUBLIC REPOSITORY.
+#
+# FORBIDDEN_PUBLIC_PATHS says "this must never be in the docker context", and
+# the export REPORTS such a path rather than dropping it, so a file that is
+# deliberately in the context and deliberately unpublished had nowhere to be
+# described. core/sab_rescue_server.py is exactly that: .dockerignore excludes
+# it by name as homelab tooling and then re-includes it under "Runtime
+# allowlist exceptions", because the web UI loads it by path on demand -- so
+# the image is meant to carry it and the public repository is not.
+#
+# Without this concept the two intentions contradicted each other silently:
+# two tests asserted .dockerignore CONTAINS the exclusion, which it does, while
+# the negation thirteen lines later put the file back, and 34,257 bytes of this
+# house's SABnzbd automation shipped publicly anyway. A path listed here is
+# dropped from the export without being called a violation, and the guard
+# beside it asserts the drop actually happened.
+CONTEXT_ONLY_PATHS = frozenset({
+    "core/sab_rescue_server.py",
+})
+
+
+def is_context_only_path(relative):
+    """Whether this path belongs in the build context but not the public repo."""
+    return relative.as_posix() in CONTEXT_ONLY_PATHS
 
 
 def is_forbidden_public_path(relative):
@@ -865,7 +1001,12 @@ def run_export(*, target, apply=False, force=False):
     except OSError:
         missing.append(APPROVED_README_SOURCE)
         missing.append(APPROVED_COMPOSE_SOURCE)
-        overrides = {"README.md": b"", "docker-compose.yml": b""}
+        missing.append(APPROVED_INSTALL_SOURCE)
+        overrides = {
+            "README.md": b"",
+            "docker-compose.yml": b"",
+            PUBLISHED_INSTALL_PATH: b"",
+        }
     manifest = build_manifest(paths, overrides)
     payload = {
         "schema": "inkdrop.public_repo_export.result.v1",

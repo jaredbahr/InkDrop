@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Portable settings backup/restore contract regression."""
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -269,6 +270,61 @@ def main():
         snapshot_document = json.loads(Path(raced["snapshot"]).read_text(encoding="utf-8"))
         require(snapshot_document["settings"]["ui.relative_dates"] is False, "snapshot differs from exact fenced pre-apply state")
         require(value(db, "ui.relative_dates") is False, "post-fence writer was silently overwritten")
+
+        # The file a user restores is not the export response: the browser
+        # writes it with JSON.stringify, which has one number type and drops
+        # the ".0" off every float. validate_value stores the registry's
+        # `integer: False` settings as floats (72 saves as 72.0), so a checksum
+        # hashed from the float could never match the file on disk -- preview
+        # failed with "settings backup checksum mismatch" on every install that
+        # had saved one of them. Model the browser here instead of reusing the
+        # production normalizer, so this tracks behaviour, not implementation.
+        def as_browser_would_write(item):
+            if type(item) is float and item.is_integer():
+                return int(item)
+            if isinstance(item, list):
+                return [as_browser_would_write(entry) for entry in item]
+            if isinstance(item, dict):
+                return {key: as_browser_would_write(entry) for key, entry in item.items()}
+            return item
+
+        float_db = root / "float-valued.sqlite3"
+        inkdrop_state.sync_settings(float_db, settings=[
+            {"key": "automation.awaiting_release_hours", "scope": "automation", "label": "Awaiting", "value": 72, "description": "test"},
+            {"key": "ui.relative_dates", "scope": "ui", "label": "Dates", "value": True, "description": "test"},
+        ])
+        inkdrop_state.update_app_setting(float_db, "automation.awaiting_release_hours", 72)
+        with sqlite3.connect(float_db) as con:
+            stored_json = con.execute("select value_json from app_settings where key='automation.awaiting_release_hours'").fetchone()[0]
+        require(stored_json == "72.0", f"fixture setting no longer stores a float: {stored_json}")
+
+        exported = backup.export_portable_settings(float_db, now=1_700_000_000, version="0.1.0-alpha.7")
+        require(type(exported["settings"]["automation.awaiting_release_hours"]) is float, "fixture setting is no longer float-valued")
+        downloaded = json.dumps(as_browser_would_write(exported), indent=2) + "\n"
+        require('"automation.awaiting_release_hours": 72,' in downloaded, "browser model did not drop the float suffix")
+        require(backup.restore_portable_settings(float_db, downloaded, apply=False)["ok"], "browser-written settings backup failed its own checksum")
+
+        # A backup downloaded before the fix holds the browser's int but a
+        # checksum hashed from the float, so nothing recomputed from the file
+        # itself can reproduce it. Those files must still restore.
+        legacy_payload = {key: item for key, item in exported.items() if key != "checksum"}
+        legacy_document = as_browser_would_write(legacy_payload)
+        legacy_document["checksum"] = "sha256:" + hashlib.sha256(
+            backup._canonical_json(legacy_payload).encode("utf-8")
+        ).hexdigest()
+        require(legacy_document["checksum"] != exported["checksum"], "legacy fixture did not reproduce the pre-fix checksum")
+        require(backup.restore_portable_settings(float_db, json.dumps(legacy_document), apply=False)["ok"], "pre-fix settings backup stayed un-restorable")
+
+        # Accepting both forms must not stop the checksum catching real edits.
+        tampered = json.loads(downloaded)
+        tampered["settings"]["automation.awaiting_release_hours"] = 96
+        try:
+            backup.restore_portable_settings(float_db, json.dumps(tampered), apply=False)
+        except ValueError as exc:
+            require("checksum mismatch" in str(exc), f"edited settings backup failed for the wrong reason: {exc}")
+        else:
+            raise AssertionError("edited settings backup passed the checksum")
+
         print(json.dumps({"ok": True, "portable_settings": "passed"}))
 
 

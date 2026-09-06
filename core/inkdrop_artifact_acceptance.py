@@ -12,6 +12,7 @@ from PIL import Image, ImageFile
 
 from core import inkdrop_library_identity
 from core import inkdrop_comicinfo_identity
+from core import inkdrop_release_credits
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 SENTINEL_TEXT_VALUES = {"-100000", "-100000.0", "1-01-01", "0001", "0001-01-01"}
@@ -180,6 +181,70 @@ def _identity_words(value):
     return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
 
 
+_TRAILING_YEAR = re.compile(r"\s(?:19|20)\d\d$")
+
+
+def _series_identity_matches(actual_words, target_words, target_year=None):
+    """Do these two series names identify the same run?
+
+    Exact word equality, EXCEPT that a trailing year on ONE side only is
+    discounted. `Lumberjanes-Gotham Academy (2016) #001 [2016-06].cbz` was
+    refused at import for this: its own ComicInfo says
+    `Series: Lumberjanes/Gotham Academy (2016)` while the wanted series carries
+    no year, so the normalised forms differed by one token and a correctly
+    tagged file was rejected `comicinfo_series_does_not_match_target`. InkDrop
+    had already found it, queued it and downloaded all 48,944,730 bytes.
+
+    THIS IS NOT A LOOSENING, AND THE ASYMMETRY IS WHAT MAKES IT ONE.
+        The year is discounted only when the OTHER side does not name one. If
+        both name a year they must name the SAME year, so a 1992 run can never
+        satisfy a want for the 2014 relaunch. Every other word still has to
+        match exactly. A wrong "satisfied" costs the book silently, which this
+        project takes as strictly worse than a wrong "missing".
+    """
+    if actual_words == target_words:
+        return True
+    a_year = bool(_TRAILING_YEAR.search(actual_words))
+    t_year = bool(_TRAILING_YEAR.search(target_words))
+    if a_year == t_year:
+        # Neither carries one, or both do and they already differ above.
+        return False
+    # A BARE YEAR IS NOT A SERIES NAME, and what guarantees that is EQUALITY,
+    # not the pattern. A Series of just "2016" strips to "" and "" is equal to
+    # nothing except "", so it satisfies no real target. Written down because
+    # the first version of this comment credited the leading `\s` instead, and
+    # a sabotage that removed the `\s` left every arm green -- the rationale was
+    # wrong while the code was right, which is the harder of the two to notice.
+    #
+    # An explicit empty-string guard was also written here first and removed: it
+    # was unreachable, and deleting it changed nothing. An unreachable guard
+    # reads as protection and provides none.
+    if (_TRAILING_YEAR.sub("", actual_words).strip()
+            != _TRAILING_YEAR.sub("", target_words).strip()):
+        return False
+
+    # A TRAILING YEAR IS ONLY DISCOUNTABLE WHEN IT IS A REDUNDANT TAG, AND WHAT
+    # MAKES IT REDUNDANT IS AGREEING WITH THE SERIES' OWN PUBLICATION YEAR.
+    # The paragraph above was right that two stated years must match and wrong
+    # that a year stated on one side only is therefore a tag.
+    # `The Wicked + The Divine 1923` is a real series -- comicvine:108547,
+    # published 2018 -- and its parent `The Wicked + The Divine` is
+    # comicvine:74863, published 2014. Both are in the library. Discounting the
+    # one-sided `1923` made those two names equal, so each satisfied a want for
+    # the other, in both directions, and a wrong "you have it" costs the book
+    # silently. Compare instead against the TARGET's own year:
+    #     Lumberjanes/Gotham Academy (2016), want year 2016 -> tag, discount
+    #     The Wicked + The Divine 1923,      want year 2014 -> name, refuse
+    #     The Wicked + The Divine,           want year 2018 -> the WANT carries
+    #                                           the name-year; refuse
+    # An unknown year refuses the discount. That costs a false "missing", which
+    # is recoverable; the other direction costs a book.
+    stated = _TRAILING_YEAR.search(actual_words) or _TRAILING_YEAR.search(target_words)
+    if not stated or not str(target_year or "").strip():
+        return False
+    return stated.group(0).strip() == str(target_year).strip()
+
+
 def source_identity_acceptance(source_identity, target=None):
     """Apply the non-content identity veto shared by source handoffs and import."""
 
@@ -265,14 +330,16 @@ def source_identity_acceptance(source_identity, target=None):
     }
 
 
-def comicinfo_target_conflicts(comicinfo, expected_series=None, expected_number=None, target_type=None):
+def comicinfo_target_conflicts(comicinfo, expected_series=None, expected_number=None,
+                               target_type=None, expected_series_year=None):
     comicinfo = comicinfo if isinstance(comicinfo, dict) else {}
     if not comicinfo.get("authoritative"):
         return []
     conflicts = []
     actual_series = _identity_words(comicinfo.get("series"))
     target_series = _identity_words(expected_series)
-    if actual_series and target_series and actual_series != target_series:
+    if actual_series and target_series and not _series_identity_matches(
+            actual_series, target_series, target_year=expected_series_year):
         conflicts.append("comicinfo_series_does_not_match_target")
     target_type = _norm(target_type)
     if target_type in {"issue", "comic_issue", "single_issue", "chapter", "manga_chapter"}:
@@ -725,7 +792,7 @@ def archive_read_undetermined(semantics):
     return str(semantics.get("archive_integrity") or "") == ARCHIVE_INTEGRITY_UNDETERMINED
 
 
-def archive_output_refusal(path):
+def archive_output_refusal(path, *, assume_suffix=None):
     """THE one answer to "is this archive sound enough to put in the library".
 
     Both CBR-to-CBZ converters end here rather than each keeping an opinion.
@@ -750,12 +817,30 @@ def archive_output_refusal(path):
     completed and must never be recorded as a verdict about the file -- the
     lesson that produced the retraction of eight false blocks on 2026-08-23.
     """
-    semantics = archive_member_semantics(Path(path), fresh=True)
+    semantics = archive_member_semantics(
+        Path(path), fresh=True, assume_suffix=assume_suffix)
     if archive_read_undetermined(semantics):
         return {
             "outcome": "undetermined",
             "reason": "archive_output_read_undetermined",
             "detail": (semantics.get("image_validation_errors") or [None])[0],
+            "archive_integrity": semantics.get("archive_integrity"),
+        }
+    if not semantics.get("checked"):
+        # THE READER DECLINED TO LOOK, AND THAT IS NOT A PASS. This branch is
+        # the whole reason #723 came back: the semantics reader answers only
+        # for names ending .cbz, both converters asked it about "<dest>.cbz.tmp",
+        # it returned an empty result, and this function read the absence of a
+        # complaint as soundness. The gate was wired, tested and inert -- a
+        # source that lost 11 of its 25 pages still repacked and imported.
+        #
+        # So an unexamined archive is refused as UNDETERMINED, never approved.
+        # A caller that gets this back has asked the wrong question about the
+        # wrong file, and the honest answer is that nothing was checked.
+        return {
+            "outcome": "undetermined",
+            "reason": "archive_output_not_examined",
+            "detail": "no soundness opinion was formed for %r" % (Path(path).name,),
             "archive_integrity": semantics.get("archive_integrity"),
         }
     if str(semantics.get("archive_integrity") or "") == "failed":
@@ -786,7 +871,7 @@ def decision_is_content_verdict(decision):
     return not bool(decision.get("read_undetermined"))
 
 
-def archive_member_semantics(path, *, fresh=False):
+def archive_member_semantics(path, *, fresh=False, assume_suffix=None):
     path = Path(path)
     result = {
         "checked": False,
@@ -818,9 +903,16 @@ def archive_member_semantics(path, *, fresh=False):
         },
         "evidence": [],
     }
-    if comic_archive_suffix(path) != ".cbz":
+    # `assume_suffix` is for a caller that KNOWS what it just wrote and is
+    # handing over a file whose name does not say so -- both converters build
+    # their output at "<dest>.cbz.tmp" before it replaces anything. Without it
+    # the name decided the answer: the identical bytes came back "failed" as
+    # <name>.cbz and unexamined as <name>.cbz.tmp, so every repack passed.
+    if (assume_suffix or comic_archive_suffix(path)) != ".cbz":
         # Not a format this function checks. Saying nothing is the correct
-        # answer and must stay distinguishable from failing to look.
+        # answer and must stay distinguishable from failing to look -- which is
+        # why `checked` stays False here and archive_output_refusal() treats
+        # that as undetermined rather than as approval.
         return result
     if not path.is_file():
         # The file is not there to be read. This used to return with NOTHING
@@ -1333,6 +1425,10 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
         target_info.get("title"),
         target_info.get("target_number"),
         target_type=target_type,
+        # The series record's own publication year. Without it the trailing-year
+        # discount is refused, which would re-refuse the correctly tagged files
+        # #1078 was written for -- so this is not optional plumbing.
+        expected_series_year=acceptance_target.get("year"),
     )
     if decision == "accepted" and not source_identity_gate.get("ok"):
         decision = "rejected_source_identity"
@@ -1468,31 +1564,13 @@ PUBLICATION_MONTH_WORDS = {
     "july", "august", "september", "october", "november", "december",
 }
 
-PUBLICATION_RELEASE_GROUP_WORDS = {
-    "1r0n",
-    "jko",
-    "lucaz",
-    "oda",
-    "rillant",
-    "shizu",
-}
-
-PUBLICATION_RELEASE_GROUP_PHRASES = {
-    ("1r0n",),
-    ("archangel", "zone", "empire"),
-    ("f", "archangel", "zone", "empire"),
-    ("f", "son", "of", "ultron", "empire"),
-    ("jko",),
-    ("lostnerevarine", "empire"),
-    ("lucaz",),
-    ("minutemen", "phd"),
-    ("oda",),
-    ("rillant",),
-    ("shizu",),
-    ("son", "of", "ultron", "empire"),
-    ("zerodaze", "dcp", "hd"),
-    ("zone", "empire"),
-}
+# The one closed credit vocabulary, shared with the matcher's singleton path
+# and the indexer classifier (inkdrop_release_credits).
+PUBLICATION_RELEASE_GROUP_WORDS = frozenset(inkdrop_release_credits.RELEASE_GROUP_HANDLES)
+PUBLICATION_RELEASE_GROUP_PHRASES = frozenset(
+    inkdrop_release_credits.RELEASE_GROUP_PHRASES
+    | {(handle,) for handle in inkdrop_release_credits.RELEASE_GROUP_HANDLES}
+)
 
 PUBLICATION_METADATA_WORDS = {
     "c2c",

@@ -303,7 +303,37 @@ HANDOFF_GATE_STATE_FILENAME = "download-handoff-gate.json"
 HANDOFF_GATE_PENDING_COUNT_LIMIT = 25
 MIN_BUDGET_RETRY_SECONDS = 5 * 60
 RUNTIME_CHILD_CLEANUP_SECONDS = 25
-SLSKD_HANDOFF_RESERVE_SECONDS = 90
+# Time held back so a found candidate can be reserved, enqueued and persisted
+# rather than stranded. 90 was too large for the window the pass actually
+# provides, and the probe -- not the reserve -- is what paid for it.
+#
+# Measured on production 2026-09-06: a pass reached SLSKD with a 160s child
+# window, so the probe was handed 160 - 25 - 90 = 45s. A search needs
+# `slskd_wait_seconds`, which is 50 there, and on an automatic pass the probe
+# correctly REFUSES to start a query it would have to cut short, because a
+# truncated answer would be cached and reused. From its own status file:
+#
+#   "SLSKD search for 'Sleep' needs 50s to answer but only 44s of probe budget
+#    remain; declining rather than starting a query this pass would cut short"
+#   probe_budget_seconds: 45, probe_budget_exhausted_count: 7, candidate_count: 0
+#
+# Seven of eight selected rows declined on that one pass and no query was
+# issued, which is why candidates, auto-grab attempts, reservations and
+# downloads all reached zero together on 2026-09-02.
+#
+# 60 leaves the same 160s window a 75s probe budget, clear of the 50s search
+# floor, while still holding back more than a minute for a handoff that is a
+# database write and one HTTP enqueue. The trade is deliberate and runs in the
+# direction the standing rule asks for: the worst case strands a found
+# candidate for one pass -- a search re-run, not a lost book -- where the
+# status quo loses every book by never searching at all.
+SLSKD_HANDOFF_RESERVE_SECONDS = 60
+# The smallest probe budget that can return an answer rather than a timeout.
+# Measured p90 cost of one SLSKD query is 50.5s, so anything under that is a
+# run that cannot finish: it takes the pass slot, issues the search -- which
+# slskd completes and answers -- and is hard-killed before it can read the
+# reply, which the parent then maps to ok:False and discards.
+SLSKD_MIN_VIABLE_PROBE_BUDGET_SECONDS = 55
 RUNTIME_HARD_EXIT_GRACE_SECONDS = 90
 RUNTIME_BUDGET_CHILD_PROVIDER_SAMPLE_LIMIT = 12
 RUNTIME_BUDGET_CHILD_PROVIDER_JOB_LIMIT = 20
@@ -1594,6 +1624,20 @@ def slskd_probe_budget_for_runtime(requested_budget, limited_timeout, deadline):
     persist the waiting record.  A runtime deadline that gives all available
     time to probing can therefore strand a safe result without weakening any
     candidate gate.
+
+    Returns 0 when the window cannot hold one query, and the caller skips the
+    provider for this pass. The reserve above is right; the floor underneath it
+    was not. It clamped to 30 no matter how little time remained -- at
+    ``limited_timeout=60`` the available time is MINUS 55 seconds and the old
+    expression still returned 30 -- and 30s cannot finish a query whose measured
+    p90 is 50.5s. Every such run took a pass slot, issued a search slskd
+    completed and answered, and was then killed before it could read the reply.
+    Skipping instead leaves the row to be probed on a pass that can actually
+    hold a query, which is the difference between a retry and a wasted slot.
+
+    A configured budget below the viable minimum therefore disables the probe
+    rather than shrinking it, which is deliberate: a run that cannot finish is
+    not a smaller version of one that can.
     """
     try:
         requested = max(30, int(requested_budget or 0))
@@ -1606,7 +1650,10 @@ def slskd_probe_budget_for_runtime(requested_budget, limited_timeout, deadline):
     except (TypeError, ValueError):
         timeout = 0.0
     available = timeout - RUNTIME_CHILD_CLEANUP_SECONDS - SLSKD_HANDOFF_RESERVE_SECONDS
-    return max(30, min(requested, int(max(30.0, available))))
+    granted = min(requested, int(available))
+    if granted < SLSKD_MIN_VIABLE_PROBE_BUDGET_SECONDS:
+        return 0
+    return granted
 
 
 def budget_retry_seconds(args):
@@ -1657,6 +1704,71 @@ def inkdrop_terminal_queue_rows():
     except Exception as exc:
         log("inkdrop_terminal_queue_rows_failed", error=f"{type(exc).__name__}: {exc}")
         return {}
+
+
+def queue_ids_with_file_evidence(keys):
+    """Of `keys`, those whose unit actually has a file we can point at.
+
+    Evidence is either an ACTIVE `media_files` row, or an `import_results` row
+    that imported and whose `dest_path` RESOLVES on disk. A stored path is a
+    claim, not a fact -- library folders get renamed and rows go stale -- so the
+    path is checked rather than trusted.
+
+    Returns a set. On any failure it returns an EMPTY set, which makes the
+    caller refuse rather than verify: the caller must not treat "I could not
+    look" as "I looked and found nothing".
+    """
+    wanted = {str(key) for key in keys if str(key or "")}
+    if not wanted or inkdrop_state is None or not INKDROP_STATE_DB.exists():
+        return set()
+    try:
+        evidenced = set()
+        ordered = list(wanted)
+        # CHUNKED because the candidate set is the un-verified queue -- 5,696
+        # rows on the 2026-08-31 snapshot, and growing. An oversized `in (...)`
+        # raises "too many SQL variables", which the handler below would turn
+        # into an EMPTY set, which makes the caller refuse EVERY unit. That is
+        # fail-closed rather than dangerous, but it is a silent mass-refusal
+        # that no fixture would show, so the limit is avoided instead of relied
+        # upon: this build allows 32,766 variables and older SQLite defaults to
+        # 999.
+        chunk_size = 400
+        with inkdrop_state.connect(INKDROP_STATE_DB) as con:
+            for start in range(0, len(ordered), chunk_size):
+                chunk = ordered[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in con.execute(
+                    f"""
+                    select queue_id, path from media_files
+                    where queue_id in ({placeholders})
+                      and active=1 and status='present'
+                    """,
+                    chunk,
+                ):
+                    evidenced.add((str(row["queue_id"]), str(row["path"] or "")))
+                for row in con.execute(
+                    f"""
+                    select queue_id, dest_path from import_results
+                    where queue_id in ({placeholders})
+                      and (coalesce(verified, 0)=1 or coalesce(imported_count, 0)>0)
+                      and coalesce(dest_path, '')<>''
+                    """,
+                    chunk,
+                ):
+                    evidenced.add((str(row["queue_id"]), str(row["dest_path"] or "")))
+        confirmed = set()
+        for queue_id, path in evidenced:
+            if queue_id in confirmed or not path:
+                continue
+            try:
+                if Path(path).is_file():
+                    confirmed.add(queue_id)
+            except OSError:
+                continue
+        return confirmed
+    except Exception as exc:
+        log("queue_ids_with_file_evidence_failed", error=f"{type(exc).__name__}: {exc}")
+        return set()
 
 
 def retire_queue_items_from_inkdrop_state(queue):
@@ -6346,8 +6458,42 @@ def has_cached_safe_slskd_candidate(item):
     return isinstance(entry, dict) and effective_safe_slskd_candidate_count(entry, item=item) > 0
 
 
+def series_removed_by_user(item):
+    """True when the user deleted this series, so no lane may hand it back.
+
+    WHAT THIS REPLACES: AN ACCIDENT. Measured on snapshot
+    inkdrop-state-20260831T102706Z-7e4a182b1d1b (as_of 2026-08-31T10:27:06Z),
+    the 112 never-attempted units under removed series were protected by NOTHING
+    that names the removal. `stale_source_absent` is not in
+    TERMINAL_QUEUE_STATES -- that set is {superseded_duplicate, verified} --
+    `present_in_watch` reads True on 112 of 112 so due_series' own skip does not
+    catch them, and 111 of the 112 bucket as `first_pass`, an ordinary broad
+    lane. The only refusal was the incidental "we have never probed this" branch
+    in slskd_source_result_reprobe_due, which is a claim about OUR history with
+    the row rather than about the user's decision -- and one row had already
+    escaped it: `b882abbd6cb83db008cd` on Vagabond returned True and bucketed as
+    `slskd_reprobe`.
+
+    THIS HAD TO LAND BEFORE THE CLOCK FIX, NOT WITH IT. That change makes a
+    selected-but-not-served group age as if it were served, which is exactly the
+    accident that was doing the protecting. Shipping them together would have
+    started searching series the user deleted, on his own data.
+
+    SCOPE, MEASURED RATHER THAN ASSUMED: `parked_reason` is `user_removed` on
+    321 of 9,466 queue rows (3.4%) and null on the other 9,145, so this refuses
+    a small, named population and nothing else. 315 of the 321 sit at
+    `stale_source_absent` and SIX at `queued` -- those six are why the state
+    cannot be the test.
+    """
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("parked_reason") or "").strip().lower() == "user_removed"
+
+
 def has_due_cached_slskd_autopick(item, now=None, lookahead_seconds=0):
     if not isinstance(item, dict):
+        return False
+    if series_removed_by_user(item):
         return False
     if item.get("state") in {"verified", "downloading", "importing", "needs_you"}:
         return False
@@ -6371,10 +6517,54 @@ def has_soon_cached_slskd_autopick(item, now=None):
     )
 
 
+def slskd_service_skipped_at(item):
+    """When SLSKD was last SELECTED for this row and then not run for budget.
+
+    A selection that never reaches the provider is still a turn taken. The
+    reprobe lane exists to rotate stale zero-result signatures back through
+    SLSKD, and it decides staleness from `last_slskd_at` /
+    `autopilot_slskd_attempted_at` -- both written only by a probe that actually
+    ran. So a group selected and then skipped keeps the same signature it had
+    before, re-qualifies on the next pass, and is selected again. The lane is
+    ordered by a timestamp its own work FAILS to update, which is the mirror of
+    the refreshing-sort-key class rather than a new one.
+
+    MEASURED, snapshot inkdrop-state-20260831T102706Z-7e4a182b1d1b, as_of
+    2026-08-31T10:27:06Z, running commit 7e4a182b1d1b. Of 2,343
+    `autopilot_series_run` events in seven days, 1,244 (53.1%) report
+    `SLSKD skipped` and 439 (18.7%) report a `runtime budget` skip across 92
+    series; 2,159 (92.1%) say `reserving runtime`. Controls on that parse: a
+    nonsense token matches 0 of 2,343 and all 2,343 carry a message.
+
+    Replaying the shipping `due_series()` against all 9,466 real queue rows for
+    60 consecutive passes at the observed 51-minute cadence separated the two
+    worlds cleanly: with each served group's clocks refreshed it reached 201
+    distinct series at 27.4% consecutive-pass overlap; with the clocks NOT
+    refreshed it reached EIGHT, at 99.4% overlap, picking the same five groups
+    sixty times. Live production sat at 172 distinct series over ~198 passes
+    with 48.5% overlap -- far closer to the arm that changes nothing.
+
+    This reads a stamp that already exists rather than writing a new one:
+    `last_source_runtime_budget_skipped_at` / `_source` are written at the skip
+    site. 1,034 of 9,466 rows carry it (305 for slskd), and on 69 of those the
+    stamp is already NEWER than the slskd signature -- those are the rows whose
+    clock this advances on the next pass.
+    """
+    item = item or {}
+    source = str(item.get("last_source_runtime_budget_skipped_source") or "").strip().lower()
+    if source != "slskd":
+        return 0
+    return numeric_timestamp(item.get("last_source_runtime_budget_skipped_at"))
+
+
 def latest_slskd_result_signature_at(item):
     latest = max(
         numeric_timestamp((item or {}).get("last_slskd_at")),
         numeric_timestamp((item or {}).get("autopilot_slskd_attempted_at")),
+        # A selected-but-not-served turn ages the group exactly like a served
+        # one. Without this the group re-presents at the front of the lane on
+        # every pass and the tail of the library is never reached.
+        slskd_service_skipped_at(item),
     )
     for attempt in (item or {}).get("attempts") or []:
         if not isinstance(attempt, dict):
@@ -6400,6 +6590,12 @@ def latest_slskd_result_signature_at(item):
 def slskd_source_result_reprobe_due(item, now=None):
     """Rotate stale automatic zero-result signatures back through SLSKD."""
     if not isinstance(item, dict):
+        return False
+    # The user's decision is checked FIRST and on its own name. Everything below
+    # this line reasons about our search history with the row, and a removed
+    # series must be refused for a reason that does not change when that history
+    # does -- see series_removed_by_user().
+    if series_removed_by_user(item):
         return False
     if item.get("state") in ACTIVE_QUEUE_STATES | TERMINAL_QUEUE_STATES | {"needs_you"}:
         return False
@@ -8281,11 +8477,12 @@ def import_status_index(queue, *, deadline=None):
     return index
 
 
-def merge_current_queue(queue, current):
+def merge_current_queue(queue, current, *, file_evidence=None):
     now = time.time()
     items = queue.setdefault("items", {})
     created = 0
     verified = 0
+    verify_refused = 0
     for key, entry in current.items():
         item = items.get(key)
         alternate_keys = entry.get("alternate_keys") if isinstance(entry.get("alternate_keys"), list) else []
@@ -8357,6 +8554,24 @@ def merge_current_queue(queue, current):
         if item.get("state") in {"", None}:
             item["state"] = "queued"
 
+    # Resolve evidence ONCE, and only for the units this pass could verify --
+    # not per row, and not for the whole queue. `file_evidence` is injectable so
+    # a test can drive both arms without a database or a filesystem.
+    verify_candidates = [
+        key
+        for key, item in items.items()
+        if key not in current
+        and isinstance(item, dict)
+        and item.get("state") != "verified"
+        and not wrong_language_quarantine_active(item)
+    ]
+    if file_evidence is None:
+        evidence_ids = queue_ids_with_file_evidence(verify_candidates)
+    elif callable(file_evidence):
+        evidence_ids = set(file_evidence(verify_candidates))
+    else:
+        evidence_ids = set(file_evidence)
+
     for key, item in items.items():
         if key in current:
             continue
@@ -8372,12 +8587,33 @@ def merge_current_queue(queue, current):
             item["last_event"] = "wrong-language source quarantined; waiting for library rescan"
             continue
         if item.get("state") != "verified":
+            # ABSENCE FROM THE WATCH LIST IS NOT PROOF OF IMPORT. This branch
+            # used to write `verified` purely because the series watcher
+            # stopped reporting the unit as missing, with no handle on the
+            # database and nothing to point at. A unit can leave that list for
+            # reasons that have nothing to do with a file arriving -- the
+            # series record changed, the provider's view of it moved, the
+            # watcher itself failed -- and once the row reads `verified` it
+            # stops being searched, so the mistake is silent AND terminal.
+            # The signal is right more often than it is wrong, so it is
+            # honoured where a file can be produced and refused where one
+            # cannot; discarding it entirely would be its own regression.
+            if key not in evidence_ids:
+                item["present_in_watch"] = False
+                item["last_event"] = (
+                    "watched series stopped reporting this as missing, but no imported file "
+                    "was found for it -- left searchable"
+                )
+                item["verify_refused_at"] = now
+                item["verify_refused_at_iso"] = now_iso(now)
+                verify_refused += 1
+                continue
             item["state"] = "verified"
             item["completed_at"] = now
             item["completed_at_iso"] = now_iso(now)
             item["last_event"] = "no longer missing in watched series"
             verified += 1
-    if created or verified:
+    if created or verified or verify_refused:
         queue.setdefault("history", []).append(
             {
                 "ts": now,
@@ -8385,10 +8621,20 @@ def merge_current_queue(queue, current):
                 "event": "reconcile",
                 "created": created,
                 "verified": verified,
+                # Countable on purpose. A refusal that leaves no trace is
+                # indistinguishable from the watcher simply having nothing to
+                # say, and the whole point is to be able to see how often the
+                # watch-list signal is unsupported.
+                "verify_refused": verify_refused,
                 "current_missing": len(current),
             }
         )
-    return {"created": created, "verified": verified, "current_missing": len(current)}
+    return {
+        "created": created,
+        "verified": verified,
+        "verify_refused": verify_refused,
+        "current_missing": len(current),
+    }
 
 
 def newest_review(rows):
@@ -12758,6 +13004,24 @@ def run_slskd(
             limited_timeout,
             deadline,
         )
+    if effective_probe_budget <= 0:
+        # No window left that can hold one query. Launching anyway spends the
+        # pass slot, asks slskd a question it will answer, and then kills the
+        # probe before it can read the reply. Skip, and say so -- an unrecorded
+        # skip here would be the same blind spot the reservation path had.
+        log(
+            "slskd_probe_window_too_small",
+            series=series,
+            requested_probe_budget=requested_probe_budget,
+            limited_timeout=limited_timeout,
+            available_seconds=int(
+                max(0.0, float(limited_timeout or 0))
+                - RUNTIME_CHILD_CLEANUP_SECONDS
+                - SLSKD_HANDOFF_RESERVE_SECONDS
+            ),
+            minimum_viable_seconds=SLSKD_MIN_VIABLE_PROBE_BUDGET_SECONDS,
+        )
+        return {}
     try:
         lock_wait_seconds = max(
             0,
@@ -12926,8 +13190,29 @@ def slskd_source_timeout_seconds(args, *, max_total=None, max_queries=None, prob
     raw_query_ceiling = effective_total * effective_queries * (wait_seconds + 4) + 20
     # The child enforces probe_budget_seconds as a hard wall. Do not reserve a
     # theoretical all-query runtime that can exceed the parent worker window.
-    query_ceiling = min(raw_query_ceiling, max(45, effective_budget + 30))
-    timeout = max(45, effective_budget + 20, query_ceiling)
+    #
+    # But the timeout MUST carry the overhead that is about to be taken back out
+    # of it. slskd_probe_budget_for_runtime() re-derives the child's budget as
+    # `limited_timeout - RUNTIME_CHILD_CLEANUP_SECONDS - SLSKD_HANDOFF_RESERVE_SECONDS`,
+    # so these two are inverses of each other -- and this side used to add only
+    # ~30s against the other side's 85. The trip lost the difference every time,
+    # with no deadline pressure at all:
+    #
+    #   asked  60 -> timeout 100 -> granted   0   (skipped entirely)
+    #   asked  90 -> timeout 130 -> granted   0
+    #   asked 120 -> timeout 160 -> granted  75
+    #
+    # So no pass could hand the probe the 60s the broad planner asks for, however
+    # much runtime it had. Live on production 2026-09-06 the parent logged
+    # limited_timeout 90 / available_seconds 5 against requested 60, and a SLSKD
+    # search needs 50 -- so every query was declined and candidates, auto-grab
+    # attempts, reservations and downloads were all zero from 2026-09-02.
+    #
+    # Derived from the constants rather than restated, so tuning either one
+    # cannot re-open the gap.
+    budget_overhead = RUNTIME_CHILD_CLEANUP_SECONDS + SLSKD_HANDOFF_RESERVE_SECONDS
+    query_ceiling = min(raw_query_ceiling, max(45, effective_budget + budget_overhead))
+    timeout = max(45, effective_budget + budget_overhead, query_ceiling)
     return min(timeout + 10, 960)
 
 

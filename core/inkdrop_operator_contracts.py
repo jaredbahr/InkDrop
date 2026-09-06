@@ -90,6 +90,36 @@ HUMAN_REASON_ACTIONS = {
 }
 
 
+# Reason codes that mean "we looked and found nothing safe". These are NOT a
+# decision anyone can make: the answer is to keep searching, which InkDrop
+# already does. Surfacing them asks the user to do work the product has not
+# finished, and a queue of them buries the rows that are real.
+#
+# Measured on snapshot inkdrop-state-20260829T102706Z-0015e38302fa, over active
+# and actionable review_exceptions:
+#
+#   automation_exhausted        16 rows. All four sentence variants are
+#                               "automatic sources found only unsafe/rejected
+#                               SLSKD candidates" or "...only low-confidence
+#                               SLSKD candidates". None reports a safe candidate.
+#   repeat_bad_slskd_candidate  23 rows. "This SLSKD candidate has been rejected
+#                               every time we re-checked it over the last N
+#                               hours."
+#
+# ROUTED, NOT SUPPRESSED. The row keeps its reason, its raw_json and its place
+# in the `all` and parked filters; it carries excluded_reason="routed_to_wanted"
+# so the search behind it is still diagnosable. Only its status as a demand
+# changes.
+#
+# Matched on the CODE and never the sentence, for the reason this module states
+# below: rewording either of these would otherwise change whether a row is a
+# demand. Both codes travel in the row's own `reason` field.
+ROUTED_TO_WANTED_REASON_CODES = frozenset({
+    "automation_exhausted",
+    "repeat_bad_slskd_candidate",
+})
+
+
 def _clean(value):
     return str(value or "").strip()
 
@@ -238,8 +268,19 @@ def manual_review_contract(row):
         (provider_wait or no_candidate or source_failed or recoverable_import)
         and not declared_actionable
     )
-    eligible = bool(actions) and not automatic_only
-    safe_default = "automation_retry" if automatic_only or automation_will_retry else "leave_unresolved"
+    # A deliberate routing decision, and the one thing that DOES outrank a
+    # writer's `declared_actionable`. The declaration says "a person should see
+    # this"; these two codes are the case where the product has already decided
+    # a person cannot help, so the assertion is about the wrong question. Every
+    # other unrecognised code still reaches the operator through the fallback
+    # above, which is what RECOVERY-P1-02 added and this must not re-open.
+    routed_to_wanted = reason_code in ROUTED_TO_WANTED_REASON_CODES
+    eligible = bool(actions) and not automatic_only and not routed_to_wanted
+    safe_default = (
+        "automation_retry"
+        if automatic_only or automation_will_retry or routed_to_wanted
+        else "leave_unresolved"
+    )
     recommended_action = _clean(row.get("recommended_action") or row.get("next_action"))
     if not recommended_action:
         if eligible:
@@ -278,7 +319,14 @@ def manual_review_contract(row):
         "created_at": row.get("created_at") or now,
         "updated_at": row.get("updated_at") or now,
         "excluded_reason": None if eligible else (
-            "automatic_retry"
+            # First, so a routed row says why it is not a demand rather than
+            # reporting the generic automatic-retry exclusion it would also
+            # match. The distinction is the whole point: "InkDrop is still
+            # looking, and there is nothing here for you" is a different
+            # statement from "this retries on a timer".
+            "routed_to_wanted"
+            if routed_to_wanted
+            else "automatic_retry"
             if automation_will_retry or retry_eligible
             else ("provider_wait" if provider_wait else ("no_candidate" if no_candidate else "no_meaningful_action"))
         ),

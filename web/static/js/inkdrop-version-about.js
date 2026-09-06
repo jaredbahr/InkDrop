@@ -49,6 +49,21 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.16",
+      slug: "v0-1-16",
+      released_at: "2026-09-06",
+      title: "Soulseek downloads stopped, and the checks that refused the right book",
+      summary: "Soulseek searches were being thrown away after the answer came back, so downloads stopped. That is fixed, along with a run of checks that were refusing the right book or marking a book missing while it sat on the shelf.",
+      highlights: [
+        "Soulseek searches are no longer discarded after the answer arrives",
+        "An accented letter no longer splits the search term",
+        "A book whose folder moved is found again instead of re-marked missing every hour",
+        "A number in a filename is no longer assumed to be an issue number",
+        "Restoring a settings backup works again",
+        "The download category InkDrop sends is one it also accepts",
+      ],
+    }),
+    publicRelease({
       version: "v0.1.15",
       slug: "v0-1-15",
       released_at: "2026-08-27",
@@ -195,23 +210,6 @@
         "Search matching is more accurate, and several import problems (ordering, stuck-in-queue, duplicate imports, multi-series packs) are fixed.",
         "Security improvements: provider credentials are no longer written to persistent storage, and a script-injection issue in search-result data has been fixed.",
         "Wanted, Queue, History, Blocklist, and Manual Review now use a new page-rendering system — pagination is noticeably faster on larger libraries."
-      ]
-    }),
-    publicRelease({
-      version: "v0.1.06",
-      slug: "v0-1-06",
-      released_at: "2026-08-02",
-      title: "Notifications become a real system, and SLSKD gets smarter searches",
-      summary: "Notifications now support per-channel event triggers, series scoping, quiet hours, and delivery history. SLSKD searches use better terms and more patience, several stuck-download patterns are fixed, and provider secrets no longer leak into diagnostics.",
-      highlights: [
-        "Notifications are a real system now: per-channel event triggers, series scoping, quiet hours, delivery history, and test buttons for Discord and Pushover.",
-        "SLSKD searches no longer waste queries on literal \"cbz\"/\"cbr\" keywords or miss singular/plural title variants, and get more time before assuming a timeout.",
-        "Fixed several stuck-download patterns: repeat-reject loops, permanent single-timeout blocks, and dead-end searches that only turn up already-rejected results.",
-        "Fixed downloads that were grabbed but never finished landing in your library.",
-        "Rate-limited or temporarily unavailable sources no longer get mislabeled as failed transfers.",
-        "The \"item imported\" notification no longer repeats for the same file on every re-check.",
-        "Provider API keys and webhook tokens no longer show up in error messages or diagnostic output.",
-        "Recover Missing's tiles no longer overlap, Search All's scope is clearer, and SLSKD's default per-user transfer cap was raised."
       ]
     })
   ]);

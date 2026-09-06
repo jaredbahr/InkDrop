@@ -39,6 +39,7 @@ Deliberate properties:
 """
 
 from __future__ import annotations
+import json
 
 import os
 import time
@@ -92,6 +93,56 @@ def record_variant_outcomes(
         # exhaustion look like a barren query.
         if attempt.get("skipped"):
             continue
+        def _rejections(attempt):
+            """The per-reason counts this search already computed, or None.
+
+            The probe builds these on every search and drops them: the summary
+            carries `rejection_reasons` (top reasons with counts) and
+            `rejected_file_count`, and neither reached any table. So for a
+            search that returned peers and produced no candidates -- 332 rows,
+            21.4% of this table, across 61 series -- the reason each file was
+            refused was unrecoverable the moment the run ended.
+
+            RETURNS None WHEN THE ATTEMPT CARRIED NO SUMMARY AT ALL, which is
+            not the same as an attempt that was summarised and refused nothing.
+            A provider timeout appends an attempt with no rejection keys; that
+            row must not claim it observed zero rejections.
+
+            FILENAMES ARE DELIBERATELY NOT STORED. `rejection_samples` is
+            already stripped before this point because full remote paths reveal
+            a peer's library inventory, and that decision is not reopened here
+            -- counts and normalised reasons answer the question without it.
+            """
+            if not isinstance(attempt, dict):
+                return None
+            if "rejection_reasons" not in attempt and "rejected_file_count" not in attempt:
+                return None
+            reasons = attempt.get("rejection_reasons")
+            if not isinstance(reasons, list):
+                reasons = []
+            cleaned = []
+            for entry in reasons[:12]:
+                if not isinstance(entry, dict):
+                    continue
+                reason = str(entry.get("reason") or "").strip()[:120]
+                if not reason:
+                    continue
+                try:
+                    count = max(0, int(entry.get("count") or 0))
+                except (TypeError, ValueError):
+                    continue
+                cleaned.append({"reason": reason, "count": count})
+            try:
+                return json.dumps(
+                    {
+                        "rejected_file_count": max(0, int(attempt.get("rejected_file_count") or 0)),
+                        "reasons": cleaned,
+                    },
+                    sort_keys=True,
+                )
+            except (TypeError, ValueError):
+                return None
+
         def _int(value):
             try:
                 return max(0, int(value or 0))
@@ -114,6 +165,8 @@ def record_variant_outcomes(
                 _int(attempt.get("response_count")),
                 _int(attempt.get("candidate_count")),
                 _int(attempt.get("auto_grab_safe_count")),
+                _int(attempt.get("locked_file_count")),
+                _rejections(attempt),
                 now,
             )
         )
@@ -127,8 +180,9 @@ def record_variant_outcomes(
                 insert into query_variant_outcomes
                     (id, variant, query, provider_id, review_id, series,
                      elapsed_seconds, response_count, candidate_count,
-                     auto_grab_safe_count, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     auto_grab_safe_count, locked_file_count,
+                     rejection_reasons_json, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )

@@ -3,9 +3,11 @@
 
 The corpus (tests/fixtures/inkdrop-candidate-matching-benchmark-v1.json,
 scored by tests/inkdrop-candidate-matching-benchmark.py) is a curated,
-adversarial gold set -- 50 hand-picked hard cases, not a general accuracy
-measurement. Its score says how the matcher handles those 50 cases, not what
-fraction of real-world matches succeed.
+adversarial gold set of hand-picked hard cases, not a general accuracy
+measurement. Its score says how the matcher handles those cases, not what
+fraction of real-world matches succeed. The corpus carries its own
+`case_count`; this file deliberately does not restate it, because the number
+it used to restate went stale at 50 while the corpus grew to 89.
 
 The gate here is non-regression against
 tests/fixtures/inkdrop-candidate-matching-benchmark-baseline.json, not a
@@ -29,6 +31,22 @@ either a matcher change regressed a case the corpus pins, or the corpus grew
 a case that needs its own reviewed baseline bump. Do not "fix" it by editing
 an expected verdict, or by lowering the baseline, without deciding which one
 first.
+
+THE GATE NAMED THOSE TWO CAUSES AND COULD ONLY EVER DETECT THE FIRST.
+    A corpus that grows cases which all PASS moves no score, so score_percent
+    never had to be bumped and nothing made the baseline's `total` follow. It
+    went 50 while the corpus went to 89 -- and the stale figure then printed
+    inside the regression message itself ("below the committed baseline of
+    50/50"), which is the one sentence a developer reads to decide which of
+    the two causes they are looking at. Found 2026-08-30 re-verifying #141:
+    every behavioural clause of that row held, and the number in its own
+    failure text was 78% low.
+
+    So the second cause is now detected rather than described: the baseline's
+    `total` must equal the corpus's case count. That is a refusal, and it is
+    meant to be -- the baseline file's own note already requires a hand bump
+    in the same PR as the change that moves it, and a corpus addition is such
+    a change even when the percentage does not move.
 """
 
 import importlib.util
@@ -83,6 +101,24 @@ def main():
 
     floor = baseline["score_percent"]
     current = result["score_percent"]
+
+    # The second documented cause, now detected. Judged against the corpus the
+    # scorer actually ran, not against the corpus file's self-declared
+    # case_count, so a corpus whose header disagrees with its own cases cannot
+    # slip through by agreeing with the baseline.
+    recorded_total = baseline.get("total")
+    if not isinstance(recorded_total, int) or recorded_total != result["total"]:
+        print(
+            f"CANDIDATE_MATCHING_BENCHMARK_FAIL: the baseline records "
+            f"{recorded_total!r} case(s) but the corpus scored {result['total']}. "
+            f"The corpus changed size without a reviewed baseline bump, so every "
+            f"count this gate prints would be wrong. Set \"total\" to "
+            f"{result['total']} in {BASELINE.name} (and \"passed\" plus "
+            "\"benchmark_version\" with it) in the same PR as the corpus change. "
+            "Leave \"score_percent\" alone unless the true score actually moved -- "
+            "adding cases that all pass does not move it."
+        )
+        return 1
 
     if current < floor:
         print(

@@ -48,6 +48,7 @@ from cryptography.hazmat.primitives import hashes
 
 from core import inkdrop_runtime_config
 from core import inkdrop_auth
+from core import inkdrop_restore_quiescence
 from core import inkdrop_settings_registry
 from core import inkdrop_state
 from core import inkdrop_version
@@ -280,9 +281,71 @@ def _canonical_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
+def _json_roundtrip_stable(value):
+    """Render numbers the way a round-trip through the browser leaves them.
+
+    JavaScript has a single number type, so JSON.stringify writes Python's 72.0
+    as `72`, and re-parsing that in Python yields int 72. The settings backup
+    file is produced by exactly that path -- the export response is stringified
+    in the browser into the .json the user downloads -- so a checksum taken over
+    the float can never match the file they actually hold. Every install that
+    had saved one of the registry's `integer: False` settings (validate_value
+    stores those as floats, so 72 becomes 72.0) got "settings backup checksum
+    mismatch" on preview, for a file that was not corrupt at all. Hash the
+    round-trip-stable form so both sides agree.
+
+    Floats too large for JS to hold exactly are left alone: normalizing them
+    would not make them survive the trip either, and both sides skip them
+    identically.
+    """
+    if type(value) is float and value.is_integer() and abs(value) < 2 ** 53:
+        return int(value)
+    if isinstance(value, list):
+        return [_json_roundtrip_stable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_roundtrip_stable(item) for key, item in value.items()}
+    return value
+
+
 def _settings_checksum(document):
     payload = {key: value for key, value in dict(document or {}).items() if key != "checksum"}
-    return "sha256:" + hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(_canonical_json(_json_roundtrip_stable(payload)).encode("utf-8")).hexdigest()
+
+
+def _legacy_settings_checksum(document):
+    """The checksum as InkDrop computed it before _json_roundtrip_stable.
+
+    Backups downloaded by an older build carry a checksum hashed from the float
+    (72.0) while the file itself holds what the browser wrote (72), so no
+    recomputation over the file's own contents can reproduce it. The registry
+    records which keys are float-valued, so the original hash input can be
+    rebuilt exactly: put the float back for those keys and hash without
+    normalization. Without this, every settings backup taken before the fix
+    would stay permanently un-restorable.
+    """
+    payload = {key: value for key, value in dict(document or {}).items() if key != "checksum"}
+    settings = payload.get("settings")
+    if not isinstance(settings, dict):
+        return ""
+    rebuilt = {}
+    for key, value in settings.items():
+        schema = inkdrop_settings_registry.field_schema(str(key))
+        if schema.get("kind") == "number" and not schema.get("integer") and type(value) is int:
+            rebuilt[key] = float(value)
+        else:
+            rebuilt[key] = value
+    payload["settings"] = rebuilt
+    try:
+        return "sha256:" + hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    except ValueError:
+        return ""
+
+
+def _checksum_matches(document, supplied):
+    if hmac.compare_digest(supplied, _settings_checksum(document)):
+        return True
+    legacy = _legacy_settings_checksum(document)
+    return bool(legacy) and hmac.compare_digest(supplied, legacy)
 
 
 def _reject_duplicate_object(pairs):
@@ -668,7 +731,7 @@ def _portable_settings_plan(document, rows):
     if not str(document.get("product_version") or "").strip() or len(str(document.get("product_version"))) > 64:
         raise ValueError("settings backup product version is invalid")
     supplied_checksum = str(document.get("checksum") or "")
-    if not supplied_checksum or not hmac.compare_digest(supplied_checksum, _settings_checksum(document)):
+    if not supplied_checksum or not _checksum_matches(document, supplied_checksum):
         raise ValueError("settings backup checksum mismatch")
     settings = document.get("settings")
     if not isinstance(settings, dict) or len(settings) > PORTABLE_SETTINGS_MAX_COUNT:
@@ -1143,6 +1206,17 @@ def create_backup_archive(
                 "staging_downloads": False,
                 "reusable_credentials": False,
             },
+            # `contains` says which CATEGORIES are in; this says which actual
+            # FILES are out. A category-only answer could not tell an operator
+            # that a specific learned file was gone.
+            "omits": uncarried_state_files(
+                Path(state_db_path).parent,
+                carried_names=(
+                    Path(state_db_path).name,
+                    Path(auth_db_path).name,
+                    Path(completion_db_path).name,
+                ),
+            ),
             "source": {
                 "config_dir": path_text(config_dir),
                 "state_db_path": path_text(state_db_path),
@@ -2066,6 +2140,160 @@ def _clear_state_auth_generation(state_db_path):
         pass
 
 
+# Files whose loss actually costs something, and what it costs. Anything not
+# named here still gets LISTED -- this map only adds the "why it matters" line.
+# The distinction that matters is rebuildable vs learned: a cache costs time to
+# refill, but a learned file cannot be reconstructed from any rescan, which is
+# the same argument that put the completion ledger into the archive in #752.
+UNCARRIED_REBUILD_NOTES = {
+    "slskd-auto-grab-learning.json": (
+        "LEARNED -- nothing rebuilds this. A restored install re-downloads releases it had already ruled out."
+    ),
+    "slskd-source-probe-cache.json": "Cache. Refills over the next probe sweeps, at the cost of those sweeps.",
+    "slskd-auto-grab-audit.jsonl": "Append-only audit trail. Not reconstructible; nothing depends on it to run.",
+    "comic-series-watches.json": "Series watch state. Rebuilt only by re-adding the watches by hand.",
+    "series-autopilot-queue.json": "In-flight autopilot work. Rebuilt by the next autopilot pass.",
+    "pending-pack-imports.jsonl": "Pack imports waiting for a decision. Lost decisions must be retaken.",
+    "pack-review-state.json": "Pack review progress. Lost progress must be redone.",
+    "manual-review-actions.json": "Operator decisions recorded outside the state database.",
+    "manual-source-queue-sync-pending.json": "Pending manual-source sync work. Rebuilt by the next sync.",
+    "sab-failed-cleanup-status.json": "Cleanup bookkeeping. Rebuilt by the next cleanup pass.",
+}
+_UNCARRIED_LIST_LIMIT = 40
+_UNCARRIED_MIN_BYTES = 4096
+
+
+def uncarried_state_files(state_dir, *, carried_names=(), limit=_UNCARRIED_LIST_LIMIT):
+    """Name what this archive does NOT carry out of the state directory.
+
+    The archive holds six members. Everything else beside them is outside it,
+    and the manifest used to say nothing at all about that -- `contains` listed
+    only broad categories (media, readers, staging) and named no actual file,
+    so an operator reading a manifest could not discover that, say, the slskd
+    learning file was gone. Silently absent was the defect; this makes absence
+    a stated property of every backup.
+
+    SCANNED, not a fixed list, for the same reason the quiescence probe scans
+    the lock directory: a hand-maintained list omits each new file silently,
+    and silence is exactly the failure being fixed.
+    """
+    directory = Path(state_dir)
+    carried = {str(name) for name in carried_names}
+    # A carried database's own -wal/-shm/-journal are not a loss: they are
+    # transient SQLite sidecars of a file that IS in the archive, and the
+    # restore deletes them at the target precisely so a stale one cannot be
+    # replayed against a restored database. Listing them as "not carried"
+    # would be true and useless, and noise in this list is what makes the
+    # entries that matter easy to skip past.
+    for name in tuple(carried):
+        for suffix in ("-wal", "-shm", "-journal"):
+            carried.add(name + suffix)
+    entries = []
+    examined = 0
+    total_bytes = 0
+    try:
+        candidates = sorted(directory.iterdir())
+    except OSError:
+        candidates = []
+    for entry in candidates:
+        try:
+            if not entry.is_file():
+                continue
+            if entry.name in carried:
+                continue
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        examined += 1
+        total_bytes += size
+        if size < _UNCARRIED_MIN_BYTES and entry.name not in UNCARRIED_REBUILD_NOTES:
+            continue
+        entries.append(
+            {
+                "name": entry.name,
+                "bytes": int(size),
+                "matters": UNCARRIED_REBUILD_NOTES.get(entry.name, "Not restored by any step; no stated rebuild path."),
+            }
+        )
+    entries.sort(key=lambda row: (-row["bytes"], row["name"]))
+    listed = entries[: max(0, int(limit))]
+    return {
+        "note": (
+            "These files sit in the state directory and are NOT in this archive. "
+            "Restoring it returns the databases only; everything below stays as it is on the "
+            "target machine, or is missing entirely on a fresh one."
+        ),
+        "files_examined": examined,
+        "files_listed": len(listed),
+        # Stated so a truncated list can never read as a complete one.
+        "files_omitted_from_this_list": max(0, len(entries) - len(listed)),
+        "total_bytes_not_carried": int(total_bytes),
+        "files": listed,
+    }
+
+
+def credentials_needing_reentry(state_db_path):
+    """What the operator will have to type back in after this restore.
+
+    Credentials are stripped from the archive BY DESIGN -- that is the right
+    call and it is not changed here. What was wrong is that it was invisible:
+    a restore reported success and produced an install whose every provider was
+    silently unauthenticated, and the operator discovered which ones only by
+    watching things fail one at a time.
+
+    Read from the ARCHIVE's own state database, never from today's config, so
+    the list describes the install the operator is about to GET rather than the
+    one they currently have.
+
+    Only names, types and `secret_ref` descriptions are read. `secret_ref` says
+    WHERE a credential comes from ("InkDrop provider setting: api_key"), never
+    what it is, so this cannot become a way to read secrets out of a backup --
+    and the archive's copy is redacted regardless.
+    """
+    summary = {"providers": [], "notification_connectors": [], "count": 0, "unavailable": None}
+    try:
+        con = sqlite3.connect("file:" + Path(state_db_path).as_posix() + "?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        summary["unavailable"] = type(exc).__name__
+        return summary
+    try:
+        try:
+            rows = con.execute(
+                "select provider_type, display_name, enabled, secret_ref from provider_configs "
+                "where secret_ref is not null and trim(secret_ref) <> '' "
+                "order by provider_type, display_name"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for provider_type, display_name, enabled, secret_ref in rows:
+            summary["providers"].append(
+                {
+                    "provider_type": str(provider_type or ""),
+                    "display_name": str(display_name or ""),
+                    "enabled": bool(enabled),
+                    "credential": str(secret_ref or "").strip(),
+                }
+            )
+        try:
+            connectors = con.execute(
+                "select type, name, enabled from notification_connectors order by type, name"
+            ).fetchall()
+        except sqlite3.Error:
+            connectors = []
+        for connector_type, name, enabled in connectors:
+            summary["notification_connectors"].append(
+                {
+                    "type": str(connector_type or ""),
+                    "name": str(name or ""),
+                    "enabled": bool(enabled),
+                }
+            )
+    finally:
+        con.close()
+    summary["count"] = len(summary["providers"]) + len(summary["notification_connectors"])
+    return summary
+
+
 def restore_backup_archive(
     archive_path,
     *,
@@ -2074,6 +2302,8 @@ def restore_backup_archive(
     apply=False,
     backup_dir=None,
     preserve_current_auth=False,
+    quiescence_lock_dir=None,
+    quiescence_status_path=None,
 ):
     archive_path = Path(archive_path)
     target_config_dir = Path(target_config_dir or inkdrop_runtime_config.config_dir())
@@ -2196,6 +2426,9 @@ def restore_backup_archive(
             database_validation = {
                 "state_db": _validate_sqlite_database(preview_state, label="backup state database")
             }
+            # Computed here, while the archive's own state database is staged
+            # and before anything is committed.
+            credential_reentry = credentials_needing_reentry(preview_state)
             _check_validation_deadline(deadline, stage="state database preview staging")
             if AUTH_DB_ARCHIVE_NAME in archive_names:
                 preview_auth = _stage_archive_member(zf, AUTH_DB_ARCHIVE_NAME, preview_root, aggregate_tracker=validation_tracker)
@@ -2219,6 +2452,7 @@ def restore_backup_archive(
             "target_state_dir": path_text(target_state_dir),
             "manifest": manifest,
             "database_validation": database_validation,
+            "credentials_needing_reentry": credential_reentry,
             "path_warnings": path_warnings,
             "would_restore": {
                 "state_db": STATE_DB_ARCHIVE_NAME in archive_names,
@@ -2228,8 +2462,49 @@ def restore_backup_archive(
                 "secret_refs": SECRET_REFS_ARCHIVE_NAME in archive_names,
             },
         }
+        # Report quiescence on the PREVIEW too, not only when applying. An
+        # operator finding out that the worker is still running only after
+        # committing to a restore has already been told too late; the preview
+        # is where "you must stop the worker first" is still actionable.
+        quiescence = inkdrop_restore_quiescence.probe_restore_quiescence(
+            lock_dir=quiescence_lock_dir,
+            status_path=quiescence_status_path,
+        )
+        # The gate belongs to the LIVE install, not to the function. Restoring
+        # into a scratch directory -- a test, a drill, an inspection copy --
+        # cannot collide with a worker, because the worker is not writing to
+        # that directory. Gating it anyway made every programmatic caller
+        # subject to whatever else happened to hold a lock at the time, which
+        # is both wrong and unpredictable: `inkdrop-backup-restore-smoke`
+        # restores into a temp directory and started failing in the full suite
+        # only when a concurrent test held the autopilot lock.
+        #
+        # So the precondition is scoped to what it actually protects: a restore
+        # that replaces the databases this install is running on.
+        live_state_dir = Path(inkdrop_runtime_config.state_dir())
+        try:
+            targets_live_install = target_state_dir.resolve() == live_state_dir.resolve()
+        except OSError:
+            targets_live_install = str(target_state_dir) == str(live_state_dir)
+        quiescence["enforced"] = bool(targets_live_install)
+        quiescence["target_is_live_install"] = bool(targets_live_install)
+        if not targets_live_install:
+            quiescence["not_enforced_because"] = (
+                "this restore targets " + path_text(target_state_dir) + ", which is not the live state "
+                "directory " + path_text(live_state_dir) + " -- no worker writes there"
+            )
+        result["quiescence"] = quiescence
         if not apply:
             return result
+        # THE GATE. The concern behind SIXH-20260812-RESTORE-P0-01 is that a
+        # restore swaps the state database while a worker may be mid-cycle
+        # against it. That concern is honoured here rather than removed: this
+        # refuses while anything else is writing. It is deliberately checked on
+        # BOTH routes -- the API path used to answer 503 and the CLI path used
+        # to answer nothing at all, and it was the ungated CLI that a real
+        # disaster recovery would have run.
+        if targets_live_install and not quiescence["quiescent"]:
+            raise inkdrop_restore_quiescence.RestoreNotQuiescent(quiescence)
         target_config_dir.mkdir(parents=True, exist_ok=True)
         target_state_dir.mkdir(parents=True, exist_ok=True)
         # An apply also has to make room for _snapshot_existing_file() copying

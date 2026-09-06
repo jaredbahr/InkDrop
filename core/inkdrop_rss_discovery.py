@@ -20,6 +20,7 @@ from core import inkdrop_state
 import json
 import os
 import re
+import unicodedata
 import time
 import xml.etree.ElementTree as ET
 from core import inkdrop_safe_xml
@@ -89,8 +90,15 @@ def load_missing():
     return load_module("inkdrop_missing_acquire", MISSING_PATH)
 
 
+def accent_fold(value):
+    # NFKD then drop combining marks, and nothing more -- see the SLSKD
+    # probe's accent_fold() for why .encode("ascii", "ignore") is wrong.
+    decomposed = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def normalize(text):
-    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+    return re.sub(r"[^a-z0-9]+", " ", accent_fold(text).lower()).strip()
 
 
 def slug_key(*parts):
@@ -280,7 +288,7 @@ def save_cache(cache):
 
 
 def title_words_pattern(title):
-    words = re.findall(r"[a-z0-9]+", str(title or "").lower())
+    words = re.findall(r"[a-z0-9]+", accent_fold(title).lower())
     return r"[\W_]+".join(re.escape(word) for word in words)
 
 
@@ -332,12 +340,12 @@ def issue_number_tokens(issue_number):
 
 
 def strict_title_issue_prefix(series, aliases, issue_number, raw_title):
-    raw_tokens = re.findall(r"[a-z0-9]+", str(raw_title or "").lower())
+    raw_tokens = re.findall(r"[a-z0-9]+", accent_fold(raw_title).lower())
     wanted_numbers = issue_number_tokens(issue_number)
     if not raw_tokens or not wanted_numbers:
         return None
     for title in [series, *aliases]:
-        title_tokens = re.findall(r"[a-z0-9]+", str(title or "").lower())
+        title_tokens = re.findall(r"[a-z0-9]+", accent_fold(title).lower())
         if not title_tokens:
             continue
         starts = [0]
@@ -357,7 +365,9 @@ def strict_title_issue_prefix(series, aliases, issue_number, raw_title):
 
 
 def title_matches(series, aliases, raw_title):
-    raw = str(raw_title or "")
+    # Fold the feed entry too: a release that carries the accent must still
+    # match a pattern built from the folded wanted title.
+    raw = accent_fold(raw_title)
     for title in [series, *aliases]:
         pattern = title_words_pattern(title)
         if pattern and re.search(rf"(^|[^a-z0-9]){pattern}([^a-z0-9]|$)", raw, re.I):

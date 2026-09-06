@@ -65,8 +65,8 @@
   /* Single source of truth for desktop content width. The shell fills the
      viewport beside the sidebar -- gutters only, no centered max-width cap.
      Sonarr/Radarr run their tables edge-to-edge the same way, and the old
-     1180px cap here is what left the dead margin Jared kept seeing on the
-     redesigned pages. The `main` width rules earlier in the bundle
+     1180px cap here is what left the dead margin on the redesigned pages.
+     The `main` width rules earlier in the bundle
      (01-base-and-navigation.css, 09-activity-dock.css) still own narrow
      viewports; at >=1100px this block wins the cascade, so any width change
      belongs here, not there. */

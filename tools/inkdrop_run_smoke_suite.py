@@ -39,6 +39,12 @@ def subprocess_env():
     root = str(ROOT)
     if root not in existing.split(os.pathsep):
         resolved["PYTHONPATH"] = os.pathsep.join([root, existing]) if existing else root
+    # A suite exercises the body it was handed, on purpose: a branch under
+    # test is a diverged body by definition. tools/tracker_guard.py refuses
+    # at import to run as anything but what origin/qa ships, and would
+    # otherwise fail every test importing it from a branch. The guard's own
+    # smoke clears this variable and plants fixtures, so it is still tested.
+    resolved.setdefault("INKDROP_ALLOW_DIVERGED_TOOL", "1")
     return resolved
 
 # INKDROP_STATE_DIR and friends default to a real, persistent path
@@ -132,13 +138,33 @@ def ensure_isolated_state_env():
 
 
 def _playwright_available():
-    """True when a browser-driving test could actually run in this environment."""
+    """True when a browser-driving test could actually run in this environment.
+
+    Probes what the tests ACTUALLY use. All 30 tests gated on this requirement
+    shell out to `node web/tests/<name>.js`, and every one of those files does
+    `require("playwright")` -- the NODE package. This used to probe
+    `import playwright.sync_api`, the PYTHON package, which nothing in this
+    repository imports.
+
+    That mismatch fails in both directions, and the second is why it survived:
+
+      * Python playwright present, Node's absent -> all 30 are marked runnable
+        and die on MODULE_NOT_FOUND, a red that looks like a product bug.
+      * Node playwright present, Python's absent -> all 30 are skipped although
+        they would have passed. That is the state installing the correct
+        dependency creates, so the fix would have looked like it did nothing.
+
+    Resolution runs from the repository root because that is where the tests
+    resolve `playwright` from; `node -e` resolves relative to the working
+    directory, so probing from anywhere else answers a different question.
+    """
     try:
         probe = subprocess.run(
-            [sys.executable, "-c", "import playwright.sync_api"],
+            ["node", "-e", "require.resolve('playwright')"],
             capture_output=True,
             timeout=60,
             env=subprocess_env(),
+            cwd=str(ROOT),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -275,6 +301,123 @@ REQUIRES = {
 # inkdrop-public-docker-runtime-smoke.py is deliberately absent: it passed in
 # 16.9s while still suppressed, so it is simply a normal test again.
 NON_QUALIFYING = {
+    # --- Browser smokes, quarantined 2026-08-28 when they first ran at all.
+    # Until that day nothing installed playwright, so all 30 reported
+    # UNRUNNABLE and no browser assertion in this project had ever been
+    # checked by automation. Enabling them turned 17 green immediately.
+    # These 13 fail, and they are quarantined WITH AN EXPIRY rather than
+    # held back, because the alternative was leaving 17 working render
+    # assertions switched off to keep the board clean -- and a permanently
+    # red Full-smoke authority is a signal nobody can read, which is worse
+    # than no signal because it looks like coverage. Each still RUNS and
+    # prints its red. Expiries are staggered by what the failure means:
+    # content assertions and unclassified crashes first, harness gaps next,
+    # stale extractions and timeouts last. See tracker row #871.
+    "inkdrop-missing-recovery-browser-smoke.py": {
+        "reason": (
+            "asserts a Needs attention affordance the rendered page did not show. GENUINE CONTENT ASSERTION -- this is one of three that may be a real defect rather than harness noise, and is triaged first for that reason. UN-SUPPRESSES WHEN: the assertion passes, or the row is re-scoped after someone decides whether the affordance should be there"
+        ),
+        "owner": "web",
+        "expires": "2026-09-11",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-series-detail-react-island-browser-smoke.py": {
+        "reason": (
+            "asserts a needs_you issue must show a review state and the island did not render one. GENUINE CONTENT ASSERTION, may be a real defect. UN-SUPPRESSES WHEN: the island renders a review state for a needs_you issue, or the expectation is corrected"
+        ),
+        "owner": "web",
+        "expires": "2026-09-11",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-settings-setup-prowlarr-browser-smoke.py": {
+        "reason": (
+            "asserts the configured comics inbox appears under Paths and it was missing. GENUINE CONTENT ASSERTION, may be a real defect. UN-SUPPRESSES WHEN: the configured inbox renders under Paths, or the test is corrected to the shipped layout"
+        ),
+        "owner": "web",
+        "expires": "2026-09-11",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-settings-opds-browser-smoke.py": {
+        "reason": (
+            "dies on an unhandled promise rejection with no assertion text, so the failure is UNCLASSIFIED -- unknown is worse than slow and it is triaged ahead of the timeouts. UN-SUPPRESSES WHEN: the rejection is surfaced and the test either passes or fails with a readable cause"
+        ),
+        "owner": "web",
+        "expires": "2026-09-11",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-system-copy-value-browser-smoke.py": {
+        "reason": (
+            "dies on an unhandled promise rejection with no assertion text, so the failure is UNCLASSIFIED. UN-SUPPRESSES WHEN: the rejection is surfaced and the test either passes or fails with a readable cause"
+        ),
+        "owner": "web",
+        "expires": "2026-09-11",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-hidden-attribute-leak-browser-smoke.py": {
+        "reason": (
+            "ERR_CONNECTION_REFUSED against a fixture server on port 8877 that nothing in the suite starts. HARNESS GAP, ours to fix and cheap. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
+        ),
+        "owner": "web",
+        "expires": "2026-09-18",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-settings-form-responsive-browser-smoke.py": {
+        "reason": (
+            "ERR_CONNECTION_REFUSED against the same unstarted fixture server on port 8877. HARNESS GAP. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
+        ),
+        "owner": "web",
+        "expires": "2026-09-18",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-system-mobile-browser-smoke.py": {
+        "reason": (
+            "ERR_CONNECTION_REFUSED against the same unstarted fixture server on port 8877. HARNESS GAP. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
+        ),
+        "owner": "web",
+        "expires": "2026-09-18",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-mobile-sheet-focus-browser-smoke.py": {
+        "reason": (
+            "ERR_CONNECTION_REFUSED against the application on port 8796, which this test expects to be running and the suite does not start. HARNESS GAP. UN-SUPPRESSES WHEN: the test starts the app it drives, as the passing browser smokes do"
+        ),
+        "owner": "web",
+        "expires": "2026-09-18",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-activity-backend-contract-browser-smoke.py": {
+        "reason": (
+            "ReferenceError for maybeHydrateSeriesDetailEditionIndifferentAction: the test extracts a function out of core/inkdrop_web.py and evaluates it in a page, and that function now calls a helper the extraction does not carry. STALE TEST following code that moved. UN-SUPPRESSES WHEN: the extraction carries the helpers its subject calls"
+        ),
+        "owner": "web",
+        "expires": "2026-09-25",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-sampled-history-facet-browser-smoke.py": {
+        "reason": (
+            "ReferenceError for appendSectionRowCountChip, same extraction drift as the activity backend contract test. STALE TEST. UN-SUPPRESSES WHEN: the extraction carries the helpers its subject calls"
+        ),
+        "owner": "web",
+        "expires": "2026-09-25",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-series-poster-title-overflow-smoke.py": {
+        "reason": (
+            "page.waitForFunction exceeded 30s. TIMEOUT, cause unestablished; lowest triage priority because slow is better understood than unknown. UN-SUPPRESSES WHEN: the awaited condition is reached, or the wait is re-pointed at what the page actually renders"
+        ),
+        "owner": "web",
+        "expires": "2026-09-25",
+        "issue": "tracker row #871",
+    },
+    "inkdrop-settings-backup-browser-smoke.py": {
+        "reason": (
+            "page.waitForEvent for a download exceeded 30s. TIMEOUT; note the viewer sandbox never fires a download for a page-initiated save, so the expectation itself may be wrong. UN-SUPPRESSES WHEN: the download fires, or the test asserts the payload without waiting on a browser download event"
+        ),
+        "owner": "web",
+        "expires": "2026-09-25",
+        "issue": "tracker row #871",
+    },
+
     "inkdrop-slskd-failover-smoke.py": {
         "reason": (
             "times out at exactly the 420s per-test ceiling on GitHub Actions "
@@ -283,7 +426,7 @@ NON_QUALIFYING = {
         ),
         "owner": "acquisition",
         "expires": "2026-09-15",
-        "issue": "https://github.com/jaredbahr/inkdrop-dev/issues/413",
+        "issue": "https://github.com/jaredbahr/InkDrop/issues/413",
     },
     # Wiring these three up is what proved they had been dead for weeks. Each
     # needs a judgement this wiring pass deliberately did not make, so each runs

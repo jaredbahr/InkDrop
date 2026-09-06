@@ -85,6 +85,12 @@ COPY core/ ./core/
 COPY web/templates/ ./web/templates/
 COPY docs/inkdrop-source-candidate-catalog-20260702.json ./docs/inkdrop-source-candidate-catalog-20260702.json
 COPY tools/inkdrop_install_support_summary.py ./tools/inkdrop_install_support_summary.py
+COPY tools/inkdrop_retire_wants.py ./tools/inkdrop_retire_wants.py
+# The clear tool has to run where the completion DB is, which is inside this
+# image. Shipped without this line it existed on qa and could not be executed
+# anywhere the data lives -- the same 'not shipped in any sense that matters'
+# failure it was written to fix, one level up. See tracker #956.
+COPY tools/inkdrop_clear_known_bad_content.py ./tools/inkdrop_clear_known_bad_content.py
 COPY \
     scripts/inkdrop-completion-identity-audit-diff-alert.sh \
     scripts/inkdrop-completion-identity-audit-diff-check.sh \

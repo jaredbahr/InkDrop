@@ -1,6 +1,6 @@
 // Isolated smoke test for settingsProviderGroup()'s handling of the "notifications"
-// provider, which must group under "Connect" next to Kavita/Komga -- Jared explicitly
-// asked for the Discord/Pushover card to sit there, not under General, since it's an
+// provider, which must group under "Connect" next to Kavita/Komga. The
+// Discord/Pushover card belongs there rather than under General, since it is an
 // outbound integration a user configures alongside the other reader/frontend adapters.
 //
 // This id has its own entry in settingsProviderGroup()'s providerGroups lookup table

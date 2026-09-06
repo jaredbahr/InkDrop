@@ -1677,6 +1677,7 @@ def detected_row_from_path(probe, item, root, path, *, record=None, source="slsk
         "score": int(details.get("score") or 0),
         "match_reasons": list(details.get("reasons") or []),
         "match_penalties": list(details.get("penalties") or []),
+        "match_unit_evidence": bool(details.get("unit_evidence")),
         "match_basis": details.get("match_basis") or "filename",
         "match_text": details.get("match_text") or path.name,
         "targeted_waiting_match": True,
@@ -2912,7 +2913,24 @@ def stored_identity_verdict_is_stale(probe, record, detected, known_bad):
     reason = str(known_bad.get("reason") or "").strip()
     if reason in IDENTITY_VERDICT_REDERIVE_EXCLUDED_REASONS:
         return False
-    queue_id = str((record or {}).get("queue_key") or "").strip()
+    # `queue_key` first, then the field the records actually carry. Measured on
+    # the live actions file 2026-08-29: 0 of 20 `manual_source_waiting` records
+    # and 0 of 1,430 per-candidate refusal rows carry `queue_key`, while
+    # `autopilot_queue_key` is on 20/20 and 1,392/1,430 and resolves to a real
+    # `queue_items.id` every time. One absent field wired this whole
+    # re-derivation to a constant False: run over all 1,430 stored refusals it
+    # returned "not stale" 1,430 times, and 249 with the key supplied.
+    #
+    # Deliberately NOT widened past these two. `legacy_key` is on 1,391 of 1,430
+    # and is a different id space -- it resolves to a queue row 0 times.
+    # `queue_identity` is a SERIES id ("comicvine:44070"). Reading either would
+    # fire on nearly every record and look up the wrong row, which is worse than
+    # the constant False it replaced.
+    queue_id = str(
+        (record or {}).get("queue_key")
+        or (record or {}).get("autopilot_queue_key")
+        or ""
+    ).strip()
     if not queue_id:
         return False
     checker = getattr(probe, "candidate_identity_compatibility", None)
@@ -4154,7 +4172,16 @@ def auto_import_quality(row, source, item=None, probe_module=None):
         score = 0
     reasons = [str(value) for value in ((row or {}).get("match_reasons") or []) if value]
     penalties = [str(value) for value in ((row or {}).get("match_penalties") or []) if value]
-    has_issue_evidence = any(
+    # The matcher's own verdict first, prose only as a fallback. Reading the
+    # reason sentences was a substring contract between two functions, and it
+    # broke the moment a branch emitted a phrase this list did not know:
+    # "volume artifact token 12" for a wanted volume 12 read as no unit evidence
+    # at all, after the file had already transferred. Rows built by callers that
+    # do not carry the flag (inkdrop_web builds one by hand) still get the scan.
+    has_issue_evidence = bool(
+        (row or {}).get("match_unit_evidence")
+        or (row or {}).get("unit_evidence")
+    ) or any(
         "issue/part token" in value
         or "issue range" in value
         or "book/volume token" in value

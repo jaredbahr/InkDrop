@@ -29,7 +29,12 @@ InkDrop checks those details before a file reaches your library.
 - Rejects broken archives and holds imports when it cannot establish a safe match.
 - Renames and organizes files with consistent folders and filenames.
 - Provides manual search when you want to choose a release yourself.
-- Can ask Kavita to scan the library after an import.
+- Can ask Kavita or Komga to scan the library after an import.
+- Adopts a library you already have. Point it at a folder and it registers
+  what you own, without downloading or moving anything.
+- Serves an OPDS 1.2 catalog, so reader apps can browse and download from
+  your library directly.
+- Shows a weekly pull list of what is due.
 
 ## What you need
 
@@ -37,7 +42,7 @@ InkDrop checks those details before a file reaches your library.
 - A comics folder, a manga folder, or both
 - At least one supported download source if you want automatic acquisition
 
-A ComicVine API key is optional because InkDrop can use local metadata. Prowlarr, slskd, qBittorrent, SABnzbd, Suwayomi, and Kavita are optional too. Use only the services that fit your setup.
+A ComicVine API key is optional because InkDrop can use local metadata. Prowlarr, slskd, qBittorrent, SABnzbd, Suwayomi, Kavita, and Komga are optional too. Use only the services that fit your setup.
 
 ## Quick start
 
@@ -82,9 +87,15 @@ Open `http://your-host:8796`.
 
 The first-run setup asks you to create a login, choose your library folders, and connect the download sources you use. InkDrop keeps its database, logs, cache, and backups under `./config`. Downloads are staged under `./downloads` before they are checked and imported.
 
+The container runs as root by default, so files it creates are root-owned on the host. Set `PUID` and `PGID` to run it as your own account instead.
+
+Updating, backups, rolling back, and running as your own user are covered in [the install guide](docs/inkdrop/docker-first-install.md).
+
 ## First steps
 
-1. Open Series and add something you collect.
+If you already have comics or manga on disk, start with Settings > Media Management > Library adoption. Point it at your folder and InkDrop works out what you already own, so it does not go looking for issues sitting on your drive. Nothing is written until you review what it found.
+
+1. Open Series and add something adoption did not cover.
 2. Choose the correct metadata result.
 3. Choose whether you collect it as issues or volumes.
 4. Open Wanted to see what is missing.
@@ -124,6 +135,7 @@ Known limitations:
 - Other integrations may need more work.
 - There is no release calendar. The available metadata does not provide dependable future dates for enough titles.
 - Updates are currently manual. Pull or replace the container image when a new build is released.
+- Every release has a matching image tag, so you can pin a version instead of tracking `latest`.
 
 ## Reporting a problem
 

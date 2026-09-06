@@ -2,25 +2,69 @@
   "schema": "inkdrop.candidate-matching-benchmark",
   "schema_version": 1,
   "benchmark_id": "adversarial-candidate-matching",
-  "benchmark_version": "1.4.0",
+  "benchmark_version": "1.5.0",
   "normalization_pipelines": [
     "direct",
     "prowlarr",
     "mangadex"
   ],
   "matcher_contract_version": 2,
-  "case_count": 89,
+  "case_count": 91,
   "cases": [
     {
-      "id": "pack-001-issue-range-is-not-one-issue",
+      "id": "pack-001-issue-range-proves-the-member",
       "category": "ambiguous_multi_unit_packs",
-      "description": "An issues 1-6 pack cannot satisfy wanted issue 3 without member proof.",
+      "description": "An issues 001-006 pack whose title names the range PROVES it holds wanted issue 3 (tracker #209, ruling 2026-08-15; PR #655). Re-pinned from blocked at 1.5.0: the 1.4.0 gold said 'without member proof', which was the pre-ruling policy.",
       "wanted": {
         "series": "Saga",
         "series_title": "Saga",
         "media_type": "comic",
         "unit_type": "issue",
         "issue_number": "3"
+      },
+      "candidate": {
+        "title": "Saga Issues 001-006 Digital Pack.cbz",
+        "filename": "Saga Issues 001-006 Digital Pack.cbz",
+        "pack": true,
+        "match_confidence": "title_match"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "pack-011-issue-range-does-not-hold-the-unit",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "The same issues 001-006 pack cannot satisfy wanted issue 9: the declared range does not contain it. Negative control for pack-001.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "9"
+      },
+      "candidate": {
+        "title": "Saga Issues 001-006 Digital Pack.cbz",
+        "filename": "Saga Issues 001-006 Digital Pack.cbz",
+        "pack": true,
+        "match_confidence": "title_match"
+      },
+      "expected": {
+        "status": "blocked",
+        "code": "coverage_not_unit_number"
+      }
+    },
+    {
+      "id": "pack-012-issue-range-is-not-a-volume-range",
+      "category": "ambiguous_multi_unit_packs",
+      "description": "An issues-labeled range says nothing about wanted VOLUME 3; a range proves membership only in the unit it names. Negative control for pack-001.",
+      "wanted": {
+        "series": "Saga",
+        "series_title": "Saga",
+        "media_type": "comic",
+        "unit_type": "volume",
+        "volume_number": "3"
       },
       "candidate": {
         "title": "Saga Issues 001-006 Digital Pack.cbz",

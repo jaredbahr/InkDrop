@@ -871,7 +871,9 @@ def convert_page_directory(
     # inkdrop_completed_import's repacker asks the same function. Two private
     # opinions about whether an archive is sound is what lets a book with
     # undecodable pages into a library.
-    soundness = inkdrop_artifact_acceptance.archive_output_refusal(tmp_dest)
+    # Same as repack_cbr_to_cbz(): the name ends .tmp, so say what it is.
+    soundness = inkdrop_artifact_acceptance.archive_output_refusal(
+        tmp_dest, assume_suffix=".cbz")
     if soundness is not None:
         tmp_dest.unlink(missing_ok=True)
         return {**result, "reason": soundness["reason"], "detail": soundness.get("detail"),

@@ -21232,8 +21232,8 @@ button.missing-recovery-metric:focus-visible {
   /* Single source of truth for desktop content width. The shell fills the
      viewport beside the sidebar -- gutters only, no centered max-width cap.
      Sonarr/Radarr run their tables edge-to-edge the same way, and the old
-     1180px cap here is what left the dead margin Jared kept seeing on the
-     redesigned pages. The `main` width rules earlier in the bundle
+     1180px cap here is what left the dead margin on the redesigned pages.
+     The `main` width rules earlier in the bundle
      (01-base-and-navigation.css, 09-activity-dock.css) still own narrow
      viewports; at >=1100px this block wins the cascade, so any width change
      belongs here, not there. */
@@ -22669,7 +22669,15 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
 .inkdrop-series-alpha-rail {
   display: grid;
   grid-auto-rows: max-content;
-  align-content: start;
+  /* The rail already fills the pane -- the layout stretches it -- but the
+     letters were packed at the top, so on a 1000px window 27 letters ended at
+     485px and left 295px of empty rail beneath them. `space-between` spends
+     that space between the letters instead, so the first sits at the top edge
+     and the last at the bottom edge, which is what a jump rail is for: the
+     letter you want is where its share of the library is. When the letters do
+     NOT fit there is no free space to distribute, so this degrades to `start`
+     and the rail scrolls itself exactly as before. */
+  align-content: space-between;
   gap: 1px;
   justify-items: center;
   /* Sits inside the pane's height now, so a 26-letter rail can never be what

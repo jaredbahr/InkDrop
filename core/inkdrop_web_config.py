@@ -220,6 +220,16 @@ def read_slskd_config_text():
             continue
     return ""
 SERIES_QUEUE_RUNNER_STATUS_FILE = STATE_DIR / "series-queue-runner-status.json"
+# Which thread is burning the CPU, readable without credentials. The web
+# process names its threads, but Python does not propagate those names to
+# /proc/<pid>/task/*/comm (checked on the deployed 3.12.13), and
+# /api/inkdrop-debug/background-threads is behind the auth gate -- correctly,
+# but it means the only reader of those names needs an API key that is stored
+# as a one-way digest and shown once at creation. A diagnostic that requires
+# an operator to mint and hold a credential is a diagnostic nobody runs. This
+# file carries the same roster to the host filesystem, where every other
+# figure in the 2026-08-28 CPU investigation came from.
+WEB_THREAD_ROSTER_FILE = STATE_DIR / "web-thread-roster.json"
 MANAGED_LIBRARY_AUDIT_LAST_FILE = STATE_DIR / "managed-library-audit-last.json"
 SERIES_QUEUE_RUNNER_LOG = LOG_DIR / "series-queue-runner.log"
 SERIES_QUEUE_RUNNER_IMPORT_LOG = LOG_DIR / "series-queue-runner-import.log"
@@ -996,6 +1006,7 @@ __all__ = [
     "WEB_RUNTIME_STARTED_AT",
     "WEB_SOCKET_TIMEOUT_SECONDS",
     "WEB_STACK_DUMP_SIGNAL_INSTALLED",
+    "WEB_THREAD_ROSTER_FILE",
     "attach_web_runtime_status",
     "env_bool",
     "env_value",

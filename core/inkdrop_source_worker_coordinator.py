@@ -337,6 +337,11 @@ def _volume_number_from_queue_text(queue, raw):
     return ""
 
 
+# Per-series, and never part of the item a matcher sees: wanted_item_from_queue()
+# turns it into one boolean and removes it.
+SHARED_ISSUE_TITLES_KEY = "series_shared_issue_titles"
+
+
 def _singleton_issue_context(db_path, series_id, *, now=None, con=None):
     series_id = str(series_id or "").strip()
     if not db_path or not series_id:
@@ -379,6 +384,12 @@ def singleton_issue_contexts_by_series_id(db_path, series_ids, *, now=None, con=
                     (*series_ids, normalized_one),
                 ).fetchall()
             }
+            shared_title_rows = lookup_con.execute(
+                "select series_id, lower(trim(title)) shared_title from issues "
+                f"where series_id in ({placeholders}) and trim(coalesce(title,''))<>'' "
+                "group by series_id, lower(trim(title)) having count(*)>1",
+                series_ids,
+            ).fetchall()
             collected_wanted_rows = lookup_con.execute(
                 "select wi.series_id as wanted_series_id, wi.id wanted_row_id, wi.issue_id, i.title, i.issue_number, i.normalized_number, "
                 "i.metadata_provider, i.metadata_id "
@@ -395,6 +406,16 @@ def singleton_issue_contexts_by_series_id(db_path, series_ids, *, now=None, con=
     collected_by_series = {}
     for row in collected_wanted_rows:
         collected_by_series.setdefault(str(row["wanted_series_id"] or "").strip(), []).append(row)
+    # Issue titles this series carries on more than one unit. An arc name spans
+    # its issues ("Book One: The Flight of the Prince" is Wynd 1 through 5), and
+    # target_context() must not read a book number off one. Carried per series
+    # so the batched callers pay for it once; wanted_item_from_queue() reduces
+    # it to a single boolean and drops the list before the item is returned.
+    shared_titles_by_series = {series_id: set() for series_id in series_ids}
+    for row in shared_title_rows:
+        shared_titles_by_series.setdefault(str(row["series_id"] or "").strip(), set()).add(
+            str(row["shared_title"] or "")
+        )
     out = {}
     for series_id in series_ids:
         out[series_id] = _singleton_issue_context_from_rows(
@@ -406,6 +427,7 @@ def singleton_issue_contexts_by_series_id(db_path, series_ids, *, now=None, con=
             now=now,
             normalized_one=normalized_one,
         )
+        out[series_id][SHARED_ISSUE_TITLES_KEY] = sorted(shared_titles_by_series.get(series_id) or ())
     return out
 
 
@@ -667,6 +689,16 @@ def wanted_item_from_queue(queue, db_path=None, *, con=None, singleton_context=N
         wanted.update(_dict(singleton_context))
     else:
         wanted.update(_singleton_issue_context(db_path, wanted.get("series_id"), con=con))
+    # Reduce the per-series census to this row's own answer, and take the list
+    # back out -- it is producer bookkeeping, not part of the wanted item. An
+    # absent census means "not computed", and target_context() then behaves
+    # exactly as it did before, so a caller with no database is unaffected.
+    shared_titles = wanted.pop(SHARED_ISSUE_TITLES_KEY, None)
+    if isinstance(shared_titles, (list, tuple, set)):
+        row_issue_title = str(queue.get("issue_title") or "").strip().lower()
+        wanted["issue_title_shared_by_sibling_units"] = bool(
+            row_issue_title and row_issue_title in {str(value or "") for value in shared_titles}
+        )
     # Tracker #296. This is the one producer on the acquisition path that holds
     # a db_path; everything downstream is pure (candidate, item) functions with
     # no database in scope. Read the stored settings here and carry them, so an

@@ -67,6 +67,173 @@ INKDROP_STATE_DB = STATE_DIR / "inkdrop-state.sqlite3"
 INKDROP_STATE_MODULE_PATH = Path(__file__).with_name("inkdrop_state.py")
 
 COMIC_CLIENT_CATEGORIES = {"comics", "manga", "mylar", "kapowarr"}
+# InkDrop's OWN handoff categories, which this list did not contain.
+#
+# `inkdrop_source_providers.py` defaults a handoff's download_category to the
+# literal "inkdrop" when the provider policy names none, and mints
+# "inkdrop-direct", "inkdrop-auto-inspect", "inkdrop-external-tool" and
+# "inkdrop-page-pack" elsewhere. The four names above are the categories a
+# HUMAN might configure; none of them is what InkDrop actually sends by
+# default, so the poll below refused roughly half of InkDrop's own downloads.
+#
+# Measured on snapshot inkdrop-state-20260830T222707Z-b8d6096d5615
+# (as_of 2026-08-30T22:27:07Z): 617 of 1,254 SABnzbd tasks (49.2%) carried
+# category 'inkdrop'. Of the 26 snapshots that provably came from SAB's
+# history endpoint, ALL 26 were category 'comics' and ZERO were 'inkdrop', and
+# the most recent was 2026-08-13T16:58Z -- 17.2 days before as_of, across a
+# period in which hundreds of SAB jobs completed.
+#
+# The fix is deliberately NOT "add a fifth string". A hard-coded allowlist
+# reproduces this the day the category is renamed or an operator configures
+# their own, and the answer is knowable: ask what InkDrop is configured to
+# send, and recognise the namespace InkDrop mints for itself.
+INKDROP_CLIENT_CATEGORY_ROOT = "inkdrop"
+_CONFIGURED_CLIENT_CATEGORIES_CACHE = None
+
+
+def _configured_client_categories():
+    """Categories the operator has configured for InkDrop's download clients.
+
+    Read once and memoised: this is consulted per history slot, and the values
+    change only when settings do. A failure to read returns an empty set rather
+    than raising -- the static comic names and the InkDrop namespace below
+    still apply, so an unreadable settings row narrows recognition instead of
+    widening it.
+    """
+    global _CONFIGURED_CLIENT_CATEGORIES_CACHE
+    if _CONFIGURED_CLIENT_CATEGORIES_CACHE is not None:
+        return _CONFIGURED_CLIENT_CATEGORIES_CACHE
+    found = set()
+    try:
+        if INKDROP_STATE_DB.exists():
+            con = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True)
+            try:
+                exists = con.execute(
+                    "select 1 from sqlite_master where type='table' and name='provider_configs'"
+                ).fetchone()
+                if exists:
+                    for row in con.execute(
+                        "select settings_json from provider_configs"
+                        " where id in ('sabnzbd','qbittorrent','nzbget')"
+                    ):
+                        try:
+                            stored = json.loads(row[0] or "{}")
+                        except ValueError:
+                            continue
+                        if not isinstance(stored, dict):
+                            continue
+                        for key in ("comics_category", "category", "download_category"):
+                            value = str(stored.get(key) or "").strip().lower()
+                            if value:
+                                found.add(value)
+                        for value in stored.get("failure_categories") or []:
+                            value = str(value or "").strip().lower()
+                            if value:
+                                found.add(value)
+            finally:
+                con.close()
+    except (sqlite3.Error, OSError):
+        found = set()
+    _CONFIGURED_CLIENT_CATEGORIES_CACHE = found
+    return found
+
+
+def inkdrop_download_client_category_names():
+    """The concrete category names to ASK SABnzbd for, newest-first per category.
+
+    `download_client_category_accepted()` below can recognise a namespace by
+    prefix, which is right for judging a slot we already hold. A server-side
+    query cannot take a prefix -- it needs names -- so this returns the bounded,
+    deterministic list: the comic categories a human may configure, whatever the
+    stored provider settings actually name, and the categories InkDrop itself
+    mints.
+    """
+    names = set(COMIC_CLIENT_CATEGORIES)
+    names.update(_configured_client_categories())
+    names.update({
+        INKDROP_CLIENT_CATEGORY_ROOT,
+        f"{INKDROP_CLIENT_CATEGORY_ROOT}-direct",
+        f"{INKDROP_CLIENT_CATEGORY_ROOT}-auto-inspect",
+        f"{INKDROP_CLIENT_CATEGORY_ROOT}-external-tool",
+        f"{INKDROP_CLIENT_CATEGORY_ROOT}-page-pack",
+    })
+    return sorted(name for name in names if name)
+
+
+def sab_history_slots_for_inkdrop(settings, limit=200):
+    """SAB history for InkDrop's own categories, not a shared newest-N page.
+
+    A single unfiltered `mode=history&limit=N` reads whatever is newest across
+    EVERY application sharing this SABnzbd. Measured live 2026-08-31: history
+    held 680 slots of which 603 were stuck Sonarr TV jobs, the newest 200 were
+    195 tv + 5 music with ZERO comics, and the first comic sat at index 426 --
+    so every recently-completed comic was invisible. `category=comics` returned
+    66 slots against `noofslots: 66`, the entire comic population, inside the
+    same limit.
+
+    Raising the limit is not the fix. It buys time against a backlog that
+    another application grows without bound; asking for our own categories
+    removes the dependency on how much foreign work is in front of ours.
+
+    THE UNFILTERED PAGE IS STILL READ, FIRST, AND UNIONED. A filtered query
+    that comes back empty because a category is misconfigured or renamed would
+    otherwise be a silent zero -- strictly worse than the read it replaced, and
+    exactly the false-green shape this codebase keeps producing. Structured so
+    the category queries can only ADD slots, never remove one.
+    """
+    ordered = []
+    seen = set()
+
+    def take(payload):
+        block = payload.get("history") if isinstance(payload, dict) else None
+        for entry in (block or {}).get("slots") or []:
+            if not isinstance(entry, dict):
+                continue
+            key = str(
+                entry.get("nzo_id") or entry.get("nzoid") or entry.get("id")
+                or entry.get("name") or entry.get("filename") or ""
+            ).strip()
+            if not key or key in seen:
+                if key:
+                    continue
+                key = f"__anon_{len(ordered)}"
+            seen.add(key)
+            ordered.append(entry)
+
+    take(sab_api(settings, "history", limit=limit))
+    for category in inkdrop_download_client_category_names():
+        try:
+            take(sab_api(settings, "history", limit=limit, category=category))
+        except Exception:
+            # One unusable category must not cost us the categories that do
+            # work, nor the unfiltered page already collected above.
+            continue
+    return ordered
+
+
+def download_client_category_accepted(category, text=""):
+    """Is this download-client slot one of InkDrop's to reconcile?
+
+    Accepts, in order: the comic categories a human may configure; whatever the
+    stored provider settings actually name; and InkDrop's own minted namespace
+    (`inkdrop`, `inkdrop-*`). Falls back to the pre-existing text test so a
+    slot filed under someone else's category but plainly naming comics or manga
+    is still admitted, exactly as before.
+
+    Deliberately still a filter: an unrelated category whose text says nothing
+    about comics is refused. A filter that stops filtering is a different bug.
+    """
+    category = str(category or "").strip().lower()
+    if category:
+        if category in COMIC_CLIENT_CATEGORIES:
+            return True
+        if category in _configured_client_categories():
+            return True
+        root = INKDROP_CLIENT_CATEGORY_ROOT
+        if category == root or category.startswith(root + "-"):
+            return True
+    haystack = norm(text)
+    return any(word in haystack for word in ("comic", "manga"))
 QBIT_BROAD_TAGS = {"inkdrop", "kavita-acquire"}
 COMIC_LOCAL_ROOTS = [
     Path(os.environ.get("INKDROP_UNMATCHED_DOWNLOAD_ROOT") or STAGING_DIR / "downloads" / "comics"),
@@ -1972,7 +2139,26 @@ def _qbit_poll_source(cfg, *, instance_id=None, db_path=None):
             category = str(torrent.get("category") or "")
             raw_tags = str(torrent.get("tags") or "")
             tags = {part.strip().lower() for part in raw_tags.split(",") if part.strip()}
-            if category not in COMIC_CLIENT_CATEGORIES and not (tags & QBIT_BROAD_TAGS):
+            release_name = str(torrent.get("name") or "")
+            # Consistency only: this site tested the raw COMIC_CLIENT_CATEGORIES
+            # allowlist while its siblings ask the shared predicate. RECOVERS
+            # NOTHING MEASURED, and the reason is worth keeping because the
+            # figures read the other way at first glance.
+            # `inkdrop_acquire.qbit_add()` stamps QBIT_BROAD_TAG ("inkdrop") on
+            # EVERY torrent it adds, so `tags & QBIT_BROAD_TAGS` was already
+            # true for all of InkDrop's own torrents and the category arm never
+            # decided any of them. On snapshot
+            # inkdrop-state-20260831T162706Z-0c240a6e3065, of the 151
+            # qBittorrent tasks carrying category `inkdrop`, 50 hold
+            # reconcile-written keys (45 `download_client_reconciled_at`) --
+            # which only the poll writes, so the old filter demonstrably
+            # admitted them. Control: category `comics`, 165 of 981, same
+            # shape, both sides non-empty.
+            # What this newly covers is a torrent in an accepted CATEGORY whose
+            # tags were stripped, or one added outside InkDrop's add path. That
+            # shape is UNOBSERVED live rather than measured at zero: the client's
+            # reported tags are not in the snapshot.
+            if not download_client_category_accepted(category, release_name) and not (tags & QBIT_BROAD_TAGS):
                 continue
             progress = float(torrent.get("progress") or 0)
             state = str(torrent.get("state") or "")
@@ -2188,7 +2374,7 @@ def sab_items():
         for slot in queue:
             category = str(slot.get("cat") or slot.get("category") or "")
             name = slot.get("filename") or slot.get("name") or slot.get("nzb_name")
-            if category not in COMIC_CLIENT_CATEGORIES and "comic" not in norm(name):
+            if not download_client_category_accepted(category, name):
                 continue
             status = str(slot.get("status") or "").lower()
             state = "queued" if "queued" in status else "downloading"
@@ -2209,12 +2395,12 @@ def sab_items():
                     "normalized": norm(name),
                 }
             )
-        history = sab_api(settings, "history", limit=200).get("history", {}).get("slots", [])
+        history = sab_history_slots_for_inkdrop(settings, limit=200)
         for slot in history:
             category = str(slot.get("cat") or slot.get("category") or "")
             name = slot.get("name") or slot.get("filename") or slot.get("nzb_name")
             text = norm(sab_slot_text(slot))
-            if category not in COMIC_CLIENT_CATEGORIES and not any(word in text for word in ("comic", "manga")):
+            if not download_client_category_accepted(category, text):
                 continue
             status = str(slot.get("status") or "").lower()
             if "complete" in status and "fail" not in status and "error" not in status:
@@ -2759,19 +2945,12 @@ def record_pack_fanout_already_imported(con, snapshot, archive_path, row, detail
     # against the same physical archive). Refuse and leave the row for the
     # real import path, which runs the full acceptance gates.
     issue_id = str(row.get("issue_id") or "").strip()
-    if dest_path and issue_id:
-        other_identity = con.execute(
-            """
-            select 1 from import_results
-            where coalesce(verified, 0) = 1
-              and dest_path = ?
-              and coalesce(issue_id, '') not in ('', ?)
-            limit 1
-            """,
-            (dest_path, issue_id),
-        ).fetchone()
-        if other_identity:
-            return False
+    # Shared with the folder-presence backfill rather than duplicated. This
+    # module loads its own inkdrop_state instance via spec_from_file_location,
+    # so the call is qualified -- a bare name would not resolve here even
+    # though the function is defined once in the source.
+    if inkdrop_state.dest_path_claimed_by_other_issue(con, dest_path, issue_id):
+        return False
     source = "local_pack" if snapshot.get("local_pack_replay") else "download_client"
     library_visibility_required = inkdrop_state.boolish(
         inkdrop_state._app_setting_value_from_connection(

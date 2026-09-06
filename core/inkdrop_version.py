@@ -51,6 +51,36 @@ UPDATE_CONNECT_TIMEOUT_SECONDS = 2.0
 UPDATE_TOTAL_TIMEOUT_SECONDS = 5.0
 UPDATE_CACHE_MAX_CONTEXTS = 8
 DEFAULT_UPDATE_MANIFEST_URL = ""
+# WHOSE releases an update manifest may come from.
+#
+# Every rule below used to name the private development repository literally.
+# That repository answers 404 to anyone without access, so a public install
+# could not check for updates even when told exactly where to look: the
+# documented INKDROP_UPDATE_MANIFEST_URL was refused by _approved_update_url()
+# before a request was made, and a manifest published by the public repository
+# was refused again by validate_update_manifest() for its release_url. Three
+# closed doors, and the shipped software could not open any of them.
+#
+# The shipped default is therefore the repository a person running a shipped
+# build can actually open. A deployment that publishes its releases somewhere
+# else names that repository in the environment, and both are then accepted --
+# adding one, never replacing the public default, so the out-of-the-box path
+# cannot be switched off by a typo. The value is validated as an owner/name
+# pair: anything else is ignored rather than trusted, because this string is
+# interpolated into the pattern that decides which host path may be fetched.
+UPDATE_RELEASE_REPOSITORY = "jaredbahr/InkDrop"
+UPDATE_RELEASE_REPOSITORY_ENV = "INKDROP_UPDATE_RELEASE_REPOSITORY"
+UPDATE_RELEASE_REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def update_release_repositories(env=None):
+    """The accepted release repositories, public default first."""
+    source = os.environ if env is None else (env or {})
+    repositories = [UPDATE_RELEASE_REPOSITORY]
+    configured = str(source.get(UPDATE_RELEASE_REPOSITORY_ENV) or "").strip()
+    if configured and UPDATE_RELEASE_REPOSITORY_RE.fullmatch(configured) and configured not in repositories:
+        repositories.append(configured)
+    return tuple(repositories)
 UPDATE_STATES = {
     "up_to_date", "update_available", "newer_prerelease_available", "channel_mismatch",
     "unsupported_install", "update_check_unavailable", "invalid_manifest",
@@ -302,7 +332,7 @@ def update_manifest_identity(payload):
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
-def validate_update_manifest(payload, now=None, max_age_seconds=UPDATE_MANIFEST_MAX_AGE_SECONDS):
+def validate_update_manifest(payload, now=None, max_age_seconds=UPDATE_MANIFEST_MAX_AGE_SECONDS, env=None):
     if not isinstance(payload, dict):
         raise ValueError("update manifest must be an object")
     keys = set(payload)
@@ -354,7 +384,11 @@ def validate_update_manifest(payload, now=None, max_age_seconds=UPDATE_MANIFEST_
     if payload["database_migration"] and not payload["restart_required"]:
         raise ValueError("database migrations require a service restart")
     release_url = str(payload.get("release_url") or "").strip()
-    if release_url != f"https://github.com/jaredbahr/inkdrop-dev/releases/tag/v{version}":
+    accepted_release_urls = {
+        f"https://github.com/{repository}/releases/tag/v{version}"
+        for repository in update_release_repositories(env)
+    }
+    if release_url not in accepted_release_urls:
         raise ValueError("release_url must identify the exact InkDrop release")
     normalized = {
         "schema_version": UPDATE_MANIFEST_SCHEMA_VERSION,
@@ -403,13 +437,17 @@ def load_update_manifest(path, now=None, max_age_seconds=UPDATE_MANIFEST_MAX_AGE
         return None
 
 
-def _approved_update_url(value):
+def _approved_update_url(value, env=None):
     raw = str(value or "").strip()
     parsed = urllib.parse.urlsplit(raw)
     if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("update URL must be secret-free HTTPS")
     host = (parsed.hostname or "").lower()
-    if host != "github.com" or not re.fullmatch(r"/jaredbahr/inkdrop-dev/releases/(?:latest/download|download/v[0-9A-Za-z.-]+)/inkdrop-update-manifest\.json", parsed.path):
+    allowed = "|".join(re.escape(repository) for repository in update_release_repositories(env))
+    if host != "github.com" or not re.fullmatch(
+        rf"/(?:{allowed})/releases/(?:latest/download|download/v[0-9A-Za-z.-]+)/inkdrop-update-manifest\.json",
+        parsed.path,
+    ):
         raise ValueError("update URL is outside the approved InkDrop release path")
     return raw
 
@@ -516,7 +554,7 @@ def update_status(environ=None, now=None, fetcher=None, allow_remote=True):
     remote_enabled = bool(allow_remote) and bool(configured_url) and str(env.get("INKDROP_UPDATE_REMOTE_ENABLED") or "1").strip().lower() not in {"0", "false", "no", "off"}
     remote_configuration_invalid = False
     try:
-        remote_url = _approved_update_url(configured_url) if remote_enabled else ""
+        remote_url = _approved_update_url(configured_url, env) if remote_enabled else ""
     except ValueError:
         remote_url, remote_configuration_invalid = "", True
     path = Path(str(env.get("INKDROP_UPDATE_MANIFEST_PATH") or (candidate_manifest_path(env).parent / "latest-update.json")))
@@ -580,7 +618,7 @@ def update_status(environ=None, now=None, fetcher=None, allow_remote=True):
             cached_good = (_UPDATE_CACHE.get("last_good") or {}).get(context_key)
         if cached_good is not None:
             try:
-                cached_good = validate_update_manifest(cached_good, now=current_time, max_age_seconds=max_age)
+                cached_good = validate_update_manifest(cached_good, now=current_time, max_age_seconds=max_age, env=env)
             except (ValueError, TypeError):
                 cached_good = None
                 with _UPDATE_CACHE_LOCK:
@@ -598,7 +636,7 @@ def update_status(environ=None, now=None, fetcher=None, allow_remote=True):
                 manifest = cached_good or local_good
                 if manifest is not None:
                     try:
-                        manifest = validate_update_manifest(manifest, now=current_time, max_age_seconds=max_age)
+                        manifest = validate_update_manifest(manifest, now=current_time, max_age_seconds=max_age, env=env)
                     except (ValueError, TypeError):
                         manifest = None
                 source = "last_known_good" if manifest else "none"
@@ -607,7 +645,7 @@ def update_status(environ=None, now=None, fetcher=None, allow_remote=True):
                 manifest = cached_good or local_good
                 if manifest is not None:
                     try:
-                        manifest = validate_update_manifest(manifest, now=current_time, max_age_seconds=max_age)
+                        manifest = validate_update_manifest(manifest, now=current_time, max_age_seconds=max_age, env=env)
                     except (ValueError, TypeError):
                         manifest = None
                 source = "last_known_good" if manifest else "none"

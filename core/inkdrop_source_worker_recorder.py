@@ -23,6 +23,7 @@ PENDING_PACKS_LOG = inkdrop_runtime_config.pending_pack_imports_path()
 PACK_HANDOFF_CONTRACT_VERSION = 1
 PACK_COVERAGE_ROW_LIMIT = 5000
 PACK_COVERAGE_ENTRY_LIMIT = 1000
+PACK_TITLE_RANGE_COVERAGE_SOURCE = "pack_title_range"
 GIB = 1024 * 1024 * 1024
 PACK_VALUE_LARGE_THRESHOLD_BYTES = 15 * GIB
 PACK_VALUE_VERY_LARGE_THRESHOLD_BYTES = 50 * GIB
@@ -317,7 +318,24 @@ def _attempt_pack_match(attempt):
         match.get("coverage_source"),
     )
     if coverage_source not in providers.PACK_CONTENTS_SAFE_COVERAGE_SOURCES:
-        return {}
+        # A pack proven only by the range in its own title has no per-file
+        # manifest, so it is deliberately not in the manifest-only safe set --
+        # nothing downstream may iterate entries it does not have. It still has
+        # to face the pack-value policy, though: without this it skipped the
+        # bytes-per-covered-item ceiling and the large/very-large minimums
+        # entirely, which would let a 40GB archive be grabbed to satisfy one
+        # issue with nothing standing in the way.
+        range_match = _dict(candidate.get("pack_range_match")) or _dict(attempt.get("pack_range_match"))
+        range_source = _first_value(
+            attempt.get("pack_range_coverage_source"),
+            candidate.get("pack_range_coverage_source"),
+            range_match.get("coverage_source"),
+        )
+        if range_source != PACK_TITLE_RANGE_COVERAGE_SOURCE:
+            return {}
+        match = dict(range_match) if range_match else {"coverage_source": range_source}
+        match.setdefault("coverage_source", range_source)
+        return match
     if not match:
         match = {"coverage_source": coverage_source}
     match.setdefault("coverage_source", coverage_source)
@@ -463,6 +481,82 @@ def _manifest_candidate_for_queue_row(row):
         "unit_type": unit_metadata.get("unit_type"),
         "volume_number": unit_metadata.get("volume_number"),
     }
+
+
+def _range_pack_queue_coverage(db_path, queue, attempt, pack_match):
+    """Coverage for a pack proven only by the range in its own title.
+
+    The manifest version can name the series of every file it reads, so it may
+    cover queue rows across series. A range cannot: "001-040" says nothing
+    about whose issues 1 to 40 those are beyond the one series the release
+    title already agreed with. So this stays inside the triggering row's own
+    series and simply asks which of that series' still-open rows fall inside
+    the declared bounds. That is what makes the grab worth its bytes -- one
+    archive settling thirty wanted rows instead of one -- and it is also what
+    keeps InkDrop from re-fetching the issues already on the shelf, since the
+    row loader has already dropped everything satisfied or verified.
+    """
+    pack_match = _dict(pack_match)
+    start = _int_value(pack_match.get("coverage_start"), 0)
+    end = _int_value(pack_match.get("coverage_end"), 0)
+    series_id = str(_dict(queue).get("series_id") or "").strip()
+    coverage_unit = str(pack_match.get("coverage_unit") or "").strip().lower()
+    if not series_id or start < 1 or end <= start:
+        return {}
+    samples = []
+    covered_queue_ids = []
+    seen_queues = set()
+    for row in _active_pack_queue_rows(db_path):
+        queue_id = str(row.get("id") or "").strip()
+        if not queue_id or queue_id in seen_queues:
+            continue
+        if str(row.get("series_id") or "").strip() != series_id:
+            continue
+        probe = _manifest_candidate_for_queue_row(row)
+        row_unit = str(probe.get("unit_type") or "").strip().lower()
+        # A volume pack covers this series' volume rows, not its chapter rows.
+        if coverage_unit == "volume":
+            if row_unit not in {"volume", "vol", "book_volume", "manga_volume"}:
+                continue
+            number = _range_unit_number(probe.get("volume_number"))
+        else:
+            if row_unit in {"volume", "vol", "book_volume", "manga_volume"}:
+                continue
+            number = _range_unit_number(
+                _first_value(probe.get("issue_number"), probe.get("normalized_number"))
+            )
+        if number is None or not (start <= number <= end):
+            continue
+        sample = _queue_pack_sample(row, attempt, pack_match)
+        sample["presence"] = "inkdrop_wanted"
+        if row.get("wanted_status"):
+            sample["wanted_status"] = row.get("wanted_status")
+        if row.get("state"):
+            sample["queue_state"] = row.get("state")
+        samples.append(sample)
+        seen_queues.add(queue_id)
+        covered_queue_ids.append(queue_id)
+    if not samples:
+        return {}
+    series = str(_dict(queue).get("series") or pack_match.get("series_title") or "").strip()
+    return {
+        "useful_missing_sample": samples,
+        "useful_missing_count": len(samples),
+        "covered_queue_ids": covered_queue_ids,
+        "covered_series": [series] if series else [],
+        "multi_series": False,
+        "coverage_source": PACK_TITLE_RANGE_COVERAGE_SOURCE,
+    }
+
+
+def _range_unit_number(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def _manifest_pack_queue_coverage(db_path, queue, attempt, pack_match):
@@ -845,7 +939,10 @@ def _source_worker_pack_match(queue, attempt, db_path=None):
     if not pack_match:
         return {}
     pack_match = dict(pack_match)
-    coverage = _manifest_pack_queue_coverage(db_path, queue, attempt, pack_match)
+    if pack_match.get("coverage_source") == PACK_TITLE_RANGE_COVERAGE_SOURCE:
+        coverage = _range_pack_queue_coverage(db_path, queue, attempt, pack_match)
+    else:
+        coverage = _manifest_pack_queue_coverage(db_path, queue, attempt, pack_match)
     if coverage:
         pack_match.update(coverage)
     sample = pack_match.get("useful_missing_sample") if isinstance(pack_match.get("useful_missing_sample"), list) else []

@@ -91,6 +91,10 @@ REFUSAL_LABEL_TABLE = (
     (PREFIX, "related subseries title tail: ", "related_series_identity", CLASS_ADJUDICATION),
     (PREFIX, "related subseries title prefix: ", "related_series_identity", CLASS_ADJUDICATION),
     (PREFIX, "related subseries title tail after publisher imprint: ", "related_series_identity", CLASS_ADJUDICATION),
+    # The prefixed form names the bracket group that could not be explained.
+    # The bare form below it is kept because 48,768 rows already carry it and
+    # classify() maps an unrecognised label to CODE_UNMAPPED without raising.
+    (PREFIX, "related subseries or untrusted publication suffix: ", "related_series_identity", CLASS_ADJUDICATION),
     (EXACT, "related subseries or untrusted publication suffix", "related_series_identity", CLASS_ADJUDICATION),
     (EXACT, "publisher imprint is not attached to an exact numbered series title", "related_series_identity", CLASS_ADJUDICATION),
     (PREFIX, "parent folder names a different series: ", "related_series_identity", CLASS_ADJUDICATION),

@@ -223,9 +223,18 @@ def main():
     exhausted = autopilot.startup_maintenance_timeout(args(), 600, time.monotonic() - 361, share=0.6)
     require(exhausted == 0, exhausted)
     probe_budget = autopilot.slskd_probe_budget_for_runtime(300, 275, time.time() + 300)
+    # Derived, not hardcoded. This arm pins that the probe leaves the handoff
+    # reserve behind, which is the property it was written for; the SIZE of that
+    # reserve is a tuning value that moved once already (90 -> 60, after a 160s
+    # production window left the probe 45s against a 50s search floor and it
+    # declined every query). A literal here re-fails on the next tuning change
+    # without saying anything about the invariant.
+    expected_probe_budget = (
+        275 - autopilot.RUNTIME_CHILD_CLEANUP_SECONDS - autopilot.SLSKD_HANDOFF_RESERVE_SECONDS
+    )
     require(
-        probe_budget == 160,
-        f"SLSKD probe did not leave the handoff reserve: {probe_budget}",
+        probe_budget == expected_probe_budget,
+        f"SLSKD probe did not leave the handoff reserve: {probe_budget} != {expected_probe_budget}",
     )
     require(
         autopilot.slskd_probe_budget_for_runtime(300, 600, None) == 300,
@@ -762,12 +771,24 @@ def main():
                 require(boundary_payload.get("ok") is True, boundary_payload)
                 require(captured_slskd_call.get("timeout") == boundary_timeout, captured_slskd_call)
                 budget_index = captured_slskd_call["cmd"].index("--probe-budget-seconds") + 1
+                # The child gets the SMALLER of what was asked for and what the
+                # window leaves. This used to assert the leftover alone, which
+                # encoded the defect it was standing next to: the timeout was
+                # derived as roughly budget+30 while the budget was derived back
+                # out as timeout-85, so the leftover was always less than the
+                # request and "budget == leftover" held by accident. With the
+                # two functions made inverses, a 300s request against a 310s
+                # window is granted 300 -- granting 310 would hand the child
+                # more than the operator configured.
                 require(
                     captured_slskd_call["cmd"][budget_index]
                     == str(
-                        boundary_timeout
-                        - autopilot.RUNTIME_CHILD_CLEANUP_SECONDS
-                        - autopilot.SLSKD_HANDOFF_RESERVE_SECONDS
+                        min(
+                            boundary_args.slskd_probe_budget_seconds,
+                            boundary_timeout
+                            - autopilot.RUNTIME_CHILD_CLEANUP_SECONDS
+                            - autopilot.SLSKD_HANDOFF_RESERVE_SECONDS,
+                        )
                     ),
                     captured_slskd_call,
                 )

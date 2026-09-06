@@ -8,11 +8,14 @@ implementation happens to return. A score below the committed baseline (see
 rewrite the gold.
 
 **This is a curated-corpus score, not a general accuracy claim.** The corpus
-is 50 hand-picked adversarial cases chosen because they are hard, not a random
-or representative sample of real-world matching traffic. "50/50" means the
-matcher gets every one of these 50 deliberately difficult cases right today --
+is 89 hand-picked adversarial cases chosen because they are hard, not a random
+or representative sample of real-world matching traffic. "89/89" means the
+matcher gets every one of these 89 deliberately difficult cases right today --
 it does not mean matching never fails in production, and it should not be
-quoted as an overall success rate.
+quoted as an overall success rate. The corpus file carries its own
+`case_count`, and the release gate refuses if the committed baseline's `total`
+disagrees with it, so this figure cannot quietly go stale again; it did once,
+staying at 50 through three corpus versions.
 
 Run the baseline from the repository root:
 
@@ -51,7 +54,8 @@ codes use the shared matcher's real contract-v2 vocabulary.
 
 ## Score
 
-The corpus scores 50/50 today. The smoke wrapper holds it at or above the
+The corpus scores 89/89 today, at corpus version 1.4.0. The smoke wrapper
+holds it at or above the
 `score_percent` committed in
 `tests/fixtures/inkdrop-candidate-matching-benchmark-baseline.json` (currently
 100.0) rather than a hardcoded 100% -- see the non-regression gate described

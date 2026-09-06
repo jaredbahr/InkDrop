@@ -111,6 +111,13 @@ def iso() -> str:
 
 
 def load_sab_helper():
+    # The helper is homelab-specific and does not ship in the public build, so
+    # its absence is an ordinary state rather than a broken install. Say which
+    # file is missing: the two web call sites answer "SAB rescue helper
+    # missing" for the same condition, and a traceback here would be the only
+    # place that turned it into a crash.
+    if not Path(SAB_HELPER).exists():
+        raise RuntimeError(f"SAB rescue helper is not installed at {SAB_HELPER}")
     spec = importlib.util.spec_from_file_location("sab_rescue_server", SAB_HELPER)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load {SAB_HELPER}")

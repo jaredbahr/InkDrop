@@ -1305,6 +1305,8 @@ def init_schema_uncached(con):
             response_count integer not null default 0,
             candidate_count integer not null default 0,
             auto_grab_safe_count integer not null default 0,
+            locked_file_count integer not null default 0,
+            rejection_reasons_json text,
             created_at real not null
         );
         create index if not exists idx_query_variant_outcomes_variant
@@ -1674,6 +1676,30 @@ def init_schema_uncached(con):
     # it, the same as before this column existed -- see
     # trg_download_tasks_progress_at_* below for what actually maintains it.
     ensure_columns(con, "download_tasks", {"progress_at": "real"})
+    # NOT NULL with a default, unlike the additive columns above, and the
+    # difference is the whole point of the column. A NULL here would read as
+    # "no locked files" to anyone counting, which is exactly the ambiguity this
+    # records against: a search that returned only locked results and a search
+    # that returned nothing currently look identical. Rows written before this
+    # upgrade read 0, which is a claim about the WRITER, not the search -- so
+    # only rows created after it are evidence either way.
+    ensure_columns(
+        con, "query_variant_outcomes", {"locked_file_count": "integer not null default 0"}
+    )
+    # WHY THIS ONE IS NULLABLE WITH NO DEFAULT, unlike locked_file_count above.
+    # That column is `not null default 0`, so every row written before it
+    # existed reads 0 -- and 0 is also what "this search had no locked files"
+    # looks like. The comment above says so, and it cost a reading: the only
+    # honest answer to "did locked results arrive for this series" turned out
+    # to be "no row is evidence yet", because a real zero and a backfilled zero
+    # are the same byte.
+    #
+    # A text column with NO default leaves pre-migration rows NULL, so
+    # "not recorded" and "recorded, and nothing was rejected" stay different
+    # readings forever. That distinction is the whole point of storing this.
+    ensure_columns(
+        con, "query_variant_outcomes", {"rejection_reasons_json": "text"}
+    )
     history_bucket_marker = con.execute(
         "select value from schema_meta where key='history_bucket_v2_complete'"
     ).fetchone()
@@ -3626,6 +3652,109 @@ def repair_media_file_identity(con):
     }
 
 
+# THE BOUND WAS NEVER THE DEFECT -- THE ORDERING WAS.
+# This pass is the only writer that flips media_files.active back to 1, and it
+# costs one filesystem stat per row, so a cap on rows is a cap on stats and is
+# worth keeping exactly where it is. What it cannot be is a cap applied to
+# `order by import_results.created_at desc` alone.
+#
+# created_at CARRIES A DELIBERATELY HISTORICAL VALUE. sync_download_reconciliation
+# builds its `ts` from the download record's own verified_at/imported_at -- weeks
+# old on purpose, because it is correct for the ROW's updated_at even though it is
+# wrong for an audit event. Ordering a bounded window by it means rows with an old
+# stamp sort below the cut and never rise: the value does not move, so neither
+# does their position.
+#
+# MEASURED ON TWO SNAPSHOTS TWELVE HOURS APART, BEFORE THIS CHANGE. 1,293 units
+# outside the window at 2026-09-04T04:27Z and 1,302 at 16:27Z -- of which 1,293
+# were the SAME units. Zero escaped in twelve hours; nine more fell in. Of the 167
+# outside units whose media row had nothing active, 125 had their file present on
+# disk (wrongly marked missing, 17 already released by release_falsely_satisfied_unit)
+# and 42 were genuinely absent and correctly marked. That negative arm is what makes
+# it a measurement rather than a claim, and it must survive this change.
+#
+# So: spend the SAME number of stats, but give a slice of them to the rows that
+# have gone longest without one. media_files.last_seen_at is rewritten on every
+# sync (`last_seen_at=excluded.last_seen_at`), so it is a true last-checked stamp;
+# a row never synced has no media row at all, and coalescing to 0 sorts it ahead of
+# everything already looked at.
+#
+# A FIFTH OF THE BUDGET, NOT A HALF. The recency arm is what keeps a fresh import
+# visible within one pass, which is what this function was built for; the aging arm
+# only has to drain a backlog and then keep it drained. At the shipping default that
+# is 4,000 + 1,000, and the 2,528-row backlog measured above clears in three passes.
+# Raising the total instead would have cost more stats every pass forever and still
+# left the oldest rows below the cut -- a bound over an ordering that never moves
+# fails identically at any size.
+MANAGED_MEDIA_AGING_SHARE = 5
+
+_MANAGED_MEDIA_CANDIDATE_SQL = """
+    select ir.id, ir.queue_id, ir.source_attempt_id, ir.series_id, ir.issue_id,
+           ir.source_path, ir.dest_path, ir.status, ir.verified, ir.outcome,
+           ir.display_phase, ir.completion_truth, ir.folder_imported,
+           ir.library_visibility_status, ir.library_visibility_provider,
+           ir.created_at, ir.raw_json,
+           s.title as series_title, s.media_type as series_media_type,
+           i.issue_number as issue_number, i.normalized_number as normalized_number,
+           q.wanted_id as queue_wanted_id
+    from import_results ir
+    left join series s on s.id = ir.series_id
+    left join issues i on i.id = ir.issue_id
+    left join queue_items q on q.id = ir.queue_id
+    left join media_files mf on mf.import_result_id = ir.id
+    where coalesce(ir.dest_path, '') != ''
+      and (
+        coalesce(ir.verified, 0) = 1
+        or coalesce(ir.folder_imported, 0) = 1
+        or lower(coalesce(ir.completion_truth, '')) = 'folder'
+        or lower(coalesce(ir.library_visibility_status, '')) = 'library_visible'
+        or lower(coalesce(ir.status, '')) in (
+            'folder_verified', 'library_visible', 'verified',
+            'imported', 'skipped_existing', 'waiting_for_library_scan',
+            'library_scan_timeout', 'waiting_for_kavita_scan', 'kavita_scan_timeout'
+        )
+      )
+    """
+
+MANAGED_MEDIA_RECENCY_ORDER = "order by coalesce(ir.created_at, 0) desc, ir.id desc"
+MANAGED_MEDIA_AGING_ORDER = "order by coalesce(mf.last_seen_at, 0) asc, ir.id asc"
+
+
+def managed_media_sync_arm_bounds(limit):
+    """(recency, aging) row budgets. They SUM TO `limit` exactly, never above.
+
+    The naive `max(1, limit // SHARE)` returns (1, 1) at limit=1 -- two stats for
+    a budget of one, which is the one thing this change must not do. Recency wins
+    the odd row: a budget too small for both arms should behave exactly as the
+    single-arm version did, not silently stop surfacing new imports.
+    """
+    limit = max(1, int(limit or 1))
+    aging = min(max(1, limit // MANAGED_MEDIA_AGING_SHARE), limit - 1) if limit > 1 else 0
+    return limit - aging, aging
+
+
+def _managed_media_sync_candidates(con, limit):
+    """Rows for one media sync pass: newest by import, plus longest-unchecked.
+
+    At most `limit` rows. The union is de-duplicated on import_results.id, so
+    overlap between the arms LOWERS the count and can never raise it -- the
+    filesystem cost of a pass stays bounded exactly as it was when this was a
+    single `order by created_at desc limit ?`.
+    """
+    recent, aging = managed_media_sync_arm_bounds(limit)
+    selected = {}
+    for order_sql, bound in (
+        (MANAGED_MEDIA_RECENCY_ORDER, recent),
+        (MANAGED_MEDIA_AGING_ORDER, aging),
+    ):
+        for row in con.execute(
+            _MANAGED_MEDIA_CANDIDATE_SQL + order_sql + "\n    limit ?\n",
+            (bound,),
+        ).fetchall():
+            selected.setdefault(row["id"], row)
+    return list(selected.values())
+
+
 def sync_managed_media_files(con, now=None, limit=5000):
     now = float(now or time.time())
     limit = max(1, min(int(limit or 5000), 50000))
@@ -3634,37 +3763,7 @@ def sync_managed_media_files(con, now=None, limit=5000):
     if not normalized_roots:
         return {"observed": 0, "present": 0, "missing": 0, "skipped": 0}
     identity_repair = repair_media_file_identity(con)
-    rows = con.execute(
-        """
-        select ir.id, ir.queue_id, ir.source_attempt_id, ir.series_id, ir.issue_id,
-               ir.source_path, ir.dest_path, ir.status, ir.verified, ir.outcome,
-               ir.display_phase, ir.completion_truth, ir.folder_imported,
-               ir.library_visibility_status, ir.library_visibility_provider,
-               ir.created_at, ir.raw_json,
-               s.title as series_title, s.media_type as series_media_type,
-               i.issue_number as issue_number, i.normalized_number as normalized_number,
-               q.wanted_id as queue_wanted_id
-        from import_results ir
-        left join series s on s.id = ir.series_id
-        left join issues i on i.id = ir.issue_id
-        left join queue_items q on q.id = ir.queue_id
-        where coalesce(ir.dest_path, '') != ''
-          and (
-            coalesce(ir.verified, 0) = 1
-            or coalesce(ir.folder_imported, 0) = 1
-            or lower(coalesce(ir.completion_truth, '')) = 'folder'
-            or lower(coalesce(ir.library_visibility_status, '')) = 'library_visible'
-            or lower(coalesce(ir.status, '')) in (
-                'folder_verified', 'library_visible', 'verified',
-                'imported', 'skipped_existing', 'waiting_for_library_scan',
-                'library_scan_timeout', 'waiting_for_kavita_scan', 'kavita_scan_timeout'
-            )
-          )
-        order by coalesce(ir.created_at, 0) desc, ir.id desc
-        limit ?
-        """,
-        (limit,),
-    ).fetchall()
+    rows = _managed_media_sync_candidates(con, limit)
     observed = 0
     present = 0
     missing = 0
@@ -5438,6 +5537,43 @@ def upsert_series(con, row, now):
             "library_adapter_path": existing["library_adapter_path"],
         }
     row_raw = dict(row)
+
+    # PROVIDER METADATA IS NOT THE QUEUE WRITER'S TO DESTROY.
+    # series.raw_json has two writers and both arrive here: sync_watches()
+    # passes a WATCH (comicvineId, knownIssues, issueCount, deck, description)
+    # and sync_queue() passes a QUEUE ITEM (issue, issue_id,
+    # adaptive_source_order). This function stores the caller's dict wholesale,
+    # so whichever ran last used to win and the provider blob was destroyed by
+    # the next queue sync. Measured on the live database 2026-09-01: of 532
+    # series only 72 still carried a provider issue count and 27 a description,
+    # 239 rows were queue-shaped, 68 provider-shaped, and ZERO held both.
+    #
+    # These are the fields series_display_metadata_from_raw() reads, plus the
+    # provider's own issue map. A caller that says NOTHING about them keeps
+    # what is already there; a caller that supplies one still wins, so a
+    # metadata refresh is unaffected. That asymmetry is the whole rule: absence
+    # is not a statement, and it was being treated as one.
+    #
+    # This is not housekeeping. The provider's unit count is the only fact that
+    # separates a standalone graphic novel from volume one of a longer run --
+    # `Over the Garden Wall: Distillatoria` from `Saga of the Swamp Thing` --
+    # and it is fetched, stored, and then thrown away before anything reads it.
+    for key in (
+        "issueCount",
+        "issue_count",
+        "count_of_issues",
+        "description",
+        "deck",
+        "summary",
+        "overview",
+        "siteUrl",
+        "site_url",
+        "site_detail_url",
+        "knownIssues",
+    ):
+        if key not in row_raw and key in existing_raw:
+            row_raw[key] = existing_raw.get(key)
+
     row_raw["media_type_decision"] = dict(media_decision)
     if has_path_contract_values(path_contract):
         row_raw["path_contract"] = dict(path_contract)
@@ -7387,6 +7523,389 @@ def replace_series_metadata(
         }
     )
     return summary
+
+
+# ---------------------------------------------------------------- projection
+#
+# `wanted_items.status` is a PROJECTION of `queue_items.state`. Twenty-five
+# sites write it, and until 2026-08-28 not one of them constrained the row it
+# overwrote, so a queue row at `queued` -- which maps to `wanted` -- erased a
+# satisfaction that `reconcile_verified_queue_wanted_statuses()` had granted on
+# valid import evidence. The credit was then re-granted next pass and erased
+# again.
+#
+# MEASURED ON THE DEPLOYED BUILD, snapshot inkdrop-state-20260828T222706Z
+# -3e6f9267a744 (as_of 2026-08-28T22:27:06Z): `wanted_satisfied_by_verified_queue`
+# fired 277 times in 4.5 days over 47 distinct wanted rows -- one of them 101
+# times, another 49 -- and 31 of those 47 were un-satisfied again. Seventeen
+# units whose files are present and archives valid read as not satisfied,
+# thirteen of them Hunter X Hunter volumes. The observed writer is
+# cleanup_non_active_searching_queue_rows(): 55 of the 79 reverting
+# satisfactions are followed within a median 149s by its
+# `non_active_searching_queue_reconcile` event, while 94% of the 180
+# satisfactions that HELD have no queue event after them at all.
+#
+# THE RULE, AND WHY IT IS NOT "NEVER OVERWRITE SATISFIED". A blanket guard
+# reintroduces row #767: a wanted row must still be projected AWAY from
+# satisfied when its evidence does NOT stand, because a false `satisfied` is a
+# book removed from the library's future with nobody told. So the question is
+# never "is it satisfied" but "is it satisfied AND does the proof still hold",
+# and the second half is answered by the same authority that granted the credit
+# rather than by a second opinion.
+#
+# COST. The evidence check is expensive -- it stats the destination and
+# validates the archive -- so it is reached only when the row is ALREADY
+# satisfied and the projection would demote it. On the measured database that
+# is at most 1,099 queue rows in total and exactly ONE that is active, because
+# 3,593 of the queue rows under a satisfied want are themselves `verified` and
+# short-circuit before any work happens.
+
+
+def verified_import_satisfies_unit(
+    con, queue_id, series_id, issue_id, managed_roots=None
+):
+    """A verified import that may actually mark this unit satisfied.
+
+    `verified_import_for_queue(..., require_existing_destination=True)` is the
+    gate every satisfying write already used, and it CANNOT see the failure it
+    is being asked about: a mis-attributed proof is filed under the row's own
+    series_id and issue_id, so linkage passes, and its file is on disk, so
+    strict completion passes. Measured live 2026-08-30, one hour after the
+    projection guard shipped: the guard refused 8 rows at 17:15-17:16Z and every
+    one read `satisfied` again afterwards, net repair zero, because three
+    functions write `wanted_items.status='satisfied'` DIRECTLY without going
+    through the projection --
+    reconcile_verified_queue_wanted_statuses (the one that fired),
+    reconcile_duplicate_issue_number_wanted_statuses (6,938 firings all-time),
+    and reconcile_collected_edition_coverage (0 all-time).
+
+    That is #889's churn shape under a new name: a repair and an un-repair
+    racing to net zero. THE EVENT STREAM CANNOT SHOW IT, which is why it took a
+    row-level read to find -- `_record_search_history` de-duplicates on a
+    deterministic id, so the second satisfaction of the same row writes nothing
+    and the absence of a later event is not evidence that nothing happened.
+
+    One predicate, three consumers, rather than the same judgement copied into
+    each site -- which is the divergence #889's own rollout existed to remove.
+    """
+    if not verified_import_for_queue(
+        con,
+        queue_id,
+        series_id,
+        issue_id,
+        managed_roots=managed_roots,
+        require_existing_destination=True,
+    ):
+        return False
+    return not wanted_satisfaction_identity_conflict(con, series_id, issue_id)
+
+
+def wanted_satisfaction_identity_conflict(con, series_id, issue_id):
+    """True when this unit's satisfaction rests on ANOTHER unit's file.
+
+    `wanted_items.status` is projected from `queue_items.state` alone and the
+    `media_files` ledger is not an input in either direction, so a unit can read
+    `satisfied` while the only file its proof names belongs to somebody else.
+    Measured on snapshot inkdrop-state-20260830T102707Z-12d5dcc30a36: of 124
+    wanted rows reading satisfied with no active media file, 69 (55.6%) name a
+    dest_path the ledger attributes to a DIFFERENT issue_id, against 4 of 1,500
+    (0.3%) among the correctly satisfied -- 208x. 58 of the 69 cross a SERIES
+    boundary, which is the duplicate-identity population: 68 series groups hold
+    both a `mangadex:` and a non-mangadex id, the ComicVine twin volume-tracked
+    and owning the files, the MangaDex twin chapter-tracked and carrying the
+    wants. Worked example: Chainsaw Man CHAPTER 13 credited against the twin's
+    VOLUME 13 file.
+
+    THE ORDER OF THE TWO CLAUSES IS BOTH THE CORRECTNESS AND THE COST ARGUMENT.
+
+    A unit that holds its OWN active file is satisfied whatever proof it cites,
+    so it returns on one indexed read -- and that is the overwhelmingly common
+    case, 3,541 of the 3,610 rows this is asked about. Refusing on the proof
+    conflict alone would also refuse 7 of those 3,541: units whose file is on
+    disk under their own identity while the cited proof is odd. Adding this
+    clause takes the false-negative cost to 0 of 3,541 while still refusing all
+    69. Measured both ways before it was written -- it is strictly better, not
+    merely more cautious.
+
+    NOTHING IS INFERRED FROM ABSENCE. No proof, no dest_path, or no ledger row
+    for that path all mean NO conflict. Only a ledger row naming a DIFFERENT
+    issue_id refuses. Treating an unindexed path as a conflict would demote
+    every unit imported before the indexer caught up.
+    """
+    series_id = str(series_id or "").strip()
+    issue_id = str(issue_id or "").strip()
+    if not series_id or not issue_id:
+        return False
+    try:
+        own = con.execute(
+            "select 1 from media_files where series_id=? and issue_id=? and active=1 limit 1",
+            (series_id, issue_id),
+        ).fetchone()
+        if own:
+            return False
+        proof = con.execute(
+            """
+            select dest_path from import_results
+                 indexed by idx_import_results_series_issue_verified_keyset
+            where series_id=? and issue_id=? and verified=1
+            order by coalesce(created_at, 0) desc, id desc
+            limit 1
+            """,
+            (series_id, issue_id),
+        ).fetchone()
+        # Only the cited path is needed here, not a validated proof -- the
+        # demotion branch already runs the full linkage and strict-completion
+        # checks through verified_import_for_queue(). Repeating them on the
+        # promotion path would put a filesystem stat on every projection.
+        dest_path = row_value(proof, "dest_path") if proof else None
+        normalized = media_file_normalized_path(dest_path)
+        if not normalized:
+            return False
+        owner = con.execute(
+            "select issue_id from media_files where normalized_path=? limit 1",
+            (normalized,),
+        ).fetchone()
+        if not owner:
+            return False
+        return str(row_value(owner, "issue_id") or "").strip() != issue_id
+    except Exception:
+        # FAIL TOWARD THE FALSE NEGATIVE, which is the same direction
+        # wanted_satisfaction_is_evidenced() fails in even though it returns the
+        # opposite literal: there, an unreadable proof returns False and ALLOWS
+        # the demotion. Here, an unreadable ledger returns True and REFUSES the
+        # satisfaction. Both cost a re-search; the other way costs the book,
+        # because nobody goes looking for a unit the system says it already has.
+        return True
+
+
+def wanted_satisfaction_is_evidenced(con, wanted_id, *, queue_id=None):
+    """Whether this row's `satisfied` is one the import evidence still earns.
+
+    Resolves content identity from the wanted row itself rather than trusting a
+    caller to thread it through -- `verified_import_for_queue()` states that
+    canonical content identity is authoritative, and twenty-five call sites
+    each passing their own ids is twenty-five chances to pass the wrong one.
+
+    Returns False for anything not currently satisfied, so the ordinary
+    projection is unchanged and costs one indexed read.
+    """
+    row = con.execute(
+        "select status, series_id, issue_id from wanted_items where id=? limit 1",
+        (wanted_id,),
+    ).fetchone()
+    if not row:
+        return False
+    if str(row_value(row, "status") or "").strip().lower() != "satisfied":
+        return False
+    series_id = str(row_value(row, "series_id") or "").strip()
+    issue_id = str(row_value(row, "issue_id") or "").strip()
+    if not series_id or not issue_id:
+        # No content identity means no proof to consult. Guessing in the
+        # permissive direction here is how a false satisfaction survives, so
+        # the row projects normally.
+        return False
+    # A PROOF THAT NAMES ANOTHER UNIT'S FILE IS NOT EVIDENCE OF THIS ONE.
+    # verified_import_for_queue() cannot see this: the proof IS filed under this
+    # row's own series_id and issue_id, so linkage is consistent, and the file IS
+    # on disk, so strict completion passes. Without this clause the guard returns
+    # True for a false satisfaction and then actively refuses to demote it --
+    # measured live before this change, wanted_projection_refused_satisfied had
+    # fired 1,224 times, 111 of them defending 3 rows of exactly this shape.
+    if wanted_satisfaction_identity_conflict(con, series_id, issue_id):
+        return False
+    try:
+        return bool(
+            verified_import_for_queue(
+                con, queue_id, series_id, issue_id, require_existing_destination=True
+            )
+        )
+    except Exception:
+        # FAIL BACK TO THE PRE-CHANGE BEHAVIOUR, DELIBERATELY. The write this
+        # guards used to be a bare execute that could not raise; consulting the
+        # evidence can, and an exception escaping here would abort a whole
+        # maintenance pass over one row. Returning False projects the row exactly
+        # as this code did before the guard existed, so the worst case is the old
+        # defect on one row rather than a cleanup pass that stops running.
+        #
+        # This is the false-negative side of the standing trade: the row may lose
+        # a satisfaction it had earned and be re-credited next pass, which costs a
+        # re-search. The alternative -- treating an unreadable proof as valid --
+        # would hold a row satisfied on evidence nobody could read, and that costs
+        # the book.
+        return False
+
+
+def wanted_projection_status(
+    con, wanted_id, queue_state, now, *, site, force=False, queue_id=None
+):
+    """The status a queue-state projection should write onto this wanted row.
+
+    Split from the write so the one caller that UPSERTS rather than updates --
+    sync_queue, through upsert_wanted -- asks the same question the twenty-three
+    updating sites ask, instead of carrying its own half of the rule. That
+    divergence is the defect this whole change exists to remove, so introducing
+    a second copy of the judgement here would be self-defeating.
+
+    Records the refusal when it declines to demote, so the loop is countable.
+    """
+    projected = wanted_status_for_queue_state(queue_state)
+    if force:
+        return projected
+    if projected == "satisfied":
+        # THE PROMOTION BRANCH USED TO RETURN HERE WITHOUT CONSULTING ANYTHING.
+        # `wanted_satisfaction_is_evidenced()` below already knew how to ask
+        # whether the file exists, and it was reachable only on the DEMOTION
+        # path -- so the one check that could have prevented a false
+        # satisfaction was asked only in the direction that cannot prevent one.
+        #
+        # This is deliberately NOT the symmetric guard. Requiring positive
+        # evidence to promote would demote every unit whose import the ledger
+        # has not indexed yet, and on this snapshot that is a much larger
+        # population than the defect: 22 of the 124 bad rows carry no verified
+        # proof at all, and so do 8 of every 1,500 good ones. What is refused
+        # here is narrower and is a POSITIVE conflict -- the unit holds no file
+        # of its own and its newest proof names one the ledger gives to another
+        # unit. Measured: refuses 69 of the 124, and 0 of 3,541 correct rows.
+        identity = con.execute(
+            "select series_id, issue_id from wanted_items where id=? limit 1",
+            (wanted_id,),
+        ).fetchone()
+        if identity is not None and wanted_satisfaction_identity_conflict(
+            con, row_value(identity, "series_id"), row_value(identity, "issue_id")
+        ):
+            _record_search_history(
+                con,
+                event_type="wanted_projection_refused_identity_conflict",
+                entity_type="wanted_item",
+                entity_id=wanted_id,
+                series_id=row_value(identity, "series_id"),
+                issue_id=row_value(identity, "issue_id"),
+                message=(
+                    "Queue-state projection refused to satisfy a wanted row whose "
+                    "import proof names another unit's file"
+                ),
+                raw={
+                    "queue_id": queue_id,
+                    "queue_state": queue_state,
+                    "projected_status": projected,
+                    "site": site,
+                    "caller_now": now,
+                },
+                source="inkdrop_state",
+                # Stamped with when the refusal happened, not the caller's
+                # `now`: several sites pass a historical timestamp, and 22 of
+                # the first 24 events on the sibling refusal landed back-dated
+                # by up to three weeks because of exactly that.
+                now=time.time(),
+            )
+            # Take the false negative and keep searching. A wrong "you have it"
+            # costs the book silently; a wrong "still missing" costs a re-search.
+            return "wanted"
+        return projected
+    if not wanted_satisfaction_is_evidenced(con, wanted_id, queue_id=queue_id):
+        return projected
+    # RECORD THE REFUSAL. The write this replaces was silent, and that silence
+    # is why the loop ran for at least a week uncounted: the granting side
+    # logged 277 times while nothing logged the writes undoing them. An
+    # instrument that logs one direction cannot measure a cycle, so "the loop
+    # has stopped" would stay unfalsifiable.
+    identity = con.execute(
+        "select series_id, issue_id from wanted_items where id=? limit 1", (wanted_id,)
+    ).fetchone()
+    # STAMP THE EVENT WITH WHEN THE REFUSAL HAPPENED, NOT WITH THE CALLER'S
+    # `now`. Several sites pass a HISTORICAL timestamp: sync_download_reconciliation
+    # derives its `ts` from the download record's own verified_at/imported_at, so
+    # it can be weeks old, and that is correct for the row's updated_at but wrong
+    # for an audit event.
+    #
+    # MEASURED, NOT ANTICIPATED. The first deploy of this guard wrote 24 refusals
+    # in 43 minutes and 22 of them landed with created_at between 2026-08-01 and
+    # 2026-08-20 -- proven by snapshot comparison, since the event type does not
+    # exist at all in the pre-deploy snapshot. A back-dated audit event cannot
+    # answer "how many refusals in this window", which is the only question it
+    # exists to answer, and it would have made the row's own clause 3 unreadable.
+    #
+    # This is the same inherited-value defect the guard was written to expose:
+    # cleanup_non_active_searching_queue_rows labels its event with
+    # row["last_event"], the PREVIOUS event's text. Inheriting a caller's value
+    # into a record that is supposed to describe THIS action is the shape.
+    # The caller's value is kept in the payload rather than discarded.
+    _record_search_history(
+        con,
+        event_type="wanted_projection_refused_satisfied",
+        entity_type="wanted_item",
+        entity_id=wanted_id,
+        series_id=row_value(identity, "series_id") if identity else None,
+        issue_id=row_value(identity, "issue_id") if identity else None,
+        message="Queue-state projection refused to un-satisfy an evidenced wanted row",
+        raw={
+            "queue_id": queue_id,
+            "queue_state": queue_state,
+            "projected_status": projected,
+            "site": site,
+            "caller_now": now,
+        },
+        source="inkdrop_state",
+        now=time.time(),
+    )
+    return "satisfied"
+
+
+def project_wanted_status(
+    con, wanted_id, queue_state, now, *, site, force=False, queue_id=None
+):
+    """Write the queue-state projection onto a wanted row, unless it would erase
+    a satisfaction the import evidence still earns.
+
+    `force=True` is for the sites that exist to demote -- an operator asking for
+    a re-search, a proof being retracted. Those carry an authority at least as
+    good as the import record and must not be blocked; see
+    WANTED_PROJECTION_FORCED_SITES for the list and the reason each is on it.
+
+    Returns the status actually written, or None when the write was refused.
+    """
+    wanted_id = str(wanted_id or "").strip()
+    if not wanted_id:
+        return None
+    status = wanted_projection_status(
+        con, wanted_id, queue_state, now, site=site, force=force, queue_id=queue_id
+    )
+    if status == "satisfied" and wanted_status_for_queue_state(queue_state) != "satisfied":
+        return None
+    con.execute(
+        "update wanted_items set status=?, updated_at=? where id=?",
+        (status, now, wanted_id),
+    )
+    return status
+
+
+# The sites that bypass the guard, and why each one is entitled to. Every entry
+# is a place whose whole purpose is to move a row AWAY from satisfied on an
+# authority at least as good as the import record. Getting this list wrong in
+# the permissive direction costs a re-search; getting it wrong in the other
+# direction leaves a book credited to a file that is not it. Per the standing
+# bar, when those trade, take the false negative.
+WANTED_PROJECTION_FORCED_SITES = {
+    # NOT LOAD-BEARING TODAY, AND KEPT ANYWAY. mark_import_wrong retracts the
+    # proof before it projects, so the guard would find no evidence and let it
+    # through even without this entry -- removing it leaves the smoke green.
+    # Its immunity is a property of statement ORDER inside that function, not of
+    # the rule, and a reorder would silently start blocking an operator.
+    "mark_import_wrong": "the import is being declared wrong",
+    "request_wanted_search": "an operator asked for this unit to be searched again",
+    "request_series_search": "an operator asked for the series to be searched again",
+    "request_queue_retry": "an operator asked for this queue row to retry",
+    "reopen_stuck_import": "a stuck import is being deliberately reopened",
+    "cleanup_collection_single_part_verified_queue_rows":
+        "the single-part import is retracted before the ladder reopens",
+    "cleanup_wrong_unit_page_pack_import_proofs":
+        "the proof is retracted because it names the wrong unit",
+    "cleanup_contradictory_completion_provenance":
+        "the proof is retracted on contradictory provenance",
+    "cleanup_missing_folder_verified_import_proofs":
+        "the proof is retracted because the folder is gone",
+    "apply_readiness_repair": "an explicit readiness repair is being applied",
+}
 
 
 def wanted_status_for_queue_state(state):
@@ -10431,9 +10950,9 @@ def cleanup_retryable_source_candidate_searching_queue_rows(con, now, limit=500)
             (message, ts, json_dumps(raw), row["queue_id"]),
         )
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), ts, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", ts,
+                site="cleanup_retryable_source_candidate_searching_queue_rows",
             )
         refresh_queue_provider_status_columns(con, row["queue_id"])
         con.execute(
@@ -11241,9 +11760,9 @@ def record_queue_source_attempt(db_path, queue_id, attempt, attempt_id=None, sta
                 ),
             )
             if queue.get("wanted_id") and not slskd_terminal_queue_fenced:
-                con.execute(
-                    "update wanted_items set status=?, updated_at=? where id=?",
-                    (wanted_status_for_queue_state(updates["state"]), updates["updated_at"], queue.get("wanted_id")),
+                project_wanted_status(
+                    con, queue.get("wanted_id"), updates["state"], updates["updated_at"],
+                    site="record_queue_source_attempt",
                 )
             if not slskd_terminal_queue_fenced:
                 refresh_queue_provider_status_columns(con, queue["id"])
@@ -11642,6 +12161,82 @@ def _release_slskd_reservation_claims(con, queue_id, reservation_id, claim_owner
             )
 
 
+SLSKD_RESERVATION_REFUSED_EVENT = "slskd_reservation_refused"
+
+
+def _record_slskd_reservation_refusal(con, queue_id, reason, requested_at, queue=None, task=None):
+    """Persist WHICH early return refused a reservation, not merely that one did.
+
+    reserve_slskd_candidate() has ten non-success returns and, before this, two
+    left a trace: slot_request_expired writes a retirement, and the probe stamps
+    skipped_durable_queue_gate for the one arm it maps to a refusal. The rest
+    returned a reason string nothing wrote down, so when reservations stopped
+    dead on 2026-09-02T10:18:53Z the question "which return is firing" had no
+    answer in the record -- candidate_reservation_active read 0 rows in
+    1,086,243 source_attempts and 0 in 2,404,317 history_events all-time while
+    its siblings in the same statement read 76 and 34. Those controls fire, so
+    the zero said the path was unrecorded, not untaken.
+
+    The id carries the moment, and that part IS load-bearing: an
+    `insert or ignore` on a queue+reason id would upsert repeat refusals into
+    one row and turn a firing count into a floor, which is exactly the reading
+    error this record exists to prevent. Sabotaging it collapses two refusals
+    into one and the suite goes red.
+
+    Durability is NOT this function's doing, and an earlier draft of this
+    docstring claimed it was. Every caller is a read-only early exit inside
+    `begin immediate` that returns without committing, so an explicit commit
+    here looked essential -- but `connect()` is a contextmanager and the
+    with-block commits on clean exit, so the row lands either way. Removing the
+    commit left the suite green, which is the negative control refusing to
+    fire. No commit is issued here now: it bought nothing, and released the
+    write lock mid-transaction for nothing.
+    """
+    reason = str(reason or "").strip()
+    if not reason or not queue_id:
+        return
+    queue = queue if isinstance(queue, dict) else {}
+    task = task if isinstance(task, dict) else {}
+    now = safe_float(requested_at, None) or time.time()
+    payload = {
+        "reason": reason,
+        "queue_id": queue_id,
+        "queue_state": queue.get("state"),
+        "wanted_id": queue.get("wanted_id"),
+        "owner_download_task_id": task.get("id") or None,
+        "owner_queue_id": task.get("queue_id") or None,
+        "owner_status": task.get("status") or None,
+        "owner_state": task.get("state") or None,
+        "refused_at": now,
+        "refused_at_iso": utc_stamp(now),
+    }
+    try:
+        con.execute(
+            """
+            insert into history_events(
+                id, entity_type, entity_id, series_id, issue_id, event_type,
+                source, message, created_at, raw_json
+            ) values(?,?,?,?,?,?,?,?,?,?)
+            on conflict(id) do nothing
+            """,
+            (
+                stable_id(SLSKD_RESERVATION_REFUSED_EVENT, str(queue_id), reason, int(now * 1000)),
+                "queue_item",
+                str(queue_id),
+                queue.get("series_id"),
+                queue.get("issue_id"),
+                SLSKD_RESERVATION_REFUSED_EVENT,
+                "slskd",
+                f"SLSKD candidate reservation refused: {reason}",
+                now,
+                json_dumps(payload),
+            ),
+        )
+    except Exception:
+        # Instrumentation must never be the thing that fails a reservation.
+        pass
+
+
 def reserve_slskd_candidate(
     db_path, queue_id, attempt, *, requested_at=None, retry_seconds=3 * 60,
     ttl_seconds=15 * 60, claim_owner_id=None, claim_seconds=120,
@@ -11665,19 +12260,24 @@ def reserve_slskd_candidate(
             con.execute("begin immediate")
             row = con.execute("select * from queue_items where id=?", (queue_id,)).fetchone()
             if not row:
+                _record_slskd_reservation_refusal(con, queue_id, "queue_item_not_found", requested_at)
                 return {"ok": False, "reason": "queue_item_not_found", "queue_id": queue_id}
             queue = dict(row)
             state = str(queue.get("state") or "").strip().lower()
             if state == "importing":
+                _record_slskd_reservation_refusal(con, queue_id, "queue_has_active_candidate_task", requested_at, queue=queue)
                 return {"ok": True, "created": False, "reason": "queue_has_active_candidate_task", "queue_id": queue_id, "state": state}
             if not int(queue.get("active") or 0) or state in {"verified", "satisfied", "superseded_duplicate", "removed", "ignored", "inactive", "needs_you", "blocked"}:
+                _record_slskd_reservation_refusal(con, queue_id, "queue_not_retryable", requested_at, queue=queue)
                 return {"ok": False, "reason": "queue_not_retryable", "queue_id": queue_id, "state": state}
             binding = slskd_candidate_exact_unit_binding(con, queue, attempt)
             if not binding.get("ok"):
+                _record_slskd_reservation_refusal(con, queue_id, binding.get("reason"), requested_at, queue=queue)
                 return {"ok": False, "reason": binding.get("reason"), "queue_id": queue_id}
             for task, same_queue, same_candidate, same_unit in slskd_candidate_owner_rows(con, queue, candidate_identity, binding):
                 raw = download_task_raw_payload(task)
                 if slskd_verified_completion_task(task) and (same_candidate or same_unit):
+                    _record_slskd_reservation_refusal(con, queue_id, "candidate_completion_fence", requested_at, queue=queue, task=task)
                     return {"ok": True, "created": False, "reason": "candidate_completion_fence", "download_task_id": task.get("id"), "status": task.get("status"), "state": task.get("state")}
                 if not download_task_is_activeish(task):
                     continue
@@ -11688,8 +12288,10 @@ def reserve_slskd_candidate(
                         if claim_owner_id:
                             claim = _claim_queue_item_con(con, queue_id, str(claim_owner_id), "slskd_auto_grab_handoff", requested_at, requested_at + max(15, min(int(claim_seconds or 120), 900)), {"reservation_id": raw.get("reservation_id")})
                             if not claim:
+                                _record_slskd_reservation_refusal(con, queue_id, "candidate_reservation_claim_unavailable", requested_at, queue=queue, task=task)
                                 return {"ok": False, "reason": "candidate_reservation_claim_unavailable", "queue_id": queue_id}
                         con.commit()
+                        _record_slskd_reservation_refusal(con, queue_id, "candidate_reservation_active", requested_at, queue=queue, task=task)
                         return {"ok": True, "created": False, "idempotent": True, "reason": "candidate_reservation_active", "queue_id": queue_id, "source_attempt_id": task.get("source_attempt_id"), "download_task_id": task.get("id"), "reservation_id": raw.get("reservation_id"), "slot_request_id": raw.get("reservation_id"), "slot_request_created_at": raw.get("reservation_created_at"), "slot_request_retry_at": raw.get("reservation_retry_at"), "slot_request_deadline": deadline, "status": task.get("status"), "state": task.get("state"), "external_id": task.get("external_id"), "claim_owner_id": claim_owner_id if claim else None}
                     failure = "SLSKD candidate reservation expired; automatic retry scheduled"
                     raw.update({"failure_reason": failure, "retry_eligible": True, "reservation_expired_at": requested_at, "reservation_expired_at_iso": utc_stamp(requested_at)})
@@ -11706,6 +12308,7 @@ def reserve_slskd_candidate(
                     con.commit()
                     return {"ok": True, "created": False, "expired": True, "reason": "slot_request_expired", "queue_id": queue_id, "download_task_id": task.get("id"), "reservation_id": raw.get("reservation_id"), "slot_request_id": raw.get("reservation_id"), "slot_request_retry_at": retry_at, "status": "slot_request_expired", "state": "failed"}
                 reason = "sibling_exact_unit_active" if same_unit and not same_queue else "queue_has_active_candidate_task"
+                _record_slskd_reservation_refusal(con, queue_id, reason, requested_at, queue=queue, task=task)
                 return {"ok": True, "created": False, "reason": reason, "queue_id": queue_id, "download_task_id": task.get("id"), "owner_queue_id": task.get("queue_id"), "status": task.get("status"), "state": task.get("state")}
             retry_at = requested_at + retry_seconds
             deadline = requested_at + ttl_seconds
@@ -12573,6 +13176,29 @@ def _reconcile_slskd_candidate_reservations_con(con, now=None, retry_seconds=3 *
     for row in rows:
         task = dict(row)
         if not download_task_is_activeish(task):
+            # A row that is terminal by STATE while still wearing a live-looking
+            # STATUS is selected by the query above and dropped by this guard on
+            # every pass, forever -- the one sweep whose job is these rows is the
+            # one thing structurally unable to touch them. On production 102 SLSKD
+            # tasks across 66 units sat in that shape, the oldest from 2026-07-26,
+            # all carrying outcome='problem' so they had reached a retirement and
+            # kept a live status afterwards.
+            #
+            # Normalise the label to the same terminal status this sweep already
+            # writes, and stop there. Deliberately NOT done here: the queue
+            # projection and claim release below, which exist for a reservation
+            # that was still live when it expired -- replaying them against a
+            # six-week-dead row would rewrite queue state on stale evidence. Also
+            # deliberately not touched: retry_eligible. Re-opening acquisition for
+            # 66 units is a separate decision with its own blast radius, and the
+            # rows are already free to be re-reserved without it.
+            if str(task.get("state") or "").strip().lower() in DOWNLOAD_TASK_TERMINAL_STATES:
+                con.execute(
+                    "update download_tasks set status=? where id=? "
+                    "and lower(coalesce(status,'')) in ('waiting_for_slot','user_load_wait','candidate_reserved')",
+                    ("reservation_expired", task.get("id")),
+                )
+                changed += 1
             continue
         raw = download_task_raw_payload(task)
         deadline = safe_float(raw.get("reservation_deadline") or raw.get("slot_request_deadline"), 0)
@@ -14761,9 +15387,9 @@ def record_direct_import_result(
             (state, queue_current_source, message, active, now, outcome, queue_display_phase, json_dumps(queue_raw), queue["id"]),
         )
         if queue.get("wanted_id"):
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(state), now, queue.get("wanted_id")),
+            project_wanted_status(
+                con, queue.get("wanted_id"), state, now,
+                site="record_direct_import_result",
             )
         if verified or folder_completion_satisfied:
             linked_download_task_id = _import_authority_identity(
@@ -15083,9 +15709,9 @@ def patch_queue_item_state(
             ),
         )
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(next_state), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], next_state, now,
+                site="patch_queue_item_state",
             )
         message = history_message or next_event or f"Queue item {next_state}"
         history_id = stable_id(event_type, "queue_item", queue_id, int(now * 1000))
@@ -15195,9 +15821,9 @@ def cleanup_stale_download_client_searching_queue_rows(con, now=None, retry_dela
             (message, retry_after, retry_after_iso, now, json_dumps(raw), row["id"]),
         )
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", now,
+                site="cleanup_stale_download_client_searching_queue_rows",
             )
         attempt = {
             "ts": now,
@@ -19085,10 +19711,16 @@ def cleanup_collection_single_part_verified_queue_rows(con, now, limit=5000):
                 (q.state = 'verified' and coalesce(q.active, 0) = 0)
                 or (q.state = 'importing' and coalesce(q.active, 0) = 1)
               )
+              -- The other half of the retirement loop. This hands the row back
+              -- as 'searching', the retirement sweep sends it to 'queued', and
+              -- round it went roughly hourly -- 26.4/day on the worst row,
+              -- against a ceiling of 4.0 -- because NEITHER end read the wait.
+              -- Gating only the sweep would have left the loop intact.
+              and coalesce(q.retry_after, 0) <= ?
             order by coalesce(q.updated_at, q.created_at, 0) desc
             limit ?
             """,
-            (max(1, int(limit or 5000)),),
+            (now, max(1, int(limit or 5000))),
         ).fetchall()
     except sqlite3.OperationalError:
         return 0
@@ -19165,9 +19797,10 @@ def cleanup_collection_single_part_verified_queue_rows(con, now, limit=5000):
             (message, now, json_dumps(raw), queue["id"]),
         )
         if queue.get("wanted_id"):
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("searching"), now, queue["wanted_id"]),
+            project_wanted_status(
+                con, queue["wanted_id"], "searching", now,
+                site="cleanup_collection_single_part_verified_queue_rows",
+                force=True,
             )
         for import_row in import_rows:
             mark_import_result_single_part_mismatch(con, import_row, reason, now)
@@ -20779,9 +21412,9 @@ def cleanup_superseded_active_download_tasks(con, now, limit=None):
                     ),
                 )
                 if task.get("wanted_id"):
-                    con.execute(
-                        "update wanted_items set status=?, updated_at=? where id=?",
-                        (wanted_status_for_queue_state("searching"), ts, task.get("wanted_id")),
+                    project_wanted_status(
+                        con, task.get("wanted_id"), "searching", ts,
+                        site="cleanup_superseded_active_download_tasks",
                     )
             retired += 1
             continue
@@ -21240,9 +21873,9 @@ def cleanup_expired_import_claims(con, now):
         )
         released += int(con.execute("select changes()").fetchone()[0] or 0)
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", now,
+                site="cleanup_expired_import_claims",
             )
         con.execute(
             """
@@ -21473,9 +22106,9 @@ def cleanup_non_active_searching_queue_rows(con, now):
             (new_state, new_outcome, new_phase, message, now, json_dumps(raw), row["id"]),
         )
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(new_state), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], new_state, now,
+                site="cleanup_non_active_searching_queue_rows",
             )
         con.execute(
             """
@@ -21852,8 +22485,29 @@ def cleanup_queue_items_with_retired_download_tasks(con, now):
         where q.active = 1
           and lower(coalesce(q.state, '')) in ('downloading', 'importing', 'source_wait', 'searching')
           and lower(coalesce(dt.state, '')) in ('failed', 'retired')
+          -- HONOUR THE BACKOFF THIS FUNCTION ITSELF WRITES. Without this the
+          -- escalating wait computed below was stored and read by nothing, so
+          -- the 6h ceiling bound nobody: 41 of 117 measurable rows exceeded 4.0
+          -- retirements/day and 55% of the traffic was above what the ceiling
+          -- permits. NULL and 0 both mean due, matching the form used elsewhere
+          -- in this file.
+          --
+          -- THE SECOND CLAUSE IS NOT AN ESCAPE HATCH, IT IS THE POINT. A task
+          -- that has failed SINCE the last retirement is new information, and
+          -- making it serve out the previous loop's sentence would turn a busy
+          -- loop into a silent stall -- nothing burning cycles and nothing
+          -- arriving, which is worse, because a loop at least shows up. The
+          -- retirement sets q.updated_at, so a task touched at or after that
+          -- instant is news. It cannot reopen the measured loop: those rows
+          -- created a MEDIAN OF ZERO new download tasks over the week they ran
+          -- at 26/day, which is what "158 retirements, zero downloads" means.
+          and (
+            coalesce(q.retry_after, 0) <= ?
+            or coalesce(dt.updated_at, dt.completed_at, dt.started_at, 0) >= coalesce(q.updated_at, 0)
+          )
         order by coalesce(q.updated_at, dt.updated_at, dt.completed_at, 0) desc
-        """
+        """,
+        (now,),
     ).fetchall()
     retired = 0
     max_stall_retries = queue_watchdog_policy(con).get("max_stall_retries", QUEUE_WATCHDOG_MAX_STALL_RETRIES_DEFAULT)
@@ -21937,9 +22591,9 @@ def cleanup_queue_items_with_retired_download_tasks(con, now):
                     (message, json_dumps(raw), now_ts, item["id"]),
                 )
                 if item.get("wanted_id"):
-                    con.execute(
-                        "update wanted_items set status=?, updated_at=? where id=?",
-                        (wanted_status_for_queue_state("needs_you"), now_ts, item["wanted_id"]),
+                    project_wanted_status(
+                        con, item["wanted_id"], "needs_you", now_ts,
+                        site="cleanup_queue_items_with_retired_download_tasks",
                     )
                 retired += 1
                 continue
@@ -23102,6 +23756,36 @@ def download_client_reconcile_stale_after(record, client, default_seconds):
     return default_seconds
 
 
+# Retired statuses that record OUR BOOKKEEPING, not a verdict about the file.
+#
+# A handoff we gave up on is a statement about how long we were willing to
+# wait; it is not evidence the download failed. Measured 2026-08-30: SABnzbd
+# completed seven named units SIX DAYS after InkDrop retired their tasks
+# (Moonshine 027/028, Redcoat 001, Junkyard Joe 001/004/005/006), and the
+# completion had no way back in because the re-entry test demanded a
+# local_path from the RETIRED TASK when it is the incoming SNAPSHOT that
+# carries the storage path. The requirement was on the wrong side of the match.
+#
+# Deliberately an allowlist and not "any failed row": statuses that ARE a
+# verdict about the file -- bad_archive, wrong_series_or_subseries,
+# false_positive, preview_not_importable, quality_rejected -- must never be
+# resurrected by a client that merely reports "done". The client knows whether
+# it finished transferring; it does not know whether the bytes are the right
+# book.
+DOWNLOAD_CLIENT_RECOVERABLE_FAILED_STATUSES = frozenset({
+    "stale_orphan",
+    "stale_no_local_file",
+    "failed_download",
+    "download_locator_missing",
+    "transfer_stale_unknown",
+    "transfer_missing_stale",
+    "superseded_by_failed_download",
+    "superseded_active_candidate",
+    "superseded_by_authoritative_snapshot",
+    "error",
+})
+
+
 def apply_download_client_snapshots(
     con,
     snapshots,
@@ -23175,14 +23859,16 @@ def apply_download_client_snapshots(
                 dt.state in ('queued', 'downloading', 'import_ready', 'importing')
                 or (
                     dt.state='failed'
-                    and lower(coalesce(dt.status, ''))='stale_orphan'
-                    and nullif(trim(coalesce(dt.local_path, '')), '') is not null
+                    and lower(coalesce(dt.status, '')) in ({recoverable_failed_statuses})
                 )
               )
         order by coalesce(dt.updated_at, dt.completed_at, dt.started_at, 0) desc, dt.id desc
         limit ?
-        """,
-        (max(1, int(limit or 2000)),),
+        """.replace(
+            "{recoverable_failed_statuses}",
+            ", ".join("?" * len(DOWNLOAD_CLIENT_RECOVERABLE_FAILED_STATUSES)),
+        ),
+        (*sorted(DOWNLOAD_CLIENT_RECOVERABLE_FAILED_STATUSES), max(1, int(limit or 2000))),
     ).fetchall()
     by_queue = {}
     for row in rows:
@@ -23258,6 +23944,18 @@ def apply_download_client_snapshots(
                 "failure_reason",
                 f"{source_display_label(client)} made no progress past the bounded retry window",
             )
+        # A row we already retired re-enters ONLY on positive evidence from the
+        # client: it must be reporting this exact job finished, AND carrying a
+        # real path to the payload. Anything less and the retirement stands --
+        # a retired task that merely fails to match a snapshot must not be
+        # walked back to "downloading", which would resurrect every abandoned
+        # handoff on every pass. The path is read from the SNAPSHOT because the
+        # retired task never had one; that asymmetry is the defect this fixes.
+        if str(record.get("task_state") or "").strip().lower() == "failed":
+            if status != "completed_in_client" or not download_client_snapshot_local_path(snapshot or {}):
+                summary["waiting"] += 1
+                client_summary["waiting"] += 1
+                continue
         completed_rejection = None
         if status == "completed_in_client":
             completed_rejection = completed_client_snapshot_rejected_by_queue(record, snapshot)
@@ -23532,9 +24230,9 @@ def apply_download_client_snapshots(
             ),
         )
         if record.get("wanted_id"):
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(queue_state), now, record["wanted_id"]),
+            project_wanted_status(
+                con, record["wanted_id"], queue_state, now,
+                site="apply_download_client_snapshots",
             )
         refresh_queue_provider_status_columns(con, record["queue_id"])
         if task_state == "failed":
@@ -23909,9 +24607,9 @@ def settle_queue_items_with_active_download_tasks(con, now):
             (queue_state, source_key, message, ts, json_dumps(existing_raw), record["queue_id"]),
         )
         if record.get("wanted_id"):
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(queue_state), ts, record["wanted_id"]),
+            project_wanted_status(
+                con, record["wanted_id"], queue_state, ts,
+                site="settle_queue_items_with_active_download_tasks",
             )
         refresh_queue_provider_status_columns(con, record["queue_id"])
         con.execute(
@@ -24268,13 +24966,54 @@ def reconciliation_records(state_dir):
                 pass
 
 
+def reverify_fair_order(records, fresh_per_aged=None):
+    """Interleave newest-stamp-first with oldest-stamp-first for the re-verify budget.
+
+    `records` arrives newest-stamp-first, and walking it in that order hands the whole
+    re-verify budget to the head. The head is not this pass's to drain: a *sibling*
+    daemon re-stamps every record it still sees on each reconcile run
+    (inkdrop_reconcile_imports.persist_reconciliation), so it is refilled faster than a
+    bounded pass can clear it. Measured 2026-09-04 on the live table: 27 re-verify-arm
+    records shared the newest stamp against a budget of 25, and the oldest record --
+    stamped 2026-07-25 and untouched since -- sat at rank 1,223 of 1,223. It sat last in
+    the 2026-08-23 backup of the same table too, so it had been unreachable for at least
+    twelve days, and 942 of 959 recorded firings re-verified nothing at all.
+
+    A continuously replenished head is worse than a fixed blocker, which would at least
+    clear once. Inverting to oldest-first just moves the starvation onto new content, so
+    this takes `fresh_per_aged` from the front for every one from the back: freshly
+    stamped records keep the majority of the budget, and the oldest record is reached on
+    the next pass instead of never. Every record still appears exactly once.
+    """
+    records = list(records or [])
+    step = int(fresh_per_aged or REVERIFY_FRESH_PER_AGED)
+    if step < 1 or len(records) < 3:
+        return records
+    ordered = []
+    front = 0
+    back = len(records) - 1
+    while front <= back:
+        for _ in range(step):
+            if front > back:
+                break
+            ordered.append(records[front])
+            front += 1
+        if front > back:
+            break
+        ordered.append(records[back])
+        back -= 1
+    return ordered
+
+
 def sync_download_reconciliation(con, state_dir, now):
     count = 0
     # Re-verification reads whole archives, so bound how many a single pass may attempt.
     reverify_budget = REVERIFY_ATTEMPTS_PER_PASS
     reverified_count = 0
+    reverify_examined = 0
+    reverify_attempted = 0
     match_candidates = None
-    for record in reconciliation_records(state_dir):
+    for record in reverify_fair_order(reconciliation_records(state_dir)):
         queue_state = reconciliation_queue_state(record.get("lifecycle_state"))
         if not queue_state:
             continue
@@ -24370,8 +25109,32 @@ def sync_download_reconciliation(con, state_dir, now):
             # folder rename; re-verifying is cheaper and far more honest than re-grabbing.
             reverified = None
             if reverify_budget > 0:
-                reverify_budget -= 1
-                reverified = reverify_managed_file_import_proof(con, queue, ts)
+                # Spend the slot on work, not on the decision not to do work. Most
+                # candidates reaching here are inside their re-verify cooldown or have no
+                # managed file to test, and charging those spent the budget on no-ops:
+                # REVERIFY_RETRY_SECONDS is 6h against an hourly pass, so one cooled unit
+                # held a slot for six consecutive passes without ever reading an archive.
+                reverify_examined += 1
+                reverify_stats = {}
+                # The pass clock, never the record's `ts`. Every use of this
+                # parameter inside reverify_managed_file_import_proof() is a
+                # clock: the 6h cooldown is compared against it AND stamped with
+                # it, and the new proof's created_at comes from it. Passing `ts`
+                # made the cooldown compare a record's timestamp against itself --
+                # `at > at - 6h` is true on every pass for ever, so a unit whose
+                # book was sitting readable in the library was skipped before the
+                # budget was charged and the caller wrote "A recheck could not
+                # confirm this import" hourly. It also dated the recovered proof
+                # at the record's time, born outside the bounded media-sync
+                # window, so it never got a media row. `ts` remains correct
+                # provenance for the attempt row and the mass-touched updated_at
+                # columns below; it is not a clock.
+                reverified = reverify_managed_file_import_proof(
+                    con, queue, now, stats=reverify_stats
+                )
+                if reverify_stats.get("attempted"):
+                    reverify_attempted += 1
+                    reverify_budget -= 1
             if reverified:
                 reverified_count += 1
                 message = "Found this issue's file still in the library; import re-verified."
@@ -24404,9 +25167,9 @@ def sync_download_reconciliation(con, state_dir, now):
             (queue_state, message, active, ts, queue_outcome, queue_display_phase, queue["id"]),
         )
         if queue["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(queue_state), ts, queue["wanted_id"]),
+            project_wanted_status(
+                con, queue["wanted_id"], queue_state, ts,
+                site="sync_download_reconciliation",
             )
         count += 1
     if reverify_budget <= 0:
@@ -24431,7 +25194,16 @@ def sync_download_reconciliation(con, state_dir, now):
                 "neutral",
                 "observed",
                 now,
-                json_dumps({"reverified": reverified_count, "attempt_budget": REVERIFY_ATTEMPTS_PER_PASS}),
+                json_dumps({
+                    "reverified": reverified_count,
+                    "attempt_budget": REVERIFY_ATTEMPTS_PER_PASS,
+                    # examined counts units the budget arm looked at; attempted counts the
+                    # ones that reached the archive gates and so actually cost a slot. The
+                    # gap between them is the no-op spend this event used to hide -- 942 of
+                    # 959 firings reported reverified=0 with no way to tell why.
+                    "examined": reverify_examined,
+                    "attempted": reverify_attempted,
+                }),
             ),
         )
     return count
@@ -27355,7 +28127,31 @@ def sync_queue(
             item["updated_at_iso"] = utc_stamp(item_updated_at)
             raw_item["activity_updated_at"] = item_updated_at
             raw_item["activity_updated_at_iso"] = utc_stamp(item_updated_at)
-        wanted_id = upsert_wanted(con, series_id, issue_id, "queue_missing", wanted_status_for_queue_state(state), item, now)
+        # SITE 24 OF 25, and the one that upserts rather than updates. It asks
+        # the shared helper for the status instead of letting it write.
+        # upsert_wanted's own conflict clause already refuses to overwrite
+        # `satisfied` with `wanted` -- it does NOT refuse `in_progress`,
+        # `blocked` or `inactive`, so a `searching` queue row could still demote
+        # an evidenced satisfaction through this path. That half-rule in one
+        # place and no rule in twenty-four others is the shape this change
+        # removes; the SQL guard stays as belt-and-braces for other callers.
+        queue_projection = wanted_status_for_queue_state(state)
+        # COST FENCE, AND IT IS LOAD-BEARING. This runs for EVERY queue row on
+        # every sync pass. upsert_wanted's conflict clause already refuses to
+        # write `wanted` over `satisfied` for free, and 1,098 of the queue rows
+        # under a satisfied want are `superseded_duplicate`, which maps to
+        # `wanted` -- consulting the evidence for those would stat a file and
+        # validate an archive 1,098 times per pass to reach a verdict the SQL
+        # already reaches. Only the statuses that clause does NOT cover need
+        # asking about, which is the half that let a `searching` queue row
+        # demote an evidenced satisfaction. Measured on the same snapshot: zero
+        # queue rows currently map to those statuses under a satisfied want, so
+        # this fence costs nothing today and bounds the worst case.
+        if issue_id and queue_projection in ("in_progress", "blocked", "inactive"):
+            queue_projection = wanted_projection_status(
+                con, f"wanted:{issue_id}", state, now, site="sync_queue",
+            )
+        wanted_id = upsert_wanted(con, series_id, issue_id, "queue_missing", queue_projection, item, now)
         canonical_ref = canonical_wanted_reference(con, wanted_id, issue_id)
         if canonical_ref.get("changed"):
             wanted_id = canonical_ref.get("wanted_id") or wanted_id
@@ -28061,12 +28857,11 @@ def reconcile_verified_queue_wanted_statuses(con, now):
         # canonical work key rather than with this repair.
         if str(row["queue_state"] or "").strip().lower() == "superseded_duplicate":
             continue
-        if not verified_import_for_queue(
+        if not verified_import_satisfies_unit(
             con,
             row["queue_id"],
             row["series_id"],
             row["issue_id"],
-            require_existing_destination=True,
         ):
             continue
         con.execute(
@@ -28142,12 +28937,11 @@ def reconcile_duplicate_issue_number_wanted_statuses(con, now, *, limit=500):
     ).fetchall()
     changed = 0
     for row in rows:
-        if not verified_import_for_queue(
+        if not verified_import_satisfies_unit(
             con,
             None,
             row["series_id"],
             row["verified_peer_issue_id"],
-            require_existing_destination=True,
         ):
             continue
         message = "Duplicate issue row satisfied by verified sibling issue"
@@ -28259,12 +29053,11 @@ def reconcile_collected_edition_coverage(con, now, *, limit=500):
     for row in rows:
         if not row["collection_issue_id"]:
             continue
-        if not verified_import_for_queue(
+        if not verified_import_satisfies_unit(
             con,
             None,
             row["collection_series_id"],
             row["collection_issue_id"],
-            require_existing_destination=True,
         ):
             continue
         message = "Satisfied by a verified collected edition covering this issue"
@@ -28834,8 +29627,23 @@ def archive_and_retire_manual_source_retracted_resolved(con, now):
     the tree and has not had one since the root commit. Three modules read it
     to build a set of review ids to skip, and a loader default keeps
     re-creating it as an empty list, so it reads as a live filter to anyone
-    who finds it. On this install it holds six entries, all written by a
-    one-off session on 2026-06-26 with retracted_reason=identity_mismatch.
+    who finds it. On this install it holds six entries.
+
+    THE SIX ARE NOT UNIFORM, AND AN EARLIER VERSION OF THIS DOCSTRING SAID
+    THEY WERE. Re-measured 2026-08-30 against the residue this migration had
+    already archived (snapshot inkdrop-state-20260830T102707Z-12d5dcc30a36,
+    as_of 2026-08-30T10:27:07Z): three moments over three days, not one
+    session -- The Climber 5/7/9 at 2026-06-26T05:52:44Z carrying
+    retracted_reason=identity_mismatch, Daytripper 1/2 at 2026-06-28T05:03:01Z
+    and Bleach 36 at 2026-06-28T05:57:59Z carrying NO retracted_reason key at
+    all. That is why the message below reads the reason with `.get(... ) or
+    'unrecorded'`: half of them have nothing to report, and indexing would
+    raise KeyError out of init_schema. Pinned by arm 4b of
+    tests/inkdrop-manual-source-retraction-retired-smoke.py.
+
+    It matters beyond accuracy: the open question on #537 is whether these six
+    are honoured, migrated or retired, and that will be decided by someone
+    reading this. Three of them record no reason for their own retraction.
 
     WHY PRESERVE RATHER THAN DELETE.
         Nobody can reconstruct what those six decisions meant -- the history is
@@ -31213,22 +32021,243 @@ REVERIFIED_IMPORT_STATUS = "reverified_managed_file"
 # must not be re-tested on every reconciliation pass.
 REVERIFY_RETRY_SECONDS = 6 * 3600
 REVERIFY_ATTEMPTS_PER_PASS = 25
+# Freshly stamped records taken per aged one in reverify_fair_order(). Keeps the
+# majority of a pass's budget on new content while guaranteeing the oldest record is
+# reached, rather than trading one starvation for its mirror image.
+REVERIFY_FRESH_PER_AGED = 2
 
 
-def managed_file_relocation_candidates(con, dest_path, series_id):
-    """Where a recorded destination might live now, after a library folder rename."""
+RELOCATION_INDEX_TTL_SECONDS = 300
+_RELOCATION_INDEX_CACHE = {}
+RELOCATION_UNIT_NUMBER_PATTERNS = (
+    re.compile(r"(?:^|[^a-z0-9])v(\d{1,4})(?:[^0-9]|$)", re.I),
+    re.compile(r"#\s*(\d{1,5}(?:\.\d+)?)"),
+    re.compile(r"(?:^|[^a-z0-9])c(\d{1,5}(?:\.\d+)?)(?:[^0-9]|$)", re.I),
+    re.compile(r"(?:^|[^a-z0-9])(?:vol|volume|chapter|ch)\.?\s*(\d{1,5}(?:\.\d+)?)", re.I),
+    re.compile(r"(?:^|\s)(\d{1,5}(?:\.\d+)?)(?:\s|$)"),
+)
+RELOCATION_YEAR_SUFFIX = re.compile(r"\((?:19|20)\d{2}\)")
+
+
+def relocation_normalized_title(value):
+    text = str(value or "").lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def relocation_normalized_number(value):
+    text = str(value or "").strip().lstrip("0") or "0"
+    try:
+        return str(float(text)) if "." in text else str(int(text))
+    except ValueError:
+        return text.lower()
+
+
+def relocation_unit_numbers(filename):
+    """Unit numbers a library filename could be announcing.
+
+    The trailing "(YYYY)" is the library's own year suffix, so it is stripped first:
+    without that, "Vagabond v19 (2005).cbz" offers 2005 as a candidate unit number.
+    """
+    stem = RELOCATION_YEAR_SUFFIX.sub(" ", os.path.splitext(str(filename or ""))[0])
+    found = set()
+    for pattern in RELOCATION_UNIT_NUMBER_PATTERNS:
+        for match in pattern.finditer(stem):
+            found.add(relocation_normalized_number(match.group(1)))
+    return found
+
+
+def library_relocation_index(managed_roots, now=None):
+    """Archives under the managed roots, indexed by folder and by unit number.
+
+    Rebuilt at most every RELOCATION_INDEX_TTL_SECONDS: the retraction sweep and the
+    re-verify pass both call this once per row, and walking the roots per row would
+    dominate their runtime.
+
+    Files are registered under EVERY ancestor directory inside the roots, not just
+    their immediate parent. The legacy layout puts a book in
+    "Series/Volume 01 (Year)/" one level below the series folder, so an index keyed
+    only on the parent cannot see it -- which is most of what this function exists
+    to find.
+    """
+    now = float(now or time.time())
+    # Normalise once, here. media_file_normalized_path() lowercases a Windows drive
+    # letter and path_under_any_root() does not, so mixing a raw root with a
+    # normalised path makes every containment test false -- and a containment test
+    # that is always false yields an empty index, which reads as "nothing to find".
+    roots = tuple(sorted(
+        media_file_normalized_path(root) for root in (managed_roots or []) if str(root or "").strip()
+    ))
+    cached = _RELOCATION_INDEX_CACHE.get(roots)
+    if cached and now - cached["built_at"] < RELOCATION_INDEX_TTL_SECONDS:
+        return cached
+    by_dir = {}
+    by_title = {}
+    present = set()
+    for root in roots:
+        if not media_root_is_mounted(root):
+            # An unmounted root reads as every file being gone. Returning that as an
+            # empty index would tell both callers "nothing relocated here", which is
+            # indistinguishable from "the library is fine" -- so skip the root and
+            # record that the index is partial.
+            continue
+        try:
+            walker = os.walk(root)
+        except OSError:
+            continue
+        for base, _dirs, files in walker:
+            base = media_file_normalized_path(base)
+            for name in files:
+                if not media_library_archive_extension(name):
+                    continue
+                full = f"{base}/{name}"
+                present.add(full)
+                numbers = relocation_unit_numbers(name)
+                # Walk up to, but not including, the managed root itself. Bounding this
+                # on a slash count instead -- which is what a first draft did -- reads
+                # the right depth for one root layout and the wrong one for every other,
+                # so the index came back empty and the resolver silently reported nothing
+                # to find. That is precisely the failure this whole change exists to
+                # remove, so the bound is the root, not a number.
+                normalized_root = root
+                current = base
+                while current and current != normalized_root and path_under_any_root(current, roots):
+                    folder = by_dir.setdefault(current, {})
+                    for number in numbers:
+                        folder.setdefault(number, []).append(full)
+                    leaf = RELOCATION_YEAR_SUFFIX.sub("", current.rsplit("/", 1)[-1])
+                    by_title.setdefault(relocation_normalized_title(leaf), set()).add(current)
+                    parent = current.rsplit("/", 1)[0]
+                    if parent == current:
+                        break
+                    current = parent
+    index = {"built_at": now, "roots": roots, "by_dir": by_dir,
+             "by_title": by_title, "present": present,
+             "partial": any(not media_root_is_mounted(root) for root in roots)}
+    _RELOCATION_INDEX_CACHE[roots] = index
+    return index
+
+
+def series_relocation_folders(con, series_id, index):
+    """Every library folder that plausibly belongs to this series record.
+
+    series.library_path alone is not enough: measured 2026-09-03, 263 of 542 series
+    carry a library_path that holds no archive at all, because a relocation moved the
+    books and the pointer was updated to a folder that is itself stale or empty. The
+    folder-name index covers that -- The Climber's two series records point at a
+    one-file folder and an empty one while sixteen books sit in "The Climber (2023)",
+    which only the title match reaches.
+    """
+    folders = set()
+    row = con.execute("select title, library_path from series where id=? limit 1", (str(series_id),)).fetchone()
+    if not row:
+        return folders
+    library_path = media_file_normalized_path(row["library_path"] or "")
+    if library_path:
+        folders.add(library_path)
+    folders |= set(index["by_title"].get(relocation_normalized_title(row["title"]), ()))
+    return folders
+
+
+def relocation_candidate_is_claimed(con, candidate):
+    row = con.execute(
+        "select 1 from media_files where normalized_path=? and active=1 and coalesce(status,'')='present' limit 1",
+        (media_file_normalized_path(candidate),),
+    ).fetchone()
+    return bool(row)
+
+
+def managed_file_relocation_candidates(
+    con, dest_path, series_id, issue_id=None, managed_roots=None, include_unit_match=True
+):
+    """Where a recorded destination might live now, after a library folder rename.
+
+    The shipped version offered exactly two candidates -- the recorded dest_path and
+    series.library_path + "/" + basename -- and BOTH judges of a stranded proof called
+    it: relocated_series_folder_import_proof_path() for the retraction sweep, and this
+    for reverify_managed_file_import_proof(). Two passes agreeing because they share
+    one under-powered helper is not corroboration, and it is why the re-verify pass has
+    written 31 rows in its lifetime and none since 2026-08-11.
+
+    That one candidate cannot see a book that moved into or out of a
+    "Volume 01 (Year)" subfolder, cannot see a renamed file, and cannot see anything at
+    all when series.library_path is itself stale -- which it is for 263 of 542 series.
+
+    Candidates are returned in descending confidence:
+      1. the recorded dest_path
+      2. library_path + basename                      (the shipped behaviour, kept)
+      3. the same basename anywhere in the series' own folder family
+      4. the unit-number match within that family, ONLY when exactly one unclaimed
+         file answers to it
+
+    Arm 4 is the loose one and callers opt out with include_unit_match=False. The
+    re-verify pass keeps it because it re-runs every archive, identity, collection and
+    unit gate against the candidate before believing it. The retraction sweep turns it
+    off, because that path rewrites dest_path with no further test and a wrong rewrite
+    is a false "you have it" -- which costs the book silently.
+
+    An ambiguous number match yields NOTHING rather than a guess. Arms 3 and 4 -- the
+    ones added here -- also refuse a candidate another active media_files row already
+    claims, because that is a duplicate identity to merge rather than a relocation to
+    follow. Arms 1 and 2 do NOT apply that filter: the retraction sweep detects the
+    same collision itself and reports it as relocation_owner_conflict, and suppressing
+    the candidate earlier silently removes that count.
+    """
+    # Normalisation is for COMPARING paths, never for what this returns. Passing the
+    # candidates back normalised silently lowercased a Windows drive letter, and two
+    # shipped tests then failed on a string mismatch while the relocation itself had
+    # worked. Callers embed these paths in operator-facing history_events, so the form
+    # they arrive in is part of the contract.
     dest_path = str(dest_path or "").strip().replace("\\", "/")
     if not dest_path:
         return []
     candidates = [dest_path]
-    leaf = dest_path.rsplit("/", 1)[-1]
+    seen = {media_file_normalized_path(dest_path)}
+
+    def offer(path):
+        key = media_file_normalized_path(path)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append(path)
+
+    row = con.execute("select library_path from series where id=? limit 1", (str(series_id),)).fetchone()
+    library_path = str((row["library_path"] if row else "") or "").strip().replace("\\", "/").rstrip("/")
+    leaf = dest_path.rstrip("/").rsplit("/", 1)[-1]
+    if leaf and library_path:
+        # Arm 2 is offered even when another row already claims it, and that is
+        # deliberate. Filtering it here looked safer and broke two shipped tests:
+        # the sweep's relocation_owner_conflict branch never fired, so a real
+        # collision stopped being COUNTED and stopped being reported. Trading a
+        # named, counted refusal for an invisible one is the exact failure this
+        # change exists to remove, so the conflict stays visible to its caller.
+        offer(f"{library_path}/{leaf}")
+
+    roots = managed_roots if managed_roots is not None else media_management_roots_from_connection(con)
+    roots = [media_file_normalized_path(root) for root in (roots or []) if str(root or "").strip()]
+    if not roots:
+        return candidates
+    index = library_relocation_index(roots)
+    if not index["present"]:
+        # No archive found under any mounted root. That is the shape of a broken read,
+        # not of an empty library, so offer nothing new rather than report "gone".
+        return candidates
+    folders = series_relocation_folders(con, series_id, index)
+
     if leaf:
-        row = con.execute("select library_path from series where id=? limit 1", (str(series_id),)).fetchone()
-        library_path = str((row["library_path"] if row else "") or "").strip().replace("\\", "/").rstrip("/")
-        if library_path:
-            relocated = f"{library_path}/{leaf}"
-            if relocated not in candidates:
-                candidates.append(relocated)
+        for folder in sorted(folders):
+            candidate = f"{folder}/{leaf}"
+            if candidate in index["present"] and not relocation_candidate_is_claimed(con, candidate):
+                offer(candidate)
+
+    if include_unit_match and issue_id:
+        issue = con.execute("select issue_number from issues where id=? limit 1", (str(issue_id),)).fetchone()
+        number = relocation_normalized_number(issue["issue_number"] if issue else "")
+        if number and str(number).strip():
+            hits = set()
+            for folder in folders:
+                hits.update(index["by_dir"].get(folder, {}).get(number, ()))
+            unclaimed = sorted(h for h in hits if not relocation_candidate_is_claimed(con, h))
+            if len(unclaimed) == 1:
+                offer(unclaimed[0])
     return candidates
 
 
@@ -31241,7 +32270,7 @@ def managed_file_identity_signature(path):
     return f"{path}|{stat.st_size}|{int(stat.st_mtime)}"
 
 
-def reverify_managed_file_import_proof(con, queue, now, managed_roots=None):
+def reverify_managed_file_import_proof(con, queue, now, managed_roots=None, stats=None):
     """Record a fresh proof when a written-off import's file is still in the library.
 
     This does not resurrect the written-off row. That row's raw_json carries the
@@ -31278,7 +32307,9 @@ def reverify_managed_file_import_proof(con, queue, now, managed_roots=None):
     for row in rows:
         if str(row["status"] or "").strip().lower() not in REVERIFIABLE_IMPORT_STATUSES:
             continue
-        for candidate_path in managed_file_relocation_candidates(con, row["dest_path"], series_id):
+        for candidate_path in managed_file_relocation_candidates(
+            con, row["dest_path"], series_id, issue_id=issue_id, managed_roots=roots
+        ):
             if candidate_path in seen_paths:
                 continue
             seen_paths.add(candidate_path)
@@ -31293,6 +32324,11 @@ def reverify_managed_file_import_proof(con, queue, now, managed_roots=None):
                 and safe_float(cooldown.get("at"), 0) > now - REVERIFY_RETRY_SECONDS
             ):
                 continue
+            if stats is not None:
+                # Past every cheap screen: from here the archive gates actually run, and
+                # this is the work the caller's per-pass budget exists to bound. Anything
+                # that returned above did no work and must not cost a slot.
+                stats["attempted"] = True
             probe = dict(row)
             probe["dest_path"] = candidate_path
             probe["queue_id"] = queue_id or row["queue_id"]
@@ -32763,9 +33799,9 @@ def verify_pending_direct_import_results(con, db_path, now):
                     (message, now, json_dumps(queue_raw), row["queue_id"]),
                 )
                 if row["wanted_id"]:
-                    con.execute(
-                        "update wanted_items set status=?, updated_at=? where id=?",
-                        (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+                    project_wanted_status(
+                        con, row["wanted_id"], "queued", now,
+                        site="verify_pending_direct_import_results",
                     )
             con.execute(
                 """
@@ -33022,9 +34058,9 @@ def verify_pending_direct_import_results(con, db_path, now):
                         (result_source, message, now, json_dumps(queue_raw), row["queue_id"]),
                     )
                     if row["wanted_id"]:
-                        con.execute(
-                            "update wanted_items set status=?, updated_at=? where id=?",
-                            (wanted_status_for_queue_state("importing"), now, row["wanted_id"]),
+                        project_wanted_status(
+                            con, row["wanted_id"], "importing", now,
+                            site="verify_pending_direct_import_results",
                         )
                 con.execute(
                     """
@@ -33832,26 +34868,39 @@ def relocated_series_folder_import_proof_path(con, row, managed_roots):
     series_id = str(row["series_id"] or "").strip()
     if not series_id:
         return None
-    series_row = con.execute(
-        "select library_path from series where id=? limit 1", (series_id,)
-    ).fetchone()
-    library_path = str((series_row["library_path"] if series_row else "") or "").strip()
-    if not library_path:
-        return None
-    basename = str(dest_path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    if not basename:
-        return None
-    candidate = f"{library_path.rstrip('/')}/{basename}"
-    if media_file_normalized_path(candidate) == media_file_normalized_path(dest_path):
-        return None
-    if not path_under_any_root(candidate, managed_roots):
-        return None
-    try:
-        if not Path(candidate).is_file():
-            return None
-    except OSError:
-        return None
-    return candidate
+    # One resolver, both judges. This used to build its own single candidate --
+    # library_path + basename -- byte-for-byte the same rule the re-verify pass
+    # applied, so the two passes agreed on "the file is gone" because they shared a
+    # blind spot, not because they had both looked. include_unit_match is off here:
+    # this caller rewrites dest_path with no further test, and a wrong rewrite is a
+    # silent false "you have it".
+    # Candidates come back normalised; comparing them against raw roots makes every
+    # containment test false on a Windows drive letter, which reads as "no relocation
+    # found" rather than as an error. Normalise the roots on the same side.
+    normalized_roots = [media_file_normalized_path(root) for root in (managed_roots or [])]
+    for candidate in managed_file_relocation_candidates(
+        con,
+        dest_path,
+        series_id,
+        issue_id=row_value(row, "issue_id"),
+        managed_roots=managed_roots,
+        include_unit_match=False,
+    ):
+        if media_file_normalized_path(candidate) == media_file_normalized_path(dest_path):
+            continue
+        # Normalise BOTH sides for the containment test and neither for the value that
+        # is returned. Normalising one side only fails every comparison on a Windows
+        # drive letter; normalising the returned path rewrites what operator-facing
+        # events display. The comparison and the payload are different questions.
+        if not path_under_any_root(media_file_normalized_path(candidate), normalized_roots):
+            continue
+        try:
+            if not Path(candidate).is_file():
+                continue
+        except OSError:
+            continue
+        return candidate
+    return None
 
 
 def wrong_unit_page_pack_raw_dicts(row):
@@ -34501,9 +35550,10 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
         if changed:
             reopened_queues.add(queue_id)
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", now,
+                site="cleanup_wrong_unit_page_pack_import_proofs",
+                force=True,
             )
         refresh_queue_provider_status_columns(con, queue_id)
         con.execute(
@@ -34684,9 +35734,10 @@ def mark_import_wrong(db_path, import_result_id, *, reason=None, marked_by="inkd
             )
             refresh_queue_provider_status_columns(con, queue_id)
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", now,
+                site="mark_import_wrong",
+                force=True,
             )
         blocked_candidate_id = None
         if row["attempt_source"] or row["attempt_download_url_hash"]:
@@ -35020,9 +36071,10 @@ def cleanup_contradictory_completion_provenance(con, now, limit=5000, *, cursor=
         )
         counts["queue_items"] += int(con.execute("select changes()").fetchone()[0] or 0)
         if row.get("wanted_id"):
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", now,
+                site="cleanup_contradictory_completion_provenance",
+                force=True,
             )
         refresh_queue_provider_status_columns(con, row["queue_id"])
         con.execute(
@@ -35237,6 +36289,28 @@ def release_falsely_satisfied_unit(con, row, now, *, dry_run=False):
     return 1
 
 
+def verified_proof_units_on_disk(con, managed_roots):
+    """Units holding a verified import proof whose file is present under a mounted root.
+
+    This is verified_import_for_queue(require_existing_destination=True) asked once for
+    the whole table instead of once per row. A verified proof whose dest_path is gone
+    does not count -- that is the stranded case the caller is trying to repair.
+    """
+    units = set()
+    for row in con.execute(
+        "select series_id, issue_id, dest_path from import_results where coalesce(verified,0)=1"
+    ):
+        dest_path = str(row["dest_path"] or "").strip()
+        if not dest_path or not path_under_any_root(dest_path, managed_roots):
+            continue
+        try:
+            if Path(dest_path).is_file():
+                units.add((row["series_id"], row["issue_id"]))
+        except OSError:
+            continue
+    return units
+
+
 def cleanup_missing_folder_verified_import_proofs(
     con, now, limit=5000, *, series_id=None, issue_number=None, dry_run=False, cursor=None
 ):
@@ -35332,6 +36406,7 @@ def cleanup_missing_folder_verified_import_proofs(
     handled_media_ids = set()
     handled_task_ids = set()
     handled_queue_ids = set()
+    live_proof_units = None
     for row in rows:
         already_retracted = str(row["status"] or "").strip().lower() == MISSING_FOLDER_PROOF_STATUS.lower()
         if not already_retracted and import_result_is_bad_or_retracted(row):
@@ -35350,7 +36425,29 @@ def cleanup_missing_folder_verified_import_proofs(
         if dest_exists:
             continue
         relocated_path = None
-        if not already_retracted:
+        # A proof retracted on an earlier pass used to be barred from relocation for
+        # good: `if not already_retracted` made retraction a one-way door. The
+        # hourly sweep then re-stamped the linked media row missing every pass while
+        # the book sat under the series' current folder -- 122 of 132 such rows had
+        # been in that loop since 2026-07-29 when measured on 2026-09-04, and a repair
+        # that moved only media_files.path was undone 25 minutes later.
+        #
+        # The bar cannot simply come off. Of 2,494 retracted proofs on that snapshot,
+        # 1,084 belong to units that already own a LIVE verified proof -- a later import
+        # re-satisfied them -- and relocating those fights the successor (an unbounded
+        # lift raised 1,117 relocation conflicts in a dry pass). So a retracted proof is
+        # relocated only when its unit holds no verified proof whose file is on disk:
+        # the same current-evidence rule release_falsely_satisfied_unit() applies to the
+        # other half of this guard, and the same predicate the re-verify pass uses.
+        # Computed once per pass; asking verified_import_for_queue() per row did not
+        # finish 9,583 rows in ten minutes, the hoisted set runs the pass in about one.
+        #
+        # Relocation moves the pointer and its media row together and nothing else:
+        # verified stays 0 and the media row stays inactive. Declaring the book owned
+        # again is reverify_managed_file_import_proof()'s job, behind the archive gates.
+        if live_proof_units is None:
+            live_proof_units = verified_proof_units_on_disk(con, managed_roots)
+        if not already_retracted or (row["series_id"], row["issue_id"]) not in live_proof_units:
             relocated_path = relocated_series_folder_import_proof_path(con, row, managed_roots)
         if relocated_path:
             normalized_dest = media_file_normalized_path(dest_path)
@@ -35443,6 +36540,9 @@ def cleanup_missing_folder_verified_import_proofs(
                 "update import_results set dest_path=? where id=?",
                 (relocated_path, row["id"]),
             )
+            # The dry run counted relocations and the live pass did not, so every
+            # scheduled pass has reported 0 here since the branch shipped.
+            relocations += 1
             if table_exists(con, "media_files"):
                 con.execute(
                     """
@@ -35547,6 +36647,33 @@ def cleanup_missing_folder_verified_import_proofs(
                         (now, json_dumps(media_raw), media_row["id"]),
                     )
                     media_files += int(con.execute("select changes()").fetchone()[0] or 0)
+                    # This re-mark ran every hour for five weeks on rows whose file was on
+                    # disk, and left no trace but a raw_json stamp: the retraction event
+                    # below fires only on the pass that FIRST retracts a proof. Keyed on
+                    # the media row so the count is a floor and never a firehose.
+                    con.execute(
+                        """
+                        insert or ignore into history_events(
+                            id, entity_type, entity_id, series_id, issue_id, event_type,
+                            source, message, outcome, display_phase, created_at, raw_json
+                        ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            stable_id("missing_folder_media_file_remarked", media_row["id"], row["id"]),
+                            "media_file",
+                            media_row["id"],
+                            row["series_id"],
+                            row["issue_id"],
+                            "missing_folder_media_file_remarked",
+                            "inkdrop_state",
+                            f"Library record marked missing: its import proof's file is not at {dest_path}",
+                            "problem",
+                            row["display_phase"],
+                            now,
+                            json_dumps({"import_result_id": row["id"], "dest_path": dest_path,
+                                        "already_retracted": bool(already_retracted)}),
+                        ),
+                    )
         if already_retracted:
             # Reaching here means the proof was retracted on an earlier pass and
             # the file is STILL absent from a mounted root. Everything above
@@ -35708,9 +36835,10 @@ def cleanup_missing_folder_verified_import_proofs(
         )
         queue_items += int(con.execute("select changes()").fetchone()[0] or 0)
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state("queued"), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], "queued", now,
+                site="cleanup_missing_folder_verified_import_proofs",
+                force=True,
             )
         refresh_queue_provider_status_columns(con, row["queue_id"])
         con.execute(
@@ -37735,6 +38863,46 @@ def managed_media_issue_file_presence(con, queue_id, series_row, issue_row, mana
     }
 
 
+def dest_path_claimed_by_other_issue(con, dest_path, issue_id):
+    """One file, one identity: is another issue already verified against these bytes?
+
+    Lifted verbatim out of `record_pack_fanout_already_imported()` in
+    `inkdrop_reconcile_imports`, which has carried this judgement for a long
+    time and cites PASS4-ACQ-01 by name -- Batman The Long Halloween #1 and #10
+    both verified against one physical archive. The logic was never wrong. It
+    was in the wrong place: measured 2026-08-31, `other_identity` appeared in
+    `inkdrop_reconcile_imports` and `inkdrop_manual_source_autoresolve` and NOT
+    in this module, which holds the writer that produces most of the
+    violations. 148 destination paths carried more than one `verified=1` claim
+    against a control of 3,790 carrying exactly one, and the newest was written
+    the same morning -- active, not historical.
+
+    It lives here rather than there because this module is imported BY the
+    other two and not the reverse, so all three call sites can share one
+    implementation. A fourth copy of a judgement is how the coverage gap
+    happened in the first place.
+
+    Refusing is deliberately not the same as losing the book: the caller skips
+    recording a proof from a shortcut path and leaves the row for the real
+    import path, which runs the full acceptance gates.
+    """
+    dest_path = str(dest_path or "").strip()
+    issue_id = str(issue_id or "").strip()
+    if not con or not dest_path or not issue_id:
+        return False
+    row = con.execute(
+        """
+        select 1 from import_results
+        where coalesce(verified, 0) = 1
+          and dest_path = ?
+          and coalesce(issue_id, '') not in ('', ?)
+        limit 1
+        """,
+        (dest_path, issue_id),
+    ).fetchone()
+    return bool(row)
+
+
 def backfill_existing_folder_presence_import_results(
     con,
     now=None,
@@ -37871,6 +39039,18 @@ def backfill_existing_folder_presence_import_results(
             skipped += 1
             continue
         if folder_presence_has_negative_import_proof(con, row["queue_id"], row["issue_id"], dest_path):
+            skipped += 1
+            continue
+        # One file, one identity. Folder presence proves a FILE is there; it
+        # does not prove it is THIS issue's file, and this pass runs across a
+        # whole series at once, so a single archive that satisfies the
+        # first issue's filename test can satisfy several. Measured on the live
+        # database: `The Spectre #003 (1992).cbz` is referenced by 18 distinct
+        # issues, and every verified multi-claim in the corpus is
+        # single-issue-shaped with completion_truth='folder' -- this pass's own
+        # signature. Skipping leaves the row for the real import path rather
+        # than minting a second proof from the same bytes.
+        if dest_path_claimed_by_other_issue(con, dest_path, row["issue_id"]):
             skipped += 1
             continue
         source = "folder_presence"
@@ -47030,7 +48210,14 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
                     continue
                 retired += 1
                 con.execute(
-                    "update review_exceptions set active=0, state='resolved', updated_at=? where id=?",
+                    # `actionable` and `parked` are written at sync time and were
+                    # never cleared here, so a resolved row went on counting. On
+                    # 2026-08-29 that was 73 rows: `where actionable=1` returned
+                    # 264 against 191 live, while the badge's own reader
+                    # (manual_review_rows) returned 153. Four sessions quoted
+                    # four different numbers off that column in one day.
+                    "update review_exceptions set active=0, state='resolved',"
+                    " actionable=0, parked=0, updated_at=? where id=?",
                     (now, existing["id"]),
                 )
                 history_id = stable_id("review_exception_resolved", existing["id"])
@@ -47054,6 +48241,72 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
                         existing["raw_json"],
                     ),
                 )
+            # Nothing re-evaluates a stored exception against current state: a row
+            # retires only when its source line falls out of the window that feeds
+            # this sync. So a demand can outlive the book it is about. 19 of the 89
+            # resolvable actionable exceptions on 2026-08-29 were for a unit that
+            # already held an active, present file.
+            #
+            # Deliberately NOT scoped to `origin`, unlike the loop above: 16 of
+            # those 19 come from the SLSKD repeat-bad-candidate breaker, whose
+            # origin the legacy sync never passes, so an origin-scoped sweep would
+            # never reach them. The predicate is about the unit, not about who
+            # filed the row.
+            #
+            # The FILE is required, not merely the status. A wanted row marked
+            # satisfied with no file anywhere is its own defect, and retiring a
+            # demand on the strength of it would silence the request for a book
+            # nobody has -- the wrong side of "take the false negative".
+            satisfied_rows = con.execute(
+                """
+                select re.id, re.series_id, re.issue_id, re.source, re.raw_json
+                from review_exceptions re
+                join wanted_items w on w.issue_id = re.issue_id
+                where re.active = 1
+                  and re.issue_id is not null and re.issue_id <> ''
+                  and lower(coalesce(w.status, '')) = 'satisfied'
+                  and exists (
+                      select 1 from media_files m
+                      where m.issue_id = re.issue_id
+                        and coalesce(m.active, 0) = 1
+                        and lower(coalesce(m.status, '')) = 'present'
+                  )
+                """
+            ).fetchall()
+            for row in satisfied_rows:
+                retired += 1
+                con.execute(
+                    "update review_exceptions set active=0, state='resolved',"
+                    " actionable=0, parked=0, updated_at=? where id=?",
+                    (now, row["id"]),
+                )
+                con.execute(
+                    """
+                    insert or ignore into history_events(
+                        id, entity_type, entity_id, series_id, issue_id, event_type,
+                        source, message, created_at, raw_json
+                    ) values(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        stable_id("review_exception_unit_satisfied", row["id"]),
+                        "review_exception",
+                        row["id"],
+                        row["series_id"],
+                        row["issue_id"],
+                        "manual_review_resolved",
+                        row["source"] or origin,
+                        "Manual review exception retired: the unit it asks about is satisfied and the file is present",
+                        now,
+                        row["raw_json"],
+                    ),
+                )
+            # One-time correction for rows retired before the clause above
+            # existed. Idempotent, and it can only clear flags on rows that are
+            # already inactive -- it cannot resurrect a row or hide a live one.
+            con.execute(
+                "update review_exceptions set actionable=0, parked=0"
+                " where coalesce(active, 0) = 0 and (actionable = 1 or parked = 1)"
+            )
             update_sync_meta(con, now, "review_exceptions", None)
             con.commit()
         return {
@@ -57399,6 +58652,12 @@ MANUAL_REVIEW_FILTERS = {
     "source_unchecked": ("Search Pending", ("provider_wait",)),
     "source_checked": ("Checked", ("provider_wait",)),
     "parked": ("Parked", ("provider_wait",)),
+    # Rows the contract routed to Wanted rather than to a person -- "we looked
+    # and found nothing safe". Not a demand, and not invisible either: the
+    # instrument has to keep them or the reason the search failed is lost with
+    # the row. Its states match `actionable` because a routed row is still a
+    # needs_you/failed/blocked row underneath; what changed is who it is for.
+    "routed_to_wanted": ("Routed To Wanted", ("needs_you", "failed", "blocked")),
     "all": ("All Exceptions", ("needs_you", "failed", "blocked", "provider_wait")),
 }
 
@@ -57563,6 +58822,16 @@ def manual_review_canonical_snapshot(db_path, limit=5000):
         row for row in review_candidates
         if str(row.get("state") or "").strip().lower() == "provider_wait"
     ]
+    # `decisions` requires manual_review_actionable and `parked` requires
+    # provider_wait, so a needs_you row the contract routed to Wanted matched
+    # neither and fell out of every list including "all" -- 26 rows on
+    # 2026-08-29, which would have made this a suppression rather than a
+    # routing. Collected here so the reason survives where it can still be
+    # read.
+    routed_to_wanted = [
+        row for row in [*queue_candidates, *review_candidates]
+        if str(row.get("excluded_reason") or "") == "routed_to_wanted"
+    ]
 
     # Presentation for the reason, the state pill and the source pill, attached
     # once here rather than derived per surface. Mobile ran all three through a
@@ -57614,7 +58883,19 @@ def manual_review_canonical_snapshot(db_path, limit=5000):
     }
     for key in MANUAL_REVIEW_SOURCE_FILTERS:
         rows_by_filter[key] = ordered(row for row in parked if manual_review_row_matches_filter(row, key))
-    rows_by_filter["all"] = ordered([*decisions, *parked])
+    rows_by_filter["routed_to_wanted"] = ordered(routed_to_wanted)
+    # De-duplicated by identity: a routed row in provider_wait would otherwise
+    # appear in both `parked` and `routed_to_wanted` and be listed twice here,
+    # which would inflate the one count that is supposed to be the whole set.
+    seen_all = set()
+    all_rows = []
+    for row in [*decisions, *parked, *routed_to_wanted]:
+        key = str(row.get("review_id") or row.get("id") or id(row))
+        if key in seen_all:
+            continue
+        seen_all.add(key)
+        all_rows.append(row)
+    rows_by_filter["all"] = ordered(all_rows)
     counts = {key: len(rows_by_filter.get(key) or []) for key in MANUAL_REVIEW_FILTERS}
     return {
         "rows_by_filter": rows_by_filter,
@@ -59829,9 +61110,10 @@ def request_queue_retry(db_path, queue_id, source_order=None, recovery_steps=Non
                 ),
             }
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(next_state), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], next_state, now,
+                site="request_queue_retry",
+                force=True,
             )
         history_id = stable_id("queue_retry_requested", "queue_item", queue_id, int(now * 1000))
         con.execute(
@@ -59998,9 +61280,10 @@ def reopen_stuck_import(db_path, queue_id, *, source="inkdrop_core", expected_re
                 ),
             }
         if row["wanted_id"]:
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(next_state), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], next_state, now,
+                site="reopen_stuck_import",
+                force=True,
             )
         history_id = stable_id("queue_import_reopened", "queue_item", queue_id, int(now * 1000))
         con.execute(
@@ -60374,6 +61657,14 @@ def request_wanted_search(db_path, wanted_id, source_order=None, recovery_steps=
         queue_row = con.execute("select state from queue_items where id=?", (queue_id,)).fetchone() if queue_id else None
         queue_state = str((queue_row or {})["state"] or "queued") if queue_row else "queued"
         next_revision = current_revision + 1
+        # SITE 25 OF 25, AND A FORCED ONE -- see WANTED_PROJECTION_FORCED_SITES.
+        # An operator asking for this unit to be searched again outranks the
+        # import record, so no projection guard applies and the mapper's output
+        # is written directly. The SQL stays hand-written because this site
+        # carries a revision compare-and-set whose rowcount it checks below;
+        # routing it through project_wanted_status() would drop that fence, and
+        # losing a concurrency fence to gain a guard that would not fire here is
+        # a bad trade.
         cursor = con.execute(
             "update wanted_items set status=?, updated_at=?, revision=? where id=? and revision=?",
             (wanted_status_for_queue_state(queue_state), now, next_revision, wanted_id, current_revision),
@@ -60490,9 +61781,10 @@ def request_series_search(db_path, series_id, source_order=None, recovery_steps=
             queue_id = upsert_queue_item_from_watch_issue(con, series_id, row["issue_id"], row["wanted_id"], watch, issue, now)
             queue_row = con.execute("select state from queue_items where id=?", (queue_id,)).fetchone() if queue_id else None
             queue_state = str((queue_row or {})["state"] or "queued") if queue_row else "queued"
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(queue_state), now, row["wanted_id"]),
+            project_wanted_status(
+                con, row["wanted_id"], queue_state, now,
+                site="request_series_search",
+                force=True,
             )
             queued.append({"wanted_id": row["wanted_id"], "queue_id": queue_id, "issue": row.get("issue_number"), "state": queue_state})
         history_id = _record_search_history(
@@ -73516,6 +74808,7 @@ def managed_folder_artifact_semantic_guard(path, series_row, issue_row):
             series_row.get("title"),
             (issue_row.get("issue_number") or issue_row.get("normalized_number")) if expected_unit == "volume" else None,
             target_type=expected_unit,
+            expected_series_year=series_row.get("year"),
         )
         if conflicts:
             compatible = False
@@ -74866,9 +76159,10 @@ def apply_readiness_repair(
                 continue
             queue_row = con.execute("select state from queue_items where id=? limit 1", (queue_id,)).fetchone() if queue_id else None
             queue_state = str((queue_row or {})["state"] or "queued") if queue_row else "queued"
-            con.execute(
-                "update wanted_items set status=?, updated_at=? where id=?",
-                (wanted_status_for_queue_state(queue_state), now, wanted_id),
+            project_wanted_status(
+                con, wanted_id, queue_state, now,
+                site="apply_readiness_repair",
+                force=True,
             )
             if queue_before:
                 updated_queue += 1

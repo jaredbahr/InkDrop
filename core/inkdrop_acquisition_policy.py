@@ -27,14 +27,33 @@ So the shape here is deliberate:
   The original gate could only block or not block, which is why "surface this
   to an operator" was unreachable and 127 items went silent.
 
-**What this deliberately does NOT decide.** Whether a multi-unit pack may be
-auto-grabbed because it declares a range containing the wanted unit is tracker
-#209, and it is on hold. The range proof it depends on is also known to accept
-the wrong series (``Berserk v13`` matching ``Berserk of Gluttony v01-13``,
-because the guard is negative-only and never requires positive series
-agreement). ``PACK_CONTAINMENT_DEFAULT`` below is therefore ``review`` and
-changing it is a one-line, reviewable decision -- not something that arrives
-as a side effect of tidying the gates.
+**Pack containment, and why this value is what it is.** Whether a multi-unit
+pack may be auto-grabbed because it declares a range containing the wanted
+unit is tracker #209: the 2026-08-15 ruling is that any needed unit justifies
+taking the whole pack. The proof that implements it lives in
+:func:`inkdrop_candidate_matching.pack_title_range_membership`, and the
+reason it was held -- a range proof that accepted the wrong series,
+``Berserk v13`` against ``Berserk of Gluttony v01-13`` -- is answered upstream
+of it: the provider classifier stamps that pair ``related_series_identity``
+on the shipping bytes (run 2026-09-04, ``Berserk v01-40`` reading
+``title_match`` as the control), and the proof declines any candidate whose
+confidence is a mismatch or a related series.
+
+This constant is narrower than that ruling. It governs one branch only: a
+*collected edition* that spans a range, reached in
+:func:`inkdrop_candidate_matching.candidate_compatibility` when the edition
+itself is acceptable. There the edition question is settled and containment
+is not, so the stricter answer is kept and the release is REFUSED, not
+reviewed -- ``tests/inkdrop-acquisition-policy-authority-smoke.py`` arm B2
+pins exactly that with ``Geiger Omnibus 001-010`` against issue 5. For
+seventeen days this paragraph said ``review`` while the constant and that
+test said ``refuse``; all three were written in one commit (#751). The code
+and the test were the intent; the prose was the error, and it is the prose
+that is corrected here. Measured on the 2026-09-04T22:27Z snapshot, 44
+outstanding units carry ``collected_edition_disallowed`` at their latest
+verdict and 0 of them carry range evidence in that verdict. Moving this to
+``review`` or ``admit`` is a one-line, reviewable decision for the owner,
+not a side effect of tidying the gates.
 """
 
 from __future__ import annotations

@@ -85,6 +85,9 @@ REVIEW_FILE = STATE_DIR / "manual-review.jsonl"
 MANUAL_REVIEW_ACTIONS_FILE = STATE_DIR / "manual-review-actions.json"
 STATUS_FILE = STATE_DIR / "slskd-source-probe-status.json"
 CACHE_FILE = STATE_DIR / "slskd-source-probe-cache.json"
+SATURATION_MEMORY_FILE = STATE_DIR / "slskd-query-saturation.json"
+SATURATION_MEMORY_RETENTION_SECONDS = 30 * 24 * 3600
+SATURATION_MEMORY_MAX_ENTRIES = 5000
 COMIC_SERIES_WATCHES_FILE = STATE_DIR / "comic-series-watches.json"
 SERIES_AUTOPILOT_QUEUE_FILE = STATE_DIR / "series-autopilot-queue.json"
 LOG_FILE = LOG_DIR / "slskd-source-probe.log"
@@ -284,6 +287,16 @@ TRANSIENT_AUTO_GRAB_ERROR_PATTERNS = (
 
 class SLSKDTransferLookupError(RuntimeError):
     pass
+
+
+class SLSKDSearchBudgetTooSmall(RuntimeError):
+    """This pass cannot fund one search, so it declines instead of truncating.
+
+    Distinct from SLSKDProviderUnavailable on purpose: the provider is fine and
+    nothing should be treated as an outage. It is the caller's budget that is
+    too small, and conflating the two would let a scheduling problem read as a
+    Soulseek problem for as long as the schedule stays wrong.
+    """
 
 
 class SLSKDProviderUnavailable(RuntimeError):
@@ -1076,7 +1089,31 @@ def utc_stamp(ts=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts or now()))
 
 
+def accent_fold(value):
+    """Drop combining marks so an accented letter keeps its ASCII base.
+
+    NFKD then strip combining marks, and nothing more. The one-liner
+    .encode("ascii", "ignore") also deletes characters that have no
+    decomposition, so an en dash vanishes and "Korra–Turf Wars" -- which
+    fills 3 of 3 today -- glues to "KorraTurf Wars". Measured 2026-09-04:
+    the three titles with a decomposable accent filled 0 of 30 units; the
+    one with a non-decomposable dash filled 3 of 3. The cut is whether an
+    ASCII base is left behind, not whether the character is ASCII.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
 def normalize(value):
+    # Accents first, so "Mortelle Adèle" keeps its word whole. Without this
+    # the [^a-z0-9] strip below turns it into "mortelle ad le", and
+    # title_match() against a share named "Mortelle Adele T01.cbz" refused
+    # it as "matched only 1/2 required title words" -- measured live
+    # 2026-09-04, 0 of 21 units filled. _acronym_fold() already did this
+    # for the acronym key and nowhere else, which is the one-place-not-the-
+    # other shape. Both sides of every comparison go through here, so a
+    # share that carries the accent still matches a wanted that does not.
+    value = accent_fold(value)
     # Fold "&" / "&amp;" to "and" before stripping non-alphanumerics -- see
     # core/inkdrop_completed_import.py's clean_words() for the root cause.
     # A bare title-symbol strip drops "&" entirely, so "Love & Rockets" and
@@ -3702,6 +3739,22 @@ def source_title_variants(item):
     series = item_series_title(item)
     raw_series = str((item or {}).get("series") or (item or {}).get("series_title") or series).strip()
     values = []
+    # Lead with the ASCII form when the title carries a decomposable accent.
+    # unique_values() keys on normalize(), which folds, so the accented and
+    # folded spellings collapse to ONE slot and the first one wins -- and
+    # the first title is the one the per-issue suffix budget is spent on.
+    # Soulseek shares are named in ASCII far more often than not -- the
+    # product ruling is to drop the accent and search the base letter -- so
+    # the accented form was
+    # the one finding nothing: 36 of 36 outbound variants for Nausicaä
+    # carried the ä, 0 of 9 units filled. This replaces rather than adds,
+    # so the variant count and the probe budget do not move.
+    for candidate in (raw_series, series):
+        folded = accent_fold(candidate)
+        if folded and folded != candidate:
+            values.extend(title_variants(folded))
+            for variant in title_variants(folded):
+                values.extend(creator_possessive_title_variants(variant))
     values.extend(inkdrop_sources.collected_title_aliases(raw_series))
     values.extend(inkdrop_sources.contributor_title_aliases(raw_series))
     values.extend(inkdrop_sources.contributor_title_aliases(series))
@@ -4127,6 +4180,15 @@ def prune_futile_queries(queries, empty_term_sets):
 # that was never in the reply set.
 SOULSEEK_RESPONSE_CEILING = 250
 
+# A search ends either because it ran out of room for replies or because it ran
+# out of time, and only the first is saturation. Requiring the count to reach
+# the ceiling exactly missed answers that plainly hit it: "Die" came back with
+# 244 peers and 25,059 files, nearly all of them music, and stayed on the bare
+# anchor permanently because 244 is not 250. Timed-out searches on this
+# deployment run 0-185 peers, so the gap between that and the ceiling is wide
+# enough to read 95% as "the window filled" without admitting them.
+SOULSEEK_SATURATION_MIN_RESPONSES = max(1, int(SOULSEEK_RESPONSE_CEILING * 0.95))
+
 # Type words that select a peer's shelf rather than naming the work. Kept
 # deliberately small: this is the set a saturated anchor may be narrowed by,
 # not a general vocabulary.
@@ -4138,6 +4200,100 @@ def search_response_count(row):
         return int((row or {}).get("responseCount") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _remembered_saturated_texts():
+    """Saturation proven earlier and still worth trusting.
+
+    saturated_query_texts() reads slskd's /searches list, which is capped by
+    volume rather than age. A series probed on a slow rotation loses its
+    saturation record to other series' traffic long before the narrowing
+    window expires, so the titles that most need the qualified anchor -- the
+    ones famous as a television show or a film under the same name -- are the
+    ones least likely to still hold the proof. Measured 2026-09-02: 4 of 275
+    live anchors had a record, covering 74 of 3,786 outstanding units.
+
+    Keeping it is sound on this function's own terms: saturation "is a
+    property of the words, not of who happens to be awake". It is re-proven
+    on every pass that sees the query again, and forgotten after
+    SATURATION_MEMORY_RETENTION_SECONDS so a title that stops being common
+    stops being narrowed.
+    """
+    payload = read_json(SATURATION_MEMORY_FILE, {}) or {}
+    queries = payload.get("queries") if isinstance(payload, dict) else None
+    if not isinstance(queries, dict):
+        return set()
+    cutoff = now() - SATURATION_MEMORY_RETENTION_SECONDS
+    out = set()
+    for text, record in queries.items():
+        if not isinstance(record, dict):
+            continue
+        try:
+            observed_at = float(record.get("observed_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if observed_at >= cutoff and text:
+            out.add(text)
+    return out
+
+
+def _remember_saturated_texts(observed, contrary=None):
+    """Persist saturating query texts, and RETIRE ones since proven otherwise.
+
+    Returns the set of texts the memory holds afterwards.
+
+    SATURATION MUST BE THE MOST RECENT FINDING, NOT THE HIGH-WATER MARK. A
+    memory that only ever grows is a clock that advances one way: a title that
+    was common in week one keeps being narrowed for the rest of the month even
+    once its anchor comes back sparse, and the narrowing costs reach precisely
+    where reach is all that is left. So a COMPLETED search that did not fill
+    the window, and is NEWER than the record, deletes it. The next saturating
+    answer writes it again -- this forgets, it does not blacklist.
+    """
+    if not observed and not contrary:
+        return set()
+    payload = read_json(SATURATION_MEMORY_FILE, {}) or {}
+    queries = payload.get("queries") if isinstance(payload, dict) else None
+    if not isinstance(queries, dict):
+        queries = {}
+    cutoff = now() - SATURATION_MEMORY_RETENTION_SECONDS
+    for text, observed_at in (observed or {}).items():
+        prior = queries.get(text) if isinstance(queries.get(text), dict) else {}
+        try:
+            prior_at = float(prior.get("observed_at") or 0)
+        except (TypeError, ValueError):
+            prior_at = 0.0
+        queries[text] = {"observed_at": max(prior_at, float(observed_at))}
+    for text, contrary_at in (contrary or {}).items():
+        record = queries.get(text)
+        if not isinstance(record, dict):
+            continue
+        try:
+            record_at = float(record.get("observed_at") or 0)
+        except (TypeError, ValueError):
+            record_at = 0.0
+        try:
+            if float(contrary_at) > record_at:
+                queries.pop(text, None)
+        except (TypeError, ValueError):
+            continue
+    fresh = {}
+    for text, record in queries.items():
+        try:
+            if float(record.get("observed_at") or 0) >= cutoff:
+                fresh[text] = record
+        except (TypeError, ValueError):
+            continue
+    if len(fresh) > SATURATION_MEMORY_MAX_ENTRIES:
+        ordered = sorted(fresh.items(), key=lambda kv: kv[1].get("observed_at") or 0, reverse=True)
+        fresh = dict(ordered[:SATURATION_MEMORY_MAX_ENTRIES])
+    try:
+        write_json(SATURATION_MEMORY_FILE, {"queries": fresh})
+    except OSError:
+        # Losing the memory degrades to today's behaviour; it must never take
+        # a probe pass down with it.
+        pass
+    return set(fresh)
 
 
 def saturated_query_texts(max_age_seconds=None):
@@ -4168,29 +4324,54 @@ def saturated_query_texts(max_age_seconds=None):
     keep paying the full ceiling cost forever while busy series got the fix.
     """
     window = slskd_repeat_query_cooldown_seconds() if max_age_seconds is None else max_age_seconds
+    remembered = _remembered_saturated_texts()
     if window <= 0:
-        return set()
+        return remembered
     try:
         rows = slskd_get("/searches", timeout=5)
     except Exception:
-        # No record is not the same as no saturation. Narrow nothing.
-        return set()
+        # No record is not the same as no saturation. Narrow nothing new, but
+        # what was already proven stands -- it did not stop being true because
+        # a diagnostic call failed.
+        return remembered
     if not isinstance(rows, list):
-        return set()
+        return remembered
     cutoff = now() - window
     saturated = set()
+    observed = {}
+    contrary = {}
     for row in rows:
         if not isinstance(row, dict) or not row.get("isComplete"):
             continue
-        if search_response_count(row) < SOULSEEK_RESPONSE_CEILING:
+        text = normalize(row.get("searchText"))
+        if not text:
             continue
         started_at = _parse_slskd_started_at(row.get("startedAt"))
-        if not started_at or started_at < cutoff:
+        if not started_at:
             continue
-        text = normalize(row.get("searchText"))
-        if text:
+        if search_response_count(row) < SOULSEEK_SATURATION_MIN_RESPONSES:
+            # A COMPLETED search that did not fill the window is evidence the
+            # words are no longer common. Kept so a stale record can be
+            # retired: without this the memory is a high-water mark, and a
+            # title narrowed once stays narrowed for thirty days after its
+            # anchor has gone sparse -- costing reach exactly where reach is
+            # the only thing left.
+            contrary[text] = max(contrary.get(text, 0.0), started_at)
+            continue
+        # Harvest every saturating search still visible, not only the ones
+        # inside the caller's window. The list is capped by VOLUME -- 101
+        # searches on 2026-09-02, 26 of them inside 24h -- so a record that is
+        # still here now will be gone before this series is asked again, and
+        # the window was never what was losing it.
+        observed[text] = max(observed.get(text, 0.0), started_at)
+        if started_at >= cutoff:
             saturated.add(text)
-    return saturated
+    # A contrary answer newer than the saturating one is the current finding,
+    # so it withdraws this pass's own in-window claim too, not just the file.
+    saturated = {t for t in saturated if contrary.get(t, 0.0) <= observed.get(t, 0.0)}
+    if observed or contrary:
+        remembered = _remember_saturated_texts(observed, contrary)
+    return saturated | remembered
 
 
 def media_qualified_rung_index(queries, anchor_terms, qualifier=""):
@@ -5428,6 +5609,36 @@ def slskd_search(query, wait_seconds=8, deadline=None, reuse_recent_seconds=0, z
                 response_count=len(reused),
             )
             return reused
+    # Reuse has already been tried and did not stand, so this is a real query
+    # against the operator's account. A window shorter than the wait does not
+    # buy a cheaper search, it buys a differently-biased one: the peers that
+    # answer within a few seconds are the ones sharing the popular thing under
+    # that name, and the shelf holding the comic is still replying when the
+    # deadline cuts in. The live case in this module's own polling comment --
+    # "League of Extraordinary Gentlemen" silent through 40s, then 134 peers
+    # and 1998 files at 45s -- returns nothing at all inside a 30s pass budget.
+    #
+    # So decline. Measured 2026-09-02 the live pass ran at probe_budget_seconds
+    # 30, the clamp floor, with 10.9s of that spent on setup, against a 50s
+    # wait floor; every such attempt spent a Soulseek search to read a partial
+    # answer as the answer.
+    # Automatic passes only, and the asymmetry is not politeness toward the
+    # person waiting: it is that an automatic search is CACHED. A truncated
+    # answer here is stored by reusable_slskd_search() and handed to every
+    # other wanted unit of the same series for the next 24 hours, so one
+    # starved pass sets the evidence for a hundred rows. A manual search is
+    # one person's explicit one-off request, is never reused, and a partial
+    # answer beats none. Reuse opt-in is the existing marker for that split --
+    # see the comment above the reuse lookup.
+    automatic_pass = bool(reuse_recent_seconds or zero_result_reuse_recent_seconds)
+    required_seconds = max(2.0, min(float(wait_seconds or 0), 55.0))
+    remaining = seconds_remaining(deadline)
+    if automatic_pass and remaining is not None and remaining < required_seconds:
+        raise SLSKDSearchBudgetTooSmall(
+            "SLSKD search for %r needs %.0fs to answer but only %.0fs of probe budget remain; "
+            "declining rather than starting a query this pass would cut short"
+            % (query, required_seconds, remaining)
+        )
     enforce_slskd_search_pacing(deadline)
     search_id = str(uuid.uuid4())
     conflict_errors = []
@@ -6903,7 +7114,7 @@ def issue_range_match(filename, item):
 def book_volume_numbers(text):
     numbers = []
     pattern = re.compile(
-        rf"\b(?:v|vol|volume|book|band|tome|tomo)\.?\s*0*({NUMBER_TOKEN_PATTERN})(?:\.\d+)?\b",
+        rf"\b(?:v|vol|volume|book|band|tome|tomo)\.?[\s._-]*0*({NUMBER_TOKEN_PATTERN})(?:\.\d+)?(?!\d)",
         flags=re.I,
     )
     for match in pattern.finditer(str(text or "")):
@@ -6915,8 +7126,15 @@ def book_volume_numbers(text):
 
 def bare_issue_numbers(filename, item):
     text = issue_match_text(filename)
+    # A part index inside a VOLUME file is a fragment of that volume, not a unit of
+    # its own: "Planetes - Volume_04_(Part-1).cbz" is half of volume 4. Read as a unit
+    # number it matched issue 1 at score 51 AND refused issue 4 with "filename issue
+    # token 1 does not match 4" -- satisfying a unit the file is not, and blocking the
+    # one it is. Tested BEFORE the strip below, which is what would otherwise erase the
+    # evidence that a volume was named at all.
+    volume_present = bool(book_volume_numbers(text))
     text = re.sub(
-        rf"\b(?:v|vol|volume|book|band|tome|tomo)\.?\s*0*{NUMBER_TOKEN_PATTERN}(?:\.\d+)?\b",
+        rf"\b(?:v|vol|volume|book|band|tome|tomo)\.?[\s._-]*0*{NUMBER_TOKEN_PATTERN}(?:\.\d+)?(?!\d)",
         " ",
         text,
         flags=re.I,
@@ -6936,6 +7154,12 @@ def bare_issue_numbers(filename, item):
             continue
         previous = words[index - 1] if index else ""
         if previous in {"v", "vol", "volume", "book", "band", "tome", "tomo"}:
+            continue
+        # Only when a volume was actually named. "Part" is a legitimate unit designator
+        # on its own -- "Planetes Part 3.cbz" with no volume token may genuinely BE unit
+        # 3 -- so demoting it unconditionally would trade this false positive for a new
+        # false negative.
+        if volume_present and previous in {"part", "pt"}:
             continue
         if number in title_numbers and index <= 1:
             continue
@@ -6991,6 +7215,24 @@ def shared_volume_artifact_match(filename, item):
         return inkdrop_source_providers.indexer_manifest_entry_matches_volume_candidate(candidate, filename)
     except Exception:
         return None
+
+
+# The two penalties below are the only ones issue_number_match() raises after
+# actually finding a number in the filename; everything else it can say means
+# "no unit token here", which is a different fact. The distinction matters
+# because the issue-title arm is allowed to rescue the second and not the
+# first: a file with no unit token may still be the wanted unit, but a file
+# that names a DIFFERENT unit is not, whatever else about it matches.
+ISSUE_NUMBER_CONTRADICTION_PREFIXES = (
+    "filename issue token ",
+    "explicit issue token ",
+)
+
+
+def issue_number_contradiction(number_details):
+    """True when a unit token was found in the filename and disagreed."""
+    penalty = str((number_details or {}).get("penalty") or "")
+    return penalty.startswith(ISSUE_NUMBER_CONTRADICTION_PREFIXES)
 
 
 def issue_number_match(filename, item):
@@ -7504,6 +7746,23 @@ def item_match_details(filename, item, candidate=None):
             }
         if not issue_matched:
             title_details = issue_title_match(filename, item)
+            # The issue-title arm is a rescue for files that carry no unit
+            # token. It must not overturn a unit token that was found and
+            # DISAGREED. When the wanted item has no issue title of its own,
+            # issue_metadata_for_item() falls back to the item's `title`, and
+            # on the item wanted_item_from_queue() builds that key holds the
+            # SERIES title -- which appears in every filename of that series,
+            # so the arm can never fail for its own series. That is how
+            # "The Invincible Red Sonja 002" was accepted against Invincible.
+            # A filename with no unit token at all still reaches the rescue,
+            # which is what one-shots and unitless works depend on.
+            if title_details.get("matched") and issue_number_contradiction(number_details):
+                return {
+                    "matched": False,
+                    "score": -40,
+                    "reasons": reasons,
+                    "penalties": [number_details.get("penalty")],
+                }
             if title_details.get("matched"):
                 issue_matched = True
                 if book_volume_details.get("matched"):
@@ -7538,7 +7797,20 @@ def item_match_details(filename, item, candidate=None):
         reasons.append(f"comic extension {ext}")
         score += 6
         score_reasons.append("comic extension +6")
-    return {"matched": True, "score": score, "reasons": reasons, "penalties": penalties, "score_reasons": score_reasons}
+    # `unit_evidence` is the same `issue_matched` the score above is built on,
+    # reported rather than left to be re-derived downstream by reading `reasons`.
+    # auto_import_quality() used to scan those sentences for one of four fixed
+    # substrings; the branch that wins for a recognised volume emits "volume
+    # artifact token N", which is not one of them, so a file the matcher had
+    # already accepted was refused after it had transferred.
+    return {
+        "matched": True,
+        "score": score,
+        "reasons": reasons,
+        "penalties": penalties,
+        "score_reasons": score_reasons,
+        "unit_evidence": bool(issue_matched),
+    }
 
 
 TRUSTED_SINGLETON_POSITIVE_EVIDENCE = {
@@ -7852,6 +8124,35 @@ def filename_without_exact_issue_titles(filename, item=None):
     return "".join(policy_chars)
 
 
+# Volume markers are deliberately absent from this set. A volume range is
+# recognised separately, below, by a pattern that requires the marker on the
+# LEFT side and refuses a right-hand side inside the year band -- "v01 - 2005"
+# is a volume printed beside its year. Adding "vol" here would let the bare
+# numeric scan overrule that on purpose-built input, so the two stay separate.
+_UNIT_RANGE_MARKERS = (
+    "prog", "progs", "issue", "issues", "chapter", "chapters",
+    "no", "nos", "number", "numbers", "#",
+)
+_UNIT_MARKED_RANGE_RE = re.compile(
+    r"(?:%s)\.?\s*$" % "|".join(
+        re.escape(marker) for marker in _UNIT_RANGE_MARKERS),
+    re.IGNORECASE,
+)
+
+
+def _range_is_unit_marked(text, start):
+    """True when the numbers just before `start` are announced as units.
+
+    A publication-year span is never introduced by "progs" or "issues", so a
+    marker is what separates a real in-band range from a date stamp. Measured
+    on 14,341 distinct live candidate names: 113 carry a hyphen pair with both
+    sides inside 1900-2099 and NOT ONE is unit-marked, so this changes no
+    classification on the current library -- it closes a shape the band skip
+    cannot otherwise see.
+    """
+    return bool(_UNIT_MARKED_RANGE_RE.search(str(text or "")[max(0, start - 16):start]))
+
+
 def filename_without_exact_series_span(filename, item=None):
     text = unicodedata.normalize("NFKC", str(filename or ""))
     series_tokens = normalize(item_series_title(item or {})).split()
@@ -7961,15 +8262,27 @@ def filename_has_pack_or_range(filename, item=None, validated_series_directory=F
         # the stories ran, not that the file holds issues 2013 through 2019.
         # Only the year/month shape was skipped above, so a single-work file
         # whose title carries its publication years classified as a pack and
-        # was refused as "not an individual handoff". Comics are not numbered
-        # in the 1900-2099 band, so requiring BOTH sides to be years leaves
-        # real ranges ("001-042", "(1-3)", "01-38") untouched -- and
+        # was refused as "not an individual handoff".
+        #
+        # THE REASON "001-042", "(1-3)" and "01-38" SURVIVE IS THAT THEY SIT
+        # BELOW THE BAND, NOT THAT COMICS ARE NEVER NUMBERED INSIDE IT. This
+        # comment used to claim the latter, and #759 was filed against exactly
+        # that claim: 2000 AD is numbered by prog and is past 2400, so a real
+        # prog range can have both sides inside 1900-2099. The examples were
+        # consistent with the rule and did not establish it, which is the shape
+        # that lets a wrong reason sit unchallenged next to right behaviour.
         # "Akira (01-38)(1988-1995)" still classifies as a pack on 01-38.
+        #
+        # So the band skip stays -- on this library it is right about every live
+        # instance -- but it yields to an explicit unit marker. "Progs
+        # 2000-2100" and "Issues 1990-2000" state what they are counting;
+        # "(2013-2019)" does not, and a date stamp is never introduced by one.
         if (
             left == left.to_integral_value()
             and right == right.to_integral_value()
             and 1900 <= left <= 2099
             and 1900 <= right <= 2099
+            and not _range_is_unit_marked(global_policy_text, match.start())
         ):
             continue
         if left != right:
@@ -8652,8 +8965,8 @@ def _acronym_fold(value):
     two-word title. Decomposing first keeps the word whole, so a title's key
     does not depend on whether its accents were typed.
     """
-    decomposed = unicodedata.normalize("NFKD", str(value or ""))
-    return normalize("".join(ch for ch in decomposed if not unicodedata.combining(ch)))
+    # normalize() folds accents itself now; kept as a name for its callers.
+    return normalize(value)
 
 
 def generated_acronym_key(title, min_letters=None):
@@ -12731,6 +13044,7 @@ def detected_staged_files(item, max_files=8, review_id=None):
             "score": int(details.get("score") or 0),
             "match_reasons": list(details.get("reasons") or []),
             "match_penalties": list(details.get("penalties") or []),
+            "match_unit_evidence": bool(details.get("unit_evidence")),
             "match_basis": details.get("match_basis") or "filename",
             "match_text": details.get("match_text") or candidate.get("filename"),
         }
@@ -12817,11 +13131,20 @@ def rejection_sample_priority(filename, details):
     return 3
 
 
-def summarize_rejections(rejections, checked_file_count, response_count):
+RAW_PAGE_LOCKED_REASON = "raw page folder skipped: pages are locked"
+
+
+def summarize_rejections(rejections, checked_file_count, response_count, locked_file_count=0,
+                         raw_page_locked_skipped=0):
     counts = {}
     for filename, details in rejections:
         label = rejection_label(details)
         counts[label] = counts.get(label, 0) + 1
+    # A default of 0 keeps every existing caller unchanged, and a 0 adds no
+    # reason at all -- an unlocked page folder must not mint a refusal.
+    if raw_page_locked_skipped:
+        counts[RAW_PAGE_LOCKED_REASON] = (
+            counts.get(RAW_PAGE_LOCKED_REASON, 0) + int(raw_page_locked_skipped))
     reason_counts = [
         {"reason": reason, "count": count}
         for reason, count in sorted(counts.items(), key=lambda row: (-row[1], row[0]))[:8]
@@ -12838,6 +13161,11 @@ def summarize_rejections(rejections, checked_file_count, response_count):
     return {
         "response_count": int(response_count or 0),
         "checked_file_count": int(checked_file_count or 0),
+        # How many files the peers offered as LOCKED, counted where they arrive
+        # rather than after matching. Always an int, never absent: "no locked
+        # files" and "nobody counted" have to be different readings, or the
+        # blindness this exists to end is rebuilt one layer up.
+        "locked_file_count": int(locked_file_count or 0),
         "rejected_file_count": len(rejections),
         "rejection_reasons": reason_counts,
         "rejection_samples": samples,
@@ -12940,15 +13268,31 @@ def raw_page_image_pack_candidates(response):
     inkdrop_archive_conversion.convert_page_directory, identity stays with
     the existing title/issue matching this candidate is handed to below.
     """
+    # RETURNS (candidates, locked_pages_skipped). The count exists because the
+    # skip below is otherwise invisible in BOTH directions: a locked page folder
+    # produces no candidate, and -- unlike every other refusal on this route --
+    # no rejection either, because this function has no rejection list and its
+    # caller only records refusals for candidates it RETURNS. So a peer offering
+    # a locked loose-page folder was indistinguishable from a peer offering no
+    # page folder at all, and would have stayed so after rejection counts began
+    # being persisted.
     if not RAW_PAGE_IMAGE_EXTENSIONS:
-        return []
+        return [], 0
     username = str(response_get(response, "username") or "")
     upload_speed = int(response_get(response, "uploadSpeed", response_get(response, "UploadSpeed", 0)) or 0)
     queue_length = int(response_get(response, "queueLength", response_get(response, "QueueLength", 0)) or 0)
     free_slot = bool(response_get(response, "hasFreeUploadSlot", response_get(response, "HasFreeUploadSlot", False)))
     grouped = {}
+    locked_pages_skipped = 0
     for raw_row in response_get(response, "files", response_get(response, "Files", [])) or []:
-        if not isinstance(raw_row, dict) or file_get(raw_row, "isLocked", False):
+        if not isinstance(raw_row, dict):
+            continue
+        if file_get(raw_row, "isLocked", False):
+            # Counted only when it is actually a page image, so the number means
+            # "page images we declined to group because they were locked" and
+            # not "locked files this peer happened to share".
+            if extension_for(str(file_get(raw_row, "filename") or "")) in RAW_PAGE_IMAGE_EXTENSIONS:
+                locked_pages_skipped += 1
             continue
         filename = str(file_get(raw_row, "filename") or "").strip()
         if not filename or extension_for(filename) not in RAW_PAGE_IMAGE_EXTENSIONS:
@@ -12989,13 +13333,22 @@ def raw_page_image_pack_candidates(response):
             "content_type": "raw_page_images",
             "raw_page_files": deduped,
         })
-    return candidates
+    return candidates, locked_pages_skipped
 
 
 def candidates_from_responses(responses, item, *, deadline=None, max_files=None, candidate_limit=None, annotate_auto_grab=True):
     out = []
     rejections = []
     checked_file_count = 0
+    # Counted off the response itself, before matching and before any file cap,
+    # so it answers "did locked results arrive" rather than "did any survive".
+    # Those are different questions and only the first distinguishes an empty
+    # lockedFiles array from a full one whose files all failed the matcher.
+    locked_file_count = 0
+    # Page images refused by the raw-page grouper for being locked. Kept apart
+    # from locked_file_count, which counts what ARRIVED; this counts what was
+    # discarded, and only this one is a refusal.
+    raw_page_locked_skipped = 0
     processing_timed_out = False
     processing_file_cap_reached = False
     bounded = deadline is not None or max_files is not None or candidate_limit is not None
@@ -13010,6 +13363,7 @@ def candidates_from_responses(responses, item, *, deadline=None, max_files=None,
         free_slot = bool(response_get(response, "hasFreeUploadSlot", response_get(response, "HasFreeUploadSlot", False)))
         files = response_get(response, "files", response_get(response, "Files", [])) or []
         locked_files = response_get(response, "lockedFiles", response_get(response, "LockedFiles", [])) or []
+        locked_file_count += len(locked_files)
         for rows, force_locked in ((files, False), (locked_files, True)):
             for raw_row in rows:
                 if deadline is not None and seconds_remaining(deadline) <= 0:
@@ -13076,7 +13430,9 @@ def candidates_from_responses(responses, item, *, deadline=None, max_files=None,
             if processing_timed_out or processing_file_cap_reached:
                 break
         if not processing_timed_out and not processing_file_cap_reached:
-            for candidate in raw_page_image_pack_candidates(response):
+            page_candidates, page_locked = raw_page_image_pack_candidates(response)
+            raw_page_locked_skipped += page_locked
+            for candidate in page_candidates:
                 if deadline is not None and seconds_remaining(deadline) <= 0:
                     processing_timed_out = True
                     break
@@ -13106,7 +13462,10 @@ def candidates_from_responses(responses, item, *, deadline=None, max_files=None,
         deduped.append(candidate)
         if len(deduped) >= AUTO_GRAB_CANDIDATE_LIMIT:
             break
-    summary = summarize_rejections(rejections, checked_file_count, len(responses or []))
+    summary = summarize_rejections(
+        rejections, checked_file_count, len(responses or []), locked_file_count,
+        raw_page_locked_skipped=raw_page_locked_skipped,
+    )
     if bounded:
         summary.update({
             "processing_complete": not processing_timed_out and not processing_file_cap_reached,
@@ -14510,6 +14869,25 @@ def probe_item(
                 early_stop_reason = "safe_exact_candidate_found"
                 return False
             return True
+        except SLSKDSearchBudgetTooSmall as exc:
+            # Loud on purpose. Replacing a truncated search with a silent
+            # no-op would hide the scheduling defect behind a clean pass.
+            attempts.append({
+                "query": query,
+                "elapsed_seconds": round(now() - started, 1),
+                "skipped": "probe_budget_below_search_floor",
+                "remaining_seconds": round(float(seconds_remaining(deadline) or 0), 1),
+                "error": str(exc),
+            })
+            log(
+                "probe_budget_below_search_floor",
+                review_id=item.get("review_id"),
+                series=item.get("series"),
+                query=query,
+                detail=str(exc),
+            )
+            early_stop_reason = "probe_budget_below_search_floor"
+            return False
         except SLSKDProviderUnavailable as exc:
             status_payload = exc.status if isinstance(exc.status, dict) else {}
             connected = status_payload.get("isConnected") if "isConnected" in status_payload else None

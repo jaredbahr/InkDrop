@@ -1199,7 +1199,11 @@
     }
     const expected = evidence.expected || {};
     const found = evidence.found || {};
-    const expectedText = [expected.series, expected.unit ? `#${expected.unit}` : ""].filter(Boolean).join(" ");
+    // expected.text is the writer's own sentence, used when the expectation
+    // was never a series and a unit (a save path, a destination folder). It is
+    // rendered verbatim for the same reason the file name below is.
+    const expectedText = [expected.series, expected.unit ? `#${expected.unit}` : ""].filter(Boolean).join(" ")
+      || String(expected.text || "");
     // The file name verbatim, never through a label function -- same rule as
     // the source pill below, for the same reason.
     const foundText = found.file_name || found.path || (found.unit ? `#${found.unit}` : "");
@@ -1226,6 +1230,14 @@
   function approveLabelFor(row) {
     if (row.can_approve_pack) return "Approve pack";
     if (row.can_approve_local_file) return "Import this file";
+    // Only affirmative when there is something to affirm. Measured 2026-08-29:
+    // `candidate` was an empty dict and all three can_approve flags were false
+    // on 175 of 175 rows in the operator view, so every card in the queue
+    // offered "Use this candidate" directly above a footer saying no candidate
+    // had been retained. approveEndpointFor() already returns "" for exactly
+    // this case and the button is rendered disabled -- the label was the only
+    // part still claiming otherwise.
+    if (!approveEndpointFor(row)) return "No candidate to use";
     return "Use this candidate";
   }
 

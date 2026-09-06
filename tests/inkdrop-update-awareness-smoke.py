@@ -21,6 +21,12 @@ NOW = 1784422800
 COMMIT = "a" * 40
 CURRENT_DIGEST = "sha256:" + "b" * 64
 LATEST_DIGEST = "sha256:" + "c" * 64
+# The repository the shipped validator accepts by default. Named here rather
+# than written out, so this fixture follows the shipped default instead of
+# pinning whichever repository happened to publish when it was written -- and
+# so the private development repository's name stops travelling into the
+# public export through a test fixture.
+REPO = updates.UPDATE_RELEASE_REPOSITORY
 
 
 def require(condition, message):
@@ -46,7 +52,7 @@ def manifest(**changes):
         "database_migration": False,
         "restart_required": True,
         "release_notes_summary": "A verified InkDrop prerelease with bounded update metadata.",
-        "release_url": "https://github.com/jaredbahr/inkdrop-dev/releases/tag/v0.1.0-alpha.53",
+        "release_url": f"https://github.com/{REPO}/releases/tag/v0.1.0-alpha.53",
         "installation_notes": "Pin the exact digest and recreate web and worker together with an external manager.",
         "rollback_notes": "Keep the prior digest and backup, then recreate both services if verification fails.",
     }
@@ -125,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
         "INKDROP_CANDIDATE_MANIFEST_PATH": str(candidate_path),
         "INKDROP_WORKER_IMAGE_DIGEST": CURRENT_DIGEST,
         "INKDROP_UPDATE_MANIFEST_PATH": str(latest_path), "INKDROP_UPDATE_REMOTE_ENABLED": "0",
-        "INKDROP_UPDATE_MANIFEST_URL": "https://github.com/jaredbahr/inkdrop-dev/releases/download/v0.1.0-alpha.53/inkdrop-update-manifest.json",
+        "INKDROP_UPDATE_MANIFEST_URL": f"https://github.com/{REPO}/releases/download/v0.1.0-alpha.53/inkdrop-update-manifest.json",
         "INKDROP_UPDATE_CACHE_SECONDS": "60", "INKDROP_UPDATE_CHANNEL": "qa",
     }
 
@@ -159,11 +165,11 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     require(prerelease["state"] == "newer_prerelease_available" and prerelease["external_updater"]["install_available"] is False, prerelease)
     require(prerelease["external_updater"]["image_ref"] == f"{updates.UPDATE_IMAGE_REPOSITORIES['qa']}@{LATEST_DIGEST}", prerelease)
 
-    stable_update = manifest(version="0.1.1", channel="stable", prerelease=False, image_repository=updates.UPDATE_IMAGE_REPOSITORIES["stable"], release_url="https://github.com/jaredbahr/inkdrop-dev/releases/tag/v0.1.1")
+    stable_update = manifest(version="0.1.1", channel="stable", prerelease=False, image_repository=updates.UPDATE_IMAGE_REPOSITORIES["stable"], release_url=f"https://github.com/{REPO}/releases/tag/v0.1.1")
     result = state_for(stable_update, INKDROP_RELEASE_CHANNEL="stable", INKDROP_UPDATE_CHANNEL="stable", INKDROP_VERSION="0.1.0")
     seen.add(result["state"]); require(result["state"] == "update_available", result)
 
-    current = manifest(version="0.1.0-alpha.52", release_url="https://github.com/jaredbahr/inkdrop-dev/releases/tag/v0.1.0-alpha.52", image_digest=CURRENT_DIGEST)
+    current = manifest(version="0.1.0-alpha.52", release_url=f"https://github.com/{REPO}/releases/tag/v0.1.0-alpha.52", image_digest=CURRENT_DIGEST)
     result = state_for(current, INKDROP_WORKER_IMAGE_DIGEST=CURRENT_DIGEST)
     seen.add(result["state"]); require(result["state"] == "up_to_date" and result["deployment"]["consistent"] is True, result)
 
@@ -316,7 +322,7 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
         ],
     }
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
-    generated = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
+    generated = release_tool.build_update_manifest(candidate_path, validation_path, contract, REPO, COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     expected_published = datetime.fromtimestamp(NOW, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     require(generated["published_at"] == expected_published, generated["published_at"])
     require(generated["database_migration"] is False, generated)
@@ -345,7 +351,7 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     candidate_path.write_text(json.dumps(candidate, sort_keys=True) + "\n", encoding="utf-8")
     validation.update(target_state_schema_version=candidate["state_schema_version"], candidate_sha256=hashlib.sha256(candidate_path.read_bytes()).hexdigest())
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
-    changed = release_tool.build_update_manifest(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
+    changed = release_tool.build_update_manifest(candidate_path, validation_path, contract, REPO, COMMIT, "177", updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     require(changed["database_migration"] is True, changed)
     candidate["state_schema_version"] = contract["previous_state_schema_version"]
     candidate_path.write_text(json.dumps(candidate, sort_keys=True) + "\n", encoding="utf-8")
@@ -353,13 +359,13 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     validation_path.write_text(json.dumps(validation), encoding="utf-8")
     update_path = folder / "inkdrop-update-manifest.json"
     update_path.write_text(json.dumps(generated, sort_keys=True) + "\n", encoding="utf-8")
-    evidence = release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
+    evidence = release_tool.load_verified_evidence(candidate_path, validation_path, contract, REPO, COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     require("inkdrop-update-manifest.json" in evidence["assets"], evidence)
     tampered = dict(generated, image_digest="sha256:" + "9" * 64)
     tampered["manifest_identity"] = updates.update_manifest_identity(tampered)
     update_path.write_text(json.dumps(tampered), encoding="utf-8")
     try:
-        release_tool.load_verified_evidence(candidate_path, validation_path, contract, "jaredbahr/inkdrop-dev", COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
+        release_tool.load_verified_evidence(candidate_path, validation_path, contract, REPO, COMMIT, "177", update_path, updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW)
     except RuntimeError as exc:
         require("evidence mismatch" in str(exc), exc)
     else:

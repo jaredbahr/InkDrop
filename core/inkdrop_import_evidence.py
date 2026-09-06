@@ -168,6 +168,14 @@ def decision_evidence(row):
         # The unit the queue asked for. From the gate's own payload when it has
         # one, else the row's issue number.
         "unit": (parsed or {}).get("expected") or str(row.get("issue_number") or "").strip(),
+        # Some writers record their expectation as a sentence rather than a
+        # series and a unit -- a save path, a destination folder. Before this
+        # they had nowhere to put it, so `incomplete` went true and the card
+        # said "InkDrop did not record what it expected for this item" about a
+        # row whose own `detail` read "qBittorrent save_path=..., expected one
+        # of [...]". The record held the expectation; only this shape could not
+        # carry it. Verbatim, like every other field here.
+        "text": _first_text(row, ("detail",)),
     }
 
     # The candidate this row is about, when the writer recorded one. A
@@ -211,8 +219,16 @@ def decision_evidence(row):
         # that read as "nothing was expected".
         # file_name counts: a candidate InkDrop can name is a candidate the
         # operator can judge, whether or not a full path was recorded.
-        "incomplete": not (expected["series"] or expected["unit"])
-        or not (found["path"] or found["unit"] or found["file_name"]),
+        # A recorded statement settles it: if the writer said what it
+        # expected, in whatever shape, the card must not claim nothing was
+        # recorded. Absent that, the original rule stands unchanged -- a row
+        # that genuinely recorded neither side still says so, which is the
+        # honest message this flag exists to produce.
+        "incomplete": not expected["text"]
+        and (
+            not (expected["series"] or expected["unit"])
+            or not (found["path"] or found["unit"] or found["file_name"])
+        ),
     }
 
 

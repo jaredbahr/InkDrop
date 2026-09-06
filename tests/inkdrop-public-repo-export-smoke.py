@@ -119,6 +119,10 @@ HARDCODED_PROVIDER_SERIES_ID_RE = re.compile(
 # attribution -- never match.
 MAINTAINER_ATTRIBUTION_RE = re.compile(r"\b" + "Jar" + r"ed\b", re.IGNORECASE)
 
+# Keep in step with SCANNED_SUFFIXES in tools/inkdrop_publish_public_repo.py;
+# tests/inkdrop-private-marker-scan-coverage-smoke.py requires the two to match.
+# .ts/.tsx were absent from both until 2026-08-28, leaving every TypeScript
+# source the export ships unread by this gate.
 TEXT_SUFFIXES = {
     "",
     ".css",
@@ -132,6 +136,8 @@ TEXT_SUFFIXES = {
     ".md",
     ".py",
     ".sh",
+    ".ts",
+    ".tsx",
     ".txt",
     ".yaml",
     ".yml",

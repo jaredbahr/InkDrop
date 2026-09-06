@@ -377,6 +377,39 @@ def _issue_number_inside_run(issue_number, issue_run):
     return low <= int(candidate.group(1)) <= high
 
 
+# The bare form, kept as the vocabulary's EXACT entry because it is already
+# written into the record: 48,768 rows across source_attempts, history_events,
+# download_tasks and bad_source_candidates carry it verbatim. classify() falls
+# through to CODE_UNMAPPED silently rather than raising, so dropping the exact
+# entry would reclassify every one of those rows with nothing going red.
+UNTRUSTED_PUBLICATION_SUFFIX = "related subseries or untrusted publication suffix"
+
+
+def untrusted_publication_suffix_reason(group, in_path_segment=False):
+    """Say which bracket group could not be explained, not merely that one was.
+
+    Every other branch of related_subseries_source_blocker() names its cause,
+    and so does the pre-download gate. These two did not, and the cost is that
+    a correct refusal and an incorrect one are byte-identical in the record.
+    A file named `NNN (1993) (digital) (color) (Handle-Empire)` is refused for
+    the `color` -- absent from the annotation vocabulary that already holds
+    `digital`, `c2c`, `webrip`, `HD` and `2 covers` -- while a real spin-off is
+    refused for a bare credit handle rather than for its subtitle. Both read
+    the same, so neither can be counted, and widening the vocabulary is
+    unsafe while the two are indistinguishable.
+
+    The payload is a bracket group off InkDrop's own staged filename, which is
+    the same class of text the sibling branches already persist. It is capped
+    because the record is not a place for an unbounded string.
+    """
+    text = " ".join(str(group or "").split())[:80]
+    if not text:
+        return UNTRUSTED_PUBLICATION_SUFFIX
+    if in_path_segment:
+        return f"{UNTRUSTED_PUBLICATION_SUFFIX}: {text} in path segment"
+    return f"{UNTRUSTED_PUBLICATION_SUFFIX}: {text}"
+
+
 def related_subseries_source_blocker(
     series_title,
     source_path,
@@ -654,8 +687,11 @@ def related_subseries_source_blocker(
             if not strict_bracket_tail:
                 pass
             elif segment_index > 0:
-                if re.search(r"[\[(][^\[\]()]+[\])]", tail_text):
-                    return "related subseries or untrusted publication suffix"
+                unexplained = re.search(r"[\[(]([^\[\]()]+)[\])]", tail_text)
+                if unexplained:
+                    return untrusted_publication_suffix_reason(
+                        unexplained.group(1), in_path_segment=True
+                    )
             else:
                 # A leaf that names a different unit than the one being
                 # imported is the wrong book however well-formed its tail is.
@@ -700,7 +736,7 @@ def related_subseries_source_blocker(
                         continue
                     if inkdrop_artifact_acceptance.release_credit_group(group):
                         continue
-                    return "related subseries or untrusted publication suffix"
+                    return untrusted_publication_suffix_reason(group)
         suspicious = []
         for index, word in enumerate(words):
             if word in stop_words or word in edition_words or word in title_words:
@@ -4017,7 +4053,10 @@ def repack_cbr_to_cbz(source, dest):
     #
     # The temp file is judged and discarded on refusal, so a rejected repack
     # leaves nothing behind at `dest`.
-    refusal = inkdrop_artifact_acceptance.archive_output_refusal(tmp_cbz)
+    # The temp carries a .cbz.tmp name, so the format has to be stated or the
+    # reader skips it and this check silently passes everything.
+    refusal = inkdrop_artifact_acceptance.archive_output_refusal(
+        tmp_cbz, assume_suffix=".cbz")
     if refusal is not None:
         try:
             tmp_cbz.unlink()
@@ -4206,6 +4245,11 @@ def normalize_manga_series_reader_contract(folder, series_title, dry_run=False):
             title,
             path_number,
             target_type="volume",
+            # The manga reader path has no series year to offer: the target it
+            # builds below is literally {"year": None}, so correct threading and
+            # None are the same value here. An unknown year refuses the
+            # trailing-year discount, which is the safe direction.
+            expected_series_year=None,
         )
         if identity_conflicts:
             result["errors"].append({"path": str(path), "reason": identity_conflicts[0]})
@@ -8678,6 +8722,40 @@ def target_aliases(target):
     return out
 
 
+# A filename that carries the unit and NOTHING ELSE -- "Volume 1.cbz",
+# "Ch.002.cbz", "009.cbz". The distinction earns the containing folder its
+# second point below: when the file names no work of its own, the folder is
+# the only title evidence there is and it is not competing with anything. When
+# the file DOES name a work ("Epic Graphic Novel - Lieutenant Blueberry 3 -
+# General Golden Mane.cbr" under a folder named "Moebius"), the folder is not
+# entitled to speak for it -- that is how the wrong book gets filed, which the
+# goal document ranks as worse than not filing at all.
+BARE_UNIT_FILENAME_NOISE = frozenset(
+    {"c", "ch", "chap", "chapter", "chapters", "issue", "issues", "no", "number",
+     "v", "vol", "volume", "volumes", "part", "pt", "of", "cbz", "cbr", "zip", "rar"}
+)
+
+
+def filename_is_bare_unit(path):
+    """True when the filename's only content is its unit designation.
+
+    Deliberately strict: a year, a scene tag or a release group is content, so
+    "Volume 1 (2014) (Digital).cbz" is not bare. Those files already carry
+    their own evidence -- a matching year scores on its own -- and widening
+    this to admit them would let the folder speak for a file that had other
+    things to say.
+    """
+    stem = Path(path).stem
+    if not stem.strip():
+        return False
+    residue = [
+        word
+        for word in clean_words(stem)
+        if not word.isdigit() and word not in BARE_UNIT_FILENAME_NOISE
+    ]
+    return not residue
+
+
 def matching_target_alias(words, target):
     best = ""
     for alias in target_aliases(target):
@@ -8720,11 +8798,46 @@ def filename_duplicate_copy_suffix(path):
     return not (1900 <= value <= 2099)
 
 
+def target_title_scan_pattern(target):
+    """A pattern that matches the target's own title inside a filename stem.
+
+    Punctuation is elastic because a filename spells a title however the
+    packager felt: "Die!Die!Die!" arrives as "Die Die Die", "ODY-C" as "ODY C".
+    Returns None for a title of fewer than two alphanumeric characters -- a
+    one-letter series name would otherwise strip every matching letter out of
+    the filename and blind the very check this feeds.
+    """
+    title = str((target or {}).get("title") or (target or {}).get("series") or "").strip()
+    parts = re.findall(r"[A-Za-z0-9]+", title)
+    if not parts or sum(len(part) for part in parts) < 2:
+        return None
+    return re.compile(r"[^A-Za-z0-9]*".join(re.escape(part) for part in parts), re.I)
+
+
 def filename_has_chapter_token(path, target=None):
     stem = Path(path).stem
     if re.search(r"\b(?:chapter|chap|ch)\.?\s*0*\d{1,5}(?:\.\d+)?\b", stem, re.I):
         return True
-    compact_matches = list(re.finditer(r"\bc\.?\s*0*\d{1,5}(?:\.\d+)?\b", stem, re.I))
+    # The series name is not evidence about the unit, so take it out before
+    # looking for a compact "c<number>" marker inside what is left. A series
+    # whose title ends in a letter puts that letter directly in front of the
+    # issue number: "ODY-C 010" matched `\bc\.?\s*0*\d+\b` as "C 010" and six
+    # ODY-C issues that were wanted sat staged on disk, refused as
+    # "A chapter-marked artifact cannot satisfy a western comic issue" against a
+    # series record whose media_type is `comic`.
+    #
+    # The target_tokens test below already aimed at this and covers the wrong
+    # shape: re.findall(r"[A-Za-z]+\d+", "ODY-C") is empty, because it only
+    # catches a title whose letters run straight into the digits ("ODY-C1"),
+    # never one separated from them by a space or a dot. It stays, because it
+    # also answers the case where no target title is available to strip.
+    #
+    # The explicit chapter/chap/ch scan above deliberately runs on the raw stem:
+    # those words are a strong enough signal that a title containing one should
+    # still be read as marked.
+    title_pattern = target_title_scan_pattern(target)
+    scan_text = title_pattern.sub(" ", stem) if title_pattern else stem
+    compact_matches = list(re.finditer(r"\bc\.?\s*0*\d{1,5}(?:\.\d+)?\b", scan_text, re.I))
     if not compact_matches:
         return False
     target_title = str((target or {}).get("title") or (target or {}).get("series") or "")
@@ -8959,8 +9072,16 @@ def classify_import_filename_safety(
         score += 2
         evidence.append(f"title:{title_alias}")
     if parent_alias:
-        score += 1
+        # +1 normally; +2 when the file names no work of its own, which is the
+        # goal document's definition of an identified file -- a unit-named file
+        # in a series-named folder. At +1 that shape scores 3 against a
+        # threshold of 4: series known, unit known, refused. The Garden of
+        # Words transfer completed and was discarded six times on it.
+        bare_unit_file = filename_is_bare_unit(path)
+        score += 2 if bare_unit_file else 1
         evidence.append(f"parent:{parent_alias}")
+        if bare_unit_file:
+            evidence.append("bare_unit_filename")
     if trusted_issue not in (None, ""):
         score += 2
         evidence.append(f"trusted_issue:{format_issue_number(trusted_issue)}")

@@ -397,6 +397,17 @@ def _queue_rows(
         join schedulable_queue sq on sq.id = sa.queue_id
         where {real_attempt_predicate}
         group by sa.queue_id
+        ), series_real_service as (
+        -- When a series was last genuinely searched, over the rows that can
+        -- be scheduled now. Real attempts only: MAD's import-retry loop
+        -- writes download_client/importer rows every hour, and a clock read
+        -- off those would mark the series as freshly served while nothing
+        -- had searched it.
+        select coalesce(nullif(trim(q.series_id), ''), q.id) as series_key,
+               max(ra.last_real_attempt_at) as series_last_real_attempt_at
+        from real_attempts ra
+        join queue_items q on q.id = ra.queue_id
+        group by coalesce(nullif(trim(q.series_id), ''), q.id)
         ), ranked_queue as (
         select q.id, q.wanted_id, q.series_id, q.issue_id, q.state,
                q.current_source, q.query, q.last_event, q.active,
@@ -425,6 +436,7 @@ def _queue_rows(
                end as series_first_seen_at,
                coalesce(ra.real_attempt_count, 0) as real_attempt_count,
                coalesce(ra.last_real_attempt_at, 0) as last_real_attempt_at,
+               coalesce(srs.series_last_real_attempt_at, 0) as series_last_real_attempt_at,
                coalesce(nullif(trim(q.series_id), ''), q.id) as series_key
                , row_number() over (
                    partition by coalesce(nullif(trim(q.series_id), ''), q.id)
@@ -440,6 +452,8 @@ def _queue_rows(
         left join series_initial_search_priority sisp on sisp.series_id=q.series_id
         left join series_latest_source_attempt slsa on slsa.series_id=q.series_id
         left join real_attempts ra on ra.queue_id=q.id
+        left join series_real_service srs
+               on srs.series_key = coalesce(nullif(trim(q.series_id), ''), q.id)
         where {" and ".join(clauses)}
         ), stalled_queue as (
         select *,
@@ -520,15 +534,32 @@ def _queue_rows(
         ), fast_ranked_queue as (
         select *,
                row_number() over (
-                 -- Newest series first, after the per-series round. Ordering
-                 -- this lane by wait instead would put a series added a minute
-                 -- ago at the back of it: live there are 174 eligible rows
-                 -- across 15 series against a 12-row quota, so "queue behind
-                 -- everything else recently added" is a real outcome, and it
-                 -- is the one being ruled out.
+                 -- Least recently searched series first, after the per-series
+                 -- round; a series never searched reads 0 and leads. This is
+                 -- the lane's service clock, and it is the one thing the pass's
+                 -- own work moves: an executed search advances it, so the seat
+                 -- rotates to the next new series instead of coming back to
+                 -- the same one.
+                 --
+                 -- The lane used to order by series_first_seen_at desc alone,
+                 -- which is a clock nothing updates. That reads as "newest
+                 -- first" and is, on paper; live, the pass funds a median of 9
+                 -- rows from an 80-row scan (54 passes over 48h to
+                 -- 2026-09-03T22:27Z) and 1 of them is a fast-lane row, so
+                 -- the newest series with untried rows held that seat until
+                 -- every one of its rows had an attempt. 18 new-work series
+                 -- sat at fast ranks 3..20 -- inside the quota, so excluded
+                 -- from the aged and steady lanes, and never executed: 22 of 34
+                 -- new-work series had no fast-lane search in 48h, and MAD's
+                 -- 268 untried units went 0 for 3 days at fast rank 8.
+                 --
+                 -- Newest-first still breaks ties among series never searched,
+                 -- so a series added a minute ago goes to the front on its
+                 -- first pass, which is what that ordering was for.
                  partition by is_new_work
                  order by fast_series_round asc,
                           real_attempt_count asc,
+                          series_last_real_attempt_at asc,
                           series_first_seen_at desc,
                           stall_seconds desc,
                           id asc

@@ -166,6 +166,8 @@ docs/inkdrop/AGENT_HANDOFF.md
 !/tools/
 /tools/**
 !/tools/inkdrop_install_support_summary.py
+!/tools/inkdrop_retire_wants.py
+!/tools/inkdrop_clear_known_bad_content.py
 
 # Development/test exclusions stay here as guardrails if the explicit runtime
 # allowlist grows later.
