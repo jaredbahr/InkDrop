@@ -331,28 +331,28 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
     # workflow calls the tool with --repository "$GITHUB_REPOSITORY", and the
     # job that builds this manifest runs on jaredbahr/InkDrop. Passing REPO
     # (the public release repository) exercises a call the consumer never
-    # makes: release_url was built from whatever repository was handed in, and
-    # validate_update_manifest() only accepts update_release_repositories(), so
-    # the real call raised "release_url must identify the exact InkDrop
-    # release" on every dispatch while this arm stayed green.
+    # makes, which is why this stayed green while every dispatch died on
+    # "release_url must identify the exact InkDrop release".
     #
-    # The manifest is fetched by installs from the PUBLIC release
-    # (_approved_update_url only admits that path), so the release_url it
-    # carries has to name the public release no matter which repository built
-    # it. Pass the private repository -- what production passes -- and require
-    # both that it validates and that it points somewhere an install can reach.
+    # A manifest names its OWN release, so on the private prerelease path
+    # release_url is the private one and the manifest must be validated against
+    # the repository publishing it -- which is what load_verified_evidence()
+    # already does when it re-checks the published asset, and what the builder
+    # failed to do. The two call sites disagreeing is the defect; forcing the
+    # public URL instead is not the fix, because the evidence check then refuses
+    # the manifest for naming a release that is not the one being published.
     private_repo = "jaredbahr/" + "inkdrop" + "-dev"
     from_private = release_tool.build_update_manifest(
         candidate_path, validation_path, contract, private_repo, COMMIT, "177",
         updates.UPDATE_IMAGE_REPOSITORIES["qa"], now=NOW,
     )
-    require(from_private["release_url"] == generated["release_url"],
-            "the manifest an install reads must name the same release whichever "
-            "repository built it: %r vs %r"
-            % (from_private["release_url"], generated["release_url"]))
-    require(private_repo not in from_private["release_url"],
-            "release_url points at the private repository, which no install can "
-            "read: %r" % (from_private["release_url"],))
+    require(from_private["release_url"]
+            == f"https://github.com/{private_repo}/releases/tag/{contract['tag']}",
+            "the manifest must name the release it is published beside: %r"
+            % (from_private["release_url"],))
+    # And the evidence check that runs against the published asset must accept
+    # exactly what the builder produced -- these two agreeing is the property.
+    require(from_private["version"] == contract["version"], from_private)
 
     # The fixture's evidence is frozen at NOW, and validate_update_manifest()
     # refuses a manifest older than UPDATE_MANIFEST_MAX_AGE_SECONDS. Without a

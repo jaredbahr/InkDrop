@@ -387,18 +387,7 @@ def build_update_manifest(candidate_path, validation_path, contract, repository,
         "version": contract["version"],
         "prerelease": True,
         "validated": True,
-        # NOT `repository`. This manifest is what an install reads to learn an
-        # update exists, and it reads it from the PUBLIC release --
-        # _approved_update_url() admits only
-        # https://github.com/<update_release_repositories()>/releases/... So the
-        # release it names has to be one the reader can actually open, whichever
-        # repository built the manifest. The job that builds it runs on the
-        # private repository, so taking `repository` here produced a private URL
-        # that validate_update_manifest() then refused, failing every dispatch.
-        "release_url": (
-            f"https://github.com/{inkdrop_version.update_release_repositories()[0]}"
-            f"/releases/tag/{contract['tag']}"
-        ),
+        "release_url": f"https://github.com/{repository}/releases/tag/{contract['tag']}",
         "commit_sha": commit,
         "image_repository": resolve_image_repository(repository, image_repository),
         "image_digest": evidence["image_digest"],
@@ -412,7 +401,19 @@ def build_update_manifest(candidate_path, validation_path, contract, repository,
         "rollback_notes": "Keep the previous immutable digest and a pre-update backup; recreate both services with that digest if verification fails.",
     }
     payload["manifest_identity"] = inkdrop_version.update_manifest_identity(payload)
-    return inkdrop_version.validate_update_manifest(payload, now=now)
+    # Validate against the repository that is PUBLISHING this manifest, exactly
+    # as load_verified_evidence() does when it re-checks the published asset.
+    # A manifest names its own release, so on the private prerelease path that
+    # is the private repository; validate_update_manifest() otherwise accepts
+    # only update_release_repositories(), whose default is the public one, and
+    # refused every dispatch with "release_url must identify the exact InkDrop
+    # release". The two call sites disagreeing is the whole defect -- the
+    # verifier passed this env and the builder did not.
+    return inkdrop_version.validate_update_manifest(
+        payload,
+        now=now,
+        env={inkdrop_version.UPDATE_RELEASE_REPOSITORY_ENV: repository},
+    )
 
 
 def sync_release_assets(api, release, assets):
