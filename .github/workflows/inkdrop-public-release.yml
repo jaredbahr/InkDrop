@@ -163,7 +163,7 @@ jobs:
       # not. Keep the contract gate on the private PR path where all four
       # inputs exist; the public workflow retains its existing smoke behavior.
       - name: Verify Full-smoke trigger and runbook truth
-        if: github.repository == 'jaredbahr/InkDrop'
+        if: github.repository != 'jaredbahr/InkDrop'
         timeout-minutes: 1
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -176,7 +176,7 @@ jobs:
       # Same repository condition as the runbook check above, for the same
       # reason: the private repo is where all of this check's inputs exist.
       - name: Verify the staged public export actually runs
-        if: github.repository == 'jaredbahr/InkDrop'
+        if: github.repository != 'jaredbahr/InkDrop'
         timeout-minutes: 10
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -970,7 +970,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request'
       && github.ref == 'refs/heads/main'
-      && github.repository != 'jaredbahr/InkDrop'
+      && github.repository == 'jaredbahr/InkDrop'
       && vars.INKDROP_PUBLIC_RELEASE_AUTOMATION == 'on'
     needs: [public_release, full_smoke_suite, release_gate]
     runs-on: ubuntu-latest

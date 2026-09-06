@@ -13,7 +13,7 @@
     },
     {
       "path": ".github/workflows/inkdrop-public-release.yml",
-      "sha256": "d1a19b7a4ceb222c37f7472233f1d92c3ab398ad31ee73b6134dcb87a4e82bed",
+      "sha256": "8a5b391e0394b008bb79be76d296573e9309e5f3624c65ac37fee3bbf011e821",
       "size_bytes": 46725
     },
     {
@@ -743,8 +743,8 @@
     },
     {
       "path": "docs/inkdrop/releases/v0.1.16.md",
-      "sha256": "daa399223753b77503d495dd3622ae6314ca4f0f88bb01cd1c8fb93a6652d6cf",
-      "size_bytes": 4452
+      "sha256": "231af68e3ab8bed1d36936fade4f3b77b8db6d6b3075c4dee920db3253535295",
+      "size_bytes": 4467
     },
     {
       "path": "tests/inkdrop-acquisition-funnel-evidence-smoke.py",
@@ -2014,5 +2014,5 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "total_size_bytes": 21238726
+  "total_size_bytes": 21238741
 }
