@@ -820,7 +820,18 @@ def main() -> int:
         status = unconfigured_adapter_status(cleanup_settings, "sab_provider_disabled")
         return finish(status, skip_exit_code(status, clear_failed or clear_completed))
 
-    sab = load_sab_helper()
+    # The rescue helper is homelab-only and deliberately does not ship in the
+    # public build (#1131). Its absence is the same operator-visible condition
+    # as an adapter with no key: there is nothing to clean up with. Both web
+    # call sites already answer that way, and load_sab_helper()'s own docstring
+    # says a traceback here would be the only place turning it into a crash --
+    # which is exactly what it became, on a job the container scheduler runs
+    # every pass.
+    try:
+        sab = load_sab_helper()
+    except RuntimeError:
+        status = unconfigured_adapter_status(cleanup_settings, "adapter_not_configured")
+        return finish(status, skip_exit_code(status, clear_failed or clear_completed))
     try:
         sab.read_sab_key()
     except RuntimeError as exc:

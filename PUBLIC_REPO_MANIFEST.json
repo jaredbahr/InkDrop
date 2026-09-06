@@ -488,8 +488,8 @@
     },
     {
       "path": "core/inkdrop_sab_failed_cleanup.py",
-      "sha256": "a78c2511867d92d5a57b77bc90f2a9f8723733af25fa1eca333ac15f6b77a6fd",
-      "size_bytes": 38313
+      "sha256": "785c7b0c6670d2b50bb29852048521b29249a7bb50a54b1386aed0fea03caee5",
+      "size_bytes": 39015
     },
     {
       "path": "core/inkdrop_safe_xml.py",
@@ -2014,5 +2014,5 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "total_size_bytes": 21238024
+  "total_size_bytes": 21238726
 }
