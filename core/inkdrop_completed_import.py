@@ -563,31 +563,35 @@ def related_subseries_source_blocker(
         if not match:
             continue
         trusted_subtitle_segments = [segment]
-        if numeric_organizer:
-            # The canonical subtitle helper intentionally requires an exact
-            # subtitle.  Scene/scan annotations after that subtitle are not a
-            # related book, so retry the same proof with only already-trusted
-            # terminal metadata/credit groups removed. Stop at the first
-            # unexplained group so a subtitle-like suffix cannot be erased.
-            unannotated_segment = str(segment or "")
-            while True:
-                annotation = re.search(
-                    r"\s*(?:\(\s*([^\[\]()]+?)\s*\)|\[\s*([^\[\]()]+?)\s*\])\s*$",
-                    unannotated_segment,
-                )
-                if not annotation:
-                    break
-                annotation_text = (
-                    annotation.group(1) if annotation.group(1) is not None else annotation.group(2)
-                ).strip()
-                if not (
-                    inkdrop_artifact_acceptance.annotation_group_shape(annotation_text)
-                    or inkdrop_artifact_acceptance.release_credit_group(annotation_text)
-                ):
-                    break
-                unannotated_segment = unannotated_segment[:annotation.start()].rstrip()
-            if unannotated_segment != segment:
-                trusted_subtitle_segments.append(unannotated_segment)
+        # The canonical subtitle helper intentionally requires an exact
+        # subtitle.  Scene/scan annotations after that subtitle are not a
+        # related book, so retry the same proof with only already-trusted
+        # terminal metadata/credit groups removed. Stop at the first
+        # unexplained group so a subtitle-like suffix cannot be erased.
+        # For every segment that carries the series title, not only one
+        # behind a numeric organizer: `Series 001 - Subtitle (Publisher)` is
+        # the common shape, and gating the retry on the organizer handed the
+        # exemption `subtitle publisher` and refused the book for its own
+        # imprint (Cleopatra In Space, 2026-09-08).
+        unannotated_segment = str(segment or "")
+        while True:
+            annotation = re.search(
+                r"\s*(?:\(\s*([^\[\]()]+?)\s*\)|\[\s*([^\[\]()]+?)\s*\])\s*$",
+                unannotated_segment,
+            )
+            if not annotation:
+                break
+            annotation_text = (
+                annotation.group(1) if annotation.group(1) is not None else annotation.group(2)
+            ).strip()
+            if not (
+                inkdrop_artifact_acceptance.annotation_group_shape(annotation_text)
+                or inkdrop_artifact_acceptance.release_credit_group(annotation_text)
+            ):
+                break
+            unannotated_segment = unannotated_segment[:annotation.start()].rstrip()
+        if unannotated_segment != segment:
+            trusted_subtitle_segments.append(unannotated_segment)
         if any(
             inkdrop_artifact_acceptance.trusted_issue_subtitle_matches_release(
                 series_title,

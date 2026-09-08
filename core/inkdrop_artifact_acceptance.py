@@ -377,6 +377,34 @@ def _credible_image_dimensions(data, suffix):
         return None
 
 
+_UNIT_PREFIX_WORDS_RE = re.compile(
+    r"^(?:book|vol|volume|part|chapter|ch)\s+"
+    r"(?:\d+|[ivxlc]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?:\s+|$)"
+)
+
+
+def _subtitle_forms(words):
+    """The identity words a subtitle may be compared under.
+
+    A metadata title often carries the unit in front of the subtitle -- `Book
+    One: Target Practice`, `Volume 3: Rite of Spring` -- while the release names
+    the unit by number and then the subtitle. Both name the same book, so the
+    words after a leading unit word plus a number or ordinal are a second form
+    of the same subtitle. Only that shape is stripped: `Book of Death` keeps
+    its first word, and a remainder that is itself a generic title (`Volume`)
+    is not admitted as a subtitle. Measured 2026-09-08: Cleopatra In Space 001
+    was refused for its title tail with the right publisher and the right
+    metadata title in hand, because only the unstripped form was compared.
+    """
+    forms = set()
+    if words:
+        forms.add(words)
+        stripped = _UNIT_PREFIX_WORDS_RE.sub("", words, count=1).strip()
+        if stripped and stripped != words and stripped not in GENERIC_ISSUE_TITLES:
+            forms.add(stripped)
+    return forms
+
+
 def trusted_issue_subtitle_matches_release(series_title, release_title, issue_title, issue_number):
     expected_number = _number_text(issue_number)
     canonical_subtitle = _identity_words(issue_title)
@@ -404,10 +432,11 @@ def trusted_issue_subtitle_matches_release(series_title, release_title, issue_ti
         tail,
         re.I,
     )
+    accepted = _subtitle_forms(canonical_subtitle)
     if numbered_tail:
         return bool(
             _number_text(numbered_tail.group("number")) == expected_number
-            and _identity_words(numbered_tail.group("subtitle")) == canonical_subtitle
+            and _subtitle_forms(_identity_words(numbered_tail.group("subtitle"))) & accepted
         )
     # Some releases put the subtitle before the issue number instead of after
     # it ("Series - Rite of Spring 006" rather than "Series 006 - Rite of
@@ -421,7 +450,7 @@ def trusted_issue_subtitle_matches_release(series_title, release_title, issue_ti
         return False
     return bool(
         _number_text(subtitled_tail.group("number")) == expected_number
-        and _identity_words(subtitled_tail.group("subtitle")) == canonical_subtitle
+        and _subtitle_forms(_identity_words(subtitled_tail.group("subtitle"))) & accepted
     )
 
 
