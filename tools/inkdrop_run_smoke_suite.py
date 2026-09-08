@@ -237,8 +237,27 @@ def _export_skip_reason(basename):
         return None
 
 
+def _origin_qa_available():
+    """True when the checkout carries origin/qa, which a pull-request checkout does not.
+
+    actions/checkout on a pull_request fetches the merge ref alone, so a test
+    that diffs against origin/qa has nothing to diff against there and exits
+    non-zero before reaching its subject. The nightly checks out qa itself and
+    carries the ref, so the test runs for real where it can mean something.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "origin/qa"],
+        capture_output=True, cwd=str(ROOT),
+    )
+    return probe.returncode == 0
+
+
 # requirement key -> (predicate, human explanation). Evaluated once per run.
 REQUIREMENTS = {
+    "origin_qa": (
+        _origin_qa_available,
+        "needs a git checkout that carries origin/qa; a pull-request checkout does not",
+    ),
     "playwright": (
         _playwright_available,
         "needs playwright plus a browser binary, which this environment does not provide",
@@ -278,6 +297,8 @@ REQUIRES = {
     # web/tests/*.js has nothing that runs it. Each shells out to a playwright
     # smoke, so it runs for real wherever playwright is present.
     "inkdrop-archive-read-undetermined-not-a-content-verdict-smoke.py": "read_denial",
+    # Derives its probes from a diff against origin/qa; see _origin_qa_available().
+    "inkdrop-qa-autodeploy-verifier-smoke.py": "origin_qa",
     "inkdrop-activity-backend-contract-browser-smoke.py": "playwright",
     "inkdrop-arr-table-menu-browser-smoke.py": "playwright",
     "inkdrop-hidden-attribute-leak-browser-smoke.py": "playwright",

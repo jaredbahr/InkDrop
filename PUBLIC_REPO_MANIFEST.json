@@ -1,5 +1,5 @@
 {
-  "file_count": 402,
+  "file_count": 403,
   "files": [
     {
       "path": ".dockerignore",
@@ -100,6 +100,11 @@
       "path": "core/inkdrop_auth_contracts.py",
       "sha256": "76fcff044a7ebbabad9fe8f611adae74cf04838d597f9b922d612e55fa351938",
       "size_bytes": 13597
+    },
+    {
+      "path": "core/inkdrop_autodeploy_guards.py",
+      "sha256": "7db8813cfa98b02ebbccd077e8ea0b3c5da146f0b5adc3f95cd133de3ffb2a4a",
+      "size_bytes": 4787
     },
     {
       "path": "core/inkdrop_backup_restore.py",
@@ -1618,8 +1623,8 @@
     },
     {
       "path": "tools/inkdrop_run_smoke_suite.py",
-      "sha256": "3fd05675a41626ec05476891f6f94fe43cb1f1fe402b20cc14ba75eb19bc96c1",
-      "size_bytes": 28732
+      "sha256": "7835a3740c6400278501c0c7f9a0fe52d0b8162d57cc5fcaf60e9e01e1bf53c4",
+      "size_bytes": 29636
     },
     {
       "path": "tools/inkdrop_settings_api_surface_audit.py",
@@ -2014,6 +2019,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "e6ec502d1a4c95484f39ecbd724b255a1762b0c4",
-  "total_size_bytes": 21242655
+  "source_commit": "20d25c2281ec35565fc1672523777c0415701b7e",
+  "total_size_bytes": 21248346
 }
