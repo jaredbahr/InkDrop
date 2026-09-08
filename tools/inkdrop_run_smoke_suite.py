@@ -313,54 +313,6 @@ NON_QUALIFYING = {
     # prints its red. Expiries are staggered by what the failure means:
     # content assertions and unclassified crashes first, harness gaps next,
     # stale extractions and timeouts last. See tracker row #871.
-    "inkdrop-missing-recovery-browser-smoke.py": {
-        "reason": (
-            "asserts a Needs attention affordance the rendered page did not show. GENUINE CONTENT ASSERTION -- this is one of three that may be a real defect rather than harness noise, and is triaged first for that reason. UN-SUPPRESSES WHEN: the assertion passes, or the row is re-scoped after someone decides whether the affordance should be there"
-        ),
-        "owner": "web",
-        "expires": "2026-09-11",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-series-detail-react-island-browser-smoke.py": {
-        "reason": (
-            "asserts a needs_you issue must show a review state and the island did not render one. GENUINE CONTENT ASSERTION, may be a real defect. UN-SUPPRESSES WHEN: the island renders a review state for a needs_you issue, or the expectation is corrected"
-        ),
-        "owner": "web",
-        "expires": "2026-09-11",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-settings-setup-prowlarr-browser-smoke.py": {
-        "reason": (
-            "asserts the configured comics inbox appears under Paths and it was missing. GENUINE CONTENT ASSERTION, may be a real defect. UN-SUPPRESSES WHEN: the configured inbox renders under Paths, or the test is corrected to the shipped layout"
-        ),
-        "owner": "web",
-        "expires": "2026-09-11",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-settings-opds-browser-smoke.py": {
-        "reason": (
-            "dies on an unhandled promise rejection with no assertion text, so the failure is UNCLASSIFIED -- unknown is worse than slow and it is triaged ahead of the timeouts. UN-SUPPRESSES WHEN: the rejection is surfaced and the test either passes or fails with a readable cause"
-        ),
-        "owner": "web",
-        "expires": "2026-09-11",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-system-copy-value-browser-smoke.py": {
-        "reason": (
-            "dies on an unhandled promise rejection with no assertion text, so the failure is UNCLASSIFIED. UN-SUPPRESSES WHEN: the rejection is surfaced and the test either passes or fails with a readable cause"
-        ),
-        "owner": "web",
-        "expires": "2026-09-11",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-hidden-attribute-leak-browser-smoke.py": {
-        "reason": (
-            "ERR_CONNECTION_REFUSED against a fixture server on port 8877 that nothing in the suite starts. HARNESS GAP, ours to fix and cheap. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
-        ),
-        "owner": "web",
-        "expires": "2026-09-18",
-        "issue": "tracker row #871",
-    },
     "inkdrop-settings-form-responsive-browser-smoke.py": {
         "reason": (
             "ERR_CONNECTION_REFUSED against the same unstarted fixture server on port 8877. HARNESS GAP. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
