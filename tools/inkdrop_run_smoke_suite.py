@@ -497,27 +497,32 @@ NON_QUALIFYING = {
     # the wiring pass, not by the tracker row -- NON_QUALIFYING requires both.
     "inkdrop-activity-queue-blocklist-contract-smoke.py": {
         "reason": (
-            "pins the Blocklist column list as [\"Series / Issue\", \"Blocked "
-            "reason\", \"Source title / provider\", \"Actions\"]; the shipped view "
-            "is \"Series / Issue\", \"Blocked reason\", \"Source\", \"Release "
-            "candidate\", \"Actions\". UN-SUPPRESSES WHEN: the test asserts the "
-            "five-column shipped literal -- which is exactly what open PR #722 "
-            "does, so landing #722 requalifies this entry"
+            "measured 2026-09-08 against qa 2ad80c96 with every assert recorded: 9 of 18 "
+            "fail, not the one the old note named. The five-column Blocklist literal "
+            "(five columns confirmed intended, row #158), the Allow & Retry call form (a ternary "
+            "endpoint and a body carrying revision since PR #349), the selection-count "
+            "guard (now manual_review only), and six Queue grid contracts the current CSS "
+            "contradicts (a source column; a 24px selection track the smoke forbids). "
+            "UN-SUPPRESSES WHEN: web re-pins all nine against the shipped tree, or rules "
+            "the changed layout contracts intended and re-pins the rest; the measured "
+            "list is on tracker row #158"
         ),
         "owner": "web",
-        "expires": "2026-09-15",
+        "expires": "2026-10-06",
         "issue": "tracker row #158",
     },
     "inkdrop-closed-alpha-user-journey-contract-smoke.py": {
         "reason": (
-            "38 copy assertions pinned to wording that has since been rewritten "
-            "(it wants /Monitor future releases/; core/inkdrop_web.py ships "
-            "'Monitoring future releases'). UN-SUPPRESSES WHEN: all 38 "
-            "assertions are re-pinned against current shipped copy -- a re-pin "
-            "pass, not a one-line edit"
+            "measured 2026-09-08 against qa 2ad80c96 with every assert recorded: 5 of 60 "
+            "fail. The add-series readiness attribute is set through dataset now, the "
+            "Series automation heading moved, 'Monitor future releases' and the "
+            "'Administration' nav-group label no longer exist anywhere in the tree, and no "
+            "Settings entry opens the setup area with the pinned call. UN-SUPPRESSES "
+            "WHEN: web re-pins all 60 against current shipped copy without deleting any "
+            "(row #159's bar); the measured list is on tracker row #159"
         ),
         "owner": "web",
-        "expires": "2026-09-15",
+        "expires": "2026-10-06",
         "issue": "tracker row #159",
     },
 }
