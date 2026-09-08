@@ -9382,14 +9382,17 @@ def import_ready(max_files):
                 env=import_ready_child_env(),
             )
         except subprocess.TimeoutExpired as exc:
+            # Bound to a plain local: `exc` is unbound the moment this block ends,
+            # and a closure over it only works while it is called from inside it.
+            timeout_exc = exc
             reconcile_update, reconcile_projection_stage = observed_lifecycle_write(
                 "completion_projection",
-                lambda: mark_reconciled_import_timeout(record, exc, timeout_seconds=timeout_seconds),
+                lambda: mark_reconciled_import_timeout(record, timeout_exc, timeout_seconds=timeout_seconds),
                 "timeout_projected_to_reconciliation",
             )
             inkdrop_update, metadata_stage = observed_lifecycle_write(
                 "metadata_write",
-                lambda: record_inkdrop_import_timeout(record, exc, timeout_seconds=timeout_seconds),
+                lambda: record_inkdrop_import_timeout(record, timeout_exc, timeout_seconds=timeout_seconds),
                 "timeout_metadata_recorded",
             )
             lifecycle_stages.update(

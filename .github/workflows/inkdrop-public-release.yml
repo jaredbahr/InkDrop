@@ -53,45 +53,12 @@ on:
       - "tests/**"
       - "core/**"
   pull_request:
-    paths:
-      - ".github/workflows/inkdrop-public-release.yml"
-      - ".github/workflows/inkdrop-beta-promotion.yml"
-      - ".dockerignore"
-      - ".gitignore"
-      - ".env.example"
-      - "Dockerfile"
-      - "docker-compose.yml"
-      - "requirements.txt"
-      - "README.md"
-      - "inkdrop-logo-mark.png"
-      - "web/static/**"
-      - "web/frontend/**"
-      - "web/tests/**"
-      - "docs/inkdrop-source-candidate-catalog-20260702.json"
-      - "docs/inkdrop/docker-first-install.md"
-      - "docs/inkdrop/QA_RELEASE_PROCESS.md"
-      - "docs/inkdrop/public-release-process.md"
-      - "docs/inkdrop/releases/**"
-      - "tools/inkdrop_docker_context_manifest.py"
-      - "tools/inkdrop_install_support_summary.py"
-      - "tools/inkdrop_github_release.py"
-      - "tools/inkdrop_public_release_gate.py"
-      - "tools/inkdrop_public_http_smoke.py"
-      - "tools/inkdrop_qa_candidate_manifest.py"
-      - "tools/inkdrop_public_release_check.py"
-      - "tools/inkdrop_public_repo_export.py"
-      - "tools/inkdrop_publish_public_repo.py"
-      - "tools/inkdrop_settings_api_surface_audit.py"
-      - "tools/inkdrop_settings_sync_smoke.py"
-      - "tools/inkdrop_state_schema_audit.py"
-      - "tools/inkdrop_web_surface_audit.py"
-      - "tools/inkdrop_run_smoke_suite.py"
-      - "inkdrop*.py"
-      - "inkdrop_*.py"
-      - "kavita*.py"
-      - "kavita_*.py"
-      - "tests/**"
-      - "core/**"
+  # No path filter on pull_request, on purpose. `Public release smoke` is a
+  # required status check: a filtered-out workflow never reports, and a pull
+  # request whose required check never reports cannot merge. The job takes a
+  # few minutes and superseded runs are cancelled below; the ninety-minute
+  # suite and every publish job still skip pull_request via their own
+  # conditions, so this does not reopen the per-push cost PR #532 removed.
   workflow_dispatch:
 
 permissions:
