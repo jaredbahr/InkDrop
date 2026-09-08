@@ -1574,6 +1574,8 @@ PUBLICATION_RELEASE_GROUP_PHRASES = frozenset(
 
 PUBLICATION_METADATA_WORDS = {
     "c2c",
+    "color",
+    "colour",
     "digital",
     "ebook",
     "eng",
@@ -1589,6 +1591,12 @@ PUBLICATION_METADATA_WORDS = {
 
 # Quality grades that only ever qualify a format tag: "(Digital-HD)".
 PUBLICATION_QUALITY_WORDS = {"hd", "hq", "lq", "sd", "webrip", "720p", "1080p"}
+
+# Publishers that appear bare in a filename's brackets -- "(Kitchen Sink)",
+# "(Scholastic)" -- and are annotations about the release, not another book.
+# A closed list on purpose: a publisher is admitted by being named here, never
+# by shape, so a spin-off's subtitle in the same position goes on refusing.
+PUBLISHER_ANNOTATION_PHRASES = frozenset({"kitchen sink", "scholastic"})
 
 # The corporate word a publisher prints after its name: "(Image Comics)".
 PUBLISHER_SUFFIX_WORDS = {
@@ -1742,6 +1750,9 @@ def annotation_group_shape(value):
     if PUBLICATION_TYPE_RE.fullmatch(normalized):
         return True
     if normalized in CONTAINER_FORMAT_PHRASES:
+        return True
+    # A publisher named bare in its own brackets, from the closed list above.
+    if normalized in PUBLISHER_ANNOTATION_PHRASES:
         return True
     # A format tag, alone or qualified: "digital", "digital hd", "fixed scan".
     words = [word for word in re.split(r"[\s-]+", normalized) if word]

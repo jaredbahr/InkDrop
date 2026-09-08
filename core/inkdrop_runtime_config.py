@@ -38,6 +38,14 @@ LEGACY_ENV_KAVITA_DB = "INKDROP_KAVITA_DB_PATH"
 ENV_WORKER_STATUS_FILE = "INKDROP_WORKER_STATUS_FILE"
 ENV_QBITTORRENT_DOWNLOAD_ROOT = "INKDROP_QBITTORRENT_DOWNLOAD_ROOT"
 
+# The least time a Soulseek search waits for peers to answer. Measured live: a
+# real query for a less-common title returned nothing for 40 s and 134 peers at
+# 45 s. The probe enforces this on every search it runs and the autopilot
+# budgets each search with it. They used to disagree -- 8 s budgeted, 50 s
+# enforced -- so a pass selected units it could not afford to search and then
+# recorded them as searched. One constant, read by both, so they cannot drift.
+SLSKD_SEARCH_WAIT_FLOOR_SECONDS = 50
+
 
 def env_value(environ, key, fallback="", *, legacy_keys=()):
     """Resolve a canonical setting before any compatibility aliases."""

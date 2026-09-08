@@ -56,7 +56,7 @@ PUBLISHER_PHRASES = frozenset(
 # One-word handles with no shape of their own -- nothing but the name says
 # "(1r0n)" is a scanner and "(Conan)" is a book. Read only where a credit can
 # sit: the last thing in a name, or inside its own parentheses.
-RELEASE_GROUP_HANDLES = frozenset({"1r0n", "jko", "lucaz", "oda", "rillant", "shizu"})
+RELEASE_GROUP_HANDLES = frozenset({"1r0n", "gomi", "jko", "lucaz", "obi", "oda", "rillant", "shizu"})
 
 # What may close a release name and nothing else: the handles, and a bare
 # "Empire" -- "digital-Empire" is the commonest credit on Usenet and the word

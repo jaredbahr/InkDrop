@@ -415,7 +415,14 @@ DEFAULT_SLSKD_COOLDOWN_HOURS = 0.75
 DEFAULT_SLSKD_AUTO_GRAB_MAX = 8
 DEFAULT_SLSKD_PROBE_BUDGET_SECONDS = 300
 DEFAULT_SLSKD_BROAD_MAX_TOTAL = 8
-DEFAULT_SLSKD_BROAD_PROBE_BUDGET_SECONDS = 120
+# Every Soulseek search waits at least the floor for peers to answer, so the
+# broad lane budgets whole searches -- floor plus settle, times the units it
+# will actually select -- and funds three per due series. The operator's
+# slskd_probe_budget_seconds still caps from above. This used to be a flat 120
+# against a ten-second-per-query estimate for a fifty-second search.
+SLSKD_SEARCH_WAIT_FLOOR_SECONDS = inkdrop_runtime_config.SLSKD_SEARCH_WAIT_FLOOR_SECONDS
+SLSKD_BROAD_SEARCH_SECONDS = SLSKD_SEARCH_WAIT_FLOOR_SECONDS + 2
+DEFAULT_SLSKD_BROAD_PROBE_BUDGET_SECONDS = 3 * SLSKD_BROAD_SEARCH_SECONDS + 24
 DEFAULT_SLSKD_BROAD_MIN_PROBE_BUDGET_SECONDS = 60
 DEFAULT_EXHAUSTION_CYCLES = 6
 # mark_automation_exhausted() re-queues a low-confidence-only result forever
@@ -13250,6 +13257,11 @@ def slskd_broad_probe_kwargs(args, eligible_count=0, row_count=0):
         configured_budget = DEFAULT_SLSKD_PROBE_BUDGET_SECONDS
     max_queries = max(1, min(int(getattr(args, "slskd_max_queries", 1) or 1), 5))
     wait_seconds = max(2, min(int(getattr(args, "slskd_wait_seconds", 8) or 8), 30))
+    # The probe waits at least the floor on every search whatever wait_seconds
+    # asks for, so budget the search that will run, not the one requested. This
+    # used to budget (8 + 2) seconds against a 50-second search: a pass selected
+    # eight units against a hundred seconds, ran two searches, and skipped six.
+    per_search = max(wait_seconds, SLSKD_SEARCH_WAIT_FLOOR_SECONDS) + 2
     wanted_batch = max(1, eligible or rows or 1)
     batch_size = max(
         1,
@@ -13260,7 +13272,7 @@ def slskd_broad_probe_kwargs(args, eligible_count=0, row_count=0):
             DEFAULT_SLSKD_BROAD_MAX_TOTAL,
         ),
     )
-    query_budget = batch_size * max_queries * (wait_seconds + 2)
+    query_budget = batch_size * max_queries * per_search
     budget_floor = min(DEFAULT_SLSKD_BROAD_MIN_PROBE_BUDGET_SECONDS, max(30, configured_budget))
     budget = max(
         budget_floor,
@@ -13270,6 +13282,11 @@ def slskd_broad_probe_kwargs(args, eligible_count=0, row_count=0):
             max(30, query_budget),
         ),
     )
+    # Select only what the budget funds. The units selected past that point
+    # were skipped at the search floor and then recorded as searched-and-empty,
+    # losing their never-probed priority without a single query having run.
+    affordable = max(1, budget // max(1, max_queries * per_search))
+    batch_size = max(1, min(batch_size, affordable))
     return {
         "max_total": batch_size,
         "max_per_series": batch_size,

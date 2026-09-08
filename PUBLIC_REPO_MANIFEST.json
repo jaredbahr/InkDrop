@@ -83,8 +83,8 @@
     },
     {
       "path": "core/inkdrop_artifact_acceptance.py",
-      "sha256": "be2f0b5dd9f85cc0501e7fa10ffe90e9f58fa6ceb73bd560e8ecf77f298a4c5e",
-      "size_bytes": 92933
+      "sha256": "08476ce7c3a3d08eeb046c6c9acf4b52b81f51a981009bf899d94ec3abdad679",
+      "size_bytes": 93491
     },
     {
       "path": "core/inkdrop_auth.py",
@@ -458,8 +458,8 @@
     },
     {
       "path": "core/inkdrop_release_credits.py",
-      "sha256": "d4ff77fc24d9264312999a34d06af9f851d656a06e7aede5bcce161a2e76fbb6",
-      "size_bytes": 2773
+      "sha256": "8ecf51e5f640b5992da5843881585b41eaebc517451eccc9a9a0d31ecbbab7bd",
+      "size_bytes": 2788
     },
     {
       "path": "core/inkdrop_release_dates.py",
@@ -488,8 +488,8 @@
     },
     {
       "path": "core/inkdrop_runtime_config.py",
-      "sha256": "ddb8884c33df8789af6843576e40664ac1f55d1dc8cca5ff49e741f1b47fa769",
-      "size_bytes": 12662
+      "sha256": "fbe0320de905863abdddb651615abc0894e07cfc8edeeafb0d29d1a73fef3437",
+      "size_bytes": 13165
     },
     {
       "path": "core/inkdrop_sab_failed_cleanup.py",
@@ -513,8 +513,8 @@
     },
     {
       "path": "core/inkdrop_series_autopilot.py",
-      "sha256": "fb9cad1d554c95eccfa806d84bf6660c71f454561a117302c6bbce6c12efc752",
-      "size_bytes": 737741
+      "sha256": "498597c7db317e1269324feec184dc8cdfeea75fff6d429844d83f59d229e724",
+      "size_bytes": 739039
     },
     {
       "path": "core/inkdrop_service_inventory.py",
@@ -543,8 +543,8 @@
     },
     {
       "path": "core/inkdrop_slskd_source_probe.py",
-      "sha256": "3c238cb753544a0e4653dcc834c1b95d64279520963fd3d7a47d5df35bf0a5b5",
-      "size_bytes": 731838
+      "sha256": "22c380c6f102c16a30bb49541998d94768b96fdff2722becb19c99f0c146fcb9",
+      "size_bytes": 738056
     },
     {
       "path": "core/inkdrop_slskd_staging_sweep.py",
@@ -2019,6 +2019,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "ab2322424a7065a961a07aee685c4a4552117b38",
-  "total_size_bytes": 21252296
+  "source_commit": "3874be5a81f859ab4613f1cc18c965388ca90df3",
+  "total_size_bytes": 21260888
 }

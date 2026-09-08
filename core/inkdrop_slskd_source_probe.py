@@ -219,6 +219,13 @@ QUERY_ROTATION_EVIDENCE_VERSION = 1
 # purpose -- this exists to close a coverage gap, not to multiply request
 # volume against a rate-limited provider.
 SEARCH_EXPANSION_MAX_QUERIES = 2
+# Every search waits at least this long for peers; the autopilot budgets each
+# search with the same constant so a pass never selects more units than it can
+# afford to search. See inkdrop_runtime_config for the measurement behind it.
+SLSKD_SEARCH_WAIT_FLOOR_SECONDS = inkdrop_runtime_config.SLSKD_SEARCH_WAIT_FLOOR_SECONDS
+# The two ways an attempt is skipped before any search runs: the pass deadline
+# is too close, or the remaining budget is under the search floor.
+PROBE_BUDGET_SKIP_REASONS = frozenset({"probe_budget_exhausted", "probe_budget_below_search_floor"})
 CANDIDATE_RECHECK_SECONDS = 20 * 60
 CANDIDATE_HEADLINE_SECONDS = 45 * 60
 ACTIVE_CACHE_SECONDS = 7 * 86400
@@ -14798,7 +14805,7 @@ def probe_item(
             # matters for the slow ones this was silently giving up on.
             responses = slskd_search(
                 query,
-                wait_seconds=max(50, int(wait_seconds or 0)),
+                wait_seconds=max(SLSKD_SEARCH_WAIT_FLOOR_SECONDS, int(wait_seconds or 0)),
                 deadline=deadline,
                 reuse_recent_seconds=slskd_repeat_query_cooldown_seconds(),
                 zero_result_reuse_recent_seconds=slskd_zero_result_query_cooldown_seconds(),
@@ -14986,8 +14993,14 @@ def probe_item(
     provider_wait_statuses = {"api_error", "provider_unavailable", "provider_wait"}
     if attempts and all(attempt.get("status") in provider_wait_statuses for attempt in attempts):
         status = next((attempt.get("status") for attempt in attempts if attempt.get("status") in {"provider_unavailable", "provider_wait"}), "provider_unavailable")
-    elif attempts and all(attempt.get("skipped") == "probe_budget_exhausted" for attempt in attempts):
-        status = "probe_budget_exhausted"
+    elif attempts and all(attempt.get("skipped") in PROBE_BUDGET_SKIP_REASONS for attempt in attempts):
+        # No search ran. Say so, and say which budget declined it -- the
+        # generic "searched_no_candidates" made a unit that was never searched
+        # read as searched and empty, and it lost its never-probed priority.
+        status = next(
+            (attempt.get("skipped") for attempt in attempts if attempt.get("skipped") == "probe_budget_below_search_floor"),
+            "probe_budget_exhausted",
+        )
     elif attempts and all(attempt.get("error") for attempt in attempts):
         status = "error"
     best_candidates = annotate_bad_candidate_verdicts(best_candidates, item.get("review_id"))
@@ -15288,7 +15301,9 @@ def cache_refresh_reason(cache_entry, queries=None):
         if int(cache_entry.get("candidate_count") or 0) > 0 and not entry_has_match_explanations(cache_entry):
             return "upgrade_match_explanation"
         return "schema_upgrade"
-    if status in {"error", "api_error", "provider_unavailable", "provider_wait", "timeout", "probe_error"}:
+    if status in {"error", "api_error", "provider_unavailable", "provider_wait", "timeout", "probe_error"} or status in PROBE_BUDGET_SKIP_REASONS:
+        # A budget skip is not a completed search; the entry is retried like a
+        # provider error rather than sitting in the cache as searched-and-empty.
         return "retry_probe_error"
     if int(cache_entry.get("candidate_count") or 0) > 0 and int(cache_entry.get("detected_count") or 0) <= 0:
         try:
@@ -15309,20 +15324,59 @@ def cache_entry_is_current(cache_entry):
         return False
 
 
-def cache_entry_is_active(cache_entry):
+def cache_entry_inactive_reason(cache_entry):
+    """Name the FIRST condition keeping this entry out of the active cache; "" if active.
+
+    cache_entry_is_active() answers yes or no. When a loaded row's entry holds a
+    safe candidate and the grab stage never looks at it, the reason it was not
+    active is the whole question, so this returns the name instead of False.
+    Clause for clause the same test as cache_entry_is_active(), which now
+    delegates here so the two cannot drift; the smoke asserts they agree.
+    """
+    if not isinstance(cache_entry, dict):
+        return "no_entry"
     if not cache_entry_is_current(cache_entry):
-        return False
-    if int(cache_entry.get("candidate_count") or 0) > 0 and not entry_has_current_auto_grab_verdicts(cache_entry):
-        return False
+        return "stale_schema"
     try:
-        checked_at = float((cache_entry or {}).get("checked_at") or 0)
+        candidate_count = int(cache_entry.get("candidate_count") or 0)
+    except (TypeError, ValueError):
+        candidate_count = 0
+    if candidate_count > 0 and not entry_has_current_auto_grab_verdicts(cache_entry):
+        return "stale_verdicts"
+    try:
+        checked_at = float(cache_entry.get("checked_at") or 0)
     except (TypeError, ValueError):
         checked_at = 0
     if checked_at <= now() - ACTIVE_CACHE_SECONDS:
+        return "active_cache_expired"
+    try:
+        detected_count = int(cache_entry.get("detected_count") or 0)
+    except (TypeError, ValueError):
+        detected_count = 0
+    if candidate_count > 0 and detected_count <= 0 and checked_at <= now() - CANDIDATE_HEADLINE_SECONDS:
+        return "headline_window_expired"
+    return ""
+
+
+def cache_entry_is_active(cache_entry):
+    return cache_entry_inactive_reason(cache_entry) == ""
+
+
+def probe_entry_should_persist(entry):
+    """Whether this probe result may replace what the cache already holds.
+
+    A result whose every attempt was skipped for budget ran no search. Writing
+    it stamped `checked_at` on a unit that was never searched: it left the
+    never-probed bucket, read as searched, and the queue row was touched as if
+    a probe had happened. Keep the prior entry -- or none -- instead. A result
+    with no attempts at all is `no_query`, a real answer, and is kept.
+    """
+    if not isinstance(entry, dict):
         return False
-    if int(cache_entry.get("candidate_count") or 0) > 0 and int(cache_entry.get("detected_count") or 0) <= 0:
-        return checked_at > now() - CANDIDATE_HEADLINE_SECONDS
-    return True
+    attempts = [row for row in (entry.get("attempts") or []) if isinstance(row, dict)]
+    if not attempts:
+        return True
+    return not all(str(row.get("skipped") or "") in PROBE_BUDGET_SKIP_REASONS for row in attempts)
 
 
 def evict_stale_cache_entries(cache, *, now_ts=None, retention_seconds=None, max_entries=None):
@@ -15666,6 +15720,58 @@ def auto_grab_scope_from_active_cache(active_cache, selected_review_ids, eligibl
             if rid not in selected and include_cached:
                 cached_candidate_count += 1
     return scoped, sorted(scoped), cached_candidate_count
+
+
+def auto_grab_not_considered_rows(cache, scoped, eligible_review_ids):
+    """Loaded rows whose cache entry holds a safe candidate the grab stage will not see.
+
+    The grab stage works from the ACTIVE cache, scoped to this pass's loaded
+    rows. A row can be loaded, hold `auto_grab_safe_count >= 1`, and still sit
+    outside that scope -- most often because its candidates are older than the
+    headline window -- and until now nothing recorded that. The four ways a
+    CONSIDERED candidate is declined already reach the audit; this is the fifth
+    outcome, the one with no record. Measured live 2026-09-08: 119 still-wanted
+    units held a safe candidate a median 468 hours after the probe that found
+    it, and 105 of them had no audit entry of any kind after that probe.
+
+    Recording only. Nothing here changes what is grabbed.
+    """
+    if not isinstance(cache, dict):
+        return []
+    eligible = {str(value) for value in eligible_review_ids or [] if str(value)}
+    scoped_ids = {str(key) for key in (scoped or {}).keys()}
+    rows = []
+    for review_id, entry in cache.items():
+        rid = str(review_id or "")
+        if not rid or rid not in eligible or rid in scoped_ids or not isinstance(entry, dict):
+            continue
+        try:
+            safe_count = int(entry.get("auto_grab_safe_count") or 0)
+        except (TypeError, ValueError):
+            safe_count = 0
+        if safe_count <= 0:
+            continue
+        rows.append({
+            "review_id": rid,
+            "series": entry.get("series"),
+            "issue": entry.get("issue"),
+            "reason": cache_entry_inactive_reason(entry) or "not_in_scope",
+            "auto_grab_safe_count": safe_count,
+            "checked_at": entry.get("checked_at"),
+        })
+    rows.sort(key=lambda row: (
+        normalize(row.get("series") or ""),
+        token_number(row.get("issue")) or 999999,
+        str(row.get("issue") or ""),
+    ))
+    return rows
+
+
+def record_auto_grab_not_considered(rows, *, live, dry_run):
+    """Write each not-considered row to the audit, the channel the four skip kinds use."""
+    for row in (rows or [])[:100]:
+        if isinstance(row, dict):
+            auto_grab_audit("not_considered", live=live, dry_run=dry_run, **row)
 
 
 def backfill_queue_context_for_active_cache(active_cache, all_items):
@@ -16081,9 +16187,23 @@ def run(args):
                     retained_candidate_count=retained.get("candidate_count"),
                 )
                 entry = retained
-        cache[review_id] = entry
+        if probe_entry_should_persist(entry):
+            cache[review_id] = entry
+            queue_row_touch = touch_autopilot_queue_probe_row(item)
+        else:
+            # No search ran, so the unit is exactly as probed as it was before
+            # this pass: the prior cache entry (or none) stands and the queue
+            # row is not touched. The result still counts in this pass's
+            # telemetry below.
+            queue_row_touch = {"updated": False, "reason": "no_search_ran"}
+            log(
+                "probe_entry_not_persisted",
+                review_id=review_id,
+                series=item.get("series"),
+                issue=item.get("issue"),
+                status=entry.get("status"),
+            )
         checked.append(entry)
-        queue_row_touch = touch_autopilot_queue_probe_row(item)
         log(
             "probe_item",
             review_id=review_id,
@@ -16306,6 +16426,14 @@ def run(args):
         auto_grab_result["items"] = scoped_items
         auto_grab_result["auto_grab_scope_review_ids"] = scope_review_ids
         auto_grab_result["auto_grab_cached_candidate_scope_count"] = cached_candidate_count
+        not_considered = auto_grab_not_considered_rows(cache, scoped_items, eligible_auto_grab_review_ids)
+        record_auto_grab_not_considered(
+            not_considered,
+            live=bool(args.auto_grab_live),
+            dry_run=bool(args.auto_grab_dry_run),
+        )
+        result["auto_grab_not_considered_count"] = len(not_considered)
+        result["auto_grab_not_considered"] = not_considered[:100]
         result["auto_grab"] = run_auto_grab(args, auto_grab_result)
         if args.auto_grab_live:
             result["policy"] = "SLSKD auto-grab live mode picks the best eligible candidate per row, starts it in SLSKD, marks the row waiting, and imports only through the existing verified Manual Source autoresolver."
