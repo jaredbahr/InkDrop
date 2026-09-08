@@ -158,6 +158,32 @@ jobs:
           python -B tools/inkdrop_public_http_smoke.py --json > inkdrop-public-http-smoke.json
           python -B tools/inkdrop_public_release_check.py --strict-host-dependencies
 
+      # A PULL REQUEST MUST RUN THE TESTS IT CHANGES. full_smoke_suite is
+      # skipped on pull_request deliberately -- ninety minutes, several sessions
+      # pushing all day -- and the consequence was that a test a PR ADDS is
+      # never executed in CI before it merges. PR #1027's smoke landed red on
+      # 2026-08-28 and stayed red for nine days, which kept qa_image skipped and
+      # meant no public image was built for that whole window; the nightly that
+      # would have said so concluded failure every day for at least six and was
+      # not read. Running only what the diff touches costs seconds.
+      #
+      # This is not a substitute for the full suite and does not pretend to be:
+      # it says nothing about what a change broke elsewhere, only that the tests
+      # it brought with it pass. The base is fetched explicitly because the PR
+      # checkout is shallow, and an unresolvable base exits non-zero rather than
+      # reporting an empty diff -- the one failure mode that would switch this
+      # off while leaving it green.
+      - name: Run the tests this pull request changes
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 20
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python -B tools/inkdrop_run_changed_tests.py --base "$BASE_SHA"
+
       # This workflow is exported to jaredbahr/InkDrop, but the nightly
       # workflow and private runbooks inspected by this test deliberately are
       # not. Keep the contract gate on the private PR path where all four

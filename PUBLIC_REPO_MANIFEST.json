@@ -13,8 +13,8 @@
     },
     {
       "path": ".github/workflows/inkdrop-public-release.yml",
-      "sha256": "8a5b391e0394b008bb79be76d296573e9309e5f3624c65ac37fee3bbf011e821",
-      "size_bytes": 46725
+      "sha256": "2c140903af59b346f41351e88ad23f917adc58cb523aed510b7226f91fe68411",
+      "size_bytes": 48215
     },
     {
       "path": ".gitignore",
@@ -2014,6 +2014,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "8c776433e22213f266e29f6ac0cb8f864045d4f0",
-  "total_size_bytes": 21244627
+  "source_commit": "78a50746f841f8ea35127e27f7e940f8c7aea67a",
+  "total_size_bytes": 21246117
 }
