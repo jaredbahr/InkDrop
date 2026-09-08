@@ -238,25 +238,92 @@ def _export_skip_reason(basename):
 
 
 def _origin_qa_available():
-    """True when the checkout carries origin/qa, which a pull-request checkout does not.
+    """True when the checkout carries origin/qa AND sixty commits of its history.
 
     actions/checkout on a pull_request fetches the merge ref alone, so a test
     that diffs against origin/qa has nothing to diff against there and exits
-    non-zero before reaching its subject. The nightly checks out qa itself and
-    carries the ref, so the test runs for real where it can mean something.
+    non-zero before reaching its subject. A shallow checkout of qa itself is
+    the same gap one step later: the ref resolves, its parent does not, and
+    on 2026-09-08 the verifier smoke failed the nightly in 0.0 s on
+    `git rev-parse <tip>^`. The smoke walks back up to sixty commits looking
+    for a diff that touches the shipped set, so that is what is asked for.
     """
-    probe = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", "origin/qa"],
-        capture_output=True, cwd=str(ROOT),
-    )
-    return probe.returncode == 0
+    for ref in ("origin/qa", "origin/qa~60"):
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+            capture_output=True, cwd=str(ROOT),
+        )
+        if probe.returncode != 0:
+            return False
+    return True
 
 
 # requirement key -> (predicate, human explanation). Evaluated once per run.
+def _change_time_moves():
+    """True when st_ctime advances on an in-place rewrite, which is what the
+    archive-validation cache keys on. Windows reports CREATION time in that
+    field, so the staleness guard under test cannot be caused there. Asked
+    directly, the way _read_denial_effective asks, rather than inferred."""
+    import tempfile
+    import time
+    try:
+        with tempfile.TemporaryDirectory(prefix="inkdrop-ctime-probe-") as tmp:
+            probe = os.path.join(tmp, "probe")
+            with open(probe, "wb") as handle:
+                handle.write(b"x")
+            before = os.stat(probe).st_ctime_ns
+            time.sleep(0.05)
+            with open(probe, "wb") as handle:
+                handle.write(b"yy")
+            return os.stat(probe).st_ctime_ns > before
+    except OSError:
+        return False
+
+
+def _symlinks_allowed():
+    """True when this process may create a symbolic link. On Windows that is a
+    privilege (or Developer Mode) and an ordinary session raises WinError 1314,
+    so a test that stages a dangling link to make a file unreadable cannot
+    stage it there."""
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory(prefix="inkdrop-symlink-probe-") as tmp:
+            target = os.path.join(tmp, "target")
+            link = os.path.join(tmp, "link")
+            with open(target, "wb") as handle:
+                handle.write(b"x")
+            os.symlink(target, link)
+            return os.path.islink(link)
+    except (OSError, NotImplementedError):
+        return False
+
+
+def _wslpath_available():
+    """True when the cron lock wrapper can be run through bash here. On POSIX
+    there is nothing to convert; on Windows the smoke runs the wrapper through
+    `bash -lc` and converts its paths with wslpath, which only WSL provides.
+    Git Bash answers 127."""
+    if os.name != "nt":
+        return True
+    try:
+        probe = subprocess.run(["bash", "-lc", "wslpath -a /"], capture_output=True, timeout=30)
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _fcntl_available():
+    """True where the fcntl module exists. core/inkdrop_slskd_staging_sweep.py
+    imports it at module level for flock, so on Windows every smoke importing
+    that module fails at import, before any assertion it exists for."""
+    import importlib.util
+    return importlib.util.find_spec("fcntl") is not None
+
 REQUIREMENTS = {
     "origin_qa": (
         _origin_qa_available,
-        "needs a git checkout that carries origin/qa; a pull-request checkout does not",
+        "needs a git checkout that carries origin/qa and sixty commits of its history; "
+        "a pull-request checkout has neither and a shallow checkout has only the ref",
     ),
     "playwright": (
         _playwright_available,
@@ -267,6 +334,22 @@ REQUIREMENTS = {
         "needs an environment where chmod 0 actually denies a read -- Windows cannot, "
         "and root on Linux bypasses the check, so the EACCES under test cannot be caused here",
     ),
+    "change_time": (
+        _change_time_moves,
+        "needs a filesystem whose st_ctime moves on an in-place rewrite -- Windows reports creation time there",
+    ),
+    "symlinks": (
+        _symlinks_allowed,
+        "needs permission to create a symbolic link -- an ordinary Windows session has not got it (WinError 1314)",
+    ),
+    "wslpath": (
+        _wslpath_available,
+        "needs WSL bash with wslpath to run the cron lock wrapper on Windows -- Git Bash has no wslpath",
+    ),
+    "fcntl": (
+        _fcntl_available,
+        "needs the fcntl module, which only POSIX Python provides; the staging sweep imports it for flock",
+    ),
 }
 
 # basename -> requirement key. A test listed here is never executed unless its
@@ -274,6 +357,13 @@ REQUIREMENTS = {
 # is a failure like any other. This is not a suppression list -- membership
 # here cannot hide a result, it can only decline to produce one.
 REQUIRES = {
+    "inkdrop-archive-validation-cache-smoke.py": "change_time",
+    "inkdrop-archive-verdict-honesty-smoke.py": "symlinks",
+    "inkdrop-series-autopilot-cron-lock-smoke.py": "wslpath",
+    "inkdrop-slskd-staging-sweep-missing-stage-priority-smoke.py": "fcntl",
+    "inkdrop-slskd-staging-sweep-raw-page-folder-smoke.py": "fcntl",
+    "inkdrop-slskd-sweep-no-scan-wait-smoke.py": "fcntl",
+    "inkdrop-slskd-sweep-trusted-issue-unit-smoke.py": "fcntl",
     "inkdrop-blocklist-react-island-browser-smoke.py": "playwright",
     "inkdrop-history-react-island-browser-smoke.py": "playwright",
     "inkdrop-manual-review-decision-actions-browser-smoke.py": "playwright",

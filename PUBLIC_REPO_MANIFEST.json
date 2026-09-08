@@ -1623,8 +1623,8 @@
     },
     {
       "path": "tools/inkdrop_run_smoke_suite.py",
-      "sha256": "7835a3740c6400278501c0c7f9a0fe52d0b8162d57cc5fcaf60e9e01e1bf53c4",
-      "size_bytes": 29636
+      "sha256": "04c291fee79a2b661ad47fe1880e4ff69fa9a30dd525451af3469f48d56fafd7",
+      "size_bytes": 33586
     },
     {
       "path": "tools/inkdrop_settings_api_surface_audit.py",
@@ -2019,6 +2019,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "20d25c2281ec35565fc1672523777c0415701b7e",
-  "total_size_bytes": 21248346
+  "source_commit": "ab2322424a7065a961a07aee685c4a4552117b38",
+  "total_size_bytes": 21252296
 }
