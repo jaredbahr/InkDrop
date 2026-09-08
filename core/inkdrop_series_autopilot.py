@@ -37,6 +37,7 @@ from core import inkdrop_bounded_read
 from core import inkdrop_db
 from core import inkdrop_deferred_sync
 from core import inkdrop_runtime_config
+from core import inkdrop_series_eligibility
 from core import inkdrop_internal_jobs
 from core import inkdrop_slskd_refusal_vocabulary
 
@@ -6497,6 +6498,49 @@ def series_removed_by_user(item):
     return str(item.get("parked_reason") or "").strip().lower() == "user_removed"
 
 
+NOMINATED_AT_KEY = "autopilot_nominated_at"
+
+
+def series_exclusions():
+    """(ids, normalized titles) of series the database marks unmonitored or removed.
+
+    Read fresh on every call -- a short read-only connection -- so a change made
+    in Settings takes effect on the very next pass. The SLSKD probe has refused
+    these series since 2026-08-22; the autopilot did not ask, and on 2026-09-08
+    handed 13 unmonitored series about 95% of the day's passes while the probe
+    returned nothing for any of them.
+    """
+    return inkdrop_series_eligibility.removed_or_unmonitored_series_identity(INKDROP_STATE_DB, normalize)
+
+
+def series_excluded_by_database(item, exclusions):
+    ids, titles = exclusions if exclusions else (set(), set())
+    return inkdrop_series_eligibility.series_excluded(item, ids, titles, normalize)
+
+
+def mark_rows_nominated(rows, now=None):
+    """Stamp the rows a pass is about to work. This is the scheduler's own clock.
+
+    Every lane already rotates on a clock, but each clock was a record of what a
+    PROVIDER did -- a result signature, an attempt time -- and a row handed to a
+    pass that the provider then declined (cooldown, budget, an unmonitored
+    series) kept the clock it had. The group re-presented at the head of its
+    lane on the next pass, and within a group the rows that tie on every other
+    term were ordered by issue number alone, so the window never moved past the
+    head of the run. A turn taken is a turn taken; the clocks read this stamp.
+    """
+    now = now or time.time()
+    count = 0
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        item[NOMINATED_AT_KEY] = now
+        item[NOMINATED_AT_KEY + "_iso"] = now_iso(now)
+        touch_queue_item(item, now)
+        count += 1
+    return count
+
+
 def has_due_cached_slskd_autopick(item, now=None, lookahead_seconds=0):
     if not isinstance(item, dict):
         return False
@@ -6572,6 +6616,9 @@ def latest_slskd_result_signature_at(item):
         # one. Without this the group re-presents at the front of the lane on
         # every pass and the tail of the library is never reached.
         slskd_service_skipped_at(item),
+        # A row handed to a pass for any source has had its turn, whatever the
+        # provider then did with it -- see mark_rows_nominated().
+        numeric_timestamp((item or {}).get(NOMINATED_AT_KEY)),
     )
     for attempt in (item or {}).get("attempts") or []:
         if not isinstance(attempt, dict):
@@ -13773,12 +13820,15 @@ def slskd_hot_retry_rows(queue, args):
     if limit <= 0:
         return []
     allowed_series = set(args.series or [])
+    exclusions = series_exclusions()
     rows = []
     seen_review_ids = set()
     for item in (queue.get("items") or {}).values():
         if item.get("state") in TERMINAL_QUEUE_STATES:
             continue
         if allowed_series and item.get("series") not in allowed_series:
+            continue
+        if series_excluded_by_database(item, exclusions):
             continue
         if not slskd_hot_retry_candidate(item, now):
             continue
@@ -13837,6 +13887,7 @@ def process_slskd_hot_retries(queue, args, progress=None, deadline=None, provide
         series = str(item.get("series") or "").strip()
         if not series:
             continue
+        mark_rows_nominated([item])
         review_id, _entry = cached_safe_slskd_entry_for_item(item)
         failed_retry = bool(item.get("last_failed_candidate_review_id") and item.get("last_failed_candidate_reason"))
         result = {
@@ -14083,6 +14134,11 @@ def due_row_sort_key(item):
         retry_after if retry_after > 0 else 0,
         queue_attempt_count(item),
         queue_first_pass_sort_ts(item),
+        # Rows that tie on everything above were ordered by issue number alone,
+        # which anchored a pass window at the head of a run for as long as the
+        # run stayed eligible. A row never handed to a pass sorts first, then the
+        # oldest hand-off, so the window walks the run instead.
+        numeric_timestamp(item.get(NOMINATED_AT_KEY)),
         issue_sort,
         normalize(str(item.get("issue") or "")),
     )
@@ -14120,7 +14176,7 @@ def broad_group_service_key(rows):
     for item in rows or []:
         if not isinstance(item, dict):
             continue
-        for field in ("last_attempt_at", "autopilot_slskd_attempted_at", "last_slskd_at"):
+        for field in ("last_attempt_at", "autopilot_slskd_attempted_at", "last_slskd_at", NOMINATED_AT_KEY):
             latest = max(latest, numeric_timestamp(item.get(field)))
     return latest
 
@@ -14578,6 +14634,7 @@ def due_series(queue, args):
     groups = collections.defaultdict(list)
     items = list((queue.get("items") or {}).values())
     allowed_series = set(args.series or [])
+    exclusions = series_exclusions()
     series_activity = collections.defaultdict(float)
     group_slskd_service_at = collections.defaultdict(float)
     for item in items:
@@ -14602,6 +14659,8 @@ def due_series(queue, args):
         if item.get("state") == "needs_you" and not args.retry_needs_you:
             continue
         if not item.get("present_in_watch", True):
+            continue
+        if series_excluded_by_database(item, exclusions):
             continue
         retry_after = float(item.get("retry_after") or 0)
         if (
@@ -16745,11 +16804,13 @@ def run(args):
                     series, rows, group_key = next_group
                     consume_user_search_priority(rows)
                     publish_progress(series=series, source="queue", note=f"starting {series}")
+                    window = rows[: args.max_issues_per_series]
+                    mark_rows_nominated(window)
                     processed.append(
                         process_series(
                             queue,
                             series,
-                            rows[: args.max_issues_per_series],
+                            window,
                             args,
                             progress=publish_progress,
                             deadline=run_deadline,

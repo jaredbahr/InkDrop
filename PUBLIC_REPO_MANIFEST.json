@@ -1,5 +1,5 @@
 {
-  "file_count": 403,
+  "file_count": 404,
   "files": [
     {
       "path": ".dockerignore",
@@ -513,8 +513,13 @@
     },
     {
       "path": "core/inkdrop_series_autopilot.py",
-      "sha256": "498597c7db317e1269324feec184dc8cdfeea75fff6d429844d83f59d229e724",
-      "size_bytes": 739039
+      "sha256": "76f46536489d98207349f7c0c92df3d0d3c98efacdeb15e8586721fa5d1530f1",
+      "size_bytes": 741833
+    },
+    {
+      "path": "core/inkdrop_series_eligibility.py",
+      "sha256": "9582abfc0695633e21e33bfbab5ee3e4f728a6979bc0a7955bc3ded604c7a54a",
+      "size_bytes": 4275
     },
     {
       "path": "core/inkdrop_service_inventory.py",
@@ -543,8 +548,8 @@
     },
     {
       "path": "core/inkdrop_slskd_source_probe.py",
-      "sha256": "22c380c6f102c16a30bb49541998d94768b96fdff2722becb19c99f0c146fcb9",
-      "size_bytes": 738056
+      "sha256": "03d2f29f0b28774b41985801f405fd6644525f191c92b2fff65e63de4c3a021c",
+      "size_bytes": 735994
     },
     {
       "path": "core/inkdrop_slskd_staging_sweep.py",
@@ -2019,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "0d16625ecb35cbfb61dd78a122375d2edf9c9515",
-  "total_size_bytes": 21261438
+  "source_commit": "e4090427faa6b1594da5ab645c297a9e6163316c",
+  "total_size_bytes": 21266445
 }

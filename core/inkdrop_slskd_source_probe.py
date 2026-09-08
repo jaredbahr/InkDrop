@@ -30,6 +30,7 @@ except Exception:
     inkdrop_state = None
 
 from core import inkdrop_runtime_config
+from core import inkdrop_series_eligibility
 from core import inkdrop_internal_jobs
 from core import inkdrop_download_client_routing
 from core import inkdrop_slskd_refusal_vocabulary
@@ -2971,74 +2972,18 @@ def load_queue_source_review_items(limit=200, series=None):
 
 
 def _removed_or_unmonitored_series_identity(db_path=None):
-    """Series currently removed or unmonitored, keyed both by id and by
-    normalized title, so an item can be matched whichever identity it carries.
+    """Series currently removed or unmonitored, keyed by id and normalized title.
 
-    Read-only, short-lived connection -- opened and closed within this call,
-    never cached -- so a removal takes effect on the very next merge rather
-    than waiting on some other cache's own refresh cycle. Two independent
-    admission paths converge in combine_source_review_items() (the live
-    queue-file path and the manual-review.jsonl tail), and neither producer
-    is wired to removal; this is the one place both are read together, so it
-    is the one place that can check removal for both without touching either
-    producer. See tracker discussion 2026-08-22 (removed series still probed).
+    The read lives in core/inkdrop_series_eligibility so the series autopilot
+    answers the same question the same way; this name stays for its callers.
     """
-    ids = set()
-    titles = set()
-    db_path = db_path or INKDROP_STATE_DB
-    try:
-        if not Path(db_path).exists():
-            return ids, titles
-    except (TypeError, OSError):
-        return ids, titles
-    try:
-        from core import inkdrop_db
-    except ImportError:
-        return ids, titles
-    try:
-        con = inkdrop_db.open_connection(
-            db_path,
-            readonly=True,
-            timeout_seconds=5,
-            operation="source_review_removed_series",
-        )
-    except Exception:
-        return ids, titles
-    try:
-        rows = con.execute(
-            "select id, title, sort_title from series"
-            " where coalesce(monitored, 1) = 0 or lower(coalesce(source, '')) = 'removed'"
-        ).fetchall()
-    except sqlite3.Error:
-        return ids, titles
-    finally:
-        con.close()
-    for row in rows:
-        row_id = str(row["id"] or "").strip()
-        if row_id:
-            ids.add(row_id)
-        for title in (row["title"], row["sort_title"]):
-            normalized = normalize(title or "")
-            if normalized:
-                titles.add(normalized)
-    return ids, titles
+    return inkdrop_series_eligibility.removed_or_unmonitored_series_identity(
+        db_path or INKDROP_STATE_DB, normalize
+    )
 
 
 def _source_review_item_series_identity(item):
-    """The most precise series identity an item carries, or "" if none.
-
-    Prefer an explicit id -- it is exact. Only an item with no id at all
-    (the manual-review.jsonl tail carries series NAME only, no id) falls
-    back to a normalized-title match, which is the same normalization the
-    caller already uses for its own deduplication key, not a new heuristic.
-    """
-    series_id = str(item.get("series_id") or "").strip()
-    if series_id:
-        return series_id
-    comicvine_id = str(item.get("comicvine_id") or "").strip()
-    if comicvine_id.isdigit():
-        return f"comicvine:{comicvine_id}"
-    return ""
+    return inkdrop_series_eligibility.item_series_identity(item)
 
 
 def combine_source_review_items(*groups):
