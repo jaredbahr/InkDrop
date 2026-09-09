@@ -2129,6 +2129,47 @@ def qbit_instance_configs(db_path):
     return results
 
 
+# Exceptions a REMOTE download client cannot cause. If one of these reaches a poll's
+# handler it is our bug, not the operator's client being off.
+#
+# Deliberately tight. KeyError, TypeError, AttributeError and IndexError are all
+# reachable from a payload we did not expect, so claiming those are ours would be the
+# same error pointing the other way -- and this codebase has made that mistake before.
+INTERNAL_FAULT_EXCEPTIONS = (NameError, UnboundLocalError, ImportError)
+
+
+def _client_poll_failure(client, exc, **extra):
+    """The record a poll returns when its body raised.
+
+    The whole body used to collapse into `client_state='client_unavailable'` -- a
+    statement about the WORLD manufactured from a fault in OUR process. A NameError
+    introduced while editing the poll does not raise out of it; it comes back as "the
+    download client is not reachable", on every pass, and nothing downstream can tell
+    the two apart. That is a false-green generator, not untidiness:
+    `client_unavailable` is a legitimate expected state whose handling is to WAIT
+    rather than act, so our defect is laundered into a routine environmental condition
+    that suppresses action and raises no alarm.
+
+    The state is unchanged on purpose. Narrowing the catch so programming errors
+    propagate would turn a degrade into a raise on a path whose callers -- qbit_items()
+    first -- do not all expect one. What changes is that the record now says WHICH kind
+    of failure it was, so a consumer can tell them apart.
+    """
+    record = {
+        "client": client,
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+        "client_state": "client_unavailable",
+        "client_state_reason": (
+            "inkdrop_internal_fault"
+            if isinstance(exc, INTERNAL_FAULT_EXCEPTIONS)
+            else "%s_poll_failed" % client
+        ),
+    }
+    record.update(extra)
+    return record
+
+
 def _qbit_poll_source(cfg, *, instance_id=None, db_path=None):
     try:
         session = requests.Session()
@@ -2215,12 +2256,8 @@ def _qbit_poll_source(cfg, *, instance_id=None, db_path=None):
         write_qbit_file_list_cache()
         return out
     except Exception as exc:
-        return [{
-            "client": "qbit",
-            "download_client_instance_id": instance_id,
-            "error": str(exc),
-            "client_state": "client_unavailable",
-        }]
+        return [_client_poll_failure(
+            "qbit", exc, download_client_instance_id=instance_id)]
 
 
 def qbit_items(db_path=None):
@@ -2445,7 +2482,7 @@ def sab_items():
                 }
             )
     except Exception as exc:
-        items.append({"client": "sab", "error": str(exc), "client_state": "client_unavailable"})
+        items.append(_client_poll_failure("sab", exc))
     return items
 
 
