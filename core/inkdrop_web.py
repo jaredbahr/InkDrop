@@ -47995,6 +47995,7 @@ def prowlarr_api_health(timeout=3.0):
             app_name = str(status_payload.get("appName") or status_payload.get("instanceName") or "").strip()
         indexer_count = 0
         enabled_indexer_count = 0
+        enabled_indexer_ids = set()
         indexer_error = ""
         torrentleech_coverage = {}
         try:
@@ -48015,6 +48016,11 @@ def prowlarr_api_health(timeout=3.0):
                 for item in indexers
                 if not isinstance(item, dict) or item.get("enable", item.get("enabled", True)) is not False
             )
+            enabled_indexer_ids = {
+                str(item.get("id"))
+                for item in indexers
+                if isinstance(item, dict) and item.get("enable", item.get("enabled", True)) is not False
+            }
             torrentleech_coverage = prowlarr_torrentleech_coverage(indexers)
         except ValueError as exc:
             # requests.exceptions.JSONDecodeError is *also* a RequestException
@@ -48064,6 +48070,10 @@ def prowlarr_api_health(timeout=3.0):
                 if isinstance(item, dict)
             }
             for indexer_id in inkdrop_prowlarr_indexer_health.unavailable_indexer_ids(status_rows):
+                # A disabled indexer in backoff answers nothing either way; only
+                # an enabled one in backoff is coverage a search would have had.
+                if enabled_indexer_ids and str(indexer_id) not in enabled_indexer_ids:
+                    continue
                 unavailable_names.append(names_by_id.get(indexer_id) or f"#{indexer_id}")
         except ValueError as exc:
             indexer_status_error = prowlarr_json_probe_failure_detail("indexerstatus", status_probe, exc)
@@ -48079,18 +48089,35 @@ def prowlarr_api_health(timeout=3.0):
 
         state = "healthy" if enabled_indexer_count > 0 else "watch"
         label = "healthy" if enabled_indexer_count > 0 else "no enabled indexers"
+        degraded = False
         if unavailable_names and enabled_indexer_count > 0:
-            # Deliberately "watch", not "unavailable": Prowlarr is fine and the
-            # remaining indexers still answer. What the operator needs to know
-            # is that searches running right now are covering less than they
-            # look like they are.
-            state = "watch"
-            label = "indexers backing off"
             joined = ", ".join(unavailable_names)
-            detail += (
-                f"; {len(unavailable_names)} unavailable right now ({joined})"
-                " -- searches are running with reduced coverage"
-            )
+            if len(unavailable_names) >= enabled_indexer_count:
+                # Every enabled indexer is in backoff: a search now answers
+                # nothing, so this is the blocking state.
+                state = "watch"
+                label = "all indexers backing off"
+                detail += (
+                    f"; {len(unavailable_names)} unavailable right now ({joined})"
+                    " -- no enabled indexer can answer"
+                )
+            else:
+                # Prowlarr is fine and the remaining indexers still answer, so
+                # this stays HEALTHY: the operator sees reduced coverage in the
+                # label and detail, and a search still runs. "watch" is the
+                # scheduler's blocking state -- the one RSS uses for a fresh
+                # explicit failure -- and reporting a notice under that name
+                # parked every Prowlarr job: measured 2026-09-08, this state
+                # held 32% of the week for one indexer at a time (DOGnzb, Tokyo
+                # Toshokan, AltHub) and the worker logged 10,414 provider_wait
+                # lines in a day.
+                state = "healthy"
+                label = "indexers backing off"
+                degraded = True
+                detail += (
+                    f"; {len(unavailable_names)} unavailable right now ({joined})"
+                    " -- searches are running with reduced coverage"
+                )
         elif indexer_status_error:
             detail += f"; availability check failed: {indexer_status_error}"
         return {
@@ -48106,6 +48133,7 @@ def prowlarr_api_health(timeout=3.0):
             "enabled_indexer_count": enabled_indexer_count,
             "unavailable_indexer_names": unavailable_names,
             "unavailable_indexer_count": len(unavailable_names),
+            "degraded": degraded,
             "indexer_status_error": indexer_status_error,
             "discovered_children": public_children,
             "settings_source": settings.get("source"),
