@@ -38165,7 +38165,26 @@ def inkdrop_auth_action_policy(path, method):
     if explicit:
         return dict(explicit)
     if method == "GET":
-        if path.startswith("/api/inkdrop-diagnostics/") or path == "/api/system/update-status":
+        # `/api/inkdrop-debug/` joins the diagnostics prefix rather than getting a
+        # gate of its own. Both routes under it report server topology --
+        # background-threads enumerates every live thread with its native_id, the
+        # TID /proc, top and docker stats show -- and they sat behind the GENERIC
+        # READ scope, so any key that could list the queue could also map the
+        # process.
+        #
+        # This removes no capability. write_web_thread_roster() publishes the same
+        # roster to the host filesystem for exactly this purpose ("written where a
+        # diagnostic session can read it without a credential"), so naming a thread
+        # that is burning CPU still works -- behind host access, which is a stronger
+        # boundary than a read key, not a weaker one. No UI calls either route.
+        #
+        # Matched on the PREFIX, not the word: a read route that merely contains
+        # "debug" must not be pulled into admin-only.
+        if (
+            path.startswith("/api/inkdrop-diagnostics/")
+            or path.startswith("/api/inkdrop-debug/")
+            or path == "/api/system/update-status"
+        ):
             return {"action": "advanced_diagnostics", "scope": "admin", "admin_only": True, "destructive": False, "high_impact": False}
         return {"action": "read", "scope": "read", "admin_only": False, "destructive": False, "high_impact": False}
     if path.startswith("/api/auth/") or path.startswith("/api/inkdrop-auth/"):
