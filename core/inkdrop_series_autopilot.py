@@ -7482,22 +7482,47 @@ def _active_automation_exhausted_review_rows(db_path):
     try:
         with inkdrop_state.connect_read(db_path) as con:
             rows = con.execute(
-                "select raw_json from review_exceptions where origin=? and active=1",
+                "select review_id, raw_json from review_exceptions where origin=? "
+                "and active=1",
                 (AUTOMATION_EXHAUSTED_REVIEW_ORIGIN,),
             ).fetchall()
     except Exception as exc:
         raise AutomationExhaustedRowsUnavailable(f"{type(exc).__name__}: {exc}") from exc
     out = {}
     for row in rows:
+        # A ROW THAT WILL NOT PARSE IS A ROW THAT CANNOT BE RE-ASSERTED, WHICH IS
+        # THE SAME FACT AS A FAILED READ AND MUST GET THE SAME ANSWER.
+        #
+        # These three cases used to `continue`. That drops the row from the merged
+        # batch, and sync_review_exceptions() retires whatever is NOT in the batch
+        # it is handed -- so one unparseable payload silently resolved every other
+        # live escalation's neighbour. Demonstrated end to end: seeding one bad row
+        # beside two good ones and running an ordinary, unrelated escalation
+        # retired the bad row.
+        #
+        # Refusing is the only faithful option available here. Substituting a
+        # minimal stand-in would rewrite the row with less than it had, which is
+        # data loss wearing the clothes of a repair; and the caller already knows
+        # how to skip a write, because the read-failure path above taught it.
         try:
             parsed = json.loads(row["raw_json"] or "{}")
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise AutomationExhaustedRowsUnavailable(
+                f"review_exceptions row {row['review_id']!r} has unparseable raw_json: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         if not isinstance(parsed, dict):
-            continue
+            raise AutomationExhaustedRowsUnavailable(
+                f"review_exceptions row {row['review_id']!r} carries a "
+                f"{type(parsed).__name__}, not an object"
+            )
         review_id = str(parsed.get("review_id") or "").strip()
-        if review_id:
-            out[review_id] = parsed
+        if not review_id:
+            raise AutomationExhaustedRowsUnavailable(
+                f"review_exceptions row {row['review_id']!r} carries no review_id, so it "
+                "cannot be merged back into the batch it belongs to"
+            )
+        out[review_id] = parsed
     return out
 
 
