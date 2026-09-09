@@ -2659,6 +2659,7 @@ def terminal_false_duplicate_attempt_reconciliation_smoke():
         old_globals = (
             probe.INKDROP_STATE_DB, probe.SLSKD_AUTO_GRAB_STATE_FILE,
             probe.SERIES_AUTOPILOT_LOCK, probe.MANUAL_REVIEW_ACTIONS_FILE,
+            probe.AUTO_GRAB_STATE_LOCK,
         )
         old_resolver_lock = resolver.SERIES_AUTOPILOT_LOCK
         originals = {}
@@ -2674,6 +2675,8 @@ def terminal_false_duplicate_attempt_reconciliation_smoke():
             probe.SLSKD_AUTO_GRAB_STATE_FILE = state_path
             probe.SERIES_AUTOPILOT_LOCK = shared_lock_path
             probe.MANUAL_REVIEW_ACTIONS_FILE = actions_path
+            # The state file's own lock lives beside it, not under the runtime lock dir.
+            probe.AUTO_GRAB_STATE_LOCK = root / "inkdrop-slskd-auto-grab-state.lock"
             resolver.SERIES_AUTOPILOT_LOCK = shared_lock_path
             entry = {
                 "review_id": review_id, "series": "Series eligible", "issue": "1",
@@ -2903,6 +2906,7 @@ def terminal_false_duplicate_attempt_reconciliation_smoke():
             (
                 probe.INKDROP_STATE_DB, probe.SLSKD_AUTO_GRAB_STATE_FILE,
                 probe.SERIES_AUTOPILOT_LOCK, probe.MANUAL_REVIEW_ACTIONS_FILE,
+                probe.AUTO_GRAB_STATE_LOCK,
             ) = old_globals
             resolver.SERIES_AUTOPILOT_LOCK = old_resolver_lock
             for name, value in originals.items():

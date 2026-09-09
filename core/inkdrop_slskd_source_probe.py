@@ -173,6 +173,15 @@ def read_slskd_config_text():
     return ""
 SLSKD_AUTO_GRAB_STATE_FILE = STATE_DIR / "slskd-auto-grab-state.json"
 SERIES_AUTOPILOT_LOCK = LOCK_DIR / "inkdrop-series-autopilot.lock"
+# The auto-grab state file is written by this probe (usually a child of a
+# scheduled pass) and by the resolver, so its writers serialise on a lock of
+# their own. It used to be SERIES_AUTOPILOT_LOCK -- the file the pass wrapper
+# holds for the whole pass -- so a child that had started a download blocked
+# in its state commit until the parent's timeout killed it, and a child that
+# started nothing skipped the commit and returned normally. Measured on
+# production 2026-09-09: 1,306 grab summaries since 09-01, none with a started
+# row, against 34 handoffs in the same window.
+AUTO_GRAB_STATE_LOCK = LOCK_DIR / "inkdrop-slskd-auto-grab-state.lock"
 SLSKD_AUTO_GRAB_AUDIT_LOG = STATE_DIR / "slskd-auto-grab-audit.jsonl"
 SLSKD_PROVIDER_SETTINGS = {"source": "fallback"}
 QUALITY_LANGUAGE_RULES = {
@@ -237,7 +246,10 @@ PROBE_BUDGET_SKIP_REASONS = frozenset({"probe_budget_exhausted", "probe_budget_b
 # 32 of 34 killed runs in seven days had found or handed off something.
 HARD_DEADLINE = None
 HARD_DEADLINE_WRITE_RESERVE_SECONDS = 20
-AUTO_GRAB_ROW_RESERVE_SECONDS = 20
+# A started row -- two handoffs, the enqueue, the waiting record -- took 50 s on
+# production 2026-09-09 (01:27:58Z probe_item -> 01:28:49Z waiting record).
+# A row started with less than that left ends under the parent's kill.
+AUTO_GRAB_ROW_RESERVE_SECONDS = 60
 
 
 def hard_deadline_remaining(now_ts=None):
@@ -1951,9 +1963,10 @@ def save_auto_grab_state(state):
 
 
 def acquire_auto_grab_state_lock(blocking=True):
+    """Exclusive lock for the auto-grab state file; never the pass lock (see AUTO_GRAB_STATE_LOCK)."""
     try:
-        SERIES_AUTOPILOT_LOCK.parent.mkdir(parents=True, exist_ok=True)
-        handle = SERIES_AUTOPILOT_LOCK.open("a+b")
+        AUTO_GRAB_STATE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        handle = AUTO_GRAB_STATE_LOCK.open("a+b")
     except OSError:
         return None
     try:
@@ -1993,7 +2006,7 @@ def commit_auto_grab_state_changes(base_state, run_state):
     """Merge this probe run's local attempt deltas into freshly locked state."""
     handle = acquire_auto_grab_state_lock(blocking=True)
     if handle is None:
-        raise RuntimeError("series autopilot lock unavailable for auto-grab state commit")
+        raise RuntimeError("auto-grab state lock unavailable for the state commit")
     try:
         current = load_auto_grab_state()
         base_state = base_state if isinstance(base_state, dict) else {}
