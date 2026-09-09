@@ -50689,6 +50689,19 @@ def run_inkdrop_library_frontend_sync(payload):
 # any internal path -- this is the boundary where the payload leaves the
 # process, and every action that acts on these rows posts an id, never a path.
 OPERATIONAL_DETAIL_REDACTED_PATH_FIELDS = frozenset({
+    # A PATH IS A PATH WHATEVER THE FIELD IS CALLED. Every other name in this
+    # set is a compound, and the import evidence served alongside a queue row
+    # calls its two fields simply `path` and `file_name` -- so
+    # rows[].evidence.found.path survived redaction whole, and mobile copies it
+    # into a title attribute (web/static/js/inkdrop-mobile.js) where it is
+    # exposed on hover.
+    #
+    # `file_name` belongs here for a reason worth keeping: the producer derives
+    # it with POSIX basename logic, so on a Windows path reported by a download
+    # client it is not a basename at all -- it is the same full string. Its name
+    # promises a leaf; only this makes the promise true.
+    "path",
+    "file_name",
     "save_path",
     "local_path",
     "source_path",
