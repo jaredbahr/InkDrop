@@ -14840,7 +14840,26 @@ def probe_item(
                     shared_observation_budget.get("truncated")
                     or query_observation_summary.get("observation_truncated")
                 )
-            candidates, rejection_summary = candidates_from_responses(responses, item)
+            # The deadline that bounds the searches bounds the processing of
+            # their responses too. Without it the function's own deadline
+            # checks are dead on this path and a saturated response set is
+            # processed until the parent kills the run: 2026-09-09 the Hunter
+            # X Hunter child made one search (97 responses, complete 01:57:45Z)
+            # and no further request until the kill at 02:01:42Z (row #918).
+            # When time allows the result is unchanged; the cut is taken only
+            # where the alternative was no result at all.
+            candidates, rejection_summary = candidates_from_responses(responses, item, deadline=deadline)
+            if rejection_summary.get("processing_timed_out"):
+                log(
+                    "candidate_processing_truncated",
+                    review_id=item.get("review_id"),
+                    series=item.get("series"),
+                    query=query,
+                    response_count=len(responses),
+                    checked_file_count=rejection_summary.get("checked_file_count"),
+                    candidate_count=len(candidates),
+                    remaining_seconds=round(float(seconds_remaining(deadline) or 0), 1),
+                )
             # A provider query may initially look safe and then be blocked by
             # durable failed-candidate memory. Apply that annotation before
             # deciding whether the exact requested unit is settled.
