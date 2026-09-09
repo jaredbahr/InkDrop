@@ -370,9 +370,17 @@ def build_reconciliation_report(db_path, *, max_files=50000, sample_limit=50, in
 def refresh_media_file_ledger(db_path, *, timeout_seconds=10.0, busy_timeout_ms=10000):
     """The one safe, idempotent repair action: recompute present/missing from disk.
 
-    This calls the same inkdrop_state.sync_managed_media_files that already runs
-    inside every periodic sync_state pass -- it only ever sets a media_files row's
-    status/active flag to match whether the file it points at exists right now.
+    This calls the same inkdrop_state.sync_managed_media_files that a FULL
+    sync_state pass runs. Not every periodic pass: outside `mode="full"` the step
+    is substituted with zeros, and this docstring used to say otherwise. Acting on
+    that sentence sent a session down the sync-mode path chasing library-resident
+    units whose cause was structural -- sync_managed_media_files reads ONLY
+    import_results, so a unit with no qualifying import row is invisible in EVERY
+    mode. A pass now names what it skipped in `skipped_maintenance_steps`, which is
+    the one-command way to check this sentence rather than trust it.
+
+    It only ever sets a media_files row's status/active flag to match whether the
+    file it points at exists right now.
     It never deletes rows, never touches series/issues, and never picks between
     two candidate files.
     """

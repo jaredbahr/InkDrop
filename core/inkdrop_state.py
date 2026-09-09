@@ -39705,14 +39705,39 @@ def sync_queue_state(
                 if sync_mode != "queue" else 0
             )
             timings["completion_reconcile"] = round(time.perf_counter() - completion_started, 6)
+            # A STEP THAT DID NOT RUN MUST BE NAMEABLE. The substituted zeros below
+            # are indistinguishable from a step that ran and found nothing, and the
+            # `mode: "skipped"` marker they carried is read by NOTHING -- no consumer
+            # anywhere in core/, web/ or tools/. So the only trace of a skipped
+            # maintenance step was a field nobody looks at, and a session lost real
+            # time to that: it went hunting for a sync-mode cause behind
+            # library-resident units whose actual cause was structural.
+            #
+            # Not a rare branch either: mode="queue" is passed routinely by
+            # inkdrop_manual_source_autoresolve and inkdrop_slskd_source_probe.
+            #
+            # Steps are named by the SUMMARY KEY they land under, so the list says
+            # exactly which entries in `synced` are zeros for want of a run. The
+            # recording happens in the same expression that performs the skip, so
+            # the two cannot drift apart the way a hand-maintained list would.
+            skipped_maintenance_steps = []
+
+            def _skipped(step, value):
+                skipped_maintenance_steps.append(step)
+                return value
+
             folder_presence_started = time.perf_counter()
             folder_presence_backfill = (
                 backfill_existing_folder_presence_import_results(con, now)
-                if sync_mode == "full" else {"checked": 0, "verified": 0, "skipped": 0, "mode": "skipped"}
+                if sync_mode == "full" else _skipped(
+                    "folder_presence_backfill",
+                    {"checked": 0, "verified": 0, "skipped": 0, "mode": "skipped"})
             )
             folder_presence_wanted_backfill = (
                 backfill_existing_folder_presence_wanted_items(con, now)
-                if sync_mode == "full" else {"checked": 0, "verified": 0, "skipped": 0, "mode": "skipped"}
+                if sync_mode == "full" else _skipped(
+                    "folder_presence_wanted_backfill",
+                    {"checked": 0, "verified": 0, "skipped": 0, "mode": "skipped"})
             )
             timings["folder_presence_backfill"] = round(time.perf_counter() - folder_presence_started, 6)
             final_cleanup_started = time.perf_counter()
@@ -39720,14 +39745,16 @@ def sync_queue_state(
             superseded_count = supersede_duplicate_queue_items(con, now)
             verification_dupes_removed = (
                 cleanup_duplicate_verified_activity_attempts(con)
-                if sync_mode == "full" else 0
+                if sync_mode == "full"
+                else _skipped("duplicate_verified_activity_attempts_removed", 0)
             )
             repeated_retry_source_attempts_coalesced = cleanup_repeated_automatic_retry_source_attempts(con, now)
             timings["final_cleanup"] = round(time.perf_counter() - final_cleanup_started, 6)
             media_files = timed(
                 "managed_media_inventory",
                 lambda: sync_managed_media_files(con, now),
-            ) if sync_mode == "full" else {"checked": 0, "upserted": 0, "missing": 0, "mode": "skipped"}
+            ) if sync_mode == "full" else _skipped(
+                "media_files", {"checked": 0, "upserted": 0, "missing": 0, "mode": "skipped"})
             update_sync_meta(con, now, f"queue_{sync_mode}", source.get("source_mtime"))
             timed("commit", con.commit)
         export_result = (
@@ -39745,6 +39772,7 @@ def sync_queue_state(
             "ok": True,
             "db_path": str(path),
             "sync_mode": sync_mode,
+            "skipped_maintenance_steps": skipped_maintenance_steps,
             "timings": timings,
             "synced": {
                 "queue_watchdog": watchdog,
