@@ -343,7 +343,19 @@ def active_pack_import_state(db_path=None, *, state_dir=None, now=None, active_s
         0.0,
     )
     active_states = {"starting", "running", "sent", "importing", "busy", "ready_import"}
-    fresh = updated_at <= 0 or now - updated_at <= max(1, float(active_seconds or PACK_IMPORT_ACTIVE_SECONDS))
+    # AN UNDATED ROW IS NOT FRESH FOR EVER. This read `updated_at <= 0 or ...`,
+    # so a row carrying no timestamp stayed active indefinitely and kept
+    # blocks_new true -- nothing could age it out, because there was nothing to
+    # age, and no later pass could clear it.
+    #
+    # THE SPLIT, MEASURED: the two other readers of this same question --
+    # inkdrop_series_autopilot.py:5870 and :5886 -- compute
+    # `now - updated_at <= PACK_IMPORT_ACTIVE_SECONDS` with no zero case, so with
+    # updated_at = 0 the difference is the whole epoch and both call it EXPIRED.
+    # One predicate said fresh for ever while two said expired, for the same row
+    # at the same instant. This aligns the outlier, which is the smaller change
+    # and matches what the system already mostly does.
+    fresh = updated_at > 0 and now - updated_at <= max(1, float(active_seconds or PACK_IMPORT_ACTIVE_SECONDS))
     is_active = bool(fresh and (lifecycle in active_states or status in active_states or payload.get("blocks_new")))
     return {
         "active": is_active,
