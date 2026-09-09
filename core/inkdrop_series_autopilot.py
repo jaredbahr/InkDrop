@@ -10763,6 +10763,29 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
                 "lifecycle_phase": "retry_later",
                 "reason": "Prowlarr search budget exhausted before finding a safe candidate; automatic retry scheduled",
             }
+        # A LIMIT IS NOT A CONTENT VERDICT. `missing` and `attempted` are things we
+        # looked at; `budget_skipped` is the search stopping because the runtime
+        # budget ran out. They shared this exit, so a pass that never finished was
+        # recorded as "Prowlarr checked; no safe automatic candidate" -- a judgement
+        # nobody made. A unit recorded as searched-and-empty reads as answered; one
+        # recorded as retry-later stays in the queue.
+        #
+        # The function already knows the difference: an exhausted budget sixteen
+        # lines above returns exactly this shape. A skip is the same fact arriving
+        # by a different field.
+        #
+        # NARROW ON PURPOSE. A pass with real attempts or real missing candidates
+        # that ALSO skipped some rows did look at something, and what it saw is
+        # reportable -- suppressing that would hide a genuine content outcome.
+        if budget_skipped > 0 and missing == 0 and attempted == 0:
+            return {
+                "status": "timeout",
+                "lifecycle_phase": "retry_later",
+                "reason": (
+                    "Prowlarr stopped on the runtime budget before checking this row;"
+                    " automatic retry scheduled"
+                ),
+            }
         if missing > 0 or attempted > 0 or budget_skipped > 0:
             return {
                 "status": "searched_no_candidates",
