@@ -1421,6 +1421,15 @@ def _is_terminal_source_attempt_history(row):
     status = _lower(row.get("status"))
     phase = _lower(row.get("lifecycle_phase"))
     outcome = _lower(row.get("outcome"))
+    if not status:
+        # A ROW THAT SAYS NOTHING IS NOT A TERMINAL ATTEMPT, and the canonical
+        # authority already said so. inkdrop_state.source_attempt_is_real_attempt()
+        # rejects an absent, null or empty status on its own line. This predicate
+        # never asked it: an empty status is in neither the non-terminal status set
+        # nor the phase/outcome pair, so it fell through to True and a blank
+        # provider-provenance row became BOTH cooldown evidence and history -- a
+        # verdict minted from a row that recorded nothing.
+        return False
     if status in NON_TERMINAL_SOURCE_ATTEMPT_STATUSES:
         return False
     if phase in NON_TERMINAL_SOURCE_ATTEMPT_PHASES and outcome in NON_TERMINAL_SOURCE_ATTEMPT_OUTCOMES:
