@@ -87,6 +87,29 @@ def looks_like_path(value):
     return "/" in text or "\\" in text
 
 
+# Extensions the importer actually handles. A bare name carrying one of these IS
+# identity even though it has no separator -- `Berserk_Vol.42.cbz` is the whole of
+# what some staging rows know about themselves.
+ARTIFACT_EXTENSIONS = {
+    ".cbz", ".cbr", ".cb7", ".cbt", ".zip", ".rar", ".7z",
+    ".pdf", ".epub", ".mobi", ".azw3",
+}
+
+
+def looks_like_artifact(value):
+    """A bare artifact name: no separator, but an extension the importer handles.
+
+    looks_like_path() answers for anything with a separator. This answers for the
+    other half of the same question, so a caller can ask "does this string carry
+    identity?" without treating a provider id like `slskd` as a file name.
+    """
+    text = str(value or "").strip()
+    if not text or looks_like_path(text):
+        return False
+    _stem, _dot, suffix = text.rpartition(".")
+    return bool(_dot) and ("." + suffix.lower()) in ARTIFACT_EXTENSIONS
+
+
 def path_leaf(value):
     """The last segment of a path, whichever separator it uses.
 

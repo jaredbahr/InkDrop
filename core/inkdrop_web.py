@@ -62457,7 +62457,15 @@ def _manual_review_retry_series(item):
     """
     series = str(item.get("series") or item.get("matched_series") or "").strip()
     if series.casefold() in MANUAL_REVIEW_PLACEHOLDER_SERIES:
-        return ""
+        # A placeholder word beside DURABLE IDENTITY is a title, not a placeholder.
+        # The 16 rows this guard was written for carry `series_id` and `issue_id`
+        # both NULL -- that absence is the evidence, and the word was only ever a
+        # proxy for it. A series genuinely called `Unknown` that InkDrop can point
+        # to in its own catalogue is a series, and refusing it silently disables
+        # `Reject & search again` for that row with nothing said.
+        durable = str(item.get("series_id") or item.get("issue_id") or "").strip()
+        if not durable:
+            return ""
     return series
 
 
@@ -62902,6 +62910,30 @@ def manual_review_legacy_activity(item, slskd_probe_status=None):
     return " · ".join(bit for bit in bits if bit)
 
 
+def manual_review_source_identity(source):
+    """The identity a row's `source` carries, or "" when it carries none.
+
+    The leaf fallback is right for a path or a file name, and it shipped for exactly
+    that: a row whose only identity is `Berserk_Vol.42.cbz` should be titled that
+    rather than `Unknown`. But `source` is not always path-shaped -- it is routinely
+    a bare provider id, and `path_leaf("slskd")` is `"slskd"`, so the operator was
+    shown the name of the PROVIDER where the series title belongs.
+
+    looks_like_path() already draws this line one function above path_leaf() and was
+    simply not consulted. Both routes are gated here, because the old chain fell
+    through the leaf to a bare `or item.get("source")` that reached the same wrong
+    title by a second path.
+    """
+    text = str(source or "").strip()
+    if not text:
+        return ""
+    if inkdrop_import_evidence.looks_like_path(text):
+        return inkdrop_import_evidence.path_leaf(text)
+    if inkdrop_import_evidence.looks_like_artifact(text):
+        return text
+    return ""
+
+
 def manual_review_legacy_row(item, slskd_probe_status=None):
     item = item if isinstance(item, dict) else {}
     issue = item.get("issue") or item.get("issue_number") or ""
@@ -62924,8 +62956,7 @@ def manual_review_legacy_row(item, slskd_probe_status=None):
             item.get("series")
             or item.get("matched_series")
             or item.get("query")
-            or inkdrop_import_evidence.path_leaf(item.get("source"))
-            or item.get("source")
+            or manual_review_source_identity(item.get("source"))
             or "Unknown"
         ),
         "issue_number": issue,
