@@ -17412,6 +17412,58 @@ def find_bad_source_candidate(
                     """,
                     (str(download_url_hash).strip(),),
                 ).fetchall()
+            # ASK FOR THE ROW, THEN FALL BACK TO THE WINDOW.
+            #
+            # The 500-row window below is global -- ordered by last_seen_at and
+            # filtered by nothing but an optional reason -- so against a table of
+            # 7,469 rows roughly 93% of durable source memory was unreachable to
+            # the lookup meant to enforce it. Measured live: a rank-2 control
+            # matched while all four Goodnight Punpun rows, ranks 991 to 1005,
+            # returned nothing -- including the staged_file_low_confidence row
+            # everyone assumed was doing the refusing. A durable refusal expired
+            # by DISPLACEMENT rather than by policy, and a row past the window
+            # was indistinguishable from one that was never recorded at all.
+            #
+            # candidate_key was already computed above and simply never reached
+            # the query, while idx_bad_source_candidates_title on
+            # (normalized_title, last_seen_at desc) exists for exactly this and
+            # the writer stores the same key this function derives.
+            #
+            # So this is NOT a policy change. Whether a bounded window is the
+            # memory InkDrop wants is a product question and this does not touch
+            # it; the lookup simply asks for the row it is about, in the same
+            # shape as the download_url_hash pass above, and the scan gets
+            # cheaper rather than wider.
+            #
+            # EQUALITY ONLY, AND THAT IS A MEASUREMENT RATHER THAN A PREFERENCE.
+            # The first cut of this asked `normalized_title = ? or
+            # normalized_title like ?` to cover the matcher's prefix case too.
+            # EXPLAIN QUERY PLAN says that is worse than useless: SQLite will not
+            # use a BINARY-collated index for a case-insensitive LIKE, so the OR
+            # defeats the index and the whole query degrades to
+            #   SCAN bad_source_candidates USING INDEX idx_..._default_order
+            # -- exactly the scan this is meant to avoid. Equality alone gives
+            #   SEARCH bad_source_candidates USING INDEX
+            #   idx_bad_source_candidates_title (normalized_title=?)
+            #
+            # So the prefix, reverse-prefix and volume-range cases that
+            # bad_source_candidate_title_matches() also accepts keep relying on
+            # the window below, exactly as they did before. This stays strictly
+            # additive: nothing that matched before stops matching, and the row
+            # this lookup is actually about is now reachable however old it is.
+            key_rows = []
+            if candidate_key:
+                key_rows = con.execute(
+                    f"""
+                    select *
+                    from bad_source_candidates
+                    where {" and ".join(filters)}
+                      and normalized_title = ?
+                    order by last_seen_at desc
+                    limit 200
+                    """,
+                    (*params, candidate_key),
+                ).fetchall()
             rows = con.execute(
                 f"""
                 select *
@@ -17438,7 +17490,10 @@ def find_bad_source_candidate(
     source_key = normalize_key(source)
     provider_key = normalize_key(provider)
     protocol_key = normalize_key(protocol)
-    for row in rows:
+    # The keyed rows first, then the window. The SAME filter loop runs over both,
+    # so the matching semantics are unchanged -- only the set of rows the loop
+    # gets to see is larger.
+    for row in list(key_rows) + list(rows):
         item = dict(row)
         if not scope_matches(item):
             continue
