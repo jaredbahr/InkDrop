@@ -13098,10 +13098,14 @@ def slskd_probe_command(
     floor at a time, and the child is told when the window closes.
     """
     requested_total = max_total if max_total is not None else args.slskd_max_total
-    queries = max(1, int(max_queries if max_queries is not None else args.slskd_max_queries) or 1)
     if hard_deadline_seconds is not None:
+        # One search per unit. The query variants are fallbacks the child
+        # budgets itself, one search at a time, stopping on the first safe
+        # hit -- multiplying by them priced every unit at five searches and
+        # sized every run to one unit (measured 2026-09-09: max_total 1 for
+        # any eligible count with the production five variants).
         per_search = SLSKD_SEARCH_WAIT_FLOOR_SECONDS + 2
-        affordable = max(1, int(effective_probe_budget or 0) // max(1, queries * per_search))
+        affordable = max(1, int(effective_probe_budget or 0) // per_search)
         requested_total = max(1, min(int(requested_total or 1), affordable))
     command = [
         python_command(),
@@ -13439,12 +13443,19 @@ def slskd_broad_probe_kwargs(args, eligible_count=0, row_count=0):
     # Select only what the budget funds. The units selected past that point
     # were skipped at the search floor and then recorded as searched-and-empty,
     # losing their never-probed priority without a single query having run.
-    affordable = max(1, budget // max(1, max_queries * per_search))
+    # One search per unit, as the budget floor above already assumes: the
+    # variants are the child's fallbacks, budgeted one search at a time.
+    affordable = max(1, budget // per_search)
     batch_size = max(1, min(batch_size, affordable))
     return {
         "max_total": batch_size,
         "max_per_series": batch_size,
-        "auto_grab_max": max(0, min(configured_auto_grab, batch_size)),
+        # The grab limit is not the search batch. Enqueuing a cached safe
+        # candidate costs no search, and the cache routinely holds the rest
+        # of a run from the same peer that the searched unit came from.
+        # Tied to batch_size, every run since 3874be5a was told
+        # --auto-grab-max 1 and stopped after its first row.
+        "auto_grab_max": max(0, configured_auto_grab),
         "probe_budget_seconds": budget,
     }
 
