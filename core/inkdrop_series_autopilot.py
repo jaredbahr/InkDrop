@@ -14069,7 +14069,12 @@ def process_slskd_hot_retries(queue, args, progress=None, deadline=None, provide
             max_queries=max_queries,
             probe_budget_seconds=probe_budget,
             cooldown_hours=24,
-            auto_grab_max=1,
+            # The lane targets one row, but its probe evaluates the peer's whole
+            # folder for the series and routinely selects the rest of the run
+            # (Gotham Central 03:30Z 2026-09-09: 8 and 13 issues selected, one
+            # grab allowed). The grab stage takes what the run selected, under
+            # the configured limit, the way the broad lane's does.
+            auto_grab_max=None,
             review_id=review_id,
             deadline=deadline,
             progress=(
