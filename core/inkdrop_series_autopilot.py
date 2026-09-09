@@ -6799,7 +6799,20 @@ def classify_source_verdict_text(*values):
     out of a sentence describing an earlier verdict, with no provider involved
     at either step. Prefer `item["last_source_verdict"]`.
     """
-    text = " ".join(str(value or "") for value in values).lower()
+    text = " ".join(str(value or "") for value in values).lower().strip()
+    if not text:
+        # NOTHING SAID IS NOT SOMETHING ADVERSE. This fell through to "error"
+        # for every input it did not recognise, including an empty one, so a
+        # provider that reported nothing was given a verdict it never gave --
+        # and a verdict is what earns a retry cooldown, so a source could be
+        # rested for a fault nobody observed. The absent-versus-adverse shape,
+        # the same one behind the Kapowarr not_linked mislabel.
+        #
+        # Only ABSENCE answers absent. Text that is present but unrecognised
+        # stays "error": callers pass real failure strings, and calling those
+        # absent would suppress a cooldown that was genuinely earned, which is
+        # this same defect pointing the other way.
+        return ""
     if "timed out" in text or "timeout" in text:
         return "timeout"
     if "busy" in text:
@@ -6823,6 +6836,11 @@ def record_source_verdict(item, source, kind, now=None, origin=SOURCE_VERDICT_OB
     if not isinstance(item, dict):
         return ""
     kind = str(kind or "").strip().lower()
+    if not kind:
+        # The same rule one layer down. An absent kind used to be minted as
+        # "error" here too, so the coercion happened twice on one path and the
+        # item carried a provider failure nobody observed.
+        return ""
     if kind not in SOURCE_VERDICT_KINDS:
         kind = "error"
     item["last_source_verdict"] = kind
