@@ -157,7 +157,22 @@ PUBLICATION_DATE_RE = re.compile(
 BRACKETED_MONTH_YEAR_RE = re.compile(
     r"(?P<open>[\[(])\s*(?P<month>\d{1,2})-(?P<year>(?:19|20)\d{2})\s*(?P<close>[\])])"
 )
-V_YEAR_RE = re.compile(r"(?i)\bv\.?\s*0*((?:19|20)\d{2})\b")
+# "(3, 2025)": a bracketed month and year with a comma. The same claim the
+# "(3-2025)" form above makes; left unread, its month counted as a second
+# unit number and kept an exact issue at review (2026-09-09).
+BRACKETED_MONTH_COMMA_YEAR_RE = re.compile(
+    r"(?P<open>[\[(])\s*(?P<month>\d{1,2})\s*,\s*(?P<year>(?:19|20)\d{2})\s*(?P<close>[\])])"
+)
+# "V2014", "v.2014", "Vol.2025", "Volume 2014": a run year, whichever way the
+# volume word is spelled. Accepting only the bare initial left "Vol.2025 #001"
+# at review while "V2025 #001" was safe.
+V_YEAR_RE = re.compile(r"(?i)\b(?:v|vol(?:ume)?)\.?\s*0*((?:19|20)\d{2})\b")
+
+
+def _bracketed_month_year_matches(text):
+    """Both bracketed month-year spellings, in text order."""
+    matches = list(BRACKETED_MONTH_YEAR_RE.finditer(text)) + list(BRACKETED_MONTH_COMMA_YEAR_RE.finditer(text))
+    return sorted(matches, key=lambda match: match.start())
 # A year sitting next to one of these names which *printing* the artifact is,
 # not which run it belongs to: "The Sandman 001 (2023 Reprint)" is the 1989
 # issue on 2023 paper, so its year says nothing about series identity.
@@ -550,7 +565,7 @@ def publication_date_evidence(value):
         masked[match.start():match.end()] = " " * (match.end() - match.start())
     # Reversed comic release stamps are safe only inside one complete,
     # matching wrapper.  A bare/prefixed ``10-2019`` remains unit coverage.
-    for match in BRACKETED_MONTH_YEAR_RE.finditer(original):
+    for match in _bracketed_month_year_matches(original):
         if (match.group("open"), match.group("close")) not in {("(", ")"), ("[", "]")}:
             continue
         if has_unit_prefix_before_number(original, match.start()):
@@ -1659,6 +1674,10 @@ def _reinterpret_vyear_run_for_issue_target(candidate, target, evidence):
     numbers_by_source = []
     for source in sources:
         text = str(source.get("parsed_identity_text") or source.get("unit_identity_title") or "")
+        # The leaf only, as parse_release_title reads unit identity: a parent
+        # folder's number ("... - Year 2 (2014)") is the uploader's shelf
+        # layout, and counting it here made the run-year read ambiguous.
+        text = re.split(r"[\\/]", text)[-1].strip() or text
         year_matches = list(V_YEAR_RE.finditer(text))
         if len(year_matches) > 1:
             return
