@@ -36885,6 +36885,16 @@ def cleanup_missing_folder_verified_import_proofs(
                 "previous_outcome": row["outcome"],
                 "previous_display_phase": row["display_phase"],
                 "previous_completion_truth": row["completion_truth"],
+                # THE UPDATE BELOW OVERWRITES TWO MORE FIELDS THAN THIS RECORDED.
+                # Five previous_* keys were stamped while seven columns were written,
+                # so folder_imported and library_visibility_status were lost at the
+                # moment of retraction. Measured on the 2026-09-04T10:27Z snapshot:
+                # 2,494 of 2,494 retracted proofs carry exactly those five keys and no
+                # other. The values survived only by accident -- the original import
+                # payload still held them in the same raw_json -- so a restore had to
+                # read a field this write never claimed to keep.
+                "previous_folder_imported": row["folder_imported"],
+                "previous_library_visibility_status": row["library_visibility_status"],
             }
         )
         con.execute(
