@@ -207,7 +207,13 @@ while the container is stopped is a complete backup.
 
 **Provider credentials are deliberately not included** — settings exports are
 written with secrets redacted. After restoring, re-enter your API keys and
-passwords. A restore brings back your library state, not your logins.
+passwords for Prowlarr, slskd and the rest.
+
+**Your own InkDrop login is a different thing, and a restore does replace it.**
+By default a restore brings back the archive's logins and API keys along with
+everything else, so if you have changed your password since the backup was
+taken, the older one is what works afterwards. Restore with
+`--preserve-current-auth` to keep today's login and API keys instead.
 
 ## When something looks wrong
 
