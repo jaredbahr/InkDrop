@@ -1803,8 +1803,8 @@
     },
     {
       "path": "web/static/css/inkdrop.css",
-      "sha256": "1075199be1db3d0097cda90cca2475f687bd8fdcd7ebb629ca531fb76c8e0f48",
-      "size_bytes": 801779
+      "sha256": "dd35727591271d2a1e2037ced653739fb9e8e200ae52e8b9d7913660de5fb736",
+      "size_bytes": 802445
     },
     {
       "path": "web/static/css/mobile.css",
@@ -1868,8 +1868,8 @@
     },
     {
       "path": "web/static/css/src/12-manual-search-and-auth.css",
-      "sha256": "4eb6db62e71bf48fa1f1580f1362e3cfe879e20be0464136ca2e59b5fe8901ee",
-      "size_bytes": 57230
+      "sha256": "2dffba1db52feee044366db53458ec0ebe5fd9d58f7f6a138a7e6c04b6a4af04",
+      "size_bytes": 57896
     },
     {
       "path": "web/static/css/src/13-download-clients-and-activity.css",
@@ -2024,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "631b8909f45dc7fad77e3a50d7a3fd48e6b3a688",
-  "total_size_bytes": 21291226
+  "source_commit": "867e82d3fdffee95c4cad1c9f7a3aa3a330c5d87",
+  "total_size_bytes": 21292558
 }

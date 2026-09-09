@@ -18966,12 +18966,28 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
     justify-content: flex-start;
   }
 
-  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row,
+  /* QUEUE AND WANTED DIVIDE HERE, BECAUSE ONLY ONE OF THEM HAS A CHECKBOX.
+     `selectableTable` in inkdrop_web.py resolves FALSE for queue -- "queue" is
+     in `operationalTable`, so the second clause cannot rescue it, and it is not
+     in the ["wanted", "manual_review"] list the first clause tests. Wanted is.
+
+     These two shared one rule, written before the Source column split
+     (SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py), and it gave BOTH a 24px
+     track and a "select" area -- so Queue reserved an empty gutter from 621px
+     to 1099px for a checkbox it never renders. "source" is a real cell in the
+     DOM and needs an area of its own in both, or it lands on top of "state"
+     (both auto-placed into the same leftover slot). */
+  body[data-inkdrop-view="queue"] .section-table-queue .section-table-row {
+    grid-template-columns: minmax(190px, 1fr) minmax(100px, .5fr) minmax(100px, .5fr) minmax(64px, auto);
+    grid-template-areas:
+      "item state source actions"
+      "detail detail detail actions";
+    gap: 5px 8px;
+    align-items: start;
+    padding: 7px 8px;
+  }
+
   body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-row {
-    /* Written before Queue/Wanted's Source column split
-       (SPLIT_SOURCE_COLUMN_VIEWS in inkdrop_web.py); "source" is now a real
-       cell in the DOM with no area of its own here, which used to land it
-       on top of "state" (both auto-placed into the same leftover slot). */
     grid-template-columns: 24px minmax(190px, 1fr) minmax(100px, .5fr) minmax(100px, .5fr) minmax(64px, auto);
     grid-template-areas:
       "select item state source actions"
@@ -18995,7 +19011,6 @@ body[data-inkdrop-view="manual_review"] .section-table-detail * {
     min-width: 0;
   }
 
-  body[data-inkdrop-view="queue"] .section-table-queue .section-table-select,
   body[data-inkdrop-view="wanted"] .section-table-wanted .section-table-select {
     position: static;
     grid-area: select;
