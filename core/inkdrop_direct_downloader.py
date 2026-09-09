@@ -187,6 +187,21 @@ def _archive_validation_reason(path, extension):
     path = Path(path)
     extension = providers.normalize_extension(extension)
     if extension in {".cbz", ".epub", ".zip"}:
+        # Ask whether we can READ it before asking what it IS. zipfile.is_zipfile()
+        # catches ordinary OSError internally and returns False, so the handler that
+        # used to wrap it was unreachable: a missing, unreadable or directory-shaped
+        # .cbz fell through to a content verdict, was charged to the provider, and
+        # was remembered for seven days -- a disk blip suppressing a good candidate
+        # for a week after the storage recovered.
+        #
+        # The .cbr branch below already gets this right, and gets it right BECAUSE it
+        # opens the file itself. This makes the two agree rather than inventing a
+        # third behaviour: the content judgement is still is_zipfile()'s, unchanged.
+        try:
+            with path.open("rb") as handle:
+                handle.read(4)
+        except OSError:
+            return "archive_unreadable_locally"
         try:
             if zipfile.is_zipfile(path):
                 return ""
