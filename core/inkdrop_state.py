@@ -36302,7 +36302,8 @@ def download_tasks_matching_missing_folder_proof(con, import_row):
     return [row for row in rows if download_task_matches_missing_folder_proof(row, import_row)]
 
 
-def release_falsely_satisfied_unit(con, row, now, *, dry_run=False):
+def release_falsely_satisfied_unit(con, row, now, *, dry_run=False,
+                                   live_proof_units=None):
     """Return a unit to `wanted` when its file is gone and nothing else holds it.
 
     THE DEFECT THIS EXISTS FOR.
@@ -36373,6 +36374,27 @@ def release_falsely_satisfied_unit(con, row, now, *, dry_run=False):
         "select 1 from media_files where issue_id=? and active=1 limit 1",
         (wanted_row["issue_id"],),
     ).fetchone():
+        return 0
+
+    # AND A LIVE PROOF IS THE SAME ANSWER FROM THE OTHER LEDGER.
+    #
+    # The media row above is one way to hold a unit; a verified import proof
+    # whose dest_path is a real file under a mounted root is another, and a unit
+    # can have the second without the first when the media row's own bookkeeping
+    # is behind. Asking only the media table released units that plainly had
+    # their file: five Akira units (comicvine:4041, issues 33713, 32250, 32251,
+    # 32249, 40231) were released at 09:40:11Z and re-satisfied at 09:43:35Z on
+    # 2026-09-04, and would be again on every hourly pass -- an oscillation, not
+    # a repair.
+    #
+    # The caller already computes exactly this set, once for the whole table,
+    # immediately before the loop that calls this function. It was never handed
+    # over. None means "the caller did not ask", which keeps every existing
+    # caller's behaviour unchanged; an empty set means "asked, and nothing
+    # qualifies", and those are different facts.
+    if live_proof_units is not None and (
+        wanted_row["series_id"], wanted_row["issue_id"]
+    ) in live_proof_units:
         return 0
 
     # A queue row in one of these states is not waiting to be searched, it has
@@ -36828,7 +36850,9 @@ def cleanup_missing_folder_verified_import_proofs(
             # re-ran and found nothing left to do; the one thing the original
             # pass may never have done is release the unit, and until now no
             # later pass could. Keyed on today's evidence, not on the retraction.
-            released_units += release_falsely_satisfied_unit(con, row, now, dry_run=dry_run)
+            released_units += release_falsely_satisfied_unit(
+                con, row, now, dry_run=dry_run, live_proof_units=live_proof_units,
+            )
             continue
         if dry_run:
             import_results += 1
