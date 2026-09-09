@@ -26525,6 +26525,30 @@ def media_management_format_template(template, values):
     return re.sub(r"\{([^{}:]+)(?::([^{}]+))?\}", token_value, str(template or ""))
 
 
+def media_management_format_without_year(template: str) -> str:
+    """Drop `{Year}` AND the parentheses that were only there to hold it.
+
+    An empty `{Year}` renders empty and the literal parentheses survive, so the
+    importer wrote `The League of Extraordinary Gentlemen - The Tempest ()` and
+    `... #001 ().cbz` -- on disk, dated 2026-08-22, beside a correctly-named
+    `#003 (2018).cbz` from the same run.
+
+    The rule was already settled and already implemented: the library_path builder
+    strips the same token, and four sibling sites in inkdrop_completed_import.py
+    guard with `if year:`. It was one judgement with two implementations and the
+    wrong one named the files. This is that judgement, once, so the next caller
+    does not have to rediscover it.
+    """
+    if "{Year}" not in template:
+        return template
+    return (
+        template.replace(" ({Year})", "")
+        .replace("({Year})", "")
+        .replace("{Year}", "")
+        .strip()
+    )
+
+
 def media_management_manga_effective_chapter_format(template, values):
     template = str(template or "{Series Title} c{Chapter:000}")
     values = values if isinstance(values, dict) else {}
@@ -27445,6 +27469,18 @@ def media_management_destination_preview(db_path, row, *, source_path=None, dest
     )
     folder_values = {**values, "year": series_year or issue_year}
     file_values = {**values, "year": issue_year or series_year}
+    # Each template is stripped against ITS OWN effective year, not a shared one.
+    # The two differ by design -- a folder prefers the series year and a filename
+    # prefers the issue's -- which is why one directory on disk held both
+    # `#001 ().cbz` and `#003 (2018).cbz`. Stripping on a single combined year
+    # would take the year off the sibling that legitimately has one.
+    if not folder_values["year"]:
+        series_format = media_management_format_without_year(series_format) or "{Series Title}"
+    if not file_values["year"]:
+        configured_issue_format = (
+            media_management_format_without_year(configured_issue_format)
+            or configured_issue_format
+        )
     issue_format_adjustment = ""
     if media_type in MANGA_MEDIA_TYPES:
         issue_format, issue_format_adjustment = media_management_manga_effective_chapter_format(
