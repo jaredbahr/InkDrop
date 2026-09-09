@@ -10,6 +10,7 @@ passes is reported so it can be un-skipped.
 """
 
 import atexit
+import argparse
 import os
 import secrets
 import string
@@ -731,5 +732,37 @@ def main():
         return 1
     return 0
 
+def parse_args(argv=None):
+    """Answer the command line before doing 38 minutes of work on it.
+
+    This script had no argv handling at all, so every argument was ignored and
+    the full sweep ran regardless. `--help` therefore RAN THE SUITE: measured
+    2026-08-25, a session invoked it that way at 14:41:56 and was still executing
+    real tests twelve minutes later.
+
+    The second cost is the one that bites. The process list lied about what was
+    happening -- two sessions read `--help` in a process tree as a harmless no-op
+    while a real suite belonging to a third agent was in flight. On a host where
+    several agents contend for one runner, and where a concurrent run is a known
+    source of false REDs, a command line that misrepresents the work is a
+    coordination hazard.
+
+    Unrecognised arguments are refused rather than ignored: silently discarding
+    an argument the caller believed in is the same failure shape either way.
+    argparse exits 2 and names the argument, which is what a caller needs.
+    """
+    parser = argparse.ArgumentParser(
+        prog="inkdrop_run_smoke_suite.py",
+        description=(
+            "Run the InkDrop smoke suite: every tracked test the discovery "
+            "pathspec finds, sequentially, in one process each. Takes roughly "
+            "38 minutes and mutates shared temp state, so do not start one "
+            "beside another -- check first."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    parse_args()
     sys.exit(main())
