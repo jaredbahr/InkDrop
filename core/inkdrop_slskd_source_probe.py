@@ -227,6 +227,33 @@ SLSKD_SEARCH_WAIT_FLOOR_SECONDS = inkdrop_runtime_config.SLSKD_SEARCH_WAIT_FLOOR
 # The two ways an attempt is skipped before any search runs: the pass deadline
 # is too close, or the remaining budget is under the search floor.
 PROBE_BUDGET_SKIP_REASONS = frozenset({"probe_budget_exhausted", "probe_budget_below_search_floor"})
+# The parent gives this process a wall-clock window and kills it at the end.
+# HARD_DEADLINE is that window as an epoch, set once per run() from
+# --hard-deadline-seconds; None when the caller set no window. The search
+# deadline yields to it less a reserve for the final writes, and the grab
+# stage stops starting rows when less than a row's worth of time remains --
+# so the run ends on its own, with its results written, instead of under a
+# kill that stamped every selected unit as an error. Measured 2026-09-08:
+# 32 of 34 killed runs in seven days had found or handed off something.
+HARD_DEADLINE = None
+HARD_DEADLINE_WRITE_RESERVE_SECONDS = 20
+AUTO_GRAB_ROW_RESERVE_SECONDS = 20
+
+
+def hard_deadline_remaining(now_ts=None):
+    """Seconds left before the parent's window closes, or None without a window."""
+    if HARD_DEADLINE is None:
+        return None
+    current = float(now_ts) if now_ts is not None else time.time()
+    return float(HARD_DEADLINE) - current
+
+
+def effective_search_deadline(network_started_at, probe_budget_seconds, hard_deadline):
+    """The budget's deadline, or the hard deadline less the write reserve if that is sooner."""
+    budget_deadline = float(network_started_at) + float(probe_budget_seconds or 0)
+    if hard_deadline is None:
+        return budget_deadline
+    return min(budget_deadline, float(hard_deadline) - float(HARD_DEADLINE_WRITE_RESERVE_SECONDS))
 CANDIDATE_RECHECK_SECONDS = 20 * 60
 CANDIDATE_HEADLINE_SECONDS = 45 * 60
 ACTIVE_CACHE_SECONDS = 7 * 86400
@@ -11942,6 +11969,8 @@ def _run_auto_grab_with_ephemeral_candidates(args, result):
         "unsafe_candidate_skipped_count": 0,
         "unsafe_candidate_skipped": [],
         "selected_count": len(selected),
+        "deferred_for_deadline_count": 0,
+        "deferred_for_deadline": [],
         "started_count": 0,
         "failed_attempt_consumed_count": 0,
         "transient_error_count": 0,
@@ -11957,7 +11986,25 @@ def _run_auto_grab_with_ephemeral_candidates(args, result):
         auto_grab_audit("user_load_skipped", live=live, dry_run=dry_run, **skipped)
     for skipped in skipped_slot_cap[:100]:
         auto_grab_audit("slot_cap_skipped", live=live, dry_run=dry_run, **skipped)
-    for review_id, entry, first_candidate in selected:
+    for position, (review_id, entry, first_candidate) in enumerate(selected):
+        remaining = hard_deadline_remaining()
+        if remaining is not None and remaining < AUTO_GRAB_ROW_RESERVE_SECONDS:
+            # A row here costs reservations and enqueues against slskd, and the
+            # parent kills the process when its window closes. Stop starting
+            # rows, say so per row, and let the run end with its writes done;
+            # the next pass finds these candidates still cached.
+            for deferred_review_id, deferred_entry, _first in selected[position:]:
+                deferred_entry = dict(deferred_entry or {})
+                deferred_row = {
+                    "review_id": deferred_review_id,
+                    "series": deferred_entry.get("series"),
+                    "issue": deferred_entry.get("issue"),
+                    "remaining_seconds": round(remaining, 1),
+                }
+                outcome["deferred_for_deadline"].append(deferred_row)
+                auto_grab_audit("deferred_for_deadline", live=live, dry_run=dry_run, **deferred_row)
+            outcome["deferred_for_deadline_count"] = len(outcome["deferred_for_deadline"])
+            break
         entry = dict(entry or {})
         entry.setdefault("review_id", review_id)
         candidates = auto_grab_attempt_candidates(entry, first_candidate)
@@ -15828,6 +15875,9 @@ def select_probe_items(items, cache, max_total, max_per_series):
 
 
 def run(args):
+    global HARD_DEADLINE
+    hard_deadline_seconds = getattr(args, "hard_deadline_seconds", None)
+    HARD_DEADLINE = (time.time() + float(hard_deadline_seconds)) if hard_deadline_seconds else None
     apply_quality_language_rules()
     SERIES_RUN_EPHEMERAL_CANDIDATES.clear()
     started_at = now()
@@ -16027,7 +16077,7 @@ def run(args):
     # durable cache and reconciling active rows must not spend that budget and
     # silently turn a scheduled search into checked_count=0.
     network_started_at = now()
-    deadline = network_started_at + probe_budget_seconds
+    deadline = effective_search_deadline(network_started_at, probe_budget_seconds, HARD_DEADLINE)
 
     checked = []
     skipped = []
@@ -16354,6 +16404,8 @@ def run(args):
         "skipped_cooldown": skipped[:100],
         "candidate_recheck_seconds": CANDIDATE_RECHECK_SECONDS,
         "candidate_headline_seconds": CANDIDATE_HEADLINE_SECONDS,
+        "hard_deadline_seconds": hard_deadline_seconds,
+        "hard_deadline_remaining_seconds": (round(hard_deadline_remaining(), 1) if HARD_DEADLINE is not None else None),
         "policy": "SLSKD auto-grab scores candidates for best-candidate autopick. PDFs and pack-like files can be selected when confidence is good; downloads stay in SLSKD/manual staging and imports still require the existing verified Manual Source autoresolver.",
     }
     if args.auto_grab_live or args.auto_grab_dry_run:
@@ -16414,6 +16466,7 @@ def main():
     parser.add_argument("--max-queries", type=int, default=None)
     parser.add_argument("--probe-budget-seconds", type=int, default=None, help="Maximum wall time for one SLSKD probe pass before deferring remaining rows.")
     parser.add_argument("--cooldown-hours", type=float, default=None)
+    parser.add_argument("--hard-deadline-seconds", type=int, default=None, help="Wall-clock window the parent gives this run; searches and the grab stage stop starting work in time to write results before it closes.")
     parser.add_argument("--series")
     parser.add_argument("--review-id", help="Restrict probing/autopick to one Manual Review row.")
     parser.add_argument("--force", action="store_true")
@@ -16432,6 +16485,8 @@ def main():
     args.probe_budget_seconds = max(30, min(int(provider_settings["probe_budget_seconds"] if args.probe_budget_seconds is None else args.probe_budget_seconds), 15 * 60))
     args.cooldown_hours = max(0.0, min(float(provider_settings["cooldown_hours"] if args.cooldown_hours is None else args.cooldown_hours), 24.0 * 30.0))
     args.auto_grab_max = max(0, min(int(provider_settings["auto_grab_max"] if args.auto_grab_max is None else args.auto_grab_max), 10))
+    if args.hard_deadline_seconds is not None:
+        args.hard_deadline_seconds = max(30, int(args.hard_deadline_seconds))
     if args.auto_grab_live:
         args.auto_grab_dry_run = False
     run(args)

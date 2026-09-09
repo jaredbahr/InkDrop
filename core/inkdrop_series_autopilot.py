@@ -13021,6 +13021,74 @@ def slskd_child_progress_note(status, *, fallback_series=None, elapsed_seconds=0
     return "; ".join(parts)
 
 
+def slskd_probe_command(
+    series,
+    args,
+    *,
+    max_total,
+    max_per_series,
+    max_queries,
+    effective_probe_budget,
+    cooldown_hours,
+    force,
+    review_id,
+    auto_grab_max,
+    hard_deadline_seconds,
+    call_id,
+):
+    """The probe's command line, sized to the window the child will actually get.
+
+    Two things the parent knows and the child did not: how much wall clock is
+    left before the parent's timeout (`hard_deadline_seconds`), and that the
+    search budget it hands over is already runtime-limited. The lane sized
+    --max-total from the operator budget (180 s -> 3 units) while the child
+    received 75 s; the child then planned three searches, was killed on the
+    second, and every selected unit was stamped as an error. Measured
+    2026-09-08: 32 of 34 killed runs in seven days had found or handed off
+    something, and the median run with a handoff took 489 s against a 160 s
+    timeout. --max-total now follows the budget the child gets, one search's
+    floor at a time, and the child is told when the window closes.
+    """
+    requested_total = max_total if max_total is not None else args.slskd_max_total
+    queries = max(1, int(max_queries if max_queries is not None else args.slskd_max_queries) or 1)
+    if hard_deadline_seconds is not None:
+        per_search = SLSKD_SEARCH_WAIT_FLOOR_SECONDS + 2
+        affordable = max(1, int(effective_probe_budget or 0) // max(1, queries * per_search))
+        requested_total = max(1, min(int(requested_total or 1), affordable))
+    command = [
+        python_command(),
+        str(SLSKD_SOURCE_PROBE_SCRIPT),
+        "--series",
+        series,
+        "--run-token",
+        call_id,
+        "--max-total",
+        str(requested_total),
+        "--max-per-series",
+        str(max_per_series if max_per_series is not None else args.slskd_max_per_series),
+        "--wait-seconds",
+        str(args.slskd_wait_seconds),
+        "--max-queries",
+        str(max_queries if max_queries is not None else args.slskd_max_queries),
+        "--probe-budget-seconds",
+        str(effective_probe_budget),
+        "--cooldown-hours",
+        str(cooldown_hours if cooldown_hours is not None else args.slskd_cooldown_hours),
+    ]
+    if hard_deadline_seconds is not None:
+        command.extend(["--hard-deadline-seconds", str(int(hard_deadline_seconds))])
+    if force:
+        command.append("--force")
+    review_id = str(review_id or "").strip()
+    if review_id:
+        command.extend(["--review-id", review_id])
+    if args.dry_run:
+        command.extend(["--auto-grab-dry-run", "--auto-grab-max", str(auto_grab_max)])
+    else:
+        command.extend(["--auto-grab-live", "--auto-grab-max", str(auto_grab_max)])
+    return command
+
+
 def run_slskd(
     series,
     args,
@@ -13087,38 +13155,29 @@ def run_slskd(
     except (TypeError, ValueError):
         lock_wait_seconds = DEFAULT_SLSKD_SOURCE_LOCK_WAIT_SECONDS
     call_id = provider_call_id("slskd")
-    probe_cmd = [
-        python_command(),
-        str(SLSKD_SOURCE_PROBE_SCRIPT),
-        "--series",
-        series,
-        "--run-token",
-        call_id,
-        "--max-total",
-        str(max_total if max_total is not None else args.slskd_max_total),
-        "--max-per-series",
-        str(max_per_series if max_per_series is not None else args.slskd_max_per_series),
-        "--wait-seconds",
-        str(args.slskd_wait_seconds),
-        "--max-queries",
-        str(max_queries if max_queries is not None else args.slskd_max_queries),
-        "--probe-budget-seconds",
-        str(effective_probe_budget),
-        "--cooldown-hours",
-        str(cooldown_hours if cooldown_hours is not None else args.slskd_cooldown_hours),
-    ]
     if force is None:
         force = args.force_slskd
-    if force:
-        probe_cmd.append("--force")
     review_id = str(review_id or "").strip()
-    if review_id:
-        probe_cmd.extend(["--review-id", review_id])
     auto_grab_max = auto_grab_max if auto_grab_max is not None else args.slskd_auto_grab_max
-    if args.dry_run:
-        probe_cmd.extend(["--auto-grab-dry-run", "--auto-grab-max", str(auto_grab_max)])
-    else:
-        probe_cmd.extend(["--auto-grab-live", "--auto-grab-max", str(auto_grab_max)])
+    # The child must end on its own before this parent's timeout: give it the
+    # window less the cleanup this side keeps for itself.
+    hard_deadline_seconds = (
+        max(30, int(limited_timeout) - RUNTIME_CHILD_CLEANUP_SECONDS) if deadline is not None else None
+    )
+    probe_cmd = slskd_probe_command(
+        series,
+        args,
+        max_total=max_total,
+        max_per_series=max_per_series,
+        max_queries=max_queries,
+        effective_probe_budget=effective_probe_budget,
+        cooldown_hours=cooldown_hours,
+        force=force,
+        review_id=review_id,
+        auto_grab_max=auto_grab_max,
+        hard_deadline_seconds=hard_deadline_seconds,
+        call_id=call_id,
+    )
     cmd = probe_cmd
     timeout = limited_timeout
 
