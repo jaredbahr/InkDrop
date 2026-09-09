@@ -324,7 +324,15 @@ TRANSIENT_AUTO_GRAB_RETRY_SECONDS = env_int("INKDROP_SLSKD_TRANSIENT_AUTO_GRAB_R
 SLSKD_SLOT_REQUEST_RETRY_SECONDS = env_int("INKDROP_SLSKD_SLOT_REQUEST_RETRY_SECONDS", 3 * 60)
 SLSKD_SLOT_REQUEST_TTL_SECONDS = env_int("INKDROP_SLSKD_SLOT_REQUEST_TTL_SECONDS", 15 * 60)
 TRANSIENT_AUTO_GRAB_ERROR_PATTERNS = (
-    "curl: (22)",
+    # NO BARE "curl: (22)". curl -fsS exits 22 for EVERY HTTP status failure, so
+    # its message reads `curl: (22) The requested URL returned error: <code>` for
+    # 400, 401, 404, 429 and 503 alike -- and matching the exit code alone made a
+    # permanent client error transient, retried every
+    # TRANSIENT_AUTO_GRAB_RETRY_SECONDS with the same candidate reconsidered.
+    #
+    # The codes below are the ones this list actually meant, and they match the
+    # same curl message by their own substrings, so nothing genuinely transient
+    # is lost by dropping the exit code.
     "error: 429",
     "error: 500",
     "error: 502",
