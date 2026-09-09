@@ -260,6 +260,17 @@ def hard_deadline_remaining(now_ts=None):
     return float(HARD_DEADLINE) - current
 
 
+def series_run_evaluation_deadline(now_ts=None):
+    """Deadline for one directory/pack evaluation pass: sized to the run, floored at eight seconds."""
+    current = float(now_ts) if now_ts is not None else time.time()
+    window = current + float(SERIES_RUN_EVALUATION_SECONDS)
+    floor = current + 8.0
+    if HARD_DEADLINE is None:
+        return max(floor, window)
+    ceiling = float(HARD_DEADLINE) - float(AUTO_GRAB_ROW_RESERVE_SECONDS) - float(HARD_DEADLINE_WRITE_RESERVE_SECONDS)
+    return max(floor, min(window, ceiling))
+
+
 def effective_search_deadline(network_started_at, probe_budget_seconds, hard_deadline):
     """The budget's deadline, or the hard deadline less the write reserve if that is sooner."""
     budget_deadline = float(network_started_at) + float(probe_budget_seconds or 0)
@@ -382,13 +393,32 @@ AUTO_GRAB_MAX_RECOVERY_ATTEMPTS_PER_REVIEW = max(
 )
 AUTO_GRAB_MAX_ATTEMPTS_PER_CANDIDATE = 1
 AUTO_GRAB_CANDIDATE_LIMIT = 25
-AUTO_GRAB_MAX_ACTIVE_PER_USER = max(1, min(env_int("INKDROP_SLSKD_MAX_ACTIVE_PER_USER", 8), 20))
-SERIES_RUN_MAX_ISSUES = max(1, min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_ISSUES", 8), 25))
+# The most rows one run may start. Was a literal 10 at two sites; the row
+# reserve against the hard deadline already stops a run that cannot finish.
+AUTO_GRAB_MAX_PER_RUN = 25
+# A peer that holds the whole run gets asked for the whole run. Measured
+# 2026-09-09: drchzbrgr offered Coda 001-012, Tiny Titans 001-041, Gotham
+# Central 001-040 and Absolute Green Lantern 001-017 in one folder each, and
+# the run took one issue. slskd queues requests per peer itself; the
+# InkDrop-side caps below only bound how much one run asks for.
+AUTO_GRAB_MAX_ACTIVE_PER_USER = max(1, min(env_int("INKDROP_SLSKD_MAX_ACTIVE_PER_USER", 20), 40))
+SERIES_RUN_MAX_ISSUES = max(1, min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_ISSUES", 25), 25))
 SERIES_RUN_MAX_BYTES = max(
     50 * 1024 * 1024,
     min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_BYTES", 1024 * 1024 * 1024), 10 * 1024 * 1024 * 1024),
 )
-SERIES_RUN_MAX_OBSERVED_FILES = max(16, min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_OBSERVED_FILES", 160), 500))
+# 160 files was spent by every responding folder in response order, junk
+# included: Absolute Green Lantern 01:28:16Z observed 13 directories and 159
+# files, and the folder holding the run was still being evaluated when the
+# window closed.
+SERIES_RUN_MAX_OBSERVED_FILES = max(16, min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_OBSERVED_FILES", 500), 500))
+# The directory and pack passes evaluate every observed file against every
+# open issue locally. They ran under a fixed eight-second deadline, which the
+# same run exhausted (624 evaluations, deadline_exhausted true, 7 of 17
+# offered issues selected). The window is now sized to the run: this many
+# seconds, but never past the parent's hard deadline less the reserves the
+# grab stage and the final writes need, and never less than the old eight.
+SERIES_RUN_EVALUATION_SECONDS = max(8, min(env_int("INKDROP_SLSKD_SERIES_RUN_EVALUATION_SECONDS", 45), 120))
 # A directory that alone already proves it holds the bulk of a series' open
 # run gets its own, larger, dedicated ceiling instead of trickling through the
 # paced SERIES_RUN_MAX_ISSUES/SERIES_RUN_MAX_BYTES budget above -- see
@@ -11954,7 +11984,7 @@ def _persist_slot_wait_skips(skipped_rows, live):
 def _run_auto_grab_with_ephemeral_candidates(args, result):
     live = bool(args.auto_grab_live)
     dry_run = not live
-    max_grabs = max(0, min(int(args.auto_grab_max or 0), 10))
+    max_grabs = max(0, min(int(args.auto_grab_max or 0), AUTO_GRAB_MAX_PER_RUN))
     transfer_identity_reconciliation = (
         reconcile_slskd_transfer_identity_tasks() if live else
         {"ok": True, "reason": "dry_run", "recovered": 0, "retired": 0}
@@ -16247,7 +16277,7 @@ def run(args):
                 checked,
                 all_items,
                 cache,
-                deadline=now() + 8,
+                deadline=series_run_evaluation_deadline(),
                 observations=run_directory_observations,
                 selection_budget=run_directory_selection_budget,
             )
@@ -16258,8 +16288,9 @@ def run(args):
         all_items,
         cache,
         # Directory intersection is local, already bounded by issue/file/byte
-        # caps, and should not inherit an exhausted network probe deadline.
-        deadline=now() + 8,
+        # caps, and should not inherit an exhausted network probe deadline;
+        # it gets its own window, sized to the run.
+        deadline=series_run_evaluation_deadline(),
         observations=run_directory_observations,
         selection_budget=run_directory_selection_budget,
     )
@@ -16284,7 +16315,7 @@ def run(args):
         all_items,
         cache,
         observations=run_directory_observations,
-        deadline=now() + 8,
+        deadline=series_run_evaluation_deadline(),
     )
     selected_review_ids.update(series_pack_complete_handoff.get("selected_review_ids") or [])
     if series_pack_complete_handoff.get("eligible_directory_count"):
@@ -16516,7 +16547,7 @@ def main():
     args.max_queries = max(0, min(int(provider_settings["max_queries"] if args.max_queries is None else args.max_queries), 5))
     args.probe_budget_seconds = max(30, min(int(provider_settings["probe_budget_seconds"] if args.probe_budget_seconds is None else args.probe_budget_seconds), 15 * 60))
     args.cooldown_hours = max(0.0, min(float(provider_settings["cooldown_hours"] if args.cooldown_hours is None else args.cooldown_hours), 24.0 * 30.0))
-    args.auto_grab_max = max(0, min(int(provider_settings["auto_grab_max"] if args.auto_grab_max is None else args.auto_grab_max), 10))
+    args.auto_grab_max = max(0, min(int(provider_settings["auto_grab_max"] if args.auto_grab_max is None else args.auto_grab_max), AUTO_GRAB_MAX_PER_RUN))
     if args.hard_deadline_seconds is not None:
         args.hard_deadline_seconds = max(30, int(args.hard_deadline_seconds))
     if args.auto_grab_live:

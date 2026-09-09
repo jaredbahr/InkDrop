@@ -8982,7 +8982,7 @@ IMPORT_AUTHORITY_TTL_MAX_HOURS = 72
 # dozens of concurrent transfers without any protocol-level issue; this
 # exists for safety, not to throttle the common case.
 SLSKD_CONCURRENT_TRANSFER_CAP_SETTING_KEY = "automation.slskd_concurrent_transfer_cap"
-SLSKD_CONCURRENT_TRANSFER_CAP_DEFAULT = 20
+SLSKD_CONCURRENT_TRANSFER_CAP_DEFAULT = 40
 SLSKD_CONCURRENT_TRANSFER_CAP_MIN = 1
 SLSKD_CONCURRENT_TRANSFER_CAP_MAX = 100
 # A handoff SLSKD accepted but that never moved a byte is not part of the

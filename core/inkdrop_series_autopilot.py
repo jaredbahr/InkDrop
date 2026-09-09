@@ -413,7 +413,8 @@ SOURCE_WORKER_RSS_DEFAULT_JOB_LIMIT = 5
 SOURCE_WORKER_MANGADEX_DEFAULT_JOB_LIMIT = 5
 DEFAULT_SLSKD_MAX_QUERIES = 5
 DEFAULT_SLSKD_COOLDOWN_HOURS = 0.75
-DEFAULT_SLSKD_AUTO_GRAB_MAX = 8
+# Default grabs per run: enough to take a whole folder in one or two runs.
+DEFAULT_SLSKD_AUTO_GRAB_MAX = 20
 DEFAULT_SLSKD_PROBE_BUDGET_SECONDS = 300
 DEFAULT_SLSKD_BROAD_MAX_TOTAL = 8
 # Every Soulseek search waits at least the floor for peers to answer, so the
@@ -2542,7 +2543,7 @@ def load_slskd_autopilot_settings():
         "wait_seconds": int_provider_setting(settings, "wait_seconds", DEFAULT_SLSKD_WAIT_SECONDS, 2, 30),
         "max_queries": int_provider_setting(settings, "max_queries", DEFAULT_SLSKD_MAX_QUERIES, 1, 5),
         "cooldown_hours": float_provider_setting(settings, "cooldown_hours", DEFAULT_SLSKD_COOLDOWN_HOURS, 0.0, 24.0 * 30.0),
-        "auto_grab_max": int_provider_setting(settings, "auto_grab_max", DEFAULT_SLSKD_AUTO_GRAB_MAX, 0, 10),
+        "auto_grab_max": int_provider_setting(settings, "auto_grab_max", DEFAULT_SLSKD_AUTO_GRAB_MAX, 0, 25),
         "probe_budget_seconds": int_provider_setting(
             settings,
             "probe_budget_seconds",
