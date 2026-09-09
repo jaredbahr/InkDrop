@@ -526,7 +526,72 @@ def gate_fetch(api, repository):
     return fetch
 
 
-def publish_public_release(contract, api, repository, commit, gate):
+REGISTRY_MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+
+
+def default_registry_fetch(url, headers=None, timeout=20):
+    """GET `url` and return (status, body). Only the status codes matter here.
+
+    Kept tiny and injectable so the smoke can drive both arms without a network,
+    and so this tool holds no registry credential: a public image answers an
+    anonymous pull token, which is all the check needs.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, headers=dict(headers or {}))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status), response.read()
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), b""
+
+
+def registry_tag_exists(image_repository, tag, fetch=None):
+    """True when `ghcr.io/<owner>/<name>:<tag>` has a manifest in the registry.
+
+    Anonymous token, then the manifest. A status other than 200 or 404 is not an
+    answer, and an unreadable precondition is refused rather than assumed: the
+    caller is about to tell users to pull this tag.
+    """
+    fetch = fetch or default_registry_fetch
+    repository = str(image_repository or "").strip().lower()
+    if not repository.startswith("ghcr.io/"):
+        raise ValueError("only GitHub Container Registry images are checked here")
+    path = repository[len("ghcr.io/"):]
+    status, body = fetch(f"https://ghcr.io/token?scope=repository:{path}:pull&service=ghcr.io", {"Accept": "application/json"})
+    if status != 200:
+        raise RuntimeError(f"the registry did not issue a pull token for {repository} (HTTP {status})")
+    try:
+        token = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body).get("token") or ""
+    except (ValueError, AttributeError):
+        token = ""
+    headers = {"Accept": REGISTRY_MANIFEST_ACCEPT}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    status, _body = fetch(f"https://ghcr.io/v2/{path}/manifests/{tag}", headers)
+    if status == 200:
+        return True
+    if status == 404:
+        return False
+    raise RuntimeError(f"the registry answered HTTP {status} for {repository}:{tag}; not publishing on an unreadable answer")
+
+
+def missing_image_tags(contract, image_repository, fetch=None):
+    """The contract's image tags the registry does not have, as full references."""
+    return [
+        f"{image_repository}:{tag}"
+        for tag in contract.get("image_tags") or []
+        if not registry_tag_exists(image_repository, tag, fetch=fetch)
+    ]
+
+
+def publish_public_release(contract, api, repository, commit, gate, registry_fetch=None):
     """Publish the public Release for `contract`, but only if `commit` passed.
 
     The public repo has no QA candidate or image-validation evidence to carry --
@@ -548,6 +613,19 @@ def publish_public_release(contract, api, repository, commit, gate):
         raise RuntimeError(
             "refusing to publish " + contract["tag"] + " at " + commit
             + " -- no passing validation run backs it: " + (detail or "no checks were produced")
+        )
+    # The notes end with "Pin this build with ghcr.io/<owner>/inkdrop:<version>".
+    # On 2026-09-06 that tag answered 404 for the first minutes v0.1.16 was
+    # public, because the publish steps ran before the image promotion the
+    # process orders ahead of them. The order is now enforced where the claim
+    # is made: every tag the contract names must resolve before the Release is
+    # created, or nothing is published.
+    image_repository = resolve_image_repository(repository)
+    missing = missing_image_tags(contract, image_repository, fetch=registry_fetch)
+    if missing:
+        raise RuntimeError(
+            "refusing to publish " + contract["tag"] + " -- the Install block names an image the "
+            "registry does not have: " + ", ".join(missing) + ". Promote the image first."
         )
     result, skip = publish_release_or_skip(contract, api, commit, None)
     return result, skip, checks
