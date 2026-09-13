@@ -45,6 +45,7 @@ import os
 import time
 import uuid
 
+from core import inkdrop_slskd_refusal_vocabulary as refusal_vocabulary
 from core import inkdrop_state
 
 
@@ -108,10 +109,22 @@ def record_variant_outcomes(
             A provider timeout appends an attempt with no rejection keys; that
             row must not claim it observed zero rejections.
 
-            FILENAMES ARE DELIBERATELY NOT STORED. `rejection_samples` is
-            already stripped before this point because full remote paths reveal
-            a peer's library inventory, and that decision is not reopened here
-            -- counts and normalised reasons answer the question without it.
+            FILENAMES ARE DELIBERATELY NOT STORED, AND NEITHER ARE FRAGMENTS OF
+            THEM. `rejection_samples` is already stripped before this point
+            because full remote paths reveal a peer's library inventory, and
+            that decision is not reopened here. The reason labels needed the
+            same treatment for the same reason: the matcher interpolates words
+            it read out of the remote file into its penalty prose, so `related
+            subseries title tail: <their folder>` is the inventory again, one
+            fragment at a time. Every label is redacted to its declared form
+            before it reaches the column.
+
+            REDACTED HERE AS WELL AS AT THE PRODUCER, on purpose. The probe
+            redacts where it counts, which covers every label a search makes
+            today; this is the boundary, and it is what makes the column's
+            contract true of whatever a future caller hands it rather than
+            true of today's only caller. `redact_label` is idempotent, so the
+            second pass is free.
             """
             if not isinstance(attempt, dict):
                 return None
@@ -121,16 +134,11 @@ def record_variant_outcomes(
             if not isinstance(reasons, list):
                 reasons = []
             cleaned = []
-            for entry in reasons[:12]:
-                if not isinstance(entry, dict):
-                    continue
+            for entry in refusal_vocabulary.redact_reason_counts(reasons)[:12]:
                 reason = str(entry.get("reason") or "").strip()[:120]
                 if not reason:
                     continue
-                try:
-                    count = max(0, int(entry.get("count") or 0))
-                except (TypeError, ValueError):
-                    continue
+                count = max(0, int(entry.get("count") or 0))
                 cleaned.append({"reason": reason, "count": count})
             try:
                 return json.dumps(

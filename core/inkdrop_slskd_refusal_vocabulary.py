@@ -25,16 +25,26 @@ exact string, declared prefix, or anchored pattern -- and each was read off the
 function in ``inkdrop_slskd_source_probe`` that produces it, not inferred from
 sampled data. There is deliberately **no substring matching**: a label that
 happens to contain a mapped label's text is not that label. Anything the table
-does not cover maps to ``unmapped`` and is recorded under its raw text, because
-a mapping that silently mis-buckets is worse than no mapping -- it looks
-authoritative while being wrong, and every consumer downstream inherits the
-error without a way to notice it.
+does not cover maps to ``unmapped``, because a mapping that silently mis-buckets
+is worse than no mapping -- it looks authoritative while being wrong, and every
+consumer downstream inherits the error without a way to notice it.
 
 The label vocabulary is unbounded by construction (1,018 distinct labels
 observed, from ~40 shapes) because producers interpolate values into the
 prose: ``book/volume token 3 does not match 14``. That is why prefixes and
 anchored patterns are declared forms here rather than an exact-match table,
 which would leave the majority unmapped.
+
+**The interpolated part is somebody else's file name, so it does not travel.**
+What gets interpolated is text lifted out of the remote file or its parent
+folder -- ``related subseries title tail: return to treehouse``, ``candidate
+appears to be a different titled series/subseries: nickelodeon``, ``unsupported
+extension .xtch``. Counted and persisted, that is a stranger's library naming
+sitting in our database. ``redact_label()`` takes the interpolation out and
+leaves the declared form, so the label still says which decision was made and
+no longer says which file it was made about. It is the reason the patterns
+above wrap their peer-derived span in a capturing group: that group is exactly
+what a redaction removes.
 """
 
 from __future__ import annotations
@@ -59,6 +69,17 @@ CLASS_ADJUDICATION = "adjudication"
 # be quietly grown -- when this shows up in the data it means a producer added
 # a shape and this table has not been told about it yet.
 CODE_UNMAPPED = "unmapped"
+
+# What an interpolated span reads as once it has been taken out. One token, no
+# spaces, so a redacted label still matches the declared form it came from and
+# `classify()` keeps working on it unchanged.
+REDACTED = "<redacted>"
+
+# The durable handle an unrecognised label keeps in place of its text. A digest
+# of the prose, so the same unknown shape counts as the same unknown shape on
+# every later attempt and a table gap is still countable -- and so an engineer
+# holding a candidate label can confirm the match by hashing it locally.
+OPAQUE_LABEL_PREFIX = "unmapped_penalty:"
 
 # (form, matcher, code, class)
 #
@@ -103,10 +124,10 @@ REFUSAL_LABEL_TABLE = (
     # `wrong_volume_number` and `wrong_issue_number` are kept distinct because
     # the shared vocabulary distinguishes them and collapsing volume evidence
     # into an issue code would misreport which axis disagreed.
-    (PATTERN, r"book/volume token .+ does not match .+", "wrong_volume_number", CLASS_ADJUDICATION),
-    (PATTERN, r"explicit issue token .+ does not match .+", "wrong_issue_number", CLASS_ADJUDICATION),
-    (PATTERN, r"filename issue token .+ does not match .+", "wrong_issue_number", CLASS_ADJUDICATION),
-    (PATTERN, r"issue range .+ does not contain .+", "wrong_issue_number", CLASS_ADJUDICATION),
+    (PATTERN, r"book/volume token (.+) does not match .+", "wrong_volume_number", CLASS_ADJUDICATION),
+    (PATTERN, r"explicit issue token (.+) does not match .+", "wrong_issue_number", CLASS_ADJUDICATION),
+    (PATTERN, r"filename issue token (.+) does not match .+", "wrong_issue_number", CLASS_ADJUDICATION),
+    (PATTERN, r"issue range (.+) does not contain .+", "wrong_issue_number", CLASS_ADJUDICATION),
     (PREFIX, "filename issue evidence overrides folder context: ", "wrong_issue_number", CLASS_ADJUDICATION),
     (EXACT, "missing issue/part token", "missing_required_unit_number", CLASS_ADJUDICATION),
     (EXACT, "no numeric issue token", "missing_required_unit_number", CLASS_ADJUDICATION),
@@ -116,7 +137,7 @@ REFUSAL_LABEL_TABLE = (
     # --- edition / collection semantics (collected_singleton_edition_conflict) ---
     (EXACT, "semantic conflict with collected comic target", "collected_edition_disallowed", CLASS_ADJUDICATION),
     (EXACT, "prefixless Absolute-edition match lacks collection/volume evidence", "collected_edition_disallowed", CLASS_ADJUDICATION),
-    (PATTERN, r"candidate year .+ conflicts with target year .+ and does not carry the target's .+ edition marker", "collected_edition_disallowed", CLASS_ADJUDICATION),
+    (PATTERN, r"candidate year (.+) conflicts with target year .+ and does not carry the target's .+ edition marker", "collected_edition_disallowed", CLASS_ADJUDICATION),
 
     # --- language (localized_title_penalty) ---
     (PREFIX, "likely translated issue title: ", "wrong_language", CLASS_ADJUDICATION),
@@ -157,7 +178,72 @@ REFUSAL_LABEL_TABLE = (
     # --- the probe's own fall-throughs (rejection_label, annotate_* ) ---
     (EXACT, "rejected by matcher", "source_did_not_mark_candidate_acceptable", CLASS_ADJUDICATION),
     (EXACT, "candidate no longer matches row", "source_identity_rejected", CLASS_ADJUDICATION),
+
+    # --- what an unrecognised label becomes once redacted ---
+    # Declared so the opaque form classifies exactly as the prose it replaced
+    # did: unmapped, and therefore still visible as a table gap. Without this
+    # row a redacted unknown would be a second unknown shape and redaction
+    # would stop being idempotent.
+    (PREFIX, OPAQUE_LABEL_PREFIX, CODE_UNMAPPED, CLASS_ADJUDICATION),
 )
+
+# Labels the product writes verbatim, with nothing interpolated into them, that
+# the table above deliberately does not claim. Declared here for one purpose
+# only: so redaction leaves them alone. They are NOT table entries, so what
+# `classify()` makes of them is unchanged -- adding a string here changes what
+# a label looks like, never what it counts as.
+#
+# The bar for this list is not "we recognise it", it is "we wrote it, all of
+# it". A string with any interpolated span belongs in the table as a prefix or
+# a pattern instead.
+#
+# Both entries were found the same way, by redacting every distinct label in
+# the 2026-09-13 snapshot and reading what came out opaque: those are the
+# strings we wrote that no table entry claims. `collection_target_single_part`
+# is deliberately left here rather than promoted to a table row -- it would
+# classify as `wrong_unit_type` and that is a change to the refusal
+# distribution, which is a different question from this one.
+DECLARED_LITERAL_LABELS = frozenset({
+    # inkdrop_slskd_source_probe.RAW_PAGE_LOCKED_REASON
+    "raw page folder skipped: pages are locked",
+    # inkdrop_candidate_matching:2131, a review reason passed through as a
+    # penalty. 4 instances in the snapshot.
+    "collection_target_single_part",
+})
+
+# File suffixes that may stay readable in ``unsupported extension <suffix>``.
+#
+# The suffix is not ours: it is whatever followed the last dot in the remote
+# file name, so the field is unbounded and a peer decides its contents. The
+# live snapshot already holds 72 distinct values, including a peer's Synology
+# sidecars (``.flac@synoeastream``) and one-offs like ``.xtch`` and ``.pck``.
+#
+# Deleting the suffix would be the easy answer and the wrong one: 91.6% of
+# refused files are refused right here and *which format* they were is the
+# whole content of that number. So the descriptor is bounded instead of
+# dropped -- a declared format name survives, anything else reads as
+# ``<redacted>`` and is still counted under `unsupported_file_extension`.
+# Undeclared costs a diagnostic; declared-by-default would cost a stranger's
+# file naming, and that is the trade this list takes.
+DECLARED_FILE_SUFFIXES = frozenset({
+    # Produced by us when there is no suffix at all, not read off the file.
+    "no extension",
+    # comics and books
+    ".cbz", ".cbr", ".cb7", ".cbt", ".pdf", ".epub", ".mobi", ".azw3", ".djvu",
+    # archives
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    # images
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+    # audio -- the bulk of the extension gate's work
+    ".mp3", ".flac", ".opus", ".ogg", ".m4a", ".m4b", ".m4p", ".wav", ".aiff",
+    ".aif", ".wma", ".ape", ".wv", ".dsf", ".aac", ".mid", ".midi",
+    # video
+    ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".m4v", ".mpg", ".mpeg",
+    # the sidecars that travel with a shared folder
+    ".nfo", ".txt", ".log", ".cue", ".sfv", ".m3u", ".m3u8", ".lrc", ".srt",
+    ".ass", ".sub", ".opf", ".xml", ".json", ".yaml", ".html", ".mht", ".url",
+    ".torrent", ".iso", ".db", ".ini", ".css", ".doc", ".docx", ".rtf",
+})
 
 
 def _compiled():
@@ -198,6 +284,112 @@ def classify(label):
 
 def is_media_filter(label):
     return classify(label)[1] == CLASS_MEDIA_FILTER
+
+
+# The one prefix whose interpolation is a bounded descriptor rather than free
+# text, handled apart from the others below.
+_EXTENSION_PREFIX = "unsupported extension "
+
+
+def _blank_interpolated_groups(text, found):
+    """Replace every capturing group's span with ``REDACTED``.
+
+    A capturing group in ``REFUSAL_LABEL_TABLE`` means one thing and is used
+    for nothing else: *this span was read off the remote file*. The
+    non-captured ``.+`` spans in the same patterns are our own target's
+    numbers, and they stay -- ``does not match 4`` is the half that says what
+    we asked for, and losing it would leave a label that names a disagreement
+    without naming either side of it.
+    """
+    spans = [
+        found.span(index)
+        for index in range(1, (found.re.groups or 0) + 1)
+        if found.span(index) != (-1, -1)
+    ]
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + REDACTED + text[end:]
+    return text
+
+
+def redact_label(label):
+    """Take the peer's own text out of one penalty string, keep the decision.
+
+    Matches the table in the same order ``classify()`` does, so the two can
+    never disagree about which entry a label belongs to:
+
+      * an **exact** entry interpolates nothing, so it comes back verbatim;
+      * a **prefix** entry's tail is filename or folder words, so it becomes
+        ``<prefix><redacted>`` -- except ``unsupported extension ``, whose
+        tail is kept when it names a declared format (see
+        ``DECLARED_FILE_SUFFIXES``);
+      * a **pattern** entry loses its capturing groups and nothing else;
+      * a string in ``DECLARED_LITERAL_LABELS`` is ours in full and is kept;
+      * anything else is prose nobody has declared, so it cannot be trusted to
+        contain nothing -- it becomes ``unmapped_penalty:<digest>``.
+
+    **Idempotent, which is what lets it sit at more than one boundary.** Every
+    output above still matches the entry its input matched, so redacting twice
+    changes nothing. That is why the probe can redact where it counts *and*
+    the writer can redact again before the column, without the second pass
+    mangling the first.
+
+    The digest is taken over the case-folded prose, so the same unknown shape
+    reported by two producers, or by the same producer twice, counts as one
+    shape -- a table gap you can count is a table gap someone can close.
+    """
+    text = str(label or "").strip()
+    if not text:
+        return ""
+    # Already redacted. Checked before the table so a second pass cannot
+    # digest a digest, which would make the handle unstable.
+    if text.startswith(OPAQUE_LABEL_PREFIX):
+        return text
+    if text in DECLARED_LITERAL_LABELS:
+        return text
+    for form, matcher, _code, _refusal_class, _raw in _TABLE:
+        if form == EXACT:
+            if text == matcher:
+                return text
+        elif form == PREFIX:
+            if not text.startswith(matcher):
+                continue
+            if matcher == _EXTENSION_PREFIX:
+                suffix = text[len(matcher):].strip().casefold()
+                if suffix in DECLARED_FILE_SUFFIXES:
+                    return matcher + suffix
+            return matcher + REDACTED
+        elif form == PATTERN:
+            found = matcher.fullmatch(text)
+            if found is not None:
+                return _blank_interpolated_groups(text, found)
+    return OPAQUE_LABEL_PREFIX + hashlib.sha256(
+        text.casefold().encode("utf-8", "replace")
+    ).hexdigest()[:16]
+
+
+def redact_reason_counts(reason_counts):
+    """Redact a ``[{"reason": str, "count": int}, ...]`` list in place of text.
+
+    Counts are re-summed after redaction, because two labels that differed
+    only by the peer text they carried are the same refusal and have to read
+    as one row rather than two identical-looking ones.
+    """
+    totals = {}
+    for row in reason_counts or []:
+        if not isinstance(row, dict):
+            continue
+        label = redact_label(row.get("reason"))
+        if not label:
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        totals[label] = totals.get(label, 0) + count
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(totals.items(), key=lambda row: (-row[1], row[0]))
+    ]
 
 
 # How many refused candidates keep an identity. Upstream `summarize_rejections`

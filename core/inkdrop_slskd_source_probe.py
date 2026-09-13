@@ -13188,7 +13188,15 @@ def summarize_rejections(rejections, checked_file_count, response_count, locked_
                          raw_page_locked_skipped=0):
     counts = {}
     for filename, details in rejections:
-        label = rejection_label(details)
+        # Redacted where it is first counted, not where it is first stored.
+        # The penalty prose carries words lifted out of the remote file
+        # (`related subseries title tail: <their folder>`), and this dict is
+        # the head of every route that text has ever taken out of memory --
+        # the probe cache entry, `query_variant_outcomes`, the ledger's
+        # refusal evidence and the Manual Review panel all read these counts.
+        # Redacting here fixes all four at once; redacting at any one of them
+        # would leave the other three.
+        label = inkdrop_slskd_refusal_vocabulary.redact_label(rejection_label(details))
         counts[label] = counts.get(label, 0) + 1
     # A default of 0 keeps every existing caller unchanged, and a 0 adds no
     # reason at all -- an unlocked page folder must not mint a refusal.
