@@ -48326,6 +48326,120 @@ def resolve_review_exception_identity(con, row):
     return series_id, issue_id
 
 
+# A unit rarely holds more than one or two active present rows; the cap is here
+# so a pathological ledger cannot turn one review exception into an unbounded
+# number of archive reads inside the state write lock.
+REVIEW_EXCEPTION_FILE_PROOF_MAX_LEDGER_ROWS = 8
+# And a cap on how many archives ONE sync pass may open, for the same reason at
+# the other scale. Measured on a hand-built 20 MiB / 24-page .cbz on local disk,
+# archive_output_refusal() costs 0.28s; a real library file is larger and lives
+# on a network mount, so that is a floor. There were 237 active review
+# exceptions on snapshot inkdrop-state-20260913T023528Z-b4a3bb1f228c (as_of_utc
+# 2026-09-13T02:35:28Z), and reading every one of them would put minutes inside
+# the state write lock -- the shape that starves auth_login and the staging
+# sweep, already paid for once in cached_artifact_content_identity(). Running
+# out of budget REFUSES the retirement, so the overflow costs a review row
+# staying open one more pass and never a book.
+REVIEW_EXCEPTION_FILE_PROOF_ARCHIVE_READ_BUDGET = max(
+    1, int(os.environ.get("INKDROP_REVIEW_EXCEPTION_ARCHIVE_READ_BUDGET") or 25)
+)
+
+
+def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=None, budget=None):
+    """The file that may retire this unit's review exception, or why none does.
+
+    `media_files` is DURABLE SCAN METADATA, not a live reading. On snapshot
+    inkdrop-state-20260913T023528Z-b4a3bb1f228c (as_of_utc 2026-09-13T02:35:28Z)
+    1,891 of the 3,970 rows reading `active=1 AND status='present'` were last
+    seen before the most recent scan day -- for nearly half of them "present" is
+    a memory of a walk that may be weeks old. Retiring a review exception on
+    that memory spends the one thing that asks a human to look, and the unit
+    leaves the wanted list with nobody going after it. So every refusal below
+    is deliberate: when the file cannot be shown, REFUSE.
+
+    Nothing is inferred from absence in the other direction either. A unit with
+    no ledger row at all never reaches here -- the caller's SQL still requires
+    one -- so this only ever makes an existing retirement harder, never easier.
+
+    The soundness question is asked of the one authority that answers it,
+    `archive_output_refusal()`, and only about the format it reads. It answers
+    for `.cbz` and says so; handed a `.cbr` it returns "not examined", which is
+    an absence of opinion and must not be read as a verdict. 421 of those 3,970
+    rows (10.6%) are `.cbr`, and refusing them all would strand every one of
+    those units' exceptions forever on a check that never looked. They are
+    proven as far as the evidence goes -- a non-empty library archive, on disk,
+    under a managed root, credited to this unit and this series -- and no
+    further.
+
+    Deliberately NOT gated on `media_root_is_mounted()`, unlike the retraction
+    sweeps: an unmounted root makes every answer here a refusal, and a refusal
+    is already the safe direction. The sweep that retracts proofs needs that
+    gate because its failure direction destroys evidence; this one only leaves
+    a review row where it was.
+    """
+
+    issue_id = str(issue_id or "").strip()
+    if not issue_id:
+        return {"ok": False, "reason": "no_unit"}
+    series_id = str(series_id or "").strip()
+    roots = managed_roots if managed_roots is not None else media_management_roots_from_connection(con)
+    ledger_rows = con.execute(
+        "select id, path, series_id from media_files"
+        " where issue_id=? and coalesce(active,0)=1 and lower(coalesce(status,''))='present'"
+        " order by coalesce(size_bytes,0) desc, id asc limit ?",
+        (issue_id, REVIEW_EXCEPTION_FILE_PROOF_MAX_LEDGER_ROWS),
+    ).fetchall()
+    reason = "no_present_ledger_row"
+    for ledger in ledger_rows:
+        owner = str(row_value(ledger, "series_id") or "").strip()
+        if series_id and owner and owner != series_id:
+            # The ledger credits this unit's file to a different series record.
+            # Both ids present and disagreeing is the only refusing shape --
+            # a ledger row with no series_id says nothing, and the duplicate
+            # identity population (a comicvine twin owning the files while the
+            # mangadex twin carries the wants) is exactly why an absent id must
+            # not be treated as a mismatch.
+            reason = "ledger_row_belongs_to_another_series"
+            continue
+        candidate_path = str(row_value(ledger, "path") or "").strip()
+        if not candidate_path:
+            reason = "ledger_row_names_no_file"
+            continue
+        if not path_exists_quietly(candidate_path):
+            reason = "file_not_on_disk"
+            continue
+        if not path_under_any_root(candidate_path, roots):
+            reason = "file_outside_managed_root"
+            continue
+        canonical = canonical_managed_media_file_path(candidate_path, roots)
+        if canonical is None:
+            # Exists, is under a root by prefix, and still is not a regular
+            # library archive contained by a real managed root -- a symlink out,
+            # a directory, a stray extension.
+            reason = "not_a_managed_library_archive"
+            continue
+        try:
+            size_bytes = int(canonical.stat().st_size)
+        except OSError:
+            reason = "file_not_readable"
+            continue
+        if size_bytes <= 0:
+            reason = "file_is_empty"
+            continue
+        if inkdrop_artifact_acceptance.comic_archive_suffix(canonical) == ".cbz":
+            if isinstance(budget, dict):
+                if int(budget.get("archive_reads") or 0) <= 0:
+                    reason = "soundness_budget_exhausted"
+                    continue
+                budget["archive_reads"] = int(budget["archive_reads"]) - 1
+            refusal = inkdrop_artifact_acceptance.archive_output_refusal(canonical)
+            if refusal is not None:
+                reason = str(refusal.get("reason") or "archive_refused")
+                continue
+        return {"ok": True, "reason": "file_verified", "path": str(canonical)}
+    return {"ok": False, "reason": reason}
+
+
 def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
     def _sync():
         path = Path(db_path)
@@ -48490,6 +48604,20 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
             # satisfied with no file anywhere is its own defect, and retiring a
             # demand on the strength of it would silence the request for a book
             # nobody has -- the wrong side of "take the false negative".
+            #
+            # And a LEDGER ROW IS NOT THE FILE. This query is the cheap
+            # prefilter that says which units are worth a look -- it is
+            # deliberately unchanged, so a unit with no ledger row still never
+            # reaches the retirement -- but the proof itself is
+            # review_exception_unit_file_proof(), which goes to disk. `present`
+            # in media_files is a memory of the last library walk: 1,891 of
+            # 3,970 such rows on snapshot
+            # inkdrop-state-20260913T023528Z-b4a3bb1f228c (as_of_utc
+            # 2026-09-13T02:35:28Z) were last seen before the most recent scan
+            # day, and a fixture built on the production function retired a
+            # review exception on a row naming a file that was never there.
+            managed_roots = media_management_roots_from_connection(con)
+            proof_budget = {"archive_reads": REVIEW_EXCEPTION_FILE_PROOF_ARCHIVE_READ_BUDGET}
             satisfied_rows = con.execute(
                 """
                 select re.id, re.series_id, re.issue_id, re.source, re.raw_json
@@ -48507,6 +48635,51 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
                 """
             ).fetchall()
             for row in satisfied_rows:
+                proof = review_exception_unit_file_proof(
+                    con,
+                    row["series_id"],
+                    row["issue_id"],
+                    managed_roots=managed_roots,
+                    budget=proof_budget,
+                )
+                if not proof.get("ok"):
+                    # Say out loud that the sweep declined, so a row that stays
+                    # open has a findable reason instead of looking like one the
+                    # sweep never considered. Keyed on the reason as well as the
+                    # row, so a pass that changes nothing writes nothing.
+                    con.execute(
+                        """
+                        insert or ignore into history_events(
+                            id, entity_type, entity_id, series_id, issue_id, event_type,
+                            source, message, created_at, raw_json
+                        ) values(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            stable_id(
+                                "review_exception_retirement_refused",
+                                row["id"],
+                                str(proof.get("reason") or ""),
+                            ),
+                            "review_exception",
+                            row["id"],
+                            row["series_id"],
+                            row["issue_id"],
+                            "manual_review_retirement_refused",
+                            row["source"] or origin,
+                            "Manual review exception kept: the unit reads satisfied but its file"
+                            f" could not be shown ({proof.get('reason')})",
+                            now,
+                            json_dumps({
+                                "review_exception_id": row["id"],
+                                "issue_id": row["issue_id"],
+                                "series_id": row["series_id"],
+                                "reason": proof.get("reason"),
+                                "observed_at": now,
+                                "observed_at_iso": utc_stamp(now),
+                            }),
+                        ),
+                    )
+                    continue
                 retired += 1
                 con.execute(
                     "update review_exceptions set active=0, state='resolved',"
@@ -48530,7 +48703,15 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
                         row["source"] or origin,
                         "Manual review exception retired: the unit it asks about is satisfied and the file is present",
                         now,
-                        row["raw_json"],
+                        # The retiring file is named on the event. Without it the
+                        # only record of WHICH file closed a review row is the
+                        # ledger as it stands later, which is the very thing that
+                        # turned out not to be a reading.
+                        json_dumps({
+                            **(json_loads(row["raw_json"] or "{}", {}) or {}),
+                            "retirement_proof_path": proof.get("path"),
+                            "retirement_proof_reason": proof.get("reason"),
+                        }),
                     ),
                 )
             # One-time correction for rows retired before the clause above
