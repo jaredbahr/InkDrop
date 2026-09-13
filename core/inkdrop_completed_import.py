@@ -6483,6 +6483,47 @@ def safe_filename_part(value):
 
 def extract_issue_number(path):
     text = " ".join([Path(path).stem, Path(path).parent.name])
+    number = _issue_number_from_text(text)
+    # AN UNDERSCORE IS A DELIMITER, AND ONLY THE LEADING SIDE FORGOT IT.
+    # The trailing boundary below was already fixed for `_` (no_alnum_after,
+    # for "Moebius 7_ The Goddess"), and filename_has_explicit_unit_token()
+    # replaces `_` with a space before it looks. The keyword patterns here
+    # still lead with `\b`, and `_` is a word character, so `Vagabond_v11`
+    # has no boundary before its `v`: the token check said "this file states
+    # a unit", this parser said None, and the import gate consults only this
+    # one -- so seven Vagabond volumes sat in Manual Review asking a person
+    # which volume a file named `v11` is, while the wanted row already held
+    # issue 11.
+    #
+    # WHY A RETRY AND NOT A WIDER BOUNDARY. Teaching the patterns to accept
+    # `_` in place would also change files that parse TODAY: `Spawn_169_v2`
+    # reads 169 now, because the underscore hides the `v2` repack marker, and
+    # an in-place fix would let the volume pattern win and return 2 -- a wrong
+    # unit, which is how a wrong "you have it" is made. Retrying only when
+    # nothing parsed cannot alter any value this function already returns.
+    #
+    # AND IT DOES NOT ANSWER FOR A CHAPTER FILE. The import-filename gate,
+    # taken alone, admits `Fairy Tail v10 c075` as unit 010 against a Fairy
+    # Tail target. On the 2026-09-13 snapshot that hole has a net under it:
+    # the real single-chapter files in that shape (`Fairy Tail v25 c208`,
+    # `Dispatch!! v01 c03`) were quarantined or refused further on, and
+    # `Kingdom v19 c196-206` is a VOLUME holding a chapter range, correctly
+    # read as 19. So it is a gate-level hole, not an observed wrong import --
+    # and the retry must not widen it. A normalised name that carries a
+    # chapter marker gets no retry value. That costs `Kingdom_v19_c196-206`
+    # the volume its space spelling gets, which is the false negative, and no
+    # such underscore file is on the snapshot.
+    # filename_has_chapter_token() is blind to `_c075` for the same reason
+    # this parser is blind to `_v11`, which is why it is asked about the
+    # spaced name rather than the real one.
+    if number is None and "_" in text:
+        spaced = Path(path).with_name(Path(path).name.replace("_", " "))
+        if not filename_has_chapter_token(spaced):
+            number = _issue_number_from_text(text.replace("_", " "))
+    return number
+
+
+def _issue_number_from_text(text):
     # The number group's trailing boundary used to be a plain `\b`, which
     # treats `_` as a word character -- filenames that use an underscore as
     # the delimiter right after the issue number (e.g. "Moebius 7_ The
