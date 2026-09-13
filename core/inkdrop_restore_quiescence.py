@@ -176,10 +176,17 @@ def probe_restore_quiescence(*, lock_dir=None, status_path=None, now=None, envir
             heartbeat_at = float(payload.get("heartbeat_at") or 0.0)
         except (TypeError, ValueError):
             heartbeat_at = 0.0
+        # A status file with no readable heartbeat cannot be dated at all, so
+        # nothing in it may be treated as stale: an undatable file is the
+        # blind case, and blind fails closed. The producer always writes
+        # heartbeat_at and active_jobs in one payload, so this is a corrupt or
+        # foreign file, not a worker state.
+        status_file_is_current = True
         if heartbeat_at:
             age = moment - heartbeat_at
             checked["worker_heartbeat_age_seconds"] = round(age, 1)
-            if age <= live_window:
+            status_file_is_current = age <= live_window
+            if status_file_is_current:
                 blockers.append(
                     {
                         "kind": "worker_scheduler_live",
@@ -193,17 +200,40 @@ def probe_restore_quiescence(*, lock_dir=None, status_path=None, now=None, envir
                         "next_action": "Stop the worker container, then retry: docker stop inkdrop-worker",
                     }
                 )
+        checked["worker_status_file_is_current"] = status_file_is_current
         active = payload.get("active_jobs")
         if isinstance(active, list) and active:
             names = sorted(str(row.get("name") or "?") for row in active if isinstance(row, dict))
             checked["worker_active_jobs"] = names
-            blockers.append(
-                {
-                    "kind": "worker_job_active",
-                    "detail": "the worker is running: " + ", ".join(names),
-                    "next_action": "Wait for these jobs to finish, or stop the worker container.",
-                }
-            )
+            # `active_jobs` is only as fresh as the heartbeat that shipped with
+            # it. The list is not a live reading -- it is a line in a file the
+            # worker leaves behind, and a worker SIGKILLed mid-job leaves it
+            # populated forever. Believing it past the heartbeat window made
+            # the operator move this gate exists to permit ("docker stop
+            # inkdrop-worker, then restore") refuse indefinitely, with no way
+            # out through the UI at all: the availability failure in row #974.
+            #
+            # The heartbeat only decides whether the FILE still describes
+            # anything. What is actually running is decided below by probing
+            # the job locks, which are evidence from live processes rather
+            # than a record of them, and which are untouched by this.
+            if status_file_is_current:
+                blockers.append(
+                    {
+                        "kind": "worker_job_active",
+                        "detail": "the worker is running: " + ", ".join(names),
+                        "next_action": "Wait for these jobs to finish, or stop the worker container.",
+                    }
+                )
+            else:
+                # Say that the list was seen and set aside. An ignored reading
+                # and a reading never taken look identical in an incident.
+                checked["worker_active_jobs_disregarded"] = (
+                    "the heartbeat that vouched for these jobs is older than "
+                    + str(live_window)
+                    + "s, so the status file no longer describes a running worker; "
+                    "the job locks decide"
+                )
 
     # 2. Is any job lock held, by anything?
     #
