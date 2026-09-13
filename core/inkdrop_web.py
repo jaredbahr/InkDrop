@@ -28413,7 +28413,11 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
             restoreDetail.appendChild(loading);
             try {
               const data = await api("/api/inkdrop-settings/backup/archives/restore/preview", {name: archive.name}, {timeoutMs: 300000});
-              renderRestorePlan(restoreDetail, data?.result, archive, status, preserveAuthCheckbox.checked);
+              // The ELEMENT, not `.checked`. The preview says nothing about
+              // auth -- it is the same request whichever way the box is set --
+              // and the box stays live while the plan is on screen, so the
+              // only honest moment to read it is the click that commits.
+              renderRestorePlan(restoreDetail, data?.result, archive, status, preserveAuthCheckbox);
             } catch (error) {
               restoreDetail.replaceChildren();
               const failed = document.createElement("p");
@@ -28501,7 +28505,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
         }
       }
 
-      function renderRestorePlan(container, result, archive, status, preserveCurrentAuth) {
+      function renderRestorePlan(container, result, archive, status, preserveAuthInput) {
         container.replaceChildren();
         if (!result) {
           const empty = document.createElement("p");
@@ -28598,11 +28602,22 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
         confirmButton.className = "danger";
         confirmButton.textContent = "Replace my data with this backup";
         confirmButton.onclick = async () => {
-          if (!confirm(`Replace this install's databases with the backup from ${manifest.created_at || "an unknown time"}?\n\nWhat is on disk now is copied aside first, but everything since this backup was taken will be gone.`)) return;
+          // Read the auth choice HERE, at the click. This used to be a boolean
+          // captured when the plan was rendered, and the checkbox is not
+          // disabled in between -- so unchecked-then-checked still sent false
+          // and checked-then-unchecked still sent true, and the panel was
+          // showing one answer while sending the other. The restore cannot be
+          // undone, so the confirmation names the epoch it is about to decide
+          // for, out of the same read that builds the payload.
+          const preserveCurrentAuth = !!(preserveAuthInput && preserveAuthInput.checked);
+          const authLine = preserveCurrentAuth
+            ? "The logins, sessions and API keys you have right now are kept, and the ones inside the backup are discarded."
+            : "The logins, sessions and API keys inside the backup replace the ones you have now. Anything created since the backup was taken stops working, including the session you are signed in with.";
+          if (!confirm(`Replace this install's databases with the backup from ${manifest.created_at || "an unknown time"}?\n\n${authLine}\n\nWhat is on disk now is copied aside first, but everything since this backup was taken will be gone.`)) return;
           confirmButton.disabled = true;
           status.textContent = "Restoring… this takes several minutes on a large database.";
           try {
-            const data = await api("/api/inkdrop-settings/backup/archives/restore/apply", {name: archive.name, preserve_current_auth: !!preserveCurrentAuth}, {timeoutMs: 3600000});
+            const data = await api("/api/inkdrop-settings/backup/archives/restore/apply", {name: archive.name, preserve_current_auth: preserveCurrentAuth}, {timeoutMs: 3600000});
             container.replaceChildren();
             const done = document.createElement("p");
             const snapshots = (data?.result?.pre_restore_snapshots || []).length;
