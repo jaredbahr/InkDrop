@@ -246,10 +246,17 @@ PROBE_BUDGET_SKIP_REASONS = frozenset({"probe_budget_exhausted", "probe_budget_b
 # 32 of 34 killed runs in seven days had found or handed off something.
 HARD_DEADLINE = None
 HARD_DEADLINE_WRITE_RESERVE_SECONDS = 20
-# A started row -- two handoffs, the enqueue, the waiting record -- took 50 s on
-# production 2026-09-09 (01:27:58Z probe_item -> 01:28:49Z waiting record).
-# A row started with less than that left ends under the parent's kill.
-AUTO_GRAB_ROW_RESERVE_SECONDS = 60
+# What the grab stage costs, measured on production 2026-09-09..13 over the 22
+# rows the fixed builds started: the first row starts a median 23 s (max 30 s)
+# after the last probe or handoff line -- cache writes, the active-cache scope,
+# queue review rows -- and each further row 4.4 s later (Corpse Knight #3 -> #5,
+# Invincible #54 -> #55 -> #75). A row used to need 60 s left, sized from a span
+# that included two folder evaluations; 15 s is three rows' worth.
+GRAB_STAGE_SETUP_SECONDS = 30
+AUTO_GRAB_ROW_RESERVE_SECONDS = 15
+GRAB_STAGE_ROWS_RESERVE_SECONDS = 50
+# Folder evaluation measured 13 to 48 s for the directory and pack passes together.
+SERIES_RUN_EVALUATION_RESERVE_SECONDS = 40
 
 
 def hard_deadline_remaining(now_ts=None):
@@ -267,8 +274,41 @@ def series_run_evaluation_deadline(now_ts=None):
     floor = current + 8.0
     if HARD_DEADLINE is None:
         return max(floor, window)
-    ceiling = float(HARD_DEADLINE) - float(AUTO_GRAB_ROW_RESERVE_SECONDS) - float(HARD_DEADLINE_WRITE_RESERVE_SECONDS)
+    ceiling = (
+        float(HARD_DEADLINE)
+        - float(GRAB_STAGE_SETUP_SECONDS)
+        - float(GRAB_STAGE_ROWS_RESERVE_SECONDS)
+        - float(HARD_DEADLINE_WRITE_RESERVE_SECONDS)
+    )
     return max(floor, min(window, ceiling))
+
+
+def effective_processing_deadline(search_deadline, observed_directory_count, hard_deadline=None):
+    """When searching and response processing must stop, so the grab stage keeps its time.
+
+    On the fixed builds 60 of 63 runs whose folder handoff selected issues started
+    none: processing ran to the search deadline, 20 s before the hard deadline
+    (one reused Gotham Central result, 1,191 files, took 177.6 s), folder
+    evaluation followed, and in 20 of 28 deferral events the grab stage arrived
+    after the hard deadline had passed. Per run, 245 of 262 runs finish exactly
+    one unit, so this truncates that unit's ranking, not the units searched.
+
+    Without a hard deadline it is the search deadline. With one it leaves the grab
+    stage's setup, one row and the final writes; once the unit has observed a peer
+    folder for its series it also leaves folder evaluation and a run of rows.
+    """
+    hard = HARD_DEADLINE if hard_deadline is None else hard_deadline
+    if search_deadline is None or hard is None:
+        return search_deadline
+    reserve = GRAB_STAGE_SETUP_SECONDS + AUTO_GRAB_ROW_RESERVE_SECONDS + HARD_DEADLINE_WRITE_RESERVE_SECONDS
+    if int(observed_directory_count or 0) > 0:
+        reserve = (
+            GRAB_STAGE_SETUP_SECONDS
+            + SERIES_RUN_EVALUATION_RESERVE_SECONDS
+            + GRAB_STAGE_ROWS_RESERVE_SECONDS
+            + HARD_DEADLINE_WRITE_RESERVE_SECONDS
+        )
+    return min(float(search_deadline), float(hard) - float(reserve))
 
 
 def effective_search_deadline(network_started_at, probe_budget_seconds, hard_deadline):
@@ -14868,7 +14908,10 @@ def probe_item(
 
     def run_query(query, attempt_total):
         nonlocal response_count, early_stop_reason
-        remaining = seconds_remaining(deadline)
+        query_deadline = effective_processing_deadline(
+            deadline, directory_observation_summary["observed_directory_count"]
+        )
+        remaining = seconds_remaining(query_deadline)
         if remaining is not None and remaining < 8:
             attempts.append({
                 "query": query,
@@ -14891,7 +14934,7 @@ def probe_item(
             responses = slskd_search(
                 query,
                 wait_seconds=max(SLSKD_SEARCH_WAIT_FLOOR_SECONDS, int(wait_seconds or 0)),
-                deadline=deadline,
+                deadline=query_deadline,
                 reuse_recent_seconds=slskd_repeat_query_cooldown_seconds(),
                 zero_result_reuse_recent_seconds=slskd_zero_result_query_cooldown_seconds(),
             )
@@ -14928,7 +14971,12 @@ def probe_item(
             # and no further request until the kill at 02:01:42Z (row #918).
             # When time allows the result is unchanged; the cut is taken only
             # where the alternative was no result at all.
-            candidates, rejection_summary = candidates_from_responses(responses, item, deadline=deadline)
+            # Re-read after this query's observations: a folder for the series
+            # just seen means the grab stage will have rows to start.
+            processing_deadline = effective_processing_deadline(
+                deadline, directory_observation_summary["observed_directory_count"]
+            )
+            candidates, rejection_summary = candidates_from_responses(responses, item, deadline=processing_deadline)
             if rejection_summary.get("processing_timed_out"):
                 log(
                     "candidate_processing_truncated",
@@ -14938,7 +14986,7 @@ def probe_item(
                     response_count=len(responses),
                     checked_file_count=rejection_summary.get("checked_file_count"),
                     candidate_count=len(candidates),
-                    remaining_seconds=round(float(seconds_remaining(deadline) or 0), 1),
+                    remaining_seconds=round(float(seconds_remaining(processing_deadline) or 0), 1),
                 )
             # A provider query may initially look safe and then be blocked by
             # durable failed-candidate memory. Apply that annotation before
