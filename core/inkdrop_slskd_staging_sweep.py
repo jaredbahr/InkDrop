@@ -260,9 +260,40 @@ def clear_error_count(con, path):
     con.commit()
 
 
+def incomplete_root_for(root):
+    """slskd's in-progress transfer folder for this download root.
+
+    slskd writes a transfer there and moves it out only once it finishes; an
+    errored transfer leaves its partial behind. Nothing in it is a finished
+    file, so the sweep must never judge it. On the 2026-09-13 snapshot four of
+    the fourteen comic_archive_regrab_needed rows were such partials, two with
+    slskd records reading "Completed, Errored" at 3.8 of 67.7 MB and 1.3 of
+    131 MB. Resolved the way inkdrop_slskd_source_probe resolves it when no
+    provider setting is given: the environment first, then root/incomplete.
+    """
+    configured = (os.environ.get("INKDROP_SLSKD_INCOMPLETE_ROOT") or "").strip()
+    return configured or os.path.join(str(root), "incomplete")
+
+
+def prune_incomplete_root(dirpath, dirnames, incomplete_root):
+    """Drop the incomplete folder from an os.walk() listing in place.
+
+    Matched by full path, not by name, so a peer's own folder that happens to
+    be called "incomplete" deeper in the tree is still walked. The probe's
+    walk likewise prunes only at the download root.
+    """
+    target = os.path.normcase(os.path.abspath(incomplete_root))
+    dirnames[:] = [
+        name for name in dirnames
+        if os.path.normcase(os.path.abspath(os.path.join(dirpath, name))) != target
+    ]
+
+
 def enumerate_files(root):
     files = []
+    incomplete_root = incomplete_root_for(root)
     for dirpath, dirnames, filenames in os.walk(root):
+        prune_incomplete_root(dirpath, dirnames, incomplete_root)
         for name in filenames:
             ext = os.path.splitext(name)[1].lower()
             if ext in ARCHIVE_EXT:
@@ -298,7 +329,9 @@ def enumerate_page_directories(root):
     no subfolders. Mirrors enumerate_files' shape so the checkpoint table
     can track a directory the same way it tracks a real file."""
     directories = []
+    incomplete_root = incomplete_root_for(root)
     for dirpath, dirnames, filenames in os.walk(root):
+        prune_incomplete_root(dirpath, dirnames, incomplete_root)
         if not filenames:
             continue
         try:
