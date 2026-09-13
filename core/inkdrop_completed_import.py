@@ -8367,7 +8367,8 @@ def pending_only_source_roots(sources, pending):
     return selected
 
 
-def append_pending_status(kind, path, status, dest=None, target=None, pending=None):
+def append_pending_status(kind, path, status, dest=None, target=None, pending=None,
+                          detail=None):
     matched, quarantined = pending_match_records(path, pending or [], target=target)
     identity_keys = (
         "downloadUrlHash",
@@ -8402,6 +8403,12 @@ def append_pending_status(kind, path, status, dest=None, target=None, pending=No
                 "query": record.get("query"),
                 "source": str(path),
                 "dest": str(dest) if dest else None,
+                # The refusal reason is computed at every gate and was logged but
+                # never written here, so a refused unit could not be read back --
+                # measured at 79 of 79 units over 30 days. Always emit the key so a
+                # reader can rely on it being present rather than inferring from
+                # its absence.
+                "detail": str(detail) if detail else None,
                 "matched_series": target.get("title") if target else None,
                 "matched_kapowarr_id": target.get("id") if target else None,
                 "created_at": now,
@@ -9909,7 +9916,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 }
                 log(event)
                 if pending_only:
-                    append_pending_status(kind, path, "false_positive", None, target, pending_imports)
+                    append_pending_status(kind, path, "false_positive", None, target, pending_imports,
+                                          detail=event.get("detail"))
                 skipped.append(event)
                 continue
             related_subseries_reason = (
@@ -9939,7 +9947,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 }
                 log(event)
                 if pending_only:
-                    append_pending_status(kind, path, "wrong_series_or_subseries", None, target, pending_imports)
+                    append_pending_status(kind, path, "wrong_series_or_subseries", None, target, pending_imports,
+                                          detail=event.get("detail"))
                 skipped.append(event)
                 continue
             weak_filename_gate = (
@@ -9986,7 +9995,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                         db_path=INKDROP_STATE_DB,
                     )
                 if pending_only:
-                    append_pending_status(kind, path, event["skip_reason"], None, target, pending_imports)
+                    append_pending_status(kind, path, event["skip_reason"], None, target, pending_imports,
+                                          detail=event.get("detail"))
                 skipped.append(event)
                 continue
             _flush_pending_write_before_slow_verification(conn)
@@ -10026,7 +10036,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                         db_path=INKDROP_STATE_DB,
                     )
                 if pending_only:
-                    append_pending_status(kind, path, "wrong_language_source", None, target, pending_imports)
+                    append_pending_status(kind, path, "wrong_language_source", None, target, pending_imports,
+                                          detail=event.get("detail"))
                 skipped.append(event)
                 continue
             if collection and collection_range_is_completed(collection, target):
@@ -10357,7 +10368,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                             db_path=INKDROP_STATE_DB,
                         )
                     if pending_only:
-                        append_pending_status(kind, path, "manual_identity_review", None, target, pending_imports)
+                        append_pending_status(kind, path, "manual_identity_review", None, target, pending_imports,
+                                              detail=identity_block.get("detail") or identity_block.get("reason"))
                     skipped.append(event)
                     continue
             if kind == "comics":
@@ -10387,7 +10399,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                             db_path=INKDROP_STATE_DB,
                         )
                     if pending_only:
-                        append_pending_status(kind, path, "bad_archive", None, target, pending_imports)
+                        append_pending_status(kind, path, "bad_archive", None, target, pending_imports,
+                                              detail=archive_check.get("reason") or archive_check.get("error"))
                     skipped.append(event)
                     continue
                 decision = artifact_acceptance_decision(
@@ -10429,7 +10442,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                                 db_path=INKDROP_STATE_DB,
                             )
                     if pending_only:
-                        append_pending_status(kind, path, decision.get("decision") or "artifact_acceptance_rejected", None, target, pending_imports)
+                        append_pending_status(kind, path, decision.get("decision") or "artifact_acceptance_rejected", None, target, pending_imports,
+                                              detail=decision.get("reason") or decision.get("decision"))
                     skipped.append(event)
                     continue
                 if collection:
