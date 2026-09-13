@@ -3453,19 +3453,53 @@ def alias_key_matches_series(key, series):
     return False
 
 
+# The operator's series aliases live in the manual-review actions file, and the
+# matcher asks for them once or twice per candidate file it checks. That file is
+# 3.5 MB in production, and parsing it per file was 69% of response processing:
+# replaying the running build on production's state (2026-09-13), 73 files took
+# 22 s, 13 s of it in 125 parses of this one file. A reused Gotham Central search
+# result then took three minutes to process, the folder handoff that followed
+# selected 11 open issues after the run's deadline, and none was ever started.
+# The alias rows are re-derived only when the file itself changes.
+_ACTION_ALIAS_ROWS_CACHE = {"identity": None, "rows": ()}
+
+
+def _file_identity(path):
+    """(path, mtime_ns, size, ctime_ns, inode) of a file, or None when it cannot be stat'ed."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (str(path), stat.st_mtime_ns, stat.st_size, getattr(stat, "st_ctime_ns", None), getattr(stat, "st_ino", None))
+
+
+def action_alias_rows():
+    """(series, alias) pairs from the actions file, parsed once per version of the file."""
+    identity = _file_identity(MANUAL_REVIEW_ACTIONS_FILE)
+    if identity is None:
+        _ACTION_ALIAS_ROWS_CACHE["identity"] = None
+        _ACTION_ALIAS_ROWS_CACHE["rows"] = ()
+        return ()
+    if _ACTION_ALIAS_ROWS_CACHE["identity"] != identity:
+        data = read_json(MANUAL_REVIEW_ACTIONS_FILE, {}) or {}
+        aliases = data.get("aliases") if isinstance(data, dict) else {}
+        rows = []
+        if isinstance(aliases, dict):
+            for row in aliases.values():
+                if isinstance(row, dict):
+                    rows.append((row.get("series") or "", row.get("alias")))
+        _ACTION_ALIAS_ROWS_CACHE["identity"] = identity
+        _ACTION_ALIAS_ROWS_CACHE["rows"] = tuple(rows)
+    return _ACTION_ALIAS_ROWS_CACHE["rows"]
+
+
 def action_aliases_for_series(series):
-    data = read_json(MANUAL_REVIEW_ACTIONS_FILE, {}) or {}
-    aliases = data.get("aliases") if isinstance(data, dict) else {}
-    if not isinstance(aliases, dict):
-        return []
     out = []
-    for row in aliases.values():
-        if not isinstance(row, dict):
+    for alias_series, alias in action_alias_rows():
+        if not alias_key_matches_series(alias_series, series):
             continue
-        if not alias_key_matches_series(row.get("series") or "", series):
-            continue
-        if row.get("alias"):
-            out.append(str(row.get("alias") or ""))
+        if alias:
+            out.append(str(alias or ""))
     return unique_values(out, limit=12)
 
 
