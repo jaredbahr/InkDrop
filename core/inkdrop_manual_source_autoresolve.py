@@ -1206,6 +1206,43 @@ def autopilot_queue_item_for_record(record, review_id="", queue_items=None):
     return None
 
 
+SINGLETON_PROOF_FIELD_PREFIXES = ("singleton_", "collected_singleton_")
+
+
+def grab_item_for_waiting_record(probe, item, record, queue_items=None):
+    """The item the grab judged this waiting record's file with.
+
+    A waiting record keeps the grab's unit context but none of the durable single-issue
+    proof the grab judged the file on, so a title-only graphic novel SLSKD downloaded as
+    safe was refused as soon as it landed. The grab's item is rebuilt through the grab's
+    own builder from the one queue row the record names, and used only when that row is
+    the same series and unit. Proof never comes from the record itself: it lives in a
+    JSON file, and the builder reads it from the durable database.
+    """
+    base = item if isinstance(item, dict) else (record if isinstance(record, dict) else {})
+    fallback = {key: value for key, value in base.items() if not str(key).startswith(SINGLETON_PROOF_FIELD_PREFIXES)}
+    owner = record if isinstance(record, dict) else base
+    key = str(owner.get("autopilot_queue_key") or "").strip()
+    if not key or not hasattr(probe, "queue_source_review_item"):
+        return fallback
+    items = queue_items if isinstance(queue_items, dict) else autopilot_queue_items()
+    row = items.get(key)
+    if not isinstance(row, dict):
+        return fallback
+    grab_item = probe.queue_source_review_item({**row, "key": row.get("key") or key})
+    if not isinstance(grab_item, dict):
+        return fallback
+    owner_series_id = str(owner.get("series_id") or "").strip()
+    if owner_series_id and owner_series_id != str(grab_item.get("series_id") or "").strip():
+        return fallback
+    if normalize_key(owner.get("series")) != normalize_key(grab_item.get("series")):
+        return fallback
+    normalize_issue = inkdrop_state.normalize_issue_number if inkdrop_state else normalize_key
+    if normalize_issue(owner.get("issue")) != normalize_issue(grab_item.get("issue")):
+        return fallback
+    return grab_item
+
+
 def autopilot_queue_item_verified(record, review_id="", queue_items=None):
     item = autopilot_queue_item_for_record(record, review_id=review_id, queue_items=queue_items)
     return isinstance(item, dict) and item.get("state") == "verified"
@@ -1745,7 +1782,10 @@ def targeted_waiting_detected_files(probe, item, record):
             continue
 
     rows = []
-    for path in unique_paths(candidates):
+    candidates = unique_paths(candidates)
+    if candidates:
+        item = grab_item_for_waiting_record(probe, item, record)
+    for path in candidates:
         row = detected_row_from_path(probe, item, root, path, record=record)
         if not row:
             continue
@@ -1812,6 +1852,7 @@ def transfer_local_path_candidates(probe, record, transfer):
 
 def completed_transfer_detected_files(probe, item, record, transfer, *, candidates=None):
     root = Path(getattr(probe, "SLSKD_DOWNLOAD_ROOT", SLSKD_DOWNLOAD_ROOT))
+    item = grab_item_for_waiting_record(probe, item, record)
     rows = []
     paths = transfer_local_path_candidates(probe, record, transfer) if candidates is None else list(candidates)
     for path in paths:

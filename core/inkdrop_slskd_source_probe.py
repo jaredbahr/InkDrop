@@ -8095,10 +8095,16 @@ def shared_candidate_match_details(filename, item, candidate=None):
     words = important_words((item or {}).get("series") or (item or {}).get("query") or "")
     matched_words = title_matched_words(words, context_words(identity_text))
     score = 35 + 6 + 10 * max(3, min(len(matched_words), 4))
+    # The title and the unit are both proven here, so say so in the two forms the
+    # post-transfer quality gate reads (auto_import_quality): a "title words" reason and
+    # unit_evidence. Without them a file this branch admitted was refused after it
+    # transferred, as "missing title match reason".
+    title_evidence = matched_words[:5] or sorted(TRUSTED_SINGLETON_POSITIVE_EVIDENCE & set(positive))
     return {
         "matched": True,
         "score": score,
         "reasons": [
+            "title words: " + ", ".join(title_evidence),
             "trusted singleton title and unit identity matched",
             "issue/part evidence from shared compatibility",
             f"comic extension {extension_for(filename)}",
@@ -8108,6 +8114,7 @@ def shared_candidate_match_details(filename, item, candidate=None):
             f"trusted singleton identity +{score - 6}",
             "comic extension +6",
         ],
+        "unit_evidence": True,
         "target_compatibility": compatibility,
         "candidate_identity_text": identity_text,
     }
@@ -12897,7 +12904,7 @@ _STAGED_PARENT_CONFLICT_MARKERS = (
 )
 
 
-def staged_parent_series_conflict(path, root, item):
+def staged_parent_series_conflict(path, root, item, *, flattened_context=True):
     """An explicit contradiction from the staged file's parent folder, or ''.
 
     `staged_match_details()` used to return the moment the leaf matched, so a
@@ -12910,6 +12917,13 @@ def staged_parent_series_conflict(path, root, item):
     Only an explicit conflict counts. Most staging roots are dated dump
     folders that say nothing about series, and treating "does not match" as
     "contradicts" would strand essentially every real import.
+
+    `flattened_context=False` reads only the relative path. A title-only file
+    admitted on durable single-issue proof never matches as flattened text
+    (there is no unit token in it), so that form said "different titled
+    series" for every folder with a word in it: 16 of 16 live refusals, under
+    "K O'Neill", "Batman comics", "Nemo Trilogy" and "A Death in the Family"
+    itself. The grab ignores those remote folders for the same file.
     """
     leaf = Path(path).name
     # Evaluate the *relative* path, not the flattened context string. The
@@ -12917,7 +12931,10 @@ def staged_parent_series_conflict(path, root, item):
     # yields the accurate "related subseries title tail: gluttony", while the
     # flattened form collapses to a vaguer repeated-title penalty that would
     # not distinguish a contradiction from ordinary noise.
-    for text in (relative_display_path(path, root), staged_context_filename(path, root)):
+    texts = [relative_display_path(path, root)]
+    if flattened_context:
+        texts.append(staged_context_filename(path, root))
+    for text in texts:
         if not text or text == leaf:
             continue
         details = item_match_details(text, item)
@@ -12928,6 +12945,26 @@ def staged_parent_series_conflict(path, root, item):
             if marker in penalties:
                 return f"parent folder names a different series: {text}"
     return ""
+
+
+def staged_leaf_match_details(leaf, item):
+    """Judge a staged file by the contract the grab admitted it under.
+
+    Returns (details, admitted_on_singleton_proof). The grab admits a file through
+    shared_candidate_match_details(), which accepts a title-only filename for an item
+    carrying durable single-issue proof. This check called item_match_details() alone,
+    so "Scooter Girl.cbr" was downloaded as safe and refused the moment it landed,
+    marked bad, and downloaded again from someone else. Only a proof-carrying item can
+    gain a match here; any other item, and any file item_match_details() already
+    decides, is judged exactly as before.
+    """
+    details = item_match_details(leaf, item)
+    if details.get("matched"):
+        return details, False
+    if not ((item or {}).get("singleton_issue_proof") or (item or {}).get("collected_singleton_proof")):
+        return details, False
+    shared = shared_candidate_match_details(leaf, item)
+    return (shared, True) if shared.get("matched") else (details, False)
 
 
 def staged_match_details(path, root, item):
@@ -12941,12 +12978,14 @@ def staged_match_details(path, root, item):
             "penalties": [weak_guard],
             "weak_filename_guard": True,
         }
-    leaf_details = item_match_details(leaf, item)
+    leaf_details, singleton_leaf = staged_leaf_match_details(leaf, item)
     if leaf_details.get("matched"):
         # Read the parent before trusting the leaf. A folder that explicitly
         # names a different series outranks a leaf that merely looks right --
         # otherwise the more specific claim never gets read at all.
-        parent_conflict = staged_parent_series_conflict(path, root, item)
+        parent_conflict = staged_parent_series_conflict(
+            path, root, item, flattened_context=not singleton_leaf
+        )
         if parent_conflict:
             penalties = list(leaf_details.get("penalties") or [])
             penalties.append(parent_conflict)
