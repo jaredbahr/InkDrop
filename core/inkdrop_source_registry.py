@@ -438,6 +438,44 @@ def apply_provider_health_to_row(row, provider_health_map=None):
     return row
 
 
+def blocking_health_provider_id(row_or_job):
+    """The provider whose health row parked this registry row or source job.
+
+    A concrete lane's health_provider_ids are [parent, download client,
+    indexer] -- a usenet Prowlarr lane waits on SABnzbd by design and a torrent
+    lane on qBittorrent -- and apply_provider_health_to_row() above has already
+    picked the offending row out of that list. Reported downstream so a park
+    can name what actually blocked it instead of naming the source.
+
+    Deliberately narrow: only a health-gate park answers. provider_health also
+    carries the first HEALTHY row found when nothing is wrong, so without the
+    provider_health_problem gate this would confidently name a provider that is
+    fine. A park that came from a lane's own fetch rather than from the health
+    gate returns "" and keeps the wording it had.
+    """
+    row_or_job = row_or_job if isinstance(row_or_job, dict) else {}
+    if not row_or_job.get("provider_health_problem"):
+        return ""
+    health = row_or_job.get("provider_health")
+    health = health if isinstance(health, dict) else {}
+    return inkdrop_sources.provider_key(health.get("provider_id"))
+
+
+def blocking_health_provider_ids(rows_or_jobs):
+    """Ordered, de-duplicated blocking providers across several lanes.
+
+    Arrival order is the registry's own priority order, so the first name is
+    the one blocking the highest-priority lane -- the provider the operator
+    should look at first.
+    """
+    out = []
+    for row_or_job in rows_or_jobs or []:
+        provider_id = blocking_health_provider_id(row_or_job)
+        if provider_id and provider_id not in out:
+            out.append(provider_id)
+    return out
+
+
 def source_order_from_snapshot(snapshot):
     values = _setting_value_map(snapshot)
     raw = values.get(SOURCE_ORDER_SETTING_KEY)

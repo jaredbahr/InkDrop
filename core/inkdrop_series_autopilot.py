@@ -40,6 +40,7 @@ from core import inkdrop_runtime_config
 from core import inkdrop_series_eligibility
 from core import inkdrop_internal_jobs
 from core import inkdrop_slskd_refusal_vocabulary
+from core import inkdrop_sources
 
 try:
     from core import inkdrop_state
@@ -10721,6 +10722,56 @@ def slskd_provider_wait_result_reason(row):
     return reason
 
 
+def _extend_provider_wait_provider_ids(target, carrier):
+    """Collect the blocking-provider attribution a plan or job result carries.
+
+    Order is the registry's priority order the carriers arrived in, so the
+    first name is the blocker of the highest-priority lane; duplicates are
+    dropped because one outage parks every lane that depends on it.
+    """
+    out = target.setdefault("provider_wait_provider_ids", [])
+    carrier = carrier if isinstance(carrier, dict) else {}
+    for value in carrier.get("health_blocking_provider_ids") or []:
+        provider_id = str(value or "").strip().lower()
+        if provider_id and provider_id not in out:
+            out.append(provider_id)
+
+
+def provider_wait_park_reason(source, payload):
+    """Name the provider whose health actually parked this row.
+
+    Each concrete lane plan carries health_provider_ids=[prowlarr, <download
+    client>, <indexer>], so a usenet Prowlarr lane waits on SABnzbd's health by
+    design. This used to be a constant naming the SOURCE, which reads to an
+    operator as "Prowlarr is waiting" while Prowlarr's own health row says
+    healthy -- on the 2026-09-13 production snapshot that was every park there
+    was, all of them on sabnzbd or qbittorrent.
+
+    Where the pipeline knows which health row blocked, it is named here. Where
+    it does not -- a park from a lane's own fetch, or a plan with no job
+    attribution -- the original wording stands rather than a guess: a park
+    labelled with the wrong provider is worse than one labelled with none.
+    """
+    label = public_source_name(source) or source
+    blockers = []
+    if isinstance(payload, dict):
+        for value in payload.get("provider_wait_provider_ids") or []:
+            name = inkdrop_sources.provider_label(value)
+            if name and name not in blockers:
+                blockers.append(name)
+    if not blockers:
+        return f"{label} source worker is waiting on provider health"
+    if len(blockers) == 1:
+        return f"{label} source worker is waiting on {blockers[0]} health"
+    # Bounded on purpose: this string lands in download_tasks.failure_reason and
+    # in the attempt's reason, and a pass where every lane has its own unhealthy
+    # indexer would otherwise write a provider list the width of the registry.
+    shown = ", ".join(blockers[:3])
+    if len(blockers) > 3:
+        shown = f"{shown} and {len(blockers) - 3} more"
+    return f"{label} source worker is waiting on provider health: {shown}"
+
+
 def source_no_row_result_attempt_status(source, payload, row_count=0):
     source = str(source or "").strip().lower()
     if source not in {"prowlarr", "rss", "comicscodes", "slskd", "mangadex"} or not isinstance(payload, dict):
@@ -10767,7 +10818,7 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
                 return {
                     "status": "provider_wait",
                     "lifecycle_phase": "provider_wait",
-                    "reason": "Prowlarr source worker is waiting on provider health",
+                    "reason": provider_wait_park_reason("prowlarr", payload),
                 }
         actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
         reviews = result_review_rows(payload)
@@ -10946,7 +10997,7 @@ def source_no_row_result_attempt_status(source, payload, row_count=0):
             return {
                 "status": "provider_wait",
                 "lifecycle_phase": "provider_wait",
-                "reason": f"{public_source_name(source) or source} source worker is waiting on provider health",
+                "reason": provider_wait_park_reason(source, payload),
             }
         missing = int(payload.get("missing_candidates") or 0)
         attempted = int(payload.get("attempted_total") or 0)
@@ -11053,6 +11104,7 @@ def source_worker_row_result_payload(payload, item):
         "missing_candidates": 0,
         "attempted_total": 0,
         "provider_wait_count": 0,
+        "provider_wait_provider_ids": [],
         "blocked_candidate_count": 0,
         "source_worker_schedule_plan_count": len(plans),
         "provider_results": [],
@@ -11099,6 +11151,7 @@ def source_worker_row_result_payload(payload, item):
             )
             if result_status in {"provider_wait", "provider_unavailable"}:
                 projected["provider_wait_count"] += 1
+                _extend_provider_wait_provider_ids(projected, job_result)
             elif result_status == "searched_no_candidates":
                 projected["missing_candidates"] += 1
             elif result_status == "blocked":
@@ -11113,6 +11166,7 @@ def source_worker_row_result_payload(payload, item):
         plan_status = str(plan.get("status") or "").strip().lower()
         if plan_status in {"provider_wait", "provider_unavailable", "waiting_for_retry"}:
             projected["provider_wait_count"] += 1
+            _extend_provider_wait_provider_ids(projected, plan)
         elif plan_status in {"no_ready_jobs", "waiting", "cooldown"}:
             projected["missing_candidates"] += 1
         elif plan_status in {"blocked", "blocked_no_jobs", "no_jobs"}:
@@ -12172,6 +12226,9 @@ def prowlarr_source_worker_payload_to_result(payload, series, source="prowlarr")
     missing_candidates = 0
     safe_candidates = 0
     provider_wait = 0
+    # The aggregate is what a caller with no queue id reads back, so it carries
+    # the same blocking-provider attribution the per-row projection collects.
+    provider_wait_attribution = {"provider_wait_provider_ids": []}
     blocked = 0
     selected_queue_ids = []
     budget_skipped = []
@@ -12193,6 +12250,7 @@ def prowlarr_source_worker_payload_to_result(payload, series, source="prowlarr")
                 schedule_blocked_count += 1
             elif plan_status in {"provider_wait", "provider_unavailable"}:
                 schedule_provider_wait_count += 1
+                _extend_provider_wait_provider_ids(provider_wait_attribution, plan)
             elif plan_status in {"no_ready_jobs", "waiting", "cooldown"}:
                 schedule_no_ready_count += 1
     for run in source_worker_result_runs(payload):
@@ -12210,6 +12268,8 @@ def prowlarr_source_worker_payload_to_result(payload, series, source="prowlarr")
             result_status = str(job_result.get("result_status") or "").strip().lower()
             if result_status in {"searched_no_candidates", "unknown"}:
                 missing_candidates += 1
+            elif result_status in {"provider_wait", "provider_unavailable"}:
+                _extend_provider_wait_provider_ids(provider_wait_attribution, job_result)
             for attempt in job_result.get("attempts") or []:
                 if not isinstance(attempt, dict):
                     continue
@@ -12243,6 +12303,7 @@ def prowlarr_source_worker_payload_to_result(payload, series, source="prowlarr")
         "attempted_total": attempted_total,
         "safe_candidates": safe_candidates,
         "provider_wait_count": provider_wait,
+        "provider_wait_provider_ids": list(provider_wait_attribution["provider_wait_provider_ids"]),
         "blocked_candidate_count": blocked,
         "budget_skipped_count": len(budget_skipped),
         "source_worker_schedule_plan_count": schedule_plan_count,

@@ -2370,6 +2370,14 @@ def _classify_queue_plan(
             "blocker": "provider outage/provider wait",
             "next_action": wait_reason,
             "selected_jobs": [],
+            # Carried so the park this plan becomes can name the health row
+            # that blocked it. The plan itself is all the autopilot's row
+            # projection sees -- the jobs stay here -- so without this the
+            # attribution the registry already made is lost by the time a
+            # reason is written.
+            "health_blocking_provider_ids": inkdrop_source_registry.blocking_health_provider_ids(
+                provider_wait_jobs
+            ),
         }
     if cooled_jobs:
         provider_id = _job_provider_id(cooled_jobs[0])
@@ -2411,6 +2419,9 @@ def _classify_queue_plan(
             "blocker": "provider outage/provider wait",
             "next_action": reasons[0] if reasons else "Provider health is limiting this source.",
             "selected_jobs": [],
+            "health_blocking_provider_ids": inkdrop_source_registry.blocking_health_provider_ids(
+                provider_wait_jobs
+            ),
         }
     if operator_jobs:
         return {

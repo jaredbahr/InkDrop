@@ -2369,6 +2369,12 @@ def run_source_job(
         result["result_status"] = job.get("job_status")
         result["reason"] = job.get("reason") or "source_job_not_executable"
         if job.get("job_status") == "provider_wait":
+            # Same fact the scheduler plan carries, on the other road into the
+            # autopilot: a job run for an explicitly requested provider comes
+            # back through job_results, not through a plan.
+            blocking = registry.blocking_health_provider_ids([job])
+            if blocking:
+                result["health_blocking_provider_ids"] = blocking
             result["attempts"] = [
                 _source_worker_attempt_for_job(
                     job,
