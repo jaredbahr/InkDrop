@@ -377,6 +377,47 @@ def _issue_number_inside_run(issue_number, issue_run):
     return low <= int(candidate.group(1)) <= high
 
 
+# A folder bracket that states how many issues the pack holds, optionally after
+# the year: "(2006 - 6 Issues)", "(6 issues)", "(2019 - 12 Issues)". A year RANGE
+# such as "(2017-2018)" deliberately does NOT match -- nothing follows it that
+# names a count -- which is what keeps the White Knight mis-import blocked.
+PACK_COUNT_ANNOTATION_RE = re.compile(
+    r"^\s*(?:(?:19|20)\d{2}\s*[-\u2013]\s*)?(\d{1,4})\s+issues?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _pack_count_covers_issue(group, issue_number):
+    """True only when the bracket states a pack SIZE the wanted issue fits inside.
+
+    Ancestor folder segments keep a blanket "any bracket is untrusted" rule,
+    because a bracket standing on a parent directory usually names something the
+    pack does not contain. An issue COUNT is the exception: it describes the
+    pack itself, so "Mouse Guard (2006 - 6 Issues)" holding issue 4 is naming
+    this book, not another one.
+
+    Deliberately incapable of a wrong "you have it". Three things must hold, and
+    any of them failing refuses: the group must state an explicit issue count,
+    the wanted issue must be a plain integer, and it must fall within the count.
+    An issue we cannot parse, or one above the stated size, keeps blocking --
+    a wrong satisfaction costs the book silently, a wrong refusal costs a retry.
+    """
+
+    match = PACK_COUNT_ANNOTATION_RE.match(str(group or ""))
+    if not match:
+        return False
+    try:
+        count = int(match.group(1))
+    except (TypeError, ValueError):
+        return False
+    if count <= 0:
+        return False
+    wanted = re.match(r"^0*(\d+)$", str(issue_number or "").strip())
+    if not wanted:
+        return False
+    return 1 <= int(wanted.group(1)) <= count
+
+
 # The bare form, kept as the vocabulary's EXACT entry because it is already
 # written into the record: 48,768 rows across source_attempts, history_events,
 # download_tasks and bad_source_candidates carry it verbatim. classify() falls
@@ -692,7 +733,14 @@ def related_subseries_source_blocker(
                 pass
             elif segment_index > 0:
                 unexplained = re.search(r"[\[(]([^\[\]()]+)[\])]", tail_text)
-                if unexplained:
+                # ...except a bracket that states the pack's SIZE, which describes
+                # this pack rather than naming another book. Measured 2026-09-13:
+                # 43 slskd units were refused for their own release folder's
+                # "(2006 - 6 Issues)" while the correct file sat in staging, and
+                # the queue row went back to re-probing Soulseek for it.
+                if unexplained and not _pack_count_covers_issue(
+                    unexplained.group(1), issue_number
+                ):
                     return untrusted_publication_suffix_reason(
                         unexplained.group(1), in_path_segment=True
                     )
