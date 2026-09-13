@@ -7233,10 +7233,15 @@ def inkdrop_series_targets(series_filter=None):
         # to tell a genuine one-shot/graphic-novel comic (exactly one issue)
         # apart from issue 1 of an ongoing run, and a per-row count(*) here
         # would turn this into an O(series) query fan-out.
-        issue_counts = {
-            row["series_id"]: int(row["issue_count"] or 0)
-            for row in conn.execute("select series_id, count(*) as issue_count from issues group by series_id")
-        }
+        issue_counts = {}
+        single_issue_numbers = {}
+        for row in conn.execute(
+            "select series_id, count(*) as issue_count, min(issue_number) as only_issue_number "
+            "from issues group by series_id"
+        ):
+            issue_counts[row["series_id"]] = int(row["issue_count"] or 0)
+            if issue_counts[row["series_id"]] == 1:
+                single_issue_numbers[row["series_id"]] = str(row["only_issue_number"] or "").strip()
     except sqlite3.Error:
         return []
     finally:
@@ -7290,6 +7295,7 @@ def inkdrop_series_targets(series_filter=None):
                 "target_source": "inkdrop_series",
                 "aliases": [normalize(alias) for alias in aliases if normalize(alias)],
                 "canonical_issue_count": issue_counts.get(row["id"], 0),
+                "canonical_single_issue_number": single_issue_numbers.get(row["id"]) or None,
             }
         )
     return targets
@@ -8217,6 +8223,26 @@ def trusted_issue_missing_source_number_is_safe(path, target, trusted_issue, com
     if manga_singleton and not filename_year_matches(path, target):
         return False
     return True
+
+
+def catalog_single_issue_hint(path, target):
+    """The catalog's one issue number for a title-only file of a single-issue comic, or None.
+
+    The staging sweep passes a unit number only when it can parse one off the filename
+    (--source-issue-hint), and a graphic novel's filename has none, so every copy of
+    "Batman - A Death in the Family.cbr" was refused and parked in Manual Review, on
+    every pass. A work with one issue has one unit and the catalog knows its number.
+    It is used with a filename hint's authority, never a queue's: only when the file
+    names no unit of its own and passes the single-issue exemption's own checks.
+    """
+    if not isinstance(target, dict) or is_manga_target(target):
+        return None
+    number = str(target.get("canonical_single_issue_number") or "").strip()
+    if not number or format_issue_number(number) != "001":
+        return None
+    if not trusted_issue_missing_source_number_is_safe(path, target, number):
+        return None
+    return number
 
 
 def trusted_issue_mismatch_reason(path, trusted_issue, target=None, comicinfo=None):
@@ -9958,6 +9984,19 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 continue
             if matched_only and not target:
                 continue
+            # Per file: `trusted_issue` belongs to the whole run, and a hint for one
+            # staged file must not carry over to the next.
+            file_trusted_issue = trusted_issue
+            file_trusted_issue_is_queue_derived = trusted_issue_is_queue_derived
+            single_issue_hint = (
+                catalog_single_issue_hint(path, target)
+                if kind == "comics" and target and not collection and trusted_issue in (None, "")
+                else None
+            )
+            if single_issue_hint:
+                file_trusted_issue = single_issue_hint
+                file_trusted_issue_is_queue_derived = False
+                target = {**target, "issue_number": single_issue_hint, "normalized_number": single_issue_hint}
             target_dir = comic_import_target_dir(target) if kind == "comics" and target else dest_dir
             unsafe_match_reason = unsafe_comic_target_match_reason(path, target) if kind == "comics" and target and not collection else None
             if unsafe_match_reason and human_override("unsafe_comic_target_match_reason", unsafe_match_reason, path=path):
@@ -10014,7 +10053,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     target.get("title"),
                     path,
                     issue_title=target.get("issue_title"),
-                    issue_number=trusted_issue or target.get("issue_number") or target.get("normalized_number"),
+                    issue_number=file_trusted_issue or target.get("issue_number") or target.get("normalized_number"),
                     publisher=target.get("publisher"),
                 )
                 if kind == "comics" and target and not collection
@@ -10045,8 +10084,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     path,
                     target,
                     kind,
-                    trusted_issue=trusted_issue,
-                    trusted_issue_is_queue_derived=trusted_issue_is_queue_derived,
+                    trusted_issue=file_trusted_issue,
+                    trusted_issue_is_queue_derived=file_trusted_issue_is_queue_derived,
                 )
                 if kind == "comics" and target and not collection
                 else {"ok": True}
@@ -10174,7 +10213,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     target,
                     suwayomi_source,
                     auto_learn=not dry_run,
-                    trusted_issue=trusted_issue,
+                    trusted_issue=file_trusted_issue,
                     exact_volume_identity=exact_volume_identity,
                 )
                 if not manga_guard.get("allowed", True):
@@ -10398,8 +10437,8 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 "matched_series_folder": target["folder"] if target else None,
                 "matched_kapowarr_id": target["id"] if target else None,
             }
-            if trusted_issue not in (None, ""):
-                event["trusted_issue"] = format_issue_number(trusted_issue) or str(trusted_issue)
+            if file_trusted_issue not in (None, ""):
+                event["trusted_issue"] = format_issue_number(file_trusted_issue) or str(file_trusted_issue)
             event.update(target_identity_fields(target))
             if collection:
                 event["truth_model"] = COLLECTION_TRUTH_MODEL
