@@ -5570,6 +5570,29 @@ def upsert_series(con, row, now):
         "site_url",
         "site_detail_url",
         "knownIssues",
+        # A PER-SERIES OVERRIDE IS THE USER SPEAKING, AND A SYNC IS NOT A
+        # RETRACTION. These live only in raw_json, so before this line every
+        # one of them was erased by the next `sync_watches()`/`sync_queue()`
+        # pass -- measured through the shipping setters and this function:
+        # set to "chapter", re-synced, read back as absent, and the consumer
+        # then reads "" and applies the provider default, which is exactly
+        # the series the user overrode BECAUSE the default was wrong for it.
+        #
+        # `media_type_override` is deliberately NOT here. Its record is lost
+        # the same way, but its EFFECT is held by the media_type /
+        # media_type_source='user' columns, which this upsert already
+        # honours, so carrying it would change nothing a reader could see.
+        # Two of the three are lost in effect; claiming three would overstate it.
+        #
+        # The asymmetry above applies unchanged: a payload that SUPPLIES an
+        # override still wins, so an override stays clearable through the
+        # sync path. Only silence is treated as silence.
+        "manga_unit_model_override",
+        "manga_unit_model_override_set_at",
+        "manga_unit_model_override_set_at_iso",
+        "edition_indifferent_override",
+        "edition_indifferent_override_set_at",
+        "edition_indifferent_override_set_at_iso",
     ):
         if key not in row_raw and key in existing_raw:
             row_raw[key] = existing_raw.get(key)
