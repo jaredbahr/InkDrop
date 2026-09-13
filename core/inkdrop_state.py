@@ -27247,7 +27247,12 @@ def persist_series_folder_identity(db_path, work_id, series_folder, *, library_t
             (normalized_library, normalized_folder, work_id),
         ).fetchone()
         if collision:
-            return {"ok": False, "reason": "canonical_series_folder_collision", "conflicting_work_id": collision["work_id"]}
+            return {
+                "ok": False,
+                "reason": "canonical_series_folder_collision",
+                "conflicting_work_id": collision["work_id"],
+                "claimed_series_folder": series_folder,
+            }
         con.execute(
             "insert into canonical_library_identities(work_id,library_type,series_folder,normalized_library_type,normalized_series_folder,created_at,updated_at,review_reason) values(?,?,?,?,?,?,?,?)",
             (work_id, str(library_type or "unknown"), series_folder, normalized_library, normalized_folder, now, now, established_review_reason),
@@ -27491,6 +27496,18 @@ def media_management_manga_unit_policy(row):
     }
 
 
+def persisted_series_folder_on_disk(root, series_folder):
+    """True when a locked series folder exists as a directory under the library root."""
+    root_text = str(root or "").strip().replace("\\", "/").rstrip("/")
+    folder = inkdrop_library_identity.relative_series_folder(series_folder)
+    if not root_text or not folder:
+        return False
+    try:
+        return Path(posixpath.join(root_text, folder)).is_dir()
+    except OSError:
+        return False
+
+
 def media_management_destination_preview(db_path, row, *, source_path=None, dest_path=None, settings=None, check_storage=True):
     row = row if isinstance(row, dict) else {}
     settings = settings if isinstance(settings, dict) else media_management_settings_context(db_path)
@@ -27581,8 +27598,22 @@ def media_management_destination_preview(db_path, row, *, source_path=None, dest
         colon_replacement=colon_replacement,
     )
     persisted_folder = str(persisted_identity.get("series_folder") or "").strip()
+    proposed_series_folder = series_folder
     folder_decision = inkdrop_library_identity.stable_folder_decision(series_folder, persisted_folder)
     series_folder = folder_decision["series_folder"]
+    if "/" in series_folder and boolish(check_storage, True) and not persisted_series_folder_on_disk(root, series_folder):
+        # A nested lock only ever comes from where a work's files already were.
+        # If that folder is gone, honouring the lock would rebuild an abandoned
+        # tree, so plan the proposed folder instead and let the lock check in
+        # persist_series_folder_identity() stop the import for review.
+        folder_decision = {
+            **folder_decision,
+            "series_folder": proposed_series_folder,
+            "persisted_nested_folder_missing": True,
+            "operator_review_required": True,
+            "reason": "persisted_nested_folder_missing",
+        }
+        series_folder = proposed_series_folder
     filename_stem = media_management_sanitize_component(
         raw_filename_stem,
         replace_illegal=replace_illegal,

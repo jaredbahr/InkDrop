@@ -7968,6 +7968,50 @@ def media_management_planned_destination_gates(planned, preview, decision, *, se
     return None
 
 
+def canonical_identity_block_review_detail(preview, decision):
+    """The sentence a blocked-import review row shows, naming the check that refused it.
+
+    The row used to show the preview's next_action. For a block that came from
+    the folder lock that was "Would import to <path>" or "Conflict at target",
+    which describes an import that did not happen and never says what refused
+    it. The reason code always ends the sentence so the row can be searched.
+    """
+    preview = preview if isinstance(preview, dict) else {}
+    decision = decision if isinstance(decision, dict) else {}
+    reason = str(decision.get("reason") or "").strip() or "canonical_identity_blocked"
+    persistence = preview.get("series_folder_persistence")
+    persistence = persistence if isinstance(persistence, dict) else {}
+    planned_folder = str(preview.get("series_folder") or "").strip()
+    if reason == "canonical_series_folder_collision":
+        folder = str(persistence.get("claimed_series_folder") or planned_folder).strip()
+        owner = str(persistence.get("conflicting_work_id") or "another series").strip()
+        sentence = f"The folder {folder} already belongs to {owner}, so this series cannot import into it."
+    elif reason == "existing_canonical_series_folder_collision":
+        owners = ", ".join(str(item) for item in persistence.get("conflicting_work_ids") or []) or "several series"
+        sentence = f"More than one series already claims the same library folder ({owners})."
+    elif reason in {"persisted_folder_migration_requires_review", "persisted_library_classification_requires_review"}:
+        locked_folder = str(persistence.get("series_folder") or "").strip()
+        locked_type = str(persistence.get("library_type") or "").strip()
+        if reason == "persisted_library_classification_requires_review":
+            sentence = f"This series is locked to the {locked_type or 'other'} library, not the one this import would use."
+        else:
+            sentence = f"This series is locked to the folder {locked_folder or 'recorded for it'}, but this import would have used {planned_folder or 'a different folder'}."
+    elif reason == "established_folder_split_requires_review":
+        candidates = ", ".join(str(item) for item in persistence.get("candidate_folders") or [])
+        sentence = f"This series' files are split evenly across folders ({candidates}), so no folder can be chosen."
+    elif reason == "canonical_series_folder_recompute_failed":
+        sentence = "The folder this series owns changed, and the planned path could not be moved onto it."
+    elif reason in {"blocked_work_identity", "blocked_library_classification", "blocked_unit_identity"}:
+        # These three come from the preview itself, whose next_action already
+        # says what to resolve.
+        sentence = str(preview.get("next_action") or "").strip() or "InkDrop could not settle where this file belongs."
+    else:
+        sentence = "InkDrop could not claim a library folder for this series."
+    if not sentence.endswith("."):
+        sentence = f"{sentence}."
+    return f"{sentence} Refused by {reason}."
+
+
 def media_management_import_destination_decision(target=None, event=None, source_path=None, legacy_dest=None, kind="comics", settings=None):
     settings = settings if isinstance(settings, dict) else {}
     legacy = Path(legacy_dest) if legacy_dest else None
@@ -10713,7 +10757,9 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                             "native_series_id": target.get("native_series_id") if target else None,
                             "source_unit": event.get("source_unit"),
                             "canonical_unit_identity": (media_preview or {}).get("canonical_unit_identity"),
-                            "detail": (media_preview or {}).get("next_action") or destination_decision.get("reason"),
+                            "block_reason": destination_decision.get("reason"),
+                            "series_folder_persistence": (media_preview or {}).get("series_folder_persistence"),
+                            "detail": canonical_identity_block_review_detail(media_preview, destination_decision),
                             "note": "InkDrop could not establish a durable work, library, or unit identity for this file and needs a human decision before it can be renamed/placed.",
                         },
                         db_path=INKDROP_STATE_DB,

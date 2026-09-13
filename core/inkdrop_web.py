@@ -16979,7 +16979,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       comic_archive_regrab_needed: {label: "Damaged archive", why: "The archive is damaged or incomplete and cannot be imported as-is."},
       pack_import_bad_archive: {label: "Damaged pack archive", why: "The pack archive is damaged or incomplete and cannot be unpacked."},
       source_target_identity_mismatch: {label: "Filename contradicts the series", why: "The filename and path do not match the series InkDrop matched this to."},
-      import_blocked_canonical_identity: {label: "No trusted issue identity", why: "The file does not carry an issue or chapter identity InkDrop can trust."},
+      import_blocked_canonical_identity: {label: "Could not settle where this file belongs", why: "InkDrop could not settle which series, library folder, or issue this file belongs to, so it did not place it."},
       weak_filename_import_guard: {label: "Filename does not prove the issue", why: "The filename does not prove which issue or chapter this is."},
       weak_filename_unit_evidence: {label: "Filename does not prove the issue", why: "The filename starts with a bare number and never says issue, chapter or volume."},
       pack_candidate_requires_pack_handling: {label: "Looks like a pack, not one issue", why: "The filename reads as a pack or a range of issues, so it needs pack review rather than a single-issue import."},

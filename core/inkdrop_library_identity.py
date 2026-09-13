@@ -89,19 +89,52 @@ def canonical_filename(series_title, unit, extension=".cbz"):
     return f"{series} {labels[unit_type]}{ext.lower()}"
 
 
+def relative_series_folder(value):
+    """A locked series folder as a path under the library root, or "" when it is not one.
+
+    A lock is usually one folder name, but the first lock for a work is seeded
+    from where its files already are, and that can be nested one level down:
+    "Daytripper (2010)/Volume 01 (2010)". Keeping only the last component of
+    that turned it into "Volume 01 (2010)", a folder directly under the root
+    that the work never owned. An absolute path, a drive, or an empty, "." or
+    ".." component is never a folder under the root, so it is not returned.
+    """
+    text = str(value or "").strip().replace("\\", "/")
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:(/|$)", text):
+        return ""
+    segments = text.split("/")
+    if any(not segment.strip() or segment.strip() in {".", ".."} for segment in segments):
+        return ""
+    return text
+
+
 def stable_folder_decision(proposed_folder, persisted_folder=None, reader_observed_folder=None):
     proposed = Path(str(proposed_folder or "Unknown")).name
-    persisted = Path(str(persisted_folder or "")).name if persisted_folder else ""
+    persisted_text = str(persisted_folder or "").strip()
+    persisted = relative_series_folder(persisted_text) if persisted_text else ""
+    # A lock that is not a folder under the root is not used to build a path.
+    # The proposed folder is planned instead, and persist_series_folder_identity()
+    # refuses it against the stored lock, so the import stops for review.
+    persisted_invalid = bool(persisted_text and not persisted)
     observed = Path(str(reader_observed_folder or "")).name if reader_observed_folder else ""
     selected = persisted or observed or proposed
     drift = bool(persisted and proposed and persisted.casefold() != proposed.casefold())
     collision = bool(persisted and observed and persisted.casefold() != observed.casefold())
+    if persisted_invalid:
+        reason = "persisted_folder_not_relative"
+    elif persisted:
+        reason = "persisted_folder_identity"
+    elif observed:
+        reason = "reader_observed_folder"
+    else:
+        reason = "initial_folder_identity"
     return {
         "series_folder": selected,
         "persisted": bool(persisted),
+        "persisted_folder_invalid": persisted_invalid,
         "metadata_drift": drift,
-        "operator_review_required": collision,
-        "reason": "persisted_folder_identity" if persisted else "reader_observed_folder" if observed else "initial_folder_identity",
+        "operator_review_required": collision or persisted_invalid,
+        "reason": reason,
     }
 
 
