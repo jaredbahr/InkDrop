@@ -553,8 +553,8 @@
     },
     {
       "path": "core/inkdrop_slskd_staging_sweep.py",
-      "sha256": "bbf33b9c1ba45111dd54d6f7aa1df130f81eec040b293dc4e8552c8188a94bc6",
-      "size_bytes": 29995
+      "sha256": "b436173c5de3f389dd80fac18d14ee9be97843474bd83bb122c63ed2da49ac98",
+      "size_bytes": 31256
     },
     {
       "path": "core/inkdrop_source_catalog.py",
@@ -2024,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "cbc00fc849ccf6b4f17acf5c98dd4b6e1e883656",
-  "total_size_bytes": 21366514
+  "source_commit": "cc67fcf9f82158d7bd969978374498ec2c35185a",
+  "total_size_bytes": 21367775
 }

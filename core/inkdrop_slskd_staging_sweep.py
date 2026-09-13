@@ -118,6 +118,15 @@ MISSING_STAGE_PRIORITY_LOOKBACK_SECONDS = int(
 )
 ARCHIVE_EXT = {".cbz", ".cbr", ".zip", ".pdf"}
 CHECKPOINT_MAX_AGE_SECONDS = int(os.environ.get("INKDROP_SLSKD_SWEEP_CHECKPOINT_MAX_AGE_SECONDS", 7 * 24 * 3600))
+# A checkpoint records a decision, and the decision belongs to the code that made it.
+# When a change lets the importer decide a refusal differently, name that refusal here
+# under a new contract: files refused for it are judged once more by the new code
+# instead of waiting out CHECKPOINT_MAX_AGE_SECONDS. Every other checkpoint, and every
+# import, keeps its age. 2026-09-13: title-only files of single-issue works stopped being
+# refused as weak filename evidence, and 25 of them sat in Manual Review on week-old
+# refusals.
+CHECKPOINT_CONTRACT = "2026-09-13-single-issue-title-only"
+CHECKPOINT_REJUDGED_REASONS = frozenset({"weak_filename_unit_evidence", "filename_confidence_too_low"})
 # A folder of loose scan pages (no archive at all -- real example: a peer
 # sharing 43 numbered .png pages with no .cbz/.cbr anywhere) is invisible to
 # every check above; ARCHIVE_EXT never matches a bare .png/.jpg. Converting
@@ -210,6 +219,9 @@ def ensure_checkpoint_table(con):
         )
         """
     )
+    columns = {row[1] for row in con.execute("pragma table_info(slskd_staging_scan_checkpoint)")}
+    if "contract" not in columns:
+        con.execute("alter table slskd_staging_scan_checkpoint add column contract text")
     con.execute(
         """
         create table if not exists slskd_staging_scan_error_counts (
@@ -318,9 +330,15 @@ def process_one_page_directory(path):
     return {"decision": "skipped", "reason": result.get("reason") or "not_convertible", "dest": result.get("dest")}
 
 
+def checkpoint_outlived_its_decision(decision, reason, contract):
+    return decision == "skipped" and reason in CHECKPOINT_REJUDGED_REASONS and contract != CHECKPOINT_CONTRACT
+
+
 def load_checkpoints(con):
-    rows = con.execute("select path, size, mtime, checked_at from slskd_staging_scan_checkpoint").fetchall()
-    return {(r[0], r[1], r[2]): r[3] for r in rows}
+    rows = con.execute(
+        "select path, size, mtime, checked_at, decision, reason, contract from slskd_staging_scan_checkpoint"
+    ).fetchall()
+    return {(r[0], r[1], r[2]): r[3] for r in rows if not checkpoint_outlived_its_decision(r[4], r[5], r[6])}
 
 
 def load_priority_paths():
@@ -538,10 +556,10 @@ def main():
                 con.execute(
                     """
                     insert or replace into slskd_staging_scan_checkpoint
-                        (path, size, mtime, decision, reason, dest, checked_at)
-                    values (?, ?, ?, ?, ?, ?, ?)
+                        (path, size, mtime, decision, reason, dest, checked_at, contract)
+                    values (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (path, image_count, mtime, result["decision"], result["reason"], result["dest"], time.time()),
+                    (path, image_count, mtime, result["decision"], result["reason"], result["dest"], time.time(), CHECKPOINT_CONTRACT),
                 )
                 con.commit()
 
@@ -637,10 +655,10 @@ def main():
         con.execute(
             """
             insert or replace into slskd_staging_scan_checkpoint
-                (path, size, mtime, decision, reason, dest, checked_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+                (path, size, mtime, decision, reason, dest, checked_at, contract)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (path, size, mtime, result["decision"], result["reason"], result["dest"], time.time()),
+            (path, size, mtime, result["decision"], result["reason"], result["dest"], time.time(), CHECKPOINT_CONTRACT),
         )
         con.commit()
 
