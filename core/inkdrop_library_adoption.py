@@ -116,26 +116,34 @@ def parse_comic_identity(path):
 def parse_manga_identity(path):
     """Best-effort (series_title, volume_number|chapter_number) guess for one manga file."""
     stem = Path(path).stem
-    parent = Path(path).parent.name
-    haystack = f"{stem} {parent}"
+    # UNIT MARKERS ARE READ FROM THE FILE, NEVER FROM ITS FOLDER. This used to
+    # search `f"{stem} {parent}"`, so a library filed in volume subfolders --
+    # "Hell's Paradise (2020)/Volume 01 (2020)/Hell's Paradise #012 (2022).cbz"
+    # -- identified EVERY file under "Volume 01" as volume 1: the folder name
+    # satisfied the volume pattern before the filename was ever consulted. On
+    # the 2026-09-05 library census that collapsed 13 distinct files onto one
+    # unit, and it was caught downstream by a one-file-per-unit refusal, not
+    # here. A folder-level volume is a statement about the folder. When the
+    # stem carries no marker the honest answer is "unknown" and the adoption
+    # plan marks the file for review, which is the cheaper mistake.
     volume = None
     chapter = None
     for pattern in _MANGA_VOLUME_PATTERNS:
-        match = re.search(pattern, haystack, re.I)
+        match = re.search(pattern, stem, re.I)
         if match:
             volume = match.group(1).lstrip("0") or "0"
             break
     for pattern in _MANGA_CHAPTER_PATTERNS:
-        match = re.search(pattern, haystack, re.I)
+        match = re.search(pattern, stem, re.I)
         if match:
             chapter = match.group(1)
             break
-    cut = len(haystack)
+    cut = len(stem)
     for pattern in (_MANGA_VOLUME_PATTERNS[0], _MANGA_CHAPTER_PATTERNS[0]):
-        match = re.search(pattern, haystack, re.I)
+        match = re.search(pattern, stem, re.I)
         if match:
             cut = min(cut, match.start())
-    title_guess = _strip_edition_noise(haystack[:cut]) or _strip_edition_noise(stem)
+    title_guess = _strip_edition_noise(stem[:cut]) or _strip_edition_noise(stem)
     if volume is not None:
         return {"title_guess": title_guess or None, "volume_number": volume, "unit_type": "volume"}
     if chapter is not None:
