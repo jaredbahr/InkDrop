@@ -473,8 +473,8 @@
     },
     {
       "path": "core/inkdrop_restore_quiescence.py",
-      "sha256": "2dd8af150485bde5cfbf08039d1601c4f8c37e1e4d535907c9fab493188ee9e7",
-      "size_bytes": 13937
+      "sha256": "d8ce51c15643c9d23ce82fc0cd83214c090795d56a73a82c1e31e0ff25b4459d",
+      "size_bytes": 14549
     },
     {
       "path": "core/inkdrop_review_reasons.py",
@@ -2024,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "a5f4e5dda5aa89e288088f7e7b4e8981e97bde58",
-  "total_size_bytes": 21355267
+  "source_commit": "17d0ff7dff48b59c8e630f61cad23ed11a338b44",
+  "total_size_bytes": 21355879
 }

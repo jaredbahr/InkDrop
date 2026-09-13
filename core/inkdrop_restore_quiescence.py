@@ -250,8 +250,18 @@ def probe_restore_quiescence(*, lock_dir=None, status_path=None, now=None, envir
     checked["lock_dir_exists"] = lock_dir_exists
     lock_files = []
     if lock_dir_exists:
+        # LIST WITH os.scandir, NOT Path.glob. The paragraph above is the intent
+        # and glob defeated it: CPython's pathlib wraps its own scandir in
+        # `except OSError: pass`, so a directory that cannot be listed came back
+        # as an EMPTY match, this except never fired, and the probe reported
+        # quiescent with lock_files_probed [] -- exactly the blind pass it names.
+        # os.scandir raises the OSError where the OS raises it.
         try:
-            lock_files = sorted(p for p in directory.glob("*.lock") if p.is_file())
+            with os.scandir(directory) as entries:
+                lock_files = sorted(
+                    Path(entry.path) for entry in entries
+                    if entry.name.endswith(".lock") and entry.is_file()
+                )
         except OSError as exc:
             blockers.append(
                 {
