@@ -553,6 +553,60 @@ def smoke_like_files():
     return sorted(name for name in out.stdout.splitlines() if name.strip())
 
 
+def _smoke_like_name(name):
+    """The discovery pathspecs' own shape: inkdrop-*smoke*.py / inkdrop_*smoke*.py.
+
+    Spelled without `re` because this module does not import it, and a new
+    module-level import for one predicate is more surface than the predicate.
+    """
+    low = name.lower()
+    return (low.startswith(("inkdrop-", "inkdrop_"))
+            and "smoke" in low and low.endswith(".py"))
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
+             ".pytest_cache", ".ruff_cache", "dist", "build"}
+
+
+def undiscovered_smokes(root=None):
+    """Smoke-shaped files present on disk that git does not track.
+
+    THE GUARD THAT LOOKS LIKE IT COVERS THIS IS BLIND, NOT LENIENT.
+    `MIN_SMOKE_DISCOVERY_RATIO` compares tracked_smokes() against
+    smoke_like_files(), and BOTH run `git ls-files`. An untracked file is
+    missing from the numerator AND the denominator, so the ratio stays
+    perfect however many there are. Measured on qa 3c933295: 864 tracked
+    smokes, an 866-file denominator, threshold 692 -- and adding one untracked
+    smoke to the tree moved none of the three.
+
+    So this reads the FILESYSTEM and subtracts what git tracks. It looks in the
+    two places the discovery pathspecs cover, `tests/` and the repository root,
+    which is where a new test is actually written.
+
+    Returns repository-relative POSIX paths, sorted. Never raises: a tree that
+    is not a git repository yields nothing to subtract, and the caller's job is
+    to report, not to fail.
+    """
+    root = Path(root) if root else ROOT
+    on_disk = set()
+    for base in (root / "tests", root):
+        if not base.is_dir():
+            continue
+        walk = base.rglob("*") if base != root else base.glob("*")
+        for path in walk:
+            if not path.is_file() or not _smoke_like_name(path.name):
+                continue
+            if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+                continue
+            on_disk.add(path.relative_to(root).as_posix())
+    probe = subprocess.run(
+        ["git", "ls-files", "--cached", "--", "*smoke*.py"],
+        capture_output=True, text=True, cwd=str(root),
+    )
+    if probe.returncode != 0:
+        return sorted(on_disk)
+    tracked = {line.strip() for line in probe.stdout.splitlines() if line.strip()}
+    return sorted(on_disk - tracked)
+
+
 def tracked_smokes():
     # Repo-root smoke scripts (inkdrop-*-smoke.py and inkdrop_*_smoke.py) were
     # never included here -- this glob only ever covered tests/. 8 tracked
@@ -610,6 +664,24 @@ def main():
             if len(missed) > 20:
                 print(f"    ... and {len(missed) - 20} more")
         return 1
+    # A TEST THE SUITE COULD NOT SEE IS NAMED BEFORE ANYTHING RUNS.
+    # This fires exactly when someone writes a NEW test, which is when the
+    # suite's answer matters most, and the old behaviour failed toward "clean".
+    # It is deliberately NOT a failure: an uncommitted test is the normal state
+    # of a workstation mid-edit, and reddening the suite there would train
+    # people to ignore it, which is the failure this exists to prevent. The
+    # commit hook refuses the STATE; this stops a run REPORTING CLEAN while it
+    # holds.
+    undiscovered = undiscovered_smokes()
+    if undiscovered:
+        print("")
+        print(f"present but NOT DISCOVERED ({len(undiscovered)}) -- untracked, so "
+              f"`git ls-files` never offered them and they did not run:")
+        for name in undiscovered:
+            print(f"  - {name}")
+        print("  `git add` them before treating this run as covering them.")
+        print("")
+
     failures = []             # executed, failed, qualifying -> red
     non_qualifying_fails = [] # executed, failed, quarantined lane
     unrunnable = []           # precondition missing -> never executed
@@ -697,7 +769,9 @@ def main():
     print(
         f"suite: {len(names)} discovered, {executed} executed, {passed} passed, "
         f"{len(failures)} FAILED, {len(non_qualifying_fails)} failed-non-qualifying, "
-        f"{len(unrunnable)} unrunnable, {time.time() - started:.0f}s total"
+        f"{len(unrunnable)} unrunnable, "
+        + (f"{len(undiscovered)} undiscovered, " if undiscovered else "")
+        + f"{time.time() - started:.0f}s total"
     )
 
     if unrunnable:
