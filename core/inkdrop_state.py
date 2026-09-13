@@ -48619,7 +48619,60 @@ def review_exception_row_from_record(row):
     declared_code = _clean_reason_code(raw.get("reason_code") or raw.get("reason"))
     if declared_code and not _clean_reason_code(out.get("reason_code")):
         out["reason_code"] = declared_code
+    # The codes the probe actually refused on. escalate_automation_exhausted_to_
+    # review() (core/inkdrop_series_autopilot.py) sets all three deliberately so
+    # an operator can see WHICH check refused WHAT instead of reading
+    # "Automation exhausted" and guessing, and sync_review_exceptions() keeps
+    # them in raw_json -- but this reader copies only the keys it names, so they
+    # stopped here, before any compacting: of 237 active review_exceptions rows
+    # on 2026-09-13, 12 carried all three in raw_json and 0 of the 12 came out
+    # of this function with them (`review_reason`, a key this reader does lift,
+    # came out of 237 of 237).
+    #
+    # Shape-checked rather than passed through. A writer that puts a sentence
+    # where the list belongs would otherwise ship a string, and a client that
+    # iterates it renders one "code" per character -- worse than the prose
+    # fallback this replaces, and exactly the promoting-prose-into-a-machine-
+    # slot mistake _clean_reason_code() exists to refuse just above.
+    for key in ("rejection_codes", "review_reasons"):
+        codes = _refusal_code_list(raw.get(key))
+        if codes:
+            out[key] = codes
+    counts = _refusal_reason_counts(raw.get("rejection_reason_counts"))
+    if counts:
+        out["rejection_reason_counts"] = counts
     return apply_manual_review_contract(out, contract_input={**raw, **out})
+
+
+def _refusal_code_list(value):
+    """The refusal codes in `value`, or [] when it is not a list of codes.
+
+    Empty in, empty out, on purpose: an empty codes list delivered as a fact
+    tells an operator the probe refused on nothing, which is a different claim
+    from "no refusal evidence was recorded". Restore, never invent.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(code).strip() for code in value if str(code or "").strip()]
+
+
+def _refusal_reason_counts(value):
+    """`{code: times refused}` from `value`, dropping entries that are not that.
+
+    Counts carry the weight in the UI -- "issue_number_mismatch x8" is a
+    different sentence from "issue_number_mismatch" -- so a non-integer count
+    is dropped rather than rendered, and a code with a count is never invented
+    for a code that had none.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for code, count in value.items():
+        code = str(code or "").strip()
+        if not code or isinstance(count, bool) or not isinstance(count, (int, float)):
+            continue
+        out[code] = int(count)
+    return out
 
 
 def _clean_reason_code(value):
@@ -73287,6 +73340,22 @@ MANUAL_REVIEW_COMPACT_ROW_KEYS = QUEUE_COMPACT_ROW_KEYS | {
     # so +12.6 KB and +4.2 KB per request -- which is why this is a fatter
     # row and not a detail endpoint.
     "decision_evidence",
+    # Tracker #980. The same shape of leak, one surface further along: the
+    # escalation writer records WHICH check refused WHAT and how often, and
+    # this allowlist dropped all three so only the generic reason_label
+    # ("Automation exhausted") reached either client. Both compactors read this
+    # set, so both shipped clients lost them.
+    #
+    # Not sufficient on its own and deliberately landed with the read-side lift
+    # in review_exception_row_from_record(): the keys live in raw_json, which
+    # that reader copies key by key, so widening only this set delivers
+    # nothing. Measured 282 bytes/row mean (396 max, 4 codes max) across the 12
+    # live rows that carry them, and only 12 of 237 active rows do -- mobile
+    # fetches 30 rows and desktop 10, so the worst case is +8.5 KB and +2.8 KB
+    # per request.
+    "rejection_codes",
+    "review_reasons",
+    "rejection_reason_counts",
     "revision",
     "review_id",
     "origin",
