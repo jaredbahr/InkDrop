@@ -41010,7 +41010,7 @@ def merge_mangadex_add_detail(detail, volume):
     return detail
 
 
-def add_mangadex_series(payload):
+def _add_mangadex_series_native(payload):
     payload = payload if isinstance(payload, dict) else {}
     volume = payload.get("volume") if isinstance(payload.get("volume"), dict) else payload
     manga_id = str(volume.get("mangadexId") or volume.get("mangadex_id") or volume.get("id") or "").strip()
@@ -42124,7 +42124,7 @@ def coerce_add_series_volume_payload(payload_data):
     return fallback
 
 
-def add_comic_series(payload):
+def _add_comic_series_native(payload):
     volume = coerce_add_series_volume_payload(payload)
     cv_id = int(volume.get("comicvineId") or 0)
     if not cv_id and volume.get("name"):
@@ -42465,8 +42465,6 @@ def add_comic_series(payload):
     }
 
 
-_add_mangadex_series_native = add_mangadex_series
-_add_comic_series_native = add_comic_series
 MANGA_COMPANION_INITIAL_CHAPTER_LIMIT = 100
 MANGA_COMPANION_JOBS = {}
 MANGA_COMPANION_JOBS_LOCK = threading.Lock()

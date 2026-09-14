@@ -693,8 +693,8 @@
     },
     {
       "path": "core/inkdrop_web.py",
-      "sha256": "1f34376cf3de35cf689f761fc2f64e987ab2112d0246b87d91c87a1ad90f3a5c",
-      "size_bytes": 3407585
+      "sha256": "533f4761391e028b531da6dd00017cc65121781143cfe1205a918c1d383bc358",
+      "size_bytes": 3407507
     },
     {
       "path": "core/inkdrop_web_config.py",
@@ -2024,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "f03a22f6d686337e494c0cbcf40d9803c1aeb8ed",
-  "total_size_bytes": 21375601
+  "source_commit": "5f3ac8a5be9bdd1023ed1791232eca44d937eebd",
+  "total_size_bytes": 21375523
 }
