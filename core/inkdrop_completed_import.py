@@ -7588,11 +7588,33 @@ def target_identity_fields(target):
     return out
 
 
-def _existing_file_event(kind, path, dest_path, digest, dry_run, target, collection):
+def existing_file_unit_number(dest_path, unit_number):
+    """The unit an existing-file event may claim, or None.
+
+    The event is for bytes already in the library, so the unit it names must be the one
+    the library copy is named as. The importer's own unit for this file (a queue issue
+    or a catalog/filename hint) is claimed only when the library copy's name agrees:
+    a source named 002 whose bytes sit at #001 claims nothing rather than proving #002.
+    """
+    expected = format_issue_number(unit_number) if unit_number not in (None, "") else ""
+    if not expected:
+        return None
+    present = extract_issue_number(Path(dest_path))
+    if present is None or format_issue_number(present) != expected:
+        return None
+    return expected
+
+
+def _existing_file_event(kind, path, dest_path, digest, dry_run, target, collection, unit_number=None):
     """Shared event shape for a source file already present in the library --
     via a DB `imported_files.sha256` hit or a `find_same_file()` filesystem
     probe in `import_files()`. Both callers build this identically; only
     which path actually matched (`dest_path`) differs.
+
+    Without a unit the event matched no queue item, and sync_import_status() minted a
+    title series for it: the second copy of "Batman - A Death in the Family" created
+    `title:batman a death in the family` on 2026-09-13 and parked the next copies as
+    ambiguous_series_alias.
     """
     event = {
         "kind": kind,
@@ -7607,6 +7629,9 @@ def _existing_file_event(kind, path, dest_path, digest, dry_run, target, collect
         "matched_kapowarr_id": target["id"] if target else None,
     }
     event.update(target_identity_fields(target))
+    claimed_unit = existing_file_unit_number(dest_path, unit_number) if not collection else None
+    if claimed_unit:
+        event["canonical_issue_number"] = claimed_unit
     if collection:
         event["truth_model"] = COLLECTION_TRUTH_MODEL
         event["collection"] = {
@@ -10330,7 +10355,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
             if existing:
                 existing_dest = Path(existing[0])
                 if existing_dest.exists() and (not target or existing_dest.parent == target_dir):
-                    event = _existing_file_event(kind, path, existing_dest, digest, dry_run, target, collection)
+                    event = _existing_file_event(kind, path, existing_dest, digest, dry_run, target, collection, unit_number=file_trusted_issue)
                     if kind == "comics" and target:
                         _flush_pending_write_before_slow_verification(conn)
                         archive_check = validate_comic_archive(path)
@@ -10361,7 +10386,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
             if not dry_run:
                 same_file = find_same_file(target_dir, path, digest)
                 if same_file:
-                    event = _existing_file_event(kind, path, same_file, digest, dry_run, target, collection)
+                    event = _existing_file_event(kind, path, same_file, digest, dry_run, target, collection, unit_number=file_trusted_issue)
                     if kind == "comics" and target:
                         _flush_pending_write_before_slow_verification(conn)
                         archive_check = validate_comic_archive(path)

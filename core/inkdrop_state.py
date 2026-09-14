@@ -37334,6 +37334,49 @@ def collapse_import_status_adapter_series(con, now):
     return collapsed
 
 
+def import_event_catalog_series_id(con, row):
+    """The catalog series an existing-file import event names by its own identity, or None.
+
+    An existing-file event (bytes already in the library) that matched no queue item used
+    to be given a series built from its title alone, even when it named its series. The second copy of
+    "Batman - A Death in the Family" carried native_series_id comicvine:25187 and still
+    created `title:batman a death in the family`. Only a series the catalog already
+    holds is returned; an unknown id invents nothing.
+    """
+    row = row if isinstance(row, dict) else {}
+    candidates = [str(row.get("native_series_id") or "").strip()]
+    provider = str(row.get("metadata_provider") or "").strip().lower()
+    metadata_id = str(row.get("metadata_id") or "").strip()
+    if provider and metadata_id:
+        candidates.append(metadata_identity_format(provider, metadata_id))
+    comicvine_id = str(row.get("comicvine_id") or "").strip()
+    if comicvine_id:
+        candidates.append(metadata_identity_format("comicvine", comicvine_id))
+    for candidate in candidates:
+        if candidate and con.execute("select 1 from series where id=? limit 1", (candidate,)).fetchone():
+            return candidate
+    return None
+
+
+def import_event_catalog_issue_id(con, series_id, row):
+    """The catalog issue an unmatched import event proves, or None; never creates one.
+
+    By the event's own number when it has one, else the series' only issue. Anything
+    ambiguous binds no issue: an issue invented here with an empty number would give a
+    one-issue work a second issue and break its single-issue proof.
+    """
+    row = row if isinstance(row, dict) else {}
+    number = row.get("canonical_issue_number") or row.get("normalized_number") or row.get("issue")
+    if number not in (None, ""):
+        rows = con.execute(
+            "select id from issues where series_id=? and (normalized_number=? or issue_number=?) limit 2",
+            (series_id, normalize_issue_number(number), str(number)),
+        ).fetchall()
+    else:
+        rows = con.execute("select id from issues where series_id=? limit 2", (series_id,)).fetchall()
+    return rows[0]["id"] if len(rows) == 1 else None
+
+
 def sync_import_status(con, state_dir, now, data=None, finalize=True):
     if data is None:
         data = read_json(Path(state_dir) / "import-status.json", {})
@@ -37370,24 +37413,34 @@ def sync_import_status(con, state_dir, now, data=None, finalize=True):
         queue_match = find_queue_for_import(con, row, None, None)
         queue_id = queue_match["id"] if queue_match else None
         wanted_id = queue_match["wanted_id"] if queue_match else None
+        catalog_series_id = None
         if queue_match:
             series_id = queue_match["series_id"]
             issue_id = queue_match["issue_id"]
         else:
-            series_payload = {
-                "series": row.get("matched_series"),
-                "kapowarr_id": row.get("matched_kapowarr_id"),
-                "source": "import_status",
-            }
-            try:
-                series_id = upsert_series(con, series_payload, now)
-            except SeriesIdentityTombstoneBlocked:
-                continue
+            # Existing-file events only: a live import's row is later linked to its queue
+            # and must stay free for the transfer's own proof to record its provenance
+            # (tests/inkdrop-import-ready-worker-smoke.py, exact manga volume).
+            catalog_series_id = import_event_catalog_series_id(con, row) if row.get("existing") else None
+            if catalog_series_id:
+                series_id = catalog_series_id
+            else:
+                series_payload = {
+                    "series": row.get("matched_series"),
+                    "kapowarr_id": row.get("matched_kapowarr_id"),
+                    "source": "import_status",
+                }
+                try:
+                    series_id = upsert_series(con, series_payload, now)
+                except SeriesIdentityTombstoneBlocked:
+                    continue
             issue_id = None
         if series_id_user_removed(con, series_id):
             retire_removed_series_work(con, series_id, now, source="sync_import_status_removed_series")
             continue
-        if not queue_match:
+        if not queue_match and catalog_series_id:
+            issue_id = import_event_catalog_issue_id(con, series_id, row)
+        elif not queue_match:
             issue_payload = {
                 "issueNumber": row.get("canonical_issue_number") or row.get("normalized_number"),
                 "title": row.get("canonical_issue_title"),
