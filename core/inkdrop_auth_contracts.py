@@ -203,6 +203,13 @@ _add("POST", {
     "/api/inkdrop-state/series-merge/apply", "/api/inkdrop-state/series_merge/apply",
 }, "destructive_maintenance", "admin", admin=True, destructive=True, high_impact=True)
 
+# Gives a locked library folder to another work on an operator's ruling. It refuses a
+# monitored owner, so it only ever moves a stale claim; admin because it decides which
+# series every later import of that folder belongs to.
+_add("POST", {
+    "/api/inkdrop-state/series/folder-identity/transfer",
+}, "series_folder_identity_transfer", "admin", admin=True, high_impact=True)
+
 # Retires deferred queue-sync snapshots, but only after replaying the writes
 # they still hold (see inkdrop_deferred_sync.reclaim_expired_replays), and a
 # snapshot whose replay fails is left in place. Nothing is discarded on a

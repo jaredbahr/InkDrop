@@ -27299,6 +27299,114 @@ def persist_series_folder_identity(db_path, work_id, series_folder, *, library_t
         return {"ok": True, "reason": "persisted_folder_identity", "series_folder": current["series_folder"]}
 
 
+def transfer_series_folder_identity(db_path, from_work_id, to_work_id, *, actor="", now=None):
+    """Give a locked library folder to another work, on an operator's ruling.
+
+    A folder lock is first come and only the import path writes it, so a lock taken by
+    the wrong work could never move. "Injustice - Gods Among Us Year Four (2015)" was
+    locked by comicvine:81996, the unmonitored print edition, while comicvine:81822, the
+    monitored digital run, held 10 of the folder's 11 files; every 81822 import was
+    refused canonical_series_folder_collision. Refuses a monitored owner (a real conflict,
+    not a stale claim), a target that already holds a lock, an unknown target, and a
+    work with no lock. One transaction; the audit is written after it commits.
+    """
+    from_work_id = str(from_work_id or "").strip()
+    to_work_id = str(to_work_id or "").strip()
+    if not from_work_id or not to_work_id:
+        return {"ok": False, "reason": "missing_work_identity"}
+    if from_work_id == to_work_id:
+        return {"ok": False, "reason": "same_work"}
+    now = float(now or time.time())
+    with connect(db_path) as con:
+        con.execute("begin immediate")
+        if not table_exists(con, "canonical_library_identities"):
+            con.rollback()
+            return {"ok": False, "reason": "source_work_has_no_folder_lock"}
+        lock = con.execute(
+            "select work_id,library_type,series_folder from canonical_library_identities where work_id=? limit 1",
+            (from_work_id,),
+        ).fetchone()
+        if not lock:
+            con.rollback()
+            return {"ok": False, "reason": "source_work_has_no_folder_lock"}
+        if con.execute("select 1 from canonical_library_identities where work_id=? limit 1", (to_work_id,)).fetchone():
+            con.rollback()
+            return {"ok": False, "reason": "target_work_has_folder_lock"}
+        owner = con.execute("select monitored,raw_json from series where id=? limit 1", (from_work_id,)).fetchone()
+        target = con.execute("select id,raw_json from series where id=? limit 1", (to_work_id,)).fetchone()
+        if not target:
+            con.rollback()
+            return {"ok": False, "reason": "target_work_not_found"}
+        if owner and int(owner["monitored"] if owner["monitored"] is not None else 1):
+            con.rollback()
+            return {"ok": False, "reason": "folder_owner_is_monitored", "series_folder": lock["series_folder"]}
+        series_folder = str(lock["series_folder"] or "").strip()
+        library_type = str(lock["library_type"] or "unknown")
+        con.execute(
+            "update canonical_library_identities set work_id=?,review_reason=null,proposed_library_type=null,"
+            "proposed_series_folder=null,updated_at=? where work_id=?",
+            (to_work_id, now, from_work_id),
+        )
+        target_raw = json_loads(target["raw_json"] or "{}", {})
+        target_raw = target_raw if isinstance(target_raw, dict) else {}
+        target_raw["canonical_library_identity_v1"] = {
+            "contract_version": 1,
+            "work_id": to_work_id,
+            "library_type": library_type,
+            "series_folder": series_folder,
+            "persisted_at": now,
+            "updated_at": now,
+            "transferred_from_work_id": from_work_id,
+        }
+        con.execute(
+            "update series set raw_json=?,updated_at=max(coalesce(updated_at,0),?) where id=?",
+            (json_dumps(target_raw), now, to_work_id),
+        )
+        if owner:
+            owner_raw = json_loads(owner["raw_json"] or "{}", {})
+            owner_raw = owner_raw if isinstance(owner_raw, dict) else {}
+            previous = owner_raw.get("canonical_library_identity_v1")
+            previous = previous if isinstance(previous, dict) else {}
+            owner_raw["canonical_library_identity_v1"] = {
+                **previous,
+                "series_folder": "",
+                "transferred_to_work_id": to_work_id,
+                "transferred_series_folder": series_folder,
+                "updated_at": now,
+            }
+            con.execute(
+                "update series set raw_json=?,updated_at=max(coalesce(updated_at,0),?) where id=?",
+                (json_dumps(owner_raw), now, from_work_id),
+            )
+        _sync_series_library_path_to_canonical_folder(con, to_work_id, series_folder, now)
+        con.commit()
+    record_history_event(
+        db_path,
+        event_type="series_folder_identity_transferred",
+        entity_type="series",
+        entity_id=to_work_id,
+        series_id=to_work_id,
+        source="operator",
+        message=f"Library folder {series_folder} moved from {from_work_id} to {to_work_id}",
+        raw={
+            "from_work_id": from_work_id,
+            "to_work_id": to_work_id,
+            "series_folder": series_folder,
+            "library_type": library_type,
+            "actor": str(actor or ""),
+        },
+        created_at=now,
+    )
+    return {
+        "ok": True,
+        "reason": "series_folder_identity_transferred",
+        "from_work_id": from_work_id,
+        "to_work_id": to_work_id,
+        "series_folder": series_folder,
+        "library_type": library_type,
+    }
+
+
 def media_management_source_extension(path, default=".cbz"):
     leaf = str(path or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
     if "." not in leaf:

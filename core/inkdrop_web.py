@@ -68739,6 +68739,17 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": bool(result.get("ok")), "result": result, "error": result.get("reason")},
                     status=200 if result.get("ok") else 409,
                 )
+            elif path == "/api/inkdrop-state/series/folder-identity/transfer":
+                result = inkdrop_state.transfer_series_folder_identity(
+                    INKDROP_STATE_DB,
+                    data.get("from_work_id"),
+                    data.get("to_work_id"),
+                    actor=manual_search_principal_label(getattr(self, "inkdrop_principal", None)),
+                )
+                self.send_json(
+                    {"ok": bool(result.get("ok")), "result": result, "error": result.get("reason")},
+                    status=200 if result.get("ok") else 409,
+                )
             elif path == "/api/inkdrop-state/wanted/run":
                 result = run_inkdrop_wanted_search(data, expected_revision=mutation_expected_revision(self.headers, data))
                 self.send_json(
