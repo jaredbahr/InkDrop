@@ -21,6 +21,84 @@ from PIL import Image
 from core import inkdrop_state
 
 
+
+@contextlib.contextmanager
+def _sqlite(*args, **kwargs):
+    """sqlite3.connect as a context manager that also CLOSES the connection.
+
+    `with sqlite3.connect(path) as con` commits or rolls back on exit but leaves
+    the connection open. On Windows the database file then stays locked until
+    garbage collection, TemporaryDirectory cannot remove it, and the
+    ignore-cleanup-errors flag this file used to pass hid that as a silent leak
+    of about 32 directories per run. The transaction behaviour is unchanged
+    (`with con:`); the connection is closed afterwards.
+    """
+    con = sqlite3.connect(*args, **kwargs)
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
+
+
+FORCED_CONNECTION_CLOSES = []
+# The importer's database, and the number of connections it leaves open across this
+# file's run on Windows, measured 2026-09-14. A forced close of any OTHER database, or
+# more closes than this, is a new leak and fails the run rather than being absorbed.
+IMPORTER_DATABASE = "imported-files.sqlite3"
+IMPORTER_LEAK_CEILING = 6
+
+
+def _close_connections_under(directory):
+    """Close live connections to the importer's database file under directory.
+
+    Only IMPORTER_DATABASE is closed: a connection left open on any other file is
+    the smoke's own leak, so it stays open and the cleanup error is raised. Returns
+    how many were closed. Used only after a cleanup has already failed.
+    """
+    import gc
+
+    target = os.path.normcase(os.path.abspath(directory))
+    closed = 0
+    for obj in gc.get_objects():
+        if not isinstance(obj, sqlite3.Connection):
+            continue
+        try:
+            files = [row[2] for row in obj.execute("pragma database_list").fetchall() if row[2]]
+        except sqlite3.ProgrammingError:
+            continue
+        if any(os.path.normcase(os.path.abspath(f)).startswith(target)
+               and os.path.basename(f) == IMPORTER_DATABASE for f in files):
+            obj.close()
+            closed += 1
+    return closed
+
+
+class _TemporaryDirectory(tempfile.TemporaryDirectory):
+    """A TemporaryDirectory whose failed cleanup is either explained or raised.
+
+    This file used to pass the ignore-cleanup-errors flag, which turned every failed
+    removal into a silent leak: about 32 directories per run on Windows, where a
+    database file with an open connection cannot be deleted. The test's own
+    connections are now closed (_sqlite). The rest come from
+    inkdrop_completed_import.import_files(), which opens its imported-files
+    database once per pass and never closes it. When cleanup fails, the
+    connections still open under this directory are closed, COUNTED into
+    FORCED_CONNECTION_CLOSES and printed at the end of the run, and cleanup is
+    retried; if nothing was open, or the retry still fails, the error is raised.
+    """
+
+    def cleanup(self):
+        try:
+            super().cleanup()
+            return
+        except PermissionError:
+            closed = _close_connections_under(self.name)
+            if not closed:
+                raise
+        FORCED_CONNECTION_CLOSES.append((os.path.basename(self.name), closed))
+        super().cleanup()
+
 def valid_large_png():
     output = io.BytesIO()
     Image.frombytes("RGB", (512, 512), os.urandom(512 * 512 * 3)).save(output, format="PNG")
@@ -82,7 +160,7 @@ def smoke_import_result_state_uses_library_neutral_statuses():
 
 
 def smoke_direct_import_short_timeout_writer():
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-smoke-") as tmp:
         root = Path(tmp)
         db_path = root / "inkdrop-state.sqlite3"
         comic_root = root / "Comics"
@@ -409,7 +487,7 @@ def smoke_direct_import_short_timeout_writer():
             fail(f"matching-destination direct import state write failed: {matching_dest_result}")
         if matching_dest_result.get("status") == "wrong_unit_quarantined":
             fail(f"already-imported matching destination was downgraded by unit gate: {matching_dest_result}")
-        with sqlite3.connect(db_path) as con:
+        with _sqlite(db_path) as con:
             row = con.execute("select state, active, current_source, outcome, display_phase from queue_items where id='queue-smoke'").fetchone()
             if row != ("verified", 0, "rss_getcomics", "productive", "verified"):
                 fail(f"optional folder-complete queue row was not satisfied: {row}")
@@ -505,7 +583,7 @@ def smoke_reconcile_lock_waits_then_reports_busy():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-lock-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-lock-smoke-") as tmp:
         lock_path = Path(tmp) / "reconcile.lock"
         old_lock = inkdrop_reconcile_imports.RECONCILE_LOCK_PATH
         holder = lock_path.open("w", encoding="utf-8")
@@ -541,7 +619,7 @@ def smoke_reconciliation_replay_to_inkdrop():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-replay-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-replay-smoke-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -609,7 +687,7 @@ def smoke_reconciliation_replay_to_inkdrop():
             inkdrop_reconcile_imports.inkdrop_state = inkdrop_state
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute(
                     "create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)"
                 )
@@ -651,7 +729,7 @@ def smoke_reconciliation_replay_to_inkdrop():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if result.get("updated") != 0 or result.get("skipped", {}).get("missing_download_task_id") != 1:
             fail(f"taskless reconciliation replay did not fail closed: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute("select state, active, current_source, last_event, display_phase from queue_items where id='queue-replay'").fetchone()
             if queue != ("importing", 1, "download_client", "ready_to_import", None):
                 fail(f"taskless reconciliation replay mutated queue state: {queue}")
@@ -670,7 +748,7 @@ def smoke_reconciliation_replay_skips_missing_import_destination():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-empty-dest-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-empty-dest-smoke-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -729,7 +807,7 @@ def smoke_reconciliation_replay_skips_missing_import_destination():
             inkdrop_reconcile_imports.inkdrop_state = inkdrop_state
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute(
                     """
                     insert into download_reconciliation(
@@ -764,7 +842,7 @@ def smoke_reconciliation_replay_skips_missing_import_destination():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if result.get("updated") != 0 or result.get("skipped", {}).get("missing_imported_destination") != 1:
             fail(f"empty destination replay was not skipped cleanly: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             count = con.execute("select count(*) from import_results where queue_id='queue-empty-dest'").fetchone()[0]
             queue = con.execute("select state, current_source, last_event from queue_items where id='queue-empty-dest'").fetchone()
         if count:
@@ -782,7 +860,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-suppressed-existing-replay-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-suppressed-existing-replay-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -924,7 +1002,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
             inkdrop_reconcile_imports.inkdrop_state = inkdrop_state
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute(
                     """
                     create table if not exists imported_files (
@@ -961,7 +1039,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
                 ],
                 updated_at=now,
             )
-            with sqlite3.connect(state_db) as con:
+            with _sqlite(state_db) as con:
                 before_without_authority = (
                     con.execute(
                         "select state,active,raw_json from queue_items where id='queue-existing-replay'"
@@ -974,7 +1052,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
                     ).fetchone()[0],
                 )
             without_authority = inkdrop_reconcile_imports.sync_inkdrop_from_reconciled_imports(limit=10)
-            with sqlite3.connect(state_db) as con:
+            with _sqlite(state_db) as con:
                 after_without_authority = (
                     con.execute(
                         "select state,active,raw_json from queue_items where id='queue-existing-replay'"
@@ -998,7 +1076,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
             repeated_claim = inkdrop_reconcile_imports.claim_suppressed_completed_import_authorities(limit=10)
             if repeated_claim.get("claimed") != 0:
                 fail(f"verified suppressed destination was claimable twice: {repeated_claim}")
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 stored_path = con.execute(
                     "select matched_local_path from download_reconciliation where pending_key='existing-replay-key'"
                 ).fetchone()[0]
@@ -1010,7 +1088,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
             fail(f"suppressed replay rewrote historical reconciliation evidence: {stored_path}")
         if result.get("updated") != 1:
             fail(f"suppressed existing path was not replayed into InkDrop: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute(
                 "select state, active, current_source, display_phase, last_event from queue_items where id='queue-existing-replay'"
             ).fetchone()
@@ -1033,7 +1111,7 @@ def smoke_reconciliation_replay_settles_suppressed_existing_path():
             fail(f"suppressed existing replay did not retire staged task: {task}")
         if import_row != ("queue_verified", 1, "folder", 1, str(existing_path)):
             fail(f"suppressed existing replay import_result mismatch: {import_row}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             con.execute(
                 """
                 insert into import_results(
@@ -1102,7 +1180,7 @@ def smoke_import_ready_sync_preserves_suppressed_existing_path():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-sync-existing-path-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-sync-existing-path-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -1245,7 +1323,7 @@ def smoke_import_ready_sync_preserves_suppressed_existing_path():
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
             result = inkdrop_reconcile_imports.sync_inkdrop_import_ready_records(max_records=10, budget_seconds=10)
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 stored = con.execute(
                     """
                     select lifecycle_state, reason, matched_local_path
@@ -1278,7 +1356,7 @@ def smoke_hash_suppression_preserves_managed_destination():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-hash-destination-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-hash-destination-") as tmp:
         root = Path(tmp)
         reconcile_db = root / "imported-files.sqlite3"
         source = root / "Downloads" / "slskd" / "Love and Rockets 006.cbz"
@@ -1289,7 +1367,7 @@ def smoke_hash_suppression_preserves_managed_destination():
             archive.writestr("001.jpg", b"same exact issue")
         managed.write_bytes(source.read_bytes())
         digest = inkdrop_reconcile_imports.imp.sha256(source)
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             con.execute(
                 "create table imported_files(sha256 text primary key, source text, dest text, size integer, imported_at real)"
             )
@@ -1372,7 +1450,7 @@ def smoke_reconciliation_replay_uses_queue_identity_for_imported_file_proof():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-replay-queue-identity-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-replay-queue-identity-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -1435,7 +1513,7 @@ def smoke_reconciliation_replay_uses_queue_identity_for_imported_file_proof():
             inkdrop_reconcile_imports.inkdrop_state = inkdrop_state
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute(
                     "create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)"
                 )
@@ -1477,7 +1555,7 @@ def smoke_reconciliation_replay_uses_queue_identity_for_imported_file_proof():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if result.get("updated") != 0 or result.get("skipped", {}).get("imported_file_identity_mismatch") != 1:
             fail(f"replay trusted stale reconciliation identity instead of queue identity: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             count = con.execute("select count(*) from import_results where queue_id='queue-identity-replay'").fetchone()[0]
             queue = con.execute("select state, active, last_event from queue_items where id='queue-identity-replay'").fetchone()
         if count:
@@ -1495,7 +1573,7 @@ def smoke_verified_manga_import_results_backfill_completion_tables():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-manga-import-backfill-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-manga-import-backfill-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -1579,7 +1657,7 @@ def smoke_verified_manga_import_results_backfill_completion_tables():
         )
         if not result.get("ok"):
             fail(f"verified manga import_result fixture failed: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             con.execute(
                 """
                 insert into import_results(
@@ -1633,7 +1711,7 @@ def smoke_verified_manga_import_results_backfill_completion_tables():
         if backfill.get("backfilled") != 1 or backfill.get("manga_unit_completion_rows") != 1:
             fail(f"verified manga import_result did not backfill completion: {backfill}")
         expected_number = inkdrop_reconcile_imports.imp.normalize_manga_number("72") or "72"
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             unit = con.execute(
                 """
                 select series_title, normalized_number, manga_unit_model, truth_model, verification_status, target_file_path
@@ -1665,7 +1743,7 @@ def smoke_stale_completion_retraction_records_history():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-stale-completion-history-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-stale-completion-history-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -1714,7 +1792,7 @@ def smoke_stale_completion_retraction_records_history():
         history_result = result.get("stale_completion_history") or {}
         if not history_result.get("ok") or history_result.get("skipped"):
             fail(f"stale completion retraction did not record history: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 """
@@ -1759,7 +1837,7 @@ def smoke_import_ready_rejection_requeues():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-reject-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-reject-smoke-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         now = time.time()
@@ -1866,7 +1944,7 @@ def smoke_import_ready_rejection_requeues():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if not result.get("ok") or result.get("task_updates") != 2:
             fail(f"import-ready rejection did not update the queue and duplicate tasks: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute("select state, current_source, last_event from queue_items where id='queue-reject'").fetchone()
             if queue[0] != "queued" or queue[1] is not None or "not importable" not in queue[2]:
                 fail(f"rejected import-ready row was not requeued automatically: {queue}")
@@ -1906,7 +1984,7 @@ def smoke_wrong_series_or_subseries_rejection_is_terminal():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-wrong-subseries-terminal-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-wrong-subseries-terminal-smoke-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         now = time.time()
@@ -2014,7 +2092,7 @@ def smoke_wrong_series_or_subseries_rejection_is_terminal():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if not result.get("ok"):
             fail(f"wrong_series_or_subseries rejection did not persist: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             task = con.execute(
                 "select status, state, retry_eligible from download_tasks where id='task-loeg-3298'"
             ).fetchone()
@@ -2052,7 +2130,7 @@ def smoke_wrong_series_or_subseries_rejection_is_terminal():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if not transient_result.get("ok"):
             fail(f"bad_archive rejection did not persist: {transient_result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             task = con.execute(
                 "select status, state, retry_eligible from download_tasks where id='task-loeg-3298'"
             ).fetchone()
@@ -2069,7 +2147,7 @@ def smoke_failed_import_attempt_requeues_import_ready_download():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-failed-import-reject-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-failed-import-reject-smoke-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         source_path = root / "Bad Pack" / "Reject Series 003.cbr"
@@ -2212,7 +2290,7 @@ def smoke_failed_import_attempt_requeues_import_ready_download():
         release = result.get("release") if isinstance(result, dict) else {}
         if result.get("skipped") != "failed_import" or not release.get("ok"):
             fail(f"failed import attempt did not reject the import-ready candidate: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute("select state, current_source, last_event from queue_items where id='queue-failed-import'").fetchone()
             if queue[0] != "queued" or queue[1] is not None or "automatic search will try another result" not in queue[2].lower():
                 fail(f"failed import attempt did not requeue the item: {queue}")
@@ -2247,7 +2325,7 @@ def smoke_failed_import_attempt_requeues_import_ready_download():
         second_recovery = inkdrop_reconcile_imports.recover_retryable_failed_staged_import_ready_records(max_records=10)
         if first_recovery.get("promoted") or second_recovery.get("promoted"):
             fail(f"terminal artifact was promoted back to import-ready: {first_recovery} / {second_recovery}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             repeated = con.execute(
                 "select status, state, retry_eligible from download_tasks where id='task-failed-import'"
             ).fetchone()
@@ -2264,7 +2342,7 @@ def smoke_import_ready_records_existing_planned_destination():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-existing-planned-dest-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-existing-planned-dest-smoke-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         source_path = root / "downloads" / "Managed Series 001.cbz"
@@ -2446,7 +2524,7 @@ def smoke_import_ready_records_existing_planned_destination():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if not result.get("ok"):
             fail(f"existing planned destination was not recorded as retained import: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             row = con.execute(
                 "select source_path, dest_path, status, verified, skipped_count, raw_json from import_results where queue_id='queue-existing-planned'"
             ).fetchone()
@@ -2476,7 +2554,7 @@ def smoke_import_ready_timeout_recovers_imported_file():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-timeout-recovery-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-timeout-recovery-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -2630,7 +2708,7 @@ def smoke_import_ready_timeout_recovers_imported_file():
             inkdrop_reconcile_imports.imp = FakeImporter()
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute("create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
                 con.execute(
                     "insert into imported_files values(?,?,?,?,?)",
@@ -2692,13 +2770,13 @@ def smoke_import_ready_timeout_recovers_imported_file():
             fail("timeout recovery did not queue a Kavita scan for a copied-but-not-visible file")
         if replay.get("updated") != 1:
             fail(f"timeout recovery did not replay into InkDrop: {replay}")
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             rec = con.execute(
                 "select lifecycle_state, reason from download_reconciliation where pending_key='inkdrop:queue-timeout'"
             ).fetchone()
         if rec != ("waiting_for_library_scan", "imported_after_timeout_waiting_for_library_scan"):
             fail(f"reconciliation row was not moved to waiting scan: {rec}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute("select state, active, current_source, last_event, display_phase from queue_items where id='queue-timeout'").fetchone()
             if queue[:3] != ("verified", 0, "qbit") or "library visibility will follow" not in str(queue[3] or "").lower() or queue[4] != "verified":
                 fail(f"queue was not satisfied by optional folder completion: {queue}")
@@ -2723,7 +2801,7 @@ def smoke_queue_backed_ready_import_skips_duplicate_prevalidation():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-prevalidate-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-prevalidate-") as tmp:
         root = Path(tmp)
         reconcile_db = root / "imported-files.sqlite3"
         source = root / "Queue Backed 001.cbr"
@@ -2753,7 +2831,7 @@ def smoke_queue_backed_ready_import_skips_duplicate_prevalidation():
             inkdrop_reconcile_imports.imp = NoPrevalidateImporter()
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute("create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
                 con.execute(
                     """
@@ -2807,7 +2885,7 @@ def smoke_failed_filename_guard_recovery_is_queue_authoritative():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-filename-recover-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-filename-recover-") as tmp:
         root = Path(tmp)
         reconcile_db = root / "imported-files.sqlite3"
         source = root / "The Department of Truth 015.cbr"
@@ -2830,7 +2908,7 @@ def smoke_failed_filename_guard_recovery_is_queue_authoritative():
             ]
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.executemany(
                     """
                     insert into download_reconciliation(
@@ -2881,7 +2959,7 @@ def smoke_failed_filename_guard_recovery_is_queue_authoritative():
                 )
                 con.commit()
             result = inkdrop_reconcile_imports.recover_failed_filename_guard_import_ready_records(max_records=10)
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 recovered = con.execute(
                     "select lifecycle_state, reason from download_reconciliation where pending_key='inkdrop:queue-trusted'"
                 ).fetchone()
@@ -2950,7 +3028,7 @@ def smoke_ready_import_defers_qbit_incomplete_source_files():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-incomplete-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-incomplete-") as tmp:
         root = Path(tmp)
         reconcile_db = root / "imported-files.sqlite3"
         source = root / "Incomplete Pack 001.cbz"
@@ -2984,7 +3062,7 @@ def smoke_ready_import_defers_qbit_incomplete_source_files():
             inkdrop_reconcile_imports.imp = IncompleteImporter()
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute("create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
                 con.execute(
                     """
@@ -3016,7 +3094,7 @@ def smoke_ready_import_defers_qbit_incomplete_source_files():
                 )
                 con.commit()
             records = inkdrop_reconcile_imports.ready_import_records(1)
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 row = con.execute(
                     "select lifecycle_state, reason from download_reconciliation where pending_key='inkdrop:queue-incomplete'"
                 ).fetchone()
@@ -3044,7 +3122,7 @@ def smoke_ready_import_accepts_valid_child_from_incomplete_pack():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-valid-child-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-valid-child-") as tmp:
         root = Path(tmp)
         reconcile_db = root / "imported-files.sqlite3"
         source = root / "2025.09.10 Weekly Pack" / "2025.09.10 DC Week" / "Absolute Batman 012.cbz"
@@ -3081,7 +3159,7 @@ def smoke_ready_import_accepts_valid_child_from_incomplete_pack():
             inkdrop_reconcile_imports.imp = ValidChildImporter()
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute("create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
                 con.execute(
                     """
@@ -3113,7 +3191,7 @@ def smoke_ready_import_accepts_valid_child_from_incomplete_pack():
                 )
                 con.commit()
             records = inkdrop_reconcile_imports.ready_import_records(1)
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 row = con.execute(
                     "select lifecycle_state, reason from download_reconciliation where pending_key='inkdrop:queue-valid-child'"
                 ).fetchone()
@@ -3141,7 +3219,7 @@ def smoke_import_ready_deferral_updates_inkdrop_task_state():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-deferral-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-deferral-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         now = time.time()
@@ -3224,7 +3302,7 @@ def smoke_import_ready_deferral_updates_inkdrop_task_state():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if not result.get("ok"):
             fail(f"import-ready deferral did not update InkDrop state: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute("select state, display_phase, current_source, last_event from queue_items where id='queue-deferral'").fetchone()
             task = con.execute("select status, state, lifecycle_phase, failure_reason from download_tasks where id='task-deferral'").fetchone()
         if queue[0] != "downloading" or queue[1] != "downloading" or "incomplete" not in queue[3].lower():
@@ -3242,7 +3320,7 @@ def smoke_import_ready_promotion_restores_completed_qbit_source_files():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-promotion-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-promotion-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -3329,7 +3407,7 @@ def smoke_import_ready_promotion_restores_completed_qbit_source_files():
             inkdrop_reconcile_imports.imp = CompleteImporter()
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute(
                     """
                     insert into download_reconciliation(
@@ -3360,7 +3438,7 @@ def smoke_import_ready_promotion_restores_completed_qbit_source_files():
                 )
                 con.commit()
             result = inkdrop_reconcile_imports.promote_complete_deferred_import_ready_records(max_records=10)
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 reconcile = con.execute(
                     "select lifecycle_state, reason from download_reconciliation where pending_key='inkdrop:queue-promotion'"
                 ).fetchone()
@@ -3370,7 +3448,7 @@ def smoke_import_ready_promotion_restores_completed_qbit_source_files():
             inkdrop_reconcile_imports.inkdrop_state = old_module
             inkdrop_reconcile_imports.imp = old_imp
 
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute("select state, display_phase, last_event from queue_items where id='queue-promotion'").fetchone()
             task = con.execute("select status, state, lifecycle_phase, failure_reason from download_tasks where id='task-promotion'").fetchone()
         if result.get("promoted") != 1 or result.get("still_incomplete") != 0:
@@ -3392,7 +3470,7 @@ def smoke_retryable_failed_staged_source_recovery_promotes_only_importable_files
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-failed-staged-recovery-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-failed-staged-recovery-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -3528,7 +3606,7 @@ def smoke_retryable_failed_staged_source_recovery_promotes_only_importable_files
             inkdrop_reconcile_imports.load_imported_state = old_load_imported
             inkdrop_reconcile_imports.load_bad_archive_validation_memory = old_bad_memory
 
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             ready_queue = con.execute("select state, display_phase, current_source, last_event from queue_items where id='queue-ready'").fetchone()
             ready_task = con.execute("select status, state, lifecycle_phase, failure_reason, retry_eligible, raw_json from download_tasks where id='task-ready'").fetchone()
             range_queue = con.execute("select state, display_phase from queue_items where id='queue-range'").fetchone()
@@ -3560,7 +3638,7 @@ def smoke_queue_only_ready_import_skips_unowned_rows():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-queue-only-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-queue-only-smoke-") as tmp:
         root = Path(tmp)
         reconcile_db = root / "imported-files.sqlite3"
         queue_source = root / "Queue Owned 001.cbz"
@@ -3593,7 +3671,7 @@ def smoke_queue_only_ready_import_skips_unowned_rows():
             inkdrop_reconcile_imports.imp = NoLegacyPrevalidateImporter()
             reconcile_db.touch()
             inkdrop_reconcile_imports.ensure_reconciliation_table()
-            with sqlite3.connect(reconcile_db) as con:
+            with _sqlite(reconcile_db) as con:
                 con.execute("create table if not exists imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
                 rows = [
                     (
@@ -3670,7 +3748,7 @@ def smoke_completed_pack_download_client_rows_are_import_ready():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-pack-row-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-pack-row-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         source = root / "Absolute Wonder Woman 002 (2025) (Digital).cbz"
@@ -3771,7 +3849,7 @@ def smoke_completed_slskd_staged_source_rows_are_import_ready():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-source-completed-import-ready-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-source-completed-import-ready-") as tmp:
         root = Path(tmp)
         source = root / "Gantz E - Chapter 77 - Ch.77.cbz"
         source.write_bytes(b"source page pack")
@@ -3932,7 +4010,7 @@ def smoke_local_completed_pack_replay_creates_import_ready_row():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-local-pack-replay-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-local-pack-replay-") as tmp:
         root = Path(tmp)
         downloads_root = root / "Downloads" / "comics"
         pack_root = downloads_root / "2026.06.24 Weekly Pack"
@@ -3947,7 +4025,7 @@ def smoke_local_completed_pack_replay_creates_import_ready_row():
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
         now = time.time()
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             con.execute("create table imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
             con.execute(
                 "insert into imported_files values(?,?,?,?,?)",
@@ -4031,7 +4109,7 @@ def smoke_local_completed_pack_replay_creates_import_ready_row():
 
         if result.get("created") != 1 or result.get("updated") != 1 or result.get("matched") != 2:
             fail(f"local completed pack replay did not create/import expected children: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute(
                 "select state, current_source, last_event from queue_items where id='queue-local-pack'"
             ).fetchone()
@@ -4071,7 +4149,7 @@ def smoke_local_completed_pack_replay_defers_qbit_incomplete_archive():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-local-pack-incomplete-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-local-pack-incomplete-") as tmp:
         root = Path(tmp)
         downloads_root = root / "Downloads" / "comics"
         pack_root = downloads_root / "2026.06.24 Weekly Pack"
@@ -4081,7 +4159,7 @@ def smoke_local_completed_pack_replay_defers_qbit_incomplete_archive():
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
         now = time.time()
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             con.execute("create table imported_files (sha256 text primary key, source text, dest text, size integer, imported_at real)")
             con.commit()
         with inkdrop_state.connect(state_db) as con:
@@ -4152,7 +4230,7 @@ def smoke_local_completed_pack_replay_defers_qbit_incomplete_archive():
             fail(f"local pack incomplete qbit replay did not defer instead of stage: {result}")
         if rows:
             fail(f"incomplete local pack archive leaked into import-ready rows: {rows}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             queue = con.execute(
                 "select state, display_phase, current_source, last_event from queue_items where id='queue-local-pack-incomplete'"
             ).fetchone()
@@ -4194,7 +4272,7 @@ def smoke_import_ready_classifier_accepts_cached_string_paths():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-ready-string-path-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-ready-string-path-") as tmp:
         source = Path(tmp) / "Queue Backed 001.cbz"
         source.write_bytes(b"queue")
         old_classify = inkdrop_reconcile_imports.classify_local_file
@@ -4405,7 +4483,7 @@ def smoke_import_ready_child_defers_broad_import_status_sync():
     if not inkdrop_completed_import.no_wait_for_library_scan_flag_present(["--no-wait-for-kavita-scan"]):
         fail("completed importer did not preserve --no-wait-for-kavita-scan compatibility")
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-status-defer-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-status-defer-") as tmp:
         root = Path(tmp)
         old_state_dir = inkdrop_completed_import.STATE_DIR
         old_status = inkdrop_completed_import.IMPORT_STATUS_PATH
@@ -4501,7 +4579,7 @@ def smoke_deferred_import_statuses_are_lossless():
         sys.modules["requests"] = types.SimpleNamespace()
     from core import inkdrop_completed_import
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-lossless-import-status-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-lossless-import-status-") as tmp:
         root = Path(tmp)
         db_path = root / "inkdrop-state.sqlite3"
         comic_root = root / "Comics"
@@ -4661,7 +4739,7 @@ def smoke_active_import_ready_recovers_from_imported_file_proof():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-active-import-proof-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-active-import-proof-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -4765,7 +4843,7 @@ def smoke_active_import_ready_recovers_from_imported_file_proof():
                 ),
             )
             con.commit()
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             con.execute(
                 "create table imported_files(sha256 text primary key, source text, dest text, size integer, imported_at real)"
             )
@@ -4788,7 +4866,7 @@ def smoke_active_import_ready_recovers_from_imported_file_proof():
                 "reason": "imported_file_proof",
             }
             def authority_snapshot():
-                with sqlite3.connect(state_db) as snapshot_con:
+                with _sqlite(state_db) as snapshot_con:
                     queue = snapshot_con.execute(
                         "select state, active, raw_json from queue_items where id='queue-active-proof'"
                     ).fetchone()
@@ -4831,7 +4909,7 @@ def smoke_active_import_ready_recovers_from_imported_file_proof():
             inkdrop_reconcile_imports.timeout_recovery_verification = old_recovery
         if result.get("recovered") != 1 or result.get("task_updates") != 1:
             fail(f"active import-ready proof recovery did not update InkDrop state: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             task = con.execute("select state, status from download_tasks where id='task-active-proof'").fetchone()
             if task != ("importing", "verification_pending"):
                 fail(f"download task did not leave import_ready after imported-file proof: {task}")
@@ -4850,7 +4928,7 @@ def smoke_active_import_ready_rejects_mismatched_imported_file_proof():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-active-import-mismatch-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-active-import-mismatch-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         reconcile_db = root / "imported-files.sqlite3"
@@ -4936,7 +5014,7 @@ def smoke_active_import_ready_rejects_mismatched_imported_file_proof():
                 ),
             )
             con.commit()
-        with sqlite3.connect(reconcile_db) as con:
+        with _sqlite(reconcile_db) as con:
             con.execute(
                 "create table imported_files(sha256 text primary key, source text, dest text, size integer, imported_at real)"
             )
@@ -4960,7 +5038,7 @@ def smoke_active_import_ready_rejects_mismatched_imported_file_proof():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if result.get("recovered") != 0 or result.get("skipped", {}).get("imported_file_identity_mismatch") != 1:
             fail(f"mismatched imported-file proof was not rejected: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             count = con.execute("select count(*) from import_results where queue_id='queue-active-mismatch'").fetchone()[0]
             if count:
                 fail(f"mismatched imported-file proof created import results: {count}")
@@ -4979,7 +5057,7 @@ def smoke_imported_path_must_match_trusted_target():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-imported-path-target-smoke-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-imported-path-target-smoke-") as tmp:
         root = Path(tmp)
         berserk = root / "Berserk v20 (2007) (Digital) (danke-Empire).cbz"
         absolute = root / "Absolute Superman 020 (2026) (Digital) (Lil-Empire).cbz"
@@ -5037,7 +5115,7 @@ def smoke_queue_owned_target_classifies_without_adapter_target():
             return
         raise
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-queue-owned-target-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-queue-owned-target-") as tmp:
         root = Path(tmp)
         library = root / "Comics" / "Native Standalone"
         library.mkdir(parents=True)
@@ -5109,7 +5187,7 @@ def smoke_queue_owned_one_word_manga_chapter_classifies_exact_unit():
         # format_issue_number(number) == format_issue_number(trusted_issue) check in
         # native_manga_explicit_chapter_import_is_safe(), the auto-learn never fired,
         # and the guard rejected with manga_chapter_requires_chapter_unit_model.
-        with tempfile.TemporaryDirectory(prefix="inkdrop-one-word-manga-unit-", ignore_cleanup_errors=True) as tmp:
+        with _TemporaryDirectory(prefix="inkdrop-one-word-manga-unit-") as tmp:
             root = Path(tmp)
             inkdrop_reconcile_imports.imp.STATE_DIR = root / "state"
             inkdrop_reconcile_imports.imp.DB_PATH = inkdrop_reconcile_imports.imp.STATE_DIR / "imported-files.sqlite3"
@@ -5356,7 +5434,7 @@ def smoke_completed_import_reports_incomplete_qbit_source_file():
         from core import inkdrop_completed_import
     except FileNotFoundError:
         return
-    with tempfile.TemporaryDirectory(prefix="inkdrop-completed-incomplete-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-completed-incomplete-") as tmp:
         root = Path(tmp)
         source = root / "Incomplete Source 001.cbz"
         source.write_bytes(b"incomplete qbit file placeholder")
@@ -5431,7 +5509,7 @@ def smoke_completed_import_reports_media_management_preview():
         from core import inkdrop_completed_import
     except FileNotFoundError:
         return
-    with tempfile.TemporaryDirectory(prefix="inkdrop-completed-media-preview-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-completed-media-preview-") as tmp:
         root = Path(tmp)
         source = root / "Preview Series 001 (2026).cbz"
         with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -5579,7 +5657,7 @@ def smoke_completed_import_applies_media_management_path_when_enabled():
         from core import inkdrop_completed_import
     except FileNotFoundError:
         return
-    with tempfile.TemporaryDirectory(prefix="inkdrop-completed-media-apply-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-completed-media-apply-") as tmp:
         root = Path(tmp)
         source_root = root / "source"
         source_root.mkdir(parents=True)
@@ -5749,7 +5827,7 @@ def smoke_exact_manga_volume_plans_and_imports_volume_only_destination():
         sys.modules["requests"] = types.SimpleNamespace()
     from core import inkdrop_completed_import
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-manga-volume-canonical-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-manga-volume-canonical-") as tmp:
         root = Path(tmp)
         source_dir = root / "completed"
         manga_root = root / "Manga"
@@ -6145,7 +6223,7 @@ def smoke_completed_import_trusted_issue_title_state_lookup():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-trusted-title-lookup-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-trusted-title-lookup-") as tmp:
         state_db = Path(tmp) / "inkdrop-state.sqlite3"
         now = time.time()
         with inkdrop_state.connect(state_db) as con:
@@ -6321,7 +6399,7 @@ def smoke_completed_import_trusted_tpb_lookup_survives_same_target_match():
         if "inkdrop_completed_import.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-trusted-title-target-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-trusted-title-target-") as tmp:
         root = Path(tmp) / "Goodbye, Eri (2023) (Digital) (1r0n)"
         library_root = Path(tmp) / "library" / "manga" / "Goodbye, Eri"
         root.mkdir(parents=True, exist_ok=True)
@@ -6494,7 +6572,7 @@ def smoke_ready_import_records_threads_issue_title():
         if "inkdrop_reconcile_imports.py" in str(exc):
             return
         raise
-    with tempfile.TemporaryDirectory(prefix="inkdrop-ready-issue-title-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-ready-issue-title-") as tmp:
         root = Path(tmp)
         source = root / "Goodbye, Eri (2023) (Digital) (1r0n).cbz"
         source.write_bytes(b"tpb archive placeholder")
@@ -6654,7 +6732,7 @@ def smoke_completed_import_allows_duplicate_chapter_token_filename():
     old_db_path = inkdrop_completed_import.DB_PATH
     old_state_dir = inkdrop_completed_import.STATE_DIR
     try:
-        with tempfile.TemporaryDirectory(prefix="inkdrop-gantz-chapter-token-", ignore_cleanup_errors=True) as tmp:
+        with _TemporaryDirectory(prefix="inkdrop-gantz-chapter-token-") as tmp:
             root = Path(tmp)
             inkdrop_completed_import.STATE_DIR = root / "state"
             inkdrop_completed_import.DB_PATH = inkdrop_completed_import.STATE_DIR / "imported-files.sqlite3"
@@ -6734,7 +6812,7 @@ def smoke_exact_volume_import_does_not_use_ambiguous_existing_file_as_duplicate(
     events = []
     volume_events = []
     try:
-        with tempfile.TemporaryDirectory(prefix="inkdrop-exact-volume-existing-order-", ignore_cleanup_errors=True) as tmp:
+        with _TemporaryDirectory(prefix="inkdrop-exact-volume-existing-order-") as tmp:
             root = Path(tmp)
             manga_root = root / "Manga"
             series_dir = manga_root / "Dorohedoro"
@@ -6878,7 +6956,7 @@ def smoke_slskd_manga_completion_requires_durable_exact_path_and_settles_wanted(
     old_comic_root = inkdrop_completed_import.COMIC_ROOT
     old_manga_root = inkdrop_completed_import.MANGA_ROOT
     try:
-        with tempfile.TemporaryDirectory(prefix="inkdropslskdmangacompletion", ignore_cleanup_errors=True) as tmp:
+        with _TemporaryDirectory(prefix="inkdropslskdmangacompletion") as tmp:
             root = Path(tmp) / "fixture" / "identity"
             state_dir = root / "state"
             manga_root = root / "Manga"
@@ -7071,7 +7149,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
         sys.modules["requests"] = types.SimpleNamespace()
     from core import inkdrop_reconcile_imports
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-authority-", ignore_cleanup_errors=True) as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-authority-") as tmp:
         root = Path(tmp)
         state_db = root / "inkdrop-state.sqlite3"
         library = root / "Comics"
@@ -7238,7 +7316,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
             "client": "slskd",
             "source_file": str(source),
         }
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             preclaim_before = (
                 con.execute("select state,current_source,raw_json from queue_items where id=?", (exact[0],)).fetchone(),
                 con.execute("select state,status,raw_json from download_tasks where id=?", (exact[3],)).fetchone(),
@@ -7259,7 +7337,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
             inkdrop_reconcile_imports.inkdrop_state = old_module
         if missing_authority_result.get("ok") or missing_authority_result.get("reason") != "import_authority_missing":
             fail(f"callback without preclaimed authority was accepted: {missing_authority_result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             preclaim_after = (
                 con.execute("select state,current_source,raw_json from queue_items where id=?", (exact[0],)).fetchone(),
                 con.execute("select state,status,raw_json from download_tasks where id=?", (exact[3],)).fetchone(),
@@ -7269,7 +7347,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
             fail(f"callback without authority mutated lifecycle state: before={preclaim_before} after={preclaim_after}")
 
         authority = claim(exact)
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             before = (
                 con.execute("select state,current_source,raw_json from queue_items where id=?", (exact[0],)).fetchone(),
                 con.execute("select state,status,external_id,source_attempt_id,raw_json from download_tasks where id=?", (exact[3],)).fetchone(),
@@ -7348,7 +7426,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
             )
             if result.get("ok") or result.get("reason") != expected_reason:
                 fail(f"conflicting import callback was not fenced: {result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             after_conflicts = (
                 con.execute("select state,current_source,raw_json from queue_items where id=?", (exact[0],)).fetchone(),
                 con.execute("select state,status,external_id,source_attempt_id,raw_json from download_tasks where id=?", (exact[3],)).fetchone(),
@@ -7388,7 +7466,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
         )
         if repeated.get("ok") or repeated.get("reason") not in {"import_authority_queue_stale", "queue_already_verified"}:
             fail(f"spent import authority was replayable: {repeated}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             wanted = con.execute("select status from wanted_items where id=?", (exact[1],)).fetchone()
             import_count = con.execute("select count(*) from import_results where queue_id=?", (exact[0],)).fetchone()[0]
         if wanted != ("satisfied",) or import_count != 1:
@@ -7407,7 +7485,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
         repeated_release = inkdrop_state.release_import_authority(
             state_db, retry_authority, reason="simulated_import_failure", released_at=now + 51
         )
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             sibling_queue = con.execute("select state,current_source from queue_items where id=?", (sibling_case[0],)).fetchone()
             sibling_wanted = con.execute("select status from wanted_items where id=?", (sibling_case[1],)).fetchone()
             sibling_task = con.execute("select state,status,external_id from download_tasks where id=?", (f"task-sibling-sibling",)).fetchone()
@@ -7440,7 +7518,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
         )
         if not verification_result.get("ok"):
             fail(f"verification-pending result did not persist: {verification_result}")
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             verification_queue = con.execute(
                 "select state,raw_json from queue_items where id=?", (verification_pending_case[0],)
             ).fetchone()
@@ -7458,7 +7536,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
         rollback_authority = claim(rollback_case)
         rollback_recovery = inkdrop_state.recover_active_import_authorities(state_db)
         repeated_recovery = inkdrop_state.recover_active_import_authorities(state_db)
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             rollback_queue = con.execute(
                 "select state,raw_json from queue_items where id=?", (rollback_case[0],)
             ).fetchone()
@@ -7480,7 +7558,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
         if not rollback_authority.get("token"):
             fail("rollback test did not begin with a durable authority token")
 
-        with sqlite3.connect(state_db) as con:
+        with _sqlite(state_db) as con:
             task_raw = json.loads(con.execute(
                 "select raw_json from download_tasks where id=?", (rollback_case[3],)
             ).fetchone()[0])
@@ -7500,7 +7578,7 @@ def smoke_import_authority_fences_callbacks_and_releases_exact_task():
 def smoke_completed_client_import_gets_turn_after_manual_source_cycle():
     from core import inkdrop_completed_import
 
-    with tempfile.TemporaryDirectory(prefix="inkdrop-import-fairness-") as tmp:
+    with _TemporaryDirectory(prefix="inkdrop-import-fairness-") as tmp:
         root = Path(tmp)
         actions_path = root / "manual-review-actions.json"
         status_path = root / "manual-source-autoresolve-status.json"
@@ -7820,6 +7898,17 @@ def main():
     smoke_retryable_failed_staged_source_recovery_promotes_only_importable_files()
     smoke_completed_client_import_gets_turn_after_manual_source_cycle()
 
+    if FORCED_CONNECTION_CLOSES:
+        total = sum(n for _name, n in FORCED_CONNECTION_CLOSES)
+        if total > IMPORTER_LEAK_CEILING:
+            fail(
+                f"{total} importer connections were force-closed, above the measured {IMPORTER_LEAK_CEILING}: "
+                f"something in this smoke now leaves a connection open ({FORCED_CONNECTION_CLOSES})"
+            )
+        print(
+            f"import_files left {total} SQLite connection(s) open across "
+            f"{len(FORCED_CONNECTION_CLOSES)} temporary directories; closed by the smoke so cleanup could run"
+        )
     print("IMPORT_READY_WORKER_OK: import-ready worker uses import lock without broad state-lock waits")
     return 0
 
