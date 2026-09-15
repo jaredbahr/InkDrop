@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Exact-target, hash-bound recovery for a known bad imported artifact."""
+"""Exact-target, hash-bound recovery for a known bad imported artifact.
+
+RECOVERY HERE MEANS RECOVERING THE LIBRARY FROM A BAD FILE, NOT RECOVERING THE FILE.
+    --apply RECORDS the file's content as known-bad in
+    `artifact_bad_content_memory`, so every later import of those bytes is
+    refused, QUARANTINES the staged file by moving it out of its staging root,
+    and retracts this issue's stale verified import proofs. It never clears or
+    un-rejects anything; `tools/inkdrop_clear_known_bad_content.py` does that.
+
+    The name reads the other way, and that is tracker row #959: someone
+    looking for a way to clear five known-bad staged files found this as the
+    only file whose name suggested it, and the flags it asks for would have
+    recorded them bad and moved them out of staging. The dry run used to open
+    with `{` and report `"known_bad_memory_recorded": false`, true of that run
+    and read as a promise about the tool. So the dry run's first line now says
+    what --apply does (`dry_run_banner()`), and so does the first line of
+    --help and of any run argparse refuses (`EFFECT_LINE`). A rename was the
+    row's other arm and was not taken here: the module is named in the public
+    export and release lists and the Docker allowlist, and a rename helps only
+    someone who reads the filename, while the banner reaches the person who has
+    already typed the command.
+"""
 import sys as _sys
 from pathlib import Path as _Path
 _ROOT = _Path(__file__).resolve().parents[1]
@@ -8,6 +29,7 @@ if str(_ROOT) not in _sys.path:
 
 
 import argparse
+import codecs
 import hashlib
 import json
 import os
@@ -55,6 +77,93 @@ def _content_fingerprint(digest):
     return hashlib.sha256(str(digest).encode("ascii")).hexdigest()[:12]
 
 
+def _quarantine_root(quarantine_root=None):
+    return Path(quarantine_root or inkdrop_runtime_config.quarantine_dir() / "incident-recovery")
+
+
+def dry_run_banner(staged_path=None, quarantine_root=None):
+    """What --apply will do, in words, for the top of a dry run's output.
+
+    The first line carries the whole warning on its own -- RECORDS known-bad,
+    QUARANTINES the file -- because the first line is what a person scanning
+    for "did it work" reads, and the JSON below it describes this run, where
+    every action field is false. Built from the arguments alone, so a dry run
+    that is refused prints it too: someone adjusting flags until the dry run
+    passes sees it on the first attempt. Without --staged-path, --apply records
+    the hash and moves nothing, and the line says so rather than promising a
+    move.
+
+    The opening says only what this run will not do, because it is printed
+    before the run starts. It used to say "nothing was changed", which no run
+    had yet earned, and a dry run on a state database with no -wal or -shm file
+    does create them. What it can promise is that no known-bad entry is written
+    and no file is moved, and both hold for a refused run too.
+    """
+    if staged_path:
+        first = (
+            "DRY RUN: this run writes no known-bad entry and moves no file. --apply does not clear or restore "
+            "anything: it RECORDS this content as known-bad, so every future import of it is refused, and "
+            f"QUARANTINES the file, moving {staged_path} into {_quarantine_root(quarantine_root)}."
+        )
+    else:
+        first = (
+            "DRY RUN: this run writes no known-bad entry and moves no file. --apply does not clear or restore "
+            "anything: it RECORDS this content hash as known-bad, so every future import of it is refused. "
+            "It QUARANTINES only a file named with --staged-path, and none was, so no file is moved."
+        )
+    return [
+        first,
+        "To clear a known-bad entry so a file can be judged again, use tools/inkdrop_clear_known_bad_content.py.",
+        '--apply also retracts stale verified import proofs for this issue; a dry run that succeeds counts them under "reconciliation".',
+    ]
+
+
+# The first line of --help and of any run argparse refuses. No staged path is
+# known there, so the sentence names the flag instead of a file.
+EFFECT_LINE = (
+    "This tool does not clear or restore anything: with --apply it RECORDS a file's content as known-bad, "
+    "so every future import of it is refused, and QUARANTINES the file named with --staged-path, "
+    "moving it into quarantine."
+)
+
+
+class _EffectFirstParser(argparse.ArgumentParser):
+    """argparse with the effect sentence ahead of --help and of every refusal.
+
+    A run missing a flag -- someone who has the staged file and has not hashed
+    it yet -- printed only argparse's usage and error, and --help opened with
+    the usage line. Neither said what the tool does.
+    """
+
+    def format_help(self):
+        return EFFECT_LINE + "\n\n" + super().format_help()
+
+    def error(self, message):
+        _sys.stderr.write(EFFECT_LINE + "\n")
+        super().error(message)
+
+
+def _stdout_survives_any_name():
+    """Print a staged name the stdout encoding cannot hold as escapes instead of dying.
+
+    A redirected stdout on Windows encodes with the ANSI code page, so a staged
+    path outside it raised UnicodeEncodeError on the dry run's first line,
+    before any work; the JSON alone never did, because json.dumps escapes
+    non-ASCII. A UTF-8 stdout using surrogateescape is left as it is, so
+    undecodable bytes in a name still round-trip there.
+    """
+    stream = _sys.stdout
+    try:
+        encoding = codecs.lookup(stream.encoding).name
+        errors = stream.errors
+    except (AttributeError, LookupError, TypeError):
+        return
+    if (encoding, errors) == ("utf-8", "surrogateescape") or errors == "backslashreplace":
+        return
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(errors="backslashreplace")
+
+
 def _target_exists(con, series_id, issue_number):
     return con.execute(
         """
@@ -82,7 +191,7 @@ def recover_exact_artifact(
         raise ValueError("expected_sha256_must_be_64_lowercase_hex")
     now = float(now or time.time())
     operation_id = _operation_id(series_id, issue_number, digest)
-    quarantine_root = Path(quarantine_root or inkdrop_runtime_config.quarantine_dir() / "incident-recovery")
+    quarantine_root = _quarantine_root(quarantine_root)
     journal = quarantine_root / ".operations" / f"{operation_id}.json"
     prior = {}
     if journal.is_file():
@@ -233,7 +342,16 @@ def recover_exact_artifact(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Safely reconcile one exact known-bad imported artifact")
+    # The description used to read "Safely reconcile one exact known-bad
+    # imported artifact", which names no action at all (row #959).
+    _stdout_survives_any_name()
+    parser = _EffectFirstParser(
+        description=(
+            "Record one file's content as known-bad and move the staged file into quarantine. "
+            "Dry run unless --apply. This never clears a known-bad entry; "
+            "tools/inkdrop_clear_known_bad_content.py does."
+        )
+    )
     parser.add_argument("--series-id", required=True)
     parser.add_argument("--issue", required=True)
     parser.add_argument("--expected-sha256", required=True)
@@ -242,8 +360,19 @@ def main():
     parser.add_argument("--quarantine-root")
     parser.add_argument("--state-db", default=str(inkdrop_runtime_config.state_dir() / inkdrop_state.STATE_DB_NAME))
     parser.add_argument("--completion-db", default=str(inkdrop_runtime_config.state_dir() / "imported-files.sqlite3"))
-    parser.add_argument("--apply", action="store_true", help="Apply after reviewing the default dry-run")
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="Record the content as known-bad and quarantine the staged file, after reviewing the default dry run",
+    )
     args = parser.parse_args()
+    if not args.apply:
+        # Printed before the call so a refused dry run carries it too. Plain
+        # text on stdout ahead of the JSON, as tools/inkdrop_clear_known_bad_content.py
+        # does: nothing in the tree parses this CLI's output, and stderr was
+        # rejected because a captured or merged stream can put it after the
+        # JSON, which is the one place it does no good. --apply keeps printing
+        # the JSON alone.
+        print("\n".join(dry_run_banner(args.staged_path, args.quarantine_root)))
     try:
         result = recover_exact_artifact(
             state_db=args.state_db, completion_db=args.completion_db,
