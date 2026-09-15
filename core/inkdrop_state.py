@@ -503,9 +503,118 @@ def clear_settings_caches():
 
 
 def clear_state_view_summary_cache():
+    """Age every summary out, keeping the payload for a concurrent reader.
+
+    The contract this must not break is inkdrop-summary-cache-invalidation's:
+    a caller that just wrote reads back on its own thread and has to be told
+    what it wrote. That still holds, because the caller that finds no fresh
+    entry is the one that rebuilds and waits -- see state_summary_single_flight.
+
+    What changes is what a DIFFERENT thread sees while that rebuild runs. It
+    used to find nothing at all and start a rebuild of its own; now the last
+    payload is still here to be handed over, labelled "stale_refreshing" with
+    its age. Setting ts to 0 rather than deleting is the whole mechanism: zero
+    can never be inside any TTL, so nothing is served as fresh, but something
+    is there to serve.
+    """
+    stale_at = 0.0
     with STATE_SUMMARY_CACHE_LOCK:
-        STATE_VIEW_SUMMARY_CACHE.clear()
-        STATE_SUMMARY_CACHE.update({"db_path": None, "ts": 0.0, "summary": None})
+        for slot in STATE_VIEW_SUMMARY_CACHE.values():
+            if isinstance(slot, dict):
+                slot["ts"] = stale_at
+        STATE_SUMMARY_CACHE["ts"] = stale_at
+
+
+def mark_operational_table_summary_stale():
+    """Age the operational table summary out the same way, payload kept.
+
+    Separate from clear_state_view_summary_cache() because that one is called
+    from the write stamp on paths this summary does not read, and because its
+    own twenty-second TTL already bounds it. This exists for the callers -- and
+    the tests -- that need to force the next read down the rebuild path without
+    throwing away what a concurrent reader could have had.
+    """
+    with STATE_SUMMARY_CACHE_LOCK:
+        for slot in OPERATIONAL_TABLE_SUMMARY_CACHE.values():
+            if isinstance(slot, dict):
+                slot["ts"] = 0.0
+
+
+def state_summary_serve_stale_enabled():
+    """The kill switch. A regression on the QA host is a .env change, not a rollback."""
+    value = str(os.environ.get("INKDROP_STATE_SUMMARY_SERVE_STALE", "1") or "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+# One rebuild per key at a time. Concurrent callers used to each start their own:
+# six cold requests for the dashboard's first paint produced six builds and a
+# worst case of 14.5s on a seeded fixture, because the rebuild IS the expensive
+# thing and six in parallel are slower each than one alone.
+#
+# The caller that finds no fresh entry becomes the leader and waits for the real
+# answer. That is deliberate and load-bearing: a writer invalidates and reads
+# back on its own thread, so a writer is always the leader, and the cache cannot
+# lie to it. Everyone who arrives afterwards is a follower and either takes the
+# last payload (labelled, with its age) or waits on the leader's build when
+# there is nothing to take.
+STATE_SUMMARY_INFLIGHT_LOCK = threading.Lock()
+STATE_SUMMARY_INFLIGHT = {}
+# A follower that waits gives up well before the client does. Longer than the
+# slowest build measured (15-22s on a live database), shorter than forever: a
+# leader that dies must not park every follower on it permanently.
+STATE_SUMMARY_SINGLE_FLIGHT_WAIT_SECONDS = 40.0
+
+
+def state_summary_single_flight(cache_key, build, stale_payload=None, stale_age_seconds=None):
+    """Run `build` once for concurrent callers on `cache_key`.
+
+    Returns the payload. The leader's is `build`'s own return value, untouched,
+    so the caller can store it and stamp it as it already does. A follower's is
+    a clone, stamped "stale_refreshing" (it took the previous payload) or
+    "coalesced" (it waited for the leader's).
+    """
+    with STATE_SUMMARY_INFLIGHT_LOCK:
+        record = STATE_SUMMARY_INFLIGHT.get(cache_key)
+        leader = record is None
+        if leader:
+            record = {"event": threading.Event(), "result": None}
+            STATE_SUMMARY_INFLIGHT[cache_key] = record
+
+    if leader:
+        try:
+            result = build()
+            if isinstance(result, dict):
+                # A clone, so a follower reading this cannot see the leader's
+                # caller stamping summary_cache onto the same dict afterwards.
+                record["result"] = clone_jsonish(result)
+            return result
+        finally:
+            with STATE_SUMMARY_INFLIGHT_LOCK:
+                STATE_SUMMARY_INFLIGHT.pop(cache_key, None)
+            record["event"].set()
+
+    if (
+        isinstance(stale_payload, dict)
+        and stale_payload.get("ok")
+        and state_summary_serve_stale_enabled()
+    ):
+        out = clone_jsonish(stale_payload)
+        out["summary_cache"] = "stale_refreshing"
+        out["summary_cache_age_seconds"] = (
+            round(float(stale_age_seconds), 3) if stale_age_seconds is not None else None
+        )
+        return out
+
+    record["event"].wait(timeout=STATE_SUMMARY_SINGLE_FLIGHT_WAIT_SECONDS)
+    result = record.get("result")
+    if isinstance(result, dict) and result.get("ok"):
+        out = clone_jsonish(result)
+        out["summary_cache"] = "coalesced"
+        out["summary_cache_age_seconds"] = 0
+        return out
+    # The leader failed or timed out. Building it here is worse than coalescing
+    # and better than returning nothing, and it is the rare path by construction.
+    return build()
 
 
 def merge_provider_settings(existing_value, runtime_settings):
@@ -1781,6 +1890,38 @@ def init_schema_uncached(con):
             on download_tasks(issue_id, updated_at desc, id desc);
         create index if not exists idx_queue_issue_updated
             on queue_items(issue_id, updated_at desc, id desc);
+
+        -- Three orderings the planner had to build a temp B-tree for, one per
+        -- request, over whole tables.
+        --
+        -- import_rows() sorts all of import_results by
+        -- `coalesce(created_at, 0) desc, id desc`. Every existing index on that
+        -- table leads with a scoping column (queue_id, series_id, issue_id,
+        -- source_attempt_id), so none of them serves the unscoped Imports page
+        -- and it fell back to SCAN + TEMP B-TREE.
+        create index if not exists idx_import_results_created_keyset
+            on import_results(coalesce(created_at, 0) desc, id desc);
+        -- The two lookups download_task_rows() makes per row, in the exact
+        -- ordering it asks for. The existing idx_import_results_*_created
+        -- indexes lead with the same columns but order on the raw created_at,
+        -- and the query orders on coalesce(created_at, 0) -- a different
+        -- expression as far as the planner is concerned, so it searched the
+        -- index and then sorted the result anyway. The repo already keys
+        -- indexes on this expression (idx_import_results_queue_verified_keyset).
+        create index if not exists idx_import_results_source_attempt_keyset
+            on import_results(source_attempt_id, coalesce(created_at, 0) desc, id desc);
+        create index if not exists idx_import_results_queue_keyset
+            on import_results(queue_id, coalesce(created_at, 0) desc, id desc);
+        -- series_compact_card_rows() and series_rows() both end
+        -- `order by ..., s.sort_title`, and sort_title had no index at all.
+        create index if not exists idx_series_sort_title on series(sort_title);
+        -- series_history_image_map() looks up history by
+        -- (entity_type, entity_id, event_type) newest-first.
+        -- idx_history_entity_created stops at entity_id, so the event_type
+        -- filter and the ordering were both left to the scan, on a table with
+        -- 1.8M+ rows.
+        create index if not exists idx_history_entity_event_created
+            on history_events(entity_type, entity_id, event_type, created_at desc);
 
         drop trigger if exists trg_history_bucket_insert;
         create trigger if not exists trg_provider_health_revision
@@ -26400,6 +26541,14 @@ def acquisition_policy_settings(db_path):
 
 
 def media_management_settings_context(db_path):
+    # One snapshot for the ~28 settings below. Each of these helpers goes
+    # through app_setting(), which opens its own read connection per key, and
+    # queue_row_from_record() calls this while shaping rows.
+    with app_settings_prefetch(db_path):
+        return _media_management_settings_context(db_path)
+
+
+def _media_management_settings_context(db_path):
     return {
         "root_folder_strategy": media_management_text_setting(db_path, "root_folder_strategy", "media_type") or "media_type",
         "comic_root": str(
@@ -27440,6 +27589,56 @@ def media_management_minimum_free_space_gb(settings):
         return 0.0
 
 
+# Free space and root existence, per library root, for a couple of seconds.
+#
+# media_management_destination_preview() is called once per queue row, and its
+# root-level checks -- does the library root exist, how much space is on it --
+# depend only on the root. There are two roots (comic and manga), so a
+# 2,700-row Manual Review snapshot ran the same statvfs and the same exists()
+# 2,700 times. The per-row checks (does THIS series folder exist, does THIS
+# planned filename collide) are not cached: they genuinely differ per row.
+#
+# Short on purpose. This is not a cache of free space, it is a way for the rows
+# of one request to share one reading, which is also more coherent than each
+# row getting its own.
+MEDIA_MANAGEMENT_ROOT_PROBE_TTL_SECONDS = 2.0
+MEDIA_MANAGEMENT_ROOT_PROBE_CACHE = {}
+MEDIA_MANAGEMENT_ROOT_PROBE_LOCK = threading.Lock()
+
+
+def clear_media_management_root_probe_cache():
+    with MEDIA_MANAGEMENT_ROOT_PROBE_LOCK:
+        MEDIA_MANAGEMENT_ROOT_PROBE_CACHE.clear()
+
+
+def media_management_root_probe(root):
+    """(root_exists, disk_usage) for one library root, shared within a request."""
+    key = str(root or "")
+    now = time.time()
+    with MEDIA_MANAGEMENT_ROOT_PROBE_LOCK:
+        slot = MEDIA_MANAGEMENT_ROOT_PROBE_CACHE.get(key)
+    if isinstance(slot, dict) and now - float(slot.get("ts") or 0) <= MEDIA_MANAGEMENT_ROOT_PROBE_TTL_SECONDS:
+        return slot["exists"], clone_jsonish(slot["usage"])
+    try:
+        root_exists = Path(key).exists()
+    except OSError:
+        root_exists = False
+    usage = (
+        media_management_disk_usage(key)
+        if root_exists
+        else {"available": False, "reason": "root_missing", "probe_path": key}
+    )
+    with MEDIA_MANAGEMENT_ROOT_PROBE_LOCK:
+        if len(MEDIA_MANAGEMENT_ROOT_PROBE_CACHE) > 16:
+            MEDIA_MANAGEMENT_ROOT_PROBE_CACHE.clear()
+        MEDIA_MANAGEMENT_ROOT_PROBE_CACHE[key] = {
+            "ts": now,
+            "exists": root_exists,
+            "usage": clone_jsonish(usage),
+        }
+    return root_exists, usage
+
+
 def media_management_disk_usage(path):
     text = str(path or "").strip()
     if not text:
@@ -27784,15 +27983,14 @@ def media_management_destination_preview(db_path, row, *, source_path=None, dest
     minimum_free_space_gb = media_management_minimum_free_space_gb(settings)
     check_storage = boolish(check_storage, True)
     if check_storage:
-        try:
-            root_exists = Path(root).exists()
-        except OSError:
-            root_exists = False
+        # Root-level: shared across the rows of one request, because it depends
+        # only on the root and there are two of them.
+        root_exists, free_snapshot = media_management_root_probe(root)
+        # Row-level: this series' own folder, so genuinely per row.
         try:
             planned_dir_exists = Path(planned_dir).exists()
         except OSError:
             planned_dir_exists = False
-        free_snapshot = media_management_disk_usage(root) if root_exists else {"available": False, "reason": "root_missing", "probe_path": root}
     else:
         root_exists = None
         planned_dir_exists = None
@@ -43049,6 +43247,81 @@ def apply_source_provider_recommendation(db_path, provider_id, recommendation_ke
     return result
 
 
+# A block that reads many settings at once, so a caller that needs dozens does
+# not open dozens of connections.
+#
+# media_management_settings_context() reads about 28 settings, each through
+# app_setting(), and app_setting() opens its own read connection per key. That
+# is 28 connections per call, and queue_row_from_record() calls it while shaping
+# rows. Every value here is configuration read within one request, so reading
+# them from one snapshot is not only cheaper, it is more consistent than 28
+# separate reads interleaved with whatever a settings write is doing.
+#
+# Thread-local, so one request's prefetch is invisible to every other thread,
+# and scoped to a `with` block so nothing outside it can be served a stale map.
+_APP_SETTINGS_PREFETCH = threading.local()
+
+
+def _app_settings_prefetch_map(db_path):
+    active = getattr(_APP_SETTINGS_PREFETCH, "frames", None)
+    if not active:
+        return None
+    for frame_path, mapping in reversed(active):
+        if frame_path == str(db_path):
+            return mapping
+    return None
+
+
+def app_settings_all(db_path):
+    """Every app setting, shaped exactly as app_setting() shapes one.
+
+    One query. app_settings is a configuration table -- tens of rows -- so
+    reading all of it costs less than three individual lookups.
+    """
+    out = {}
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return out
+    try:
+        with connect_read(db_path, timeout_seconds=5) as con:
+            if not table_exists(con, "app_settings"):
+                return out
+            for row in con.execute(
+                "select key, scope, label, value_json, description, source, updated_at from app_settings"
+            ):
+                try:
+                    value = json.loads(row["value_json"] or "null")
+                except ValueError:
+                    value = None
+                out[str(row["key"])] = {
+                    "key": row["key"],
+                    "scope": row["scope"],
+                    "label": row["label"],
+                    "value": value,
+                    "description": row["description"],
+                    "source": row["source"],
+                    "updated_at": row["updated_at"],
+                }
+    except Exception:
+        return {}
+    return out
+
+
+@contextlib.contextmanager
+def app_settings_prefetch(db_path):
+    """Serve app_setting() from one snapshot for the duration of this block."""
+    mapping = app_settings_all(db_path)
+    frames = getattr(_APP_SETTINGS_PREFETCH, "frames", None)
+    if frames is None:
+        frames = []
+        _APP_SETTINGS_PREFETCH.frames = frames
+    frames.append((str(db_path), mapping))
+    try:
+        yield mapping
+    finally:
+        frames.pop()
+
+
 def app_setting(db_path, key):
     key = str(key or "").strip()
     if not key:
@@ -43056,6 +43329,12 @@ def app_setting(db_path, key):
     db_path = Path(db_path)
     if not db_path.exists():
         return None
+
+    prefetched = _app_settings_prefetch_map(db_path)
+    if prefetched is not None:
+        # A key absent from the snapshot is an unset setting, which is what a
+        # per-key read would have reported too.
+        return prefetched.get(key)
 
     def _read():
         with connect_read(db_path) as con:
@@ -49681,16 +49960,20 @@ def state_summary(db_path, use_cache=True):
         cached = STATE_SUMMARY_CACHE.get("summary")
         cached_at = float(STATE_SUMMARY_CACHE.get("ts") or 0)
         cached_key = STATE_SUMMARY_CACHE.get("db_path")
+        # built_at survives invalidation (which zeroes ts); the payload can still
+        # be handed to a concurrent reader, and it must go out with its real age.
+        built_at = float(STATE_SUMMARY_CACHE.get("built_at") or cached_at)
     if (
         use_cache
         and isinstance(cached, dict)
         and cached.get("ok")
         and cached_key == cache_key
+        and cached_at
         and now - cached_at <= STATE_VIEW_SUMMARY_TTL_SECONDS
     ):
         out = clone_jsonish(cached)
         out["summary_cache"] = "hit"
-        out["summary_cache_age_seconds"] = round(now - cached_at, 3)
+        out["summary_cache_age_seconds"] = round(now - built_at, 3)
         diag_ts = out.get("queue_diagnostic_cache_ts")
         out["queue_diagnostic_cache_age_seconds"] = round(max(0.0, now - diag_ts), 3) if diag_ts is not None else 0
         return out
@@ -49924,19 +50207,35 @@ def state_summary(db_path, use_cache=True):
                 ),
             }
 
-    summary = with_db_lock_retry(_summary, attempts=3, initial_delay=0.75)
-    if isinstance(summary, dict) and summary.get("ok"):
-        review_snapshot = manual_review_canonical_snapshot(db_path)
-        summary["manual_review_actionable_count"] = int(review_snapshot["counts"].get("actionable") or 0)
-        summary["manual_review_parked_count"] = int(review_snapshot["counts"].get("parked") or 0)
+    def _build():
+        summary = with_db_lock_retry(_summary, attempts=3, initial_delay=0.75)
+        if isinstance(summary, dict) and summary.get("ok"):
+            review_snapshot = manual_review_canonical_snapshot(db_path)
+            summary["manual_review_actionable_count"] = int(review_snapshot["counts"].get("actionable") or 0)
+            summary["manual_review_parked_count"] = int(review_snapshot["counts"].get("parked") or 0)
+        return summary
+
+    # use_cache=False is "I just wrote and want to report the result", so it must
+    # not be handed someone else's in-flight answer either. It builds its own.
+    summary = _build() if not use_cache else state_summary_single_flight(
+        ("state_summary", cache_key),
+        _build,
+        stale_payload=cached if cached_key == cache_key else None,
+        stale_age_seconds=(now - built_at) if built_at else None,
+    )
+    # Only the caller that built it stores it -- a follower's payload is already
+    # cached or deliberately stale, and re-storing it would reset its age to zero.
+    if isinstance(summary, dict) and summary.get("ok") and summary.get("summary_cache") is None:
         summary["summary_cache"] = "miss"
         summary["summary_cache_age_seconds"] = 0
         diag_ts = summary.get("queue_diagnostic_cache_ts")
         summary["queue_diagnostic_cache_age_seconds"] = round(max(0.0, time.time() - diag_ts), 3) if diag_ts is not None else 0
+        stored_at = time.time()
         with STATE_SUMMARY_CACHE_LOCK:
             STATE_SUMMARY_CACHE.update({
                 "db_path": cache_key,
-                "ts": time.time(),
+                "ts": stored_at,
+                "built_at": stored_at,
                 "summary": clone_jsonish(summary),
             })
     return summary
@@ -50021,7 +50320,25 @@ def state_sections_from_summary(summary, db_path=None, fast=False):
     queue_working_count = searching_count + downloading_count + importing_count
     queue_exception_count = sum(int(active_queue.get(state) or 0) for state in ("needs_you", "blocked", "failed"))
     review_parked_count = int(review.get("provider_wait") or 0)
-    manual_review_count = state_view_total_count(summary, "manual_review", db_path=db_path)
+    # `fast` is the dashboard's first paint, which loadInkdropCore() gives seven
+    # seconds before it shows "Could not load InkDrop's state". Handing a db_path
+    # to state_view_total_count sends it down the exact branch --
+    # len(manual_review_rows(db, 5000, "actionable")) -- which builds the entire
+    # canonical Manual Review snapshot (a queue_rows(5000) pass, a
+    # review_exceptions pass, a batched cover lookup and the per-row contract)
+    # so one integer can be taken from its length. Measured at 4.13s for this
+    # route alone on a 7,200-row queue. Withholding db_path here takes the
+    # number the summary already computed instead.
+    #
+    # It is a slightly different number, and deliberately so: the summary counts
+    # active review_exceptions in needs_you/failed/blocked, while the shaped list
+    # also drops rows the Manual Review contract routed to Wanted and rows
+    # already decided in manual-review-actions.json. This is the dashboard tile,
+    # where a bounded difference is worth four seconds; every caller that is not
+    # the first paint still passes db_path and still gets the exact count.
+    manual_review_count = state_view_total_count(
+        summary, "manual_review", db_path=None if fast else db_path
+    )
     queue_section_count = queue_working_count + queue_exception_count + retry_due_count
     if queue_exception_count:
         queue_state = "needs_you"
@@ -50495,10 +50812,40 @@ def series_thumb_images_by_series_id(db_path, series_ids):
 
 
 def series_attention_count(db_path):
+    """How many series have something actionable waiting on a person.
+
+    This is one number on the Series filter bar, and it used to be produced by
+    len(series_review_attention_counts(db_path)) -- which builds the entire
+    canonical Manual Review snapshot (queue_rows(5000), the review_exceptions
+    pass, the batched cover lookup and the per-row contract) and then throws
+    every row away except the distinct series ids. series_filter_options() is on
+    the Series compact first paint, so that snapshot was rebuilt on every Series
+    page load: 3.22s for that route on a 7,200-row queue at ref ec78393.
+
+    The count itself needs no rows. It is the same predicate the operational
+    summary's manual_review_actionable_count uses (active review_exceptions in
+    needs_you/failed/blocked), counted distinct by series instead of summed.
+
+    series_review_attention_counts() is unchanged and still used by the callers
+    that need the per-series breakdown for rows they are already shaping.
+    """
     path = Path(db_path)
     if not path.exists():
         return 0
-    return len(series_review_attention_counts(db_path))
+    try:
+        with connect_read(path, timeout_seconds=5) as con:
+            row = con.execute(
+                """
+                select count(distinct series_id) as count
+                from review_exceptions
+                where active = 1
+                  and coalesce(series_id, '') <> ''
+                  and state in ('needs_you', 'failed', 'blocked')
+                """
+            ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except Exception:
+        return 0
 
 
 def wanted_provider_wait_count(db_path):
@@ -57093,6 +57440,14 @@ def queue_row_from_record(row, provider_health=None, db_path=None, media_managem
     if not isinstance(raw, dict):
         raw = {}
     raw = apply_queue_retry_columns_to_raw(raw, row)
+    # Parsed once. "image" and "image_thumb" below each used to json.loads the
+    # same series blob, so every queue row decoded its series JSON twice -- at
+    # 2,700 rows on a Manual Review snapshot that is 2,700 wasted parses.
+    series_raw = (
+        json_loads(row["series_raw_json"] or "{}", {}) if "series_raw_json" in row.keys() else {}
+    )
+    if not isinstance(series_raw, dict):
+        series_raw = {}
     out = {
         "id": row["id"],
         "queue_id": row["id"],
@@ -57116,11 +57471,11 @@ def queue_row_from_record(row, provider_health=None, db_path=None, media_managem
         "updated_at": row["updated_at"],
         "series": row["series"],
         "year": row["series_year"] if "series_year" in row.keys() else None,
-        "image": series_image_from_raw(json_loads(row["series_raw_json"] or "{}", {})) if "series_raw_json" in row.keys() else "",
+        "image": series_image_from_raw(series_raw) if "series_raw_json" in row.keys() else "",
         # Small variant of the same field, for surfaces that render this row
         # at thumbnail size (mobile Needs Review) rather than fetching the
         # full-size "image" above and scaling it down client-side.
-        "image_thumb": series_thumb_image_from_raw(json_loads(row["series_raw_json"] or "{}", {})) if "series_raw_json" in row.keys() else "",
+        "image_thumb": series_thumb_image_from_raw(series_raw) if "series_raw_json" in row.keys() else "",
         "media_type": row["media_type"],
         "metadata_provider": row["metadata_provider"],
         "metadata_id": row["metadata_id"],
@@ -57809,14 +58164,74 @@ QUEUE_ROWS_DEFAULT_ORDER_BY = """
 QUEUE_ROWS_BUCKET_ORDER_BY = "coalesce(q.updated_at, q.created_at, 0) desc, q.id desc"
 
 
+def queue_stalled_import_candidate_ids(db_path, limit=5000):
+    """Queue ids that could possibly be a stalled import, from columns alone.
+
+    inkdrop_staged_projection.classify() opens with four preconditions before it
+    looks at anything on disk: the row must be active and in state 'importing',
+    it must carry no download task and no import result (either means somebody is
+    still reporting on it), and it must have an attempt in a staged status.
+
+    All four are columns, so they can rule rows out here instead of after a full
+    projection has been built for each one. This is deliberately a SUPERSET --
+    it decides nothing. The artifact's existence, its extension, the permitted
+    roots and the sidecar are still classify()'s to check, on the survivors, so
+    there is exactly one definition of "stalled import" and it is that function.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    limit = max(1, min(int(limit or 5000), 5000))
+    staged = sorted(inkdrop_staged_projection.STAGED_STATUSES)
+    placeholders = ",".join("?" for _ in staged)
+    try:
+        with connect_read(path, timeout_seconds=5) as con:
+            return [
+                str(row["id"])
+                for row in con.execute(
+                    f"""
+                    select q.id
+                    from queue_items q
+                    where q.active = 1
+                      and lower(q.state) = 'importing'
+                      and not exists (select 1 from download_tasks dt where dt.queue_id = q.id)
+                      and not exists (select 1 from import_results ir where ir.queue_id = q.id)
+                      and exists (
+                          select 1 from source_attempts sa
+                          where sa.queue_id = q.id
+                            and lower(coalesce(sa.status, '')) in ({placeholders})
+                      )
+                    order by q.updated_at desc, q.id desc
+                    limit ?
+                    """,
+                    (*staged, limit),
+                )
+            ]
+    except Exception:
+        return []
+
+
 def queue_stalled_import_rows(db_path, limit=5000):
-    """Return bounded read-only queue projections for preserved stalled imports."""
+    """Return bounded read-only queue projections for preserved stalled imports.
+
+    This was queue_rows(5000) over every active importing row, shaped in full --
+    the joins, the per-row contract, the provider status, the explainability
+    block -- so that the handful whose display_state came out as
+    "stalled_import" could be kept. It runs on every Queue request and again
+    inside download_task_count(db, "problems"): profiled warm on a 7,200-row
+    queue it was 0.857s of a 1.00s route, shaping 974 rows to produce a number.
+    """
+    limit = max(1, min(int(limit or 5000), 5000))
+    candidate_ids = queue_stalled_import_candidate_ids(db_path, limit)
+    if not candidate_ids:
+        return []
     rows = queue_rows(
         db_path,
-        max(1, min(int(limit or 5000), 5000)),
+        limit,
         states=("importing",),
         active_only=True,
         include_media_management_preview=False,
+        queue_ids=candidate_ids,
     )
     return [row for row in rows if str(row.get("display_state") or "").lower() == "stalled_import"]
 
@@ -59834,7 +60249,125 @@ def manual_review_resolved_ids():
     return resolved
 
 
+# The canonical snapshot is the single most expensive read in the web tier and
+# four call sites want a NUMBER out of it, not its rows: the Series card badges
+# (series_review_attention_counts), the Series filter bar, the Manual Review
+# tile and the Manual Review page. Measured at 1.73s (2,700 shaped queue rows)
+# on a 7,200-row queue, paid once per caller, so one Series compact page load
+# built it repeatedly -- 4.20s of that route's 4.31s at ref 4fbe725.
+#
+# NOT a plain TTL. A time-only bound would mean a queue row that just moved into
+# needs_you, or a decision a person just made, stayed invisible until a timer
+# expired -- and "the row came straight back" is a defect this file has already
+# had once (see the resolved_ids note in the builder below). Instead the key
+# carries a CONTENT signature of everything the snapshot reads:
+#
+#   - the actionable queue_items: count and max(updated_at)
+#   - the active review_exceptions: count and max(updated_at)
+#   - manual-review-actions.json's (mtime_ns, size), which is the only place a
+#     recorded decision exists -- neither table has a terminal state for one at
+#     the moment it lands, which is precisely why that file exists
+#
+# Two indexed aggregates, measured at 2.3ms against a 1.73s build, so exact
+# invalidation costs about a seventh of a percent of what it saves. Anything a
+# writer changes without touching a count or an updated_at is caught by the TTL
+# backstop, which is why that still exists rather than being removed as
+# redundant.
+#
+# Deliberately NOT keyed on the database file's mtime: acquisition workers write
+# many times a second, so an mtime key is a cache that never hits -- see the
+# note above STATE_VIEW_SUMMARY_TTL_SECONDS for where that was measured.
+MANUAL_REVIEW_SNAPSHOT_TTL_SECONDS = 60
+MANUAL_REVIEW_SNAPSHOT_CACHE_LOCK = threading.Lock()
+MANUAL_REVIEW_SNAPSHOT_CACHE = {}
+MANUAL_REVIEW_SNAPSHOT_CACHE_MAX_ENTRIES = 4
+
+
+def clear_manual_review_snapshot_cache():
+    with MANUAL_REVIEW_SNAPSHOT_CACHE_LOCK:
+        MANUAL_REVIEW_SNAPSHOT_CACHE.clear()
+
+
+def manual_review_actions_signature():
+    """(mtime_ns, size) of the decisions file, or None when it does not exist.
+
+    Any recorded decision rewrites that file, so this changes the cache key the
+    moment one lands. Read defensively: an unreadable file must mean "rebuild",
+    never "serve whatever was cached".
+    """
+    try:
+        from core.inkdrop_web_config import MANUAL_REVIEW_ACTIONS_FILE
+        stat = MANUAL_REVIEW_ACTIONS_FILE.stat()
+        return (stat.st_mtime_ns, stat.st_size)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # Cannot decide, so do not reuse: a unique value forces a rebuild.
+        return ("unreadable", time.time())
+
+
+def manual_review_snapshot_signature(db_path):
+    """What the snapshot would read, cheaply enough to check on every call.
+
+    A failure here returns a unique value rather than a reusable one: not being
+    able to tell whether the rows changed has to mean "rebuild", never "serve
+    what was cached".
+    """
+    try:
+        with connect_read(db_path, timeout_seconds=5) as con:
+            queue = con.execute(
+                """
+                select count(*) as count, coalesce(max(updated_at), 0) as updated
+                from queue_items
+                where active = 1 and state in ('needs_you', 'failed', 'blocked')
+                """
+            ).fetchone()
+            review = con.execute(
+                """
+                select count(*) as count, coalesce(max(updated_at), 0) as updated
+                from review_exceptions
+                where active = 1
+                """
+            ).fetchone()
+    except Exception:
+        return ("unreadable", time.time())
+    return (
+        int(queue["count"] or 0), float(queue["updated"] or 0),
+        int(review["count"] or 0), float(review["updated"] or 0),
+        manual_review_actions_signature(),
+    )
+
+
 def manual_review_canonical_snapshot(db_path, limit=5000):
+    limit = max(1, min(int(limit or 5000), 5000))
+    cache_key = (str(db_path), limit)
+    signature = manual_review_snapshot_signature(db_path)
+    now = time.time()
+    with MANUAL_REVIEW_SNAPSHOT_CACHE_LOCK:
+        slot = MANUAL_REVIEW_SNAPSHOT_CACHE.get(cache_key)
+    if (
+        isinstance(slot, dict)
+        and slot.get("signature") == signature
+        and now - float(slot.get("ts") or 0) <= MANUAL_REVIEW_SNAPSHOT_TTL_SECONDS
+    ):
+        # Cloned on the way out: callers shape rows in place (manual_review_rows
+        # hands its list straight to view builders), and a shared row dict makes
+        # one caller's edit everyone's data. Measured at 0.041s against a 1.73s
+        # build, so the copy is not what this was avoiding.
+        return clone_jsonish(slot["snapshot"])
+    snapshot = _manual_review_canonical_snapshot_build(db_path, limit)
+    with MANUAL_REVIEW_SNAPSHOT_CACHE_LOCK:
+        if len(MANUAL_REVIEW_SNAPSHOT_CACHE) >= MANUAL_REVIEW_SNAPSHOT_CACHE_MAX_ENTRIES:
+            MANUAL_REVIEW_SNAPSHOT_CACHE.clear()
+        MANUAL_REVIEW_SNAPSHOT_CACHE[cache_key] = {
+            "ts": now,
+            "signature": signature,
+            "snapshot": clone_jsonish(snapshot),
+        }
+    return snapshot
+
+
+def _manual_review_canonical_snapshot_build(db_path, limit=5000):
     limit = max(1, min(int(limit or 5000), 5000))
     decision_states = MANUAL_REVIEW_FILTERS["actionable"][1]
     queue_candidates = queue_rows(db_path, limit, states=decision_states, active_only=True)
@@ -61588,7 +62121,7 @@ def download_task_count(db_path, download_filter=None):
         return 0
     filter_key = download_task_filter_key(download_filter)
     if filter_key in {"problems", "source_attention", "auto_retry", "cleanup"}:
-        with connect(db_path) as con:
+        with connect_read(db_path, timeout_seconds=5) as con:
             rollup = download_task_problem_rollup(con, latest_provider_health_map(con))
         if filter_key == "problems":
             return int(rollup.get("download_task_problem_items") or 0) + queue_stalled_import_count(db_path)
@@ -61600,7 +62133,7 @@ def download_task_count(db_path, download_filter=None):
             return int(rollup.get("download_task_problem_cleanup_items") or 0)
     _filter, where_sql, params = download_task_filter_sql(filter_key)
     where = f"where {where_sql}" if where_sql else ""
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         try:
             row = con.execute(
                 f"""
@@ -61677,7 +62210,7 @@ def download_task_rows(db_path, limit=80, download_filter=None):
     query_limit = 5000 if problem_subset_filter else limit
     download_filter, where_sql, params = download_task_filter_sql(download_filter)
     where = f"where {where_sql}" if where_sql else ""
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         try:
             rows = con.execute(
                 f"""
@@ -61721,13 +62254,37 @@ def download_task_rows(db_path, limit=80, download_filter=None):
                 left join queue_items q on q.id = dt.queue_id
                 left join wanted_items w on w.id = dt.wanted_id
                 left join source_attempts sa on sa.id = dt.source_attempt_id
-                left join import_results li on li.id = (
-                    select ir.id
-                    from import_results ir
-                    where ir.source_attempt_id = dt.source_attempt_id
-                       or ir.queue_id = dt.queue_id
-                    order by coalesce(ir.created_at, 0) desc, ir.id desc
-                    limit 1
+                -- Two indexed lookups rather than one OR. Read from `explain
+                -- query plan`, which corrected the expectation: SQLite does not
+                -- scan for the OR, it takes a MULTI-INDEX OR across
+                -- idx_import_results_source_attempt and
+                -- idx_import_results_queue_created. What it cannot do is
+                -- produce the union in order from either, so it sorts it in a
+                -- temp B-tree -- once per download-task row. Each single-column
+                -- lookup below reads straight down its own index and stops at
+                -- the first row, with no sort at all.
+                --
+                -- THIS CHANGES A TIE-BREAK, deliberately: where a task has both
+                -- a source_attempt import and a queue import, the OR took
+                -- whichever was newer and this takes the attempt's. The attempt
+                -- is the more specific link (a queue can carry several), so
+                -- where they disagree this is the better answer; where only one
+                -- exists, which is the ordinary case, the result is identical.
+                left join import_results li on li.id = coalesce(
+                    (
+                        select ir.id
+                        from import_results ir
+                        where ir.source_attempt_id = dt.source_attempt_id
+                        order by coalesce(ir.created_at, 0) desc, ir.id desc
+                        limit 1
+                    ),
+                    (
+                        select ir.id
+                        from import_results ir
+                        where ir.queue_id = dt.queue_id
+                        order by coalesce(ir.created_at, 0) desc, ir.id desc
+                        limit 1
+                    )
                 )
                 {where}
                 order by
@@ -63504,29 +64061,51 @@ def series_history_image_map(con, series_ids):
     if not ids:
         return {}
     out = {}
-    for series_id in ids:
-        try:
-            rows = con.execute(
-                """
-                select raw_json
+    # One query for every series on the page, not one per series. This ran a
+    # history_events query per series -- up to eighty round-trips for one Series
+    # page, against a table with 1.8M+ rows -- and then json_loads'd up to twelve
+    # blobs from each.
+    #
+    # The window function is what keeps the twelve-per-series bound: without it,
+    # an `entity_id in (...)` query would return every matching event for every
+    # series, and a series with thousands of them would be read in full. Same
+    # rows, same order, same first-image-wins rule, one statement.
+    # idx_history_entity_event_created serves the partition and the ordering.
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = con.execute(
+            f"""
+            select entity_id, raw_json
+            from (
+                select entity_id,
+                       raw_json,
+                       row_number() over (
+                           partition by entity_id
+                           order by created_at desc
+                       ) as rank
                 from history_events
                 where entity_type = 'series'
-                  and entity_id = ?
+                  and entity_id in ({placeholders})
                   and raw_json is not null
                   and event_type in ('series_added', 'series_add_failed', 'series_monitor_synced')
-                order by created_at desc
-                limit 12
-                """,
-                (series_id,),
-            ).fetchall()
-        except sqlite3.Error:
-            return out
-        for row in rows:
-            raw = json_loads(row["raw_json"] or "{}", {})
-            raw = raw if isinstance(raw, dict) else {}
-            if series_image_from_raw(raw):
-                out[series_id] = raw
-                break
+            )
+            where rank <= 12
+            order by entity_id, rank
+            """,
+            tuple(ids),
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    for row in rows:
+        series_id = str(row["entity_id"] or "")
+        if series_id in out:
+            # The rows arrive newest-first per series and the first one carrying
+            # an image wins, exactly as the per-series loop decided.
+            continue
+        raw = json_loads(row["raw_json"] or "{}", {})
+        raw = raw if isinstance(raw, dict) else {}
+        if series_image_from_raw(raw):
+            out[series_id] = raw
     return out
 
 
@@ -63752,18 +64331,14 @@ def series_rows(db_path, limit=80, series_filter=None):
     query_limit = 5000
     provider_wait_counts = series_provider_wait_counts(db_path)
     review_attention_counts = series_review_attention_counts(db_path)
-    with connect(db_path, configure_wal=False) as con:
-        ensure_columns(
-            con,
-            "series",
-            {
-                "library_root": "text",
-                "library_path": "text",
-                "library_path_template": "text",
-                "library_path_source": "text",
-                "library_adapter_path": "text",
-            },
-        )
+    # A read, through a read connection. This opened a WRITE handle and ran
+    # ensure_columns -- a pragma table_info plus a potential ALTER TABLE -- on
+    # every Series page load. Both are unnecessary: all five columns are in
+    # series' own `create table` (see the schema above) and init_schema_uncached
+    # runs the same ensure_columns for them, so by the time any reader can open
+    # this database they exist. A read path is also the wrong place to discover
+    # that they do not: init_schema refuses to open an older schema at all.
+    with connect_read(db_path, timeout_seconds=5) as con:
         rows = con.execute(
             f"""
             select s.id, s.title, s.media_type, s.year, s.publisher,
@@ -64515,7 +65090,7 @@ def issue_rows(db_path, limit=80, issue_filter=None, focus=None):
         if series_focused_all
         else "coalesce(q.updated_at, w.updated_at, li.created_at, i.updated_at, i.created_at, 0) desc, s.sort_title, i.normalized_number"
     )
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         scan_limit = limit
         if series_focused_all:
             scan_limit = min(5000, max(limit * 3, limit + 50))
@@ -64688,7 +65263,7 @@ def issue_filter_options(db_path, summary=None):
     db_path = Path(db_path)
     if not db_path.exists():
         return []
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         row = con.execute(
             """
             select
@@ -68435,7 +69010,7 @@ def import_filter_options(db_path):
     db_path = Path(db_path)
     if not db_path.exists():
         return []
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         active_sql = f"not ({IMPORT_RESULT_HISTORICAL_SQL})"
         row = con.execute(
             f"""
@@ -69510,7 +70085,7 @@ def import_rows(db_path, limit=80, import_filter=None):
     limit = max(1, min(int(limit or 80), 300))
     import_filter, where_sql, where_params = import_filter_clause(import_filter)
     where_sql = f"where {where_sql}" if where_sql else ""
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         rows = con.execute(
             f"""
             select ir.id, ir.queue_id, ir.series_id, ir.issue_id, ir.source_path, ir.dest_path, ir.status,
@@ -70196,7 +70771,10 @@ def configured_provider_keys(db_path):
     if not db_path.exists():
         return set()
     try:
-        with connect(db_path) as con:
+        # A read. connect() opens a write handle and probes journal_mode to do
+        # it, which on the dashboard's first paint is a write-lock wait in the
+        # middle of the route the seven-second toast is timing.
+        with connect_read(db_path, timeout_seconds=5) as con:
             return {
                 provider_activity_key(row["id"])
                 for row in con.execute("select id from provider_configs")
@@ -72010,7 +72588,7 @@ def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0)
         offset = 0 if focus else max(0, min(int(offset or 0), 1000000))
     except (TypeError, ValueError):
         offset = 0
-    with connect_read(db_path) as probe_con:
+    with connect_read(db_path, timeout_seconds=5) as probe_con:
         history_columns = {row["name"] for row in probe_con.execute("pragma table_info(history_events)")}
         source_attempt_columns = {row["name"] for row in probe_con.execute("pragma table_info(source_attempts)")}
         download_task_columns = {row["name"] for row in probe_con.execute("pragma table_info(download_tasks)")}
@@ -72201,7 +72779,7 @@ def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0)
                 # offset in this pass; see bounded_limit below.
                 *((limit,) if history_filter == "downloads" else ()),
             )
-        with connect(db_path) as con:
+        with connect_read(db_path, timeout_seconds=5) as con:
             rows = con.execute(
                 f"""
                 with {recent_cte_sql}
@@ -72281,7 +72859,7 @@ def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0)
                     break
         return out
     where_sql = f"where {where_sql}" if where_sql else ""
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         rows = con.execute(
             f"""
             with recent_h as (
@@ -72365,7 +72943,7 @@ def history_filter_count(db_path, history_filter):
         return 0
     history_filter, where_sql, where_params = history_filter_clause(history_filter)
     where_sql = f"where {where_sql}" if where_sql else ""
-    with connect(db_path) as con:
+    with connect_read(db_path, timeout_seconds=5) as con:
         row = con.execute(
             f"select count(*) as count from history_events h {where_sql}",
             where_params,
@@ -73156,14 +73734,18 @@ def state_view_summary(db_path, scope=STATE_SUMMARY_SCOPE_FULL):
         slot = STATE_VIEW_SUMMARY_CACHE.get(cache_key)
         cached = slot.get("summary") if isinstance(slot, dict) else None
         cached_at = float(slot.get("ts") or 0) if isinstance(slot, dict) else 0.0
+        # built_at survives invalidation (which zeroes ts); the payload can still
+        # be handed to a concurrent reader, and it must go out with its real age.
+        built_at = float(slot.get("built_at") or cached_at) if isinstance(slot, dict) else 0.0
     if (
         isinstance(cached, dict)
         and cached.get("ok")
+        and cached_at
         and now - cached_at <= STATE_VIEW_SUMMARY_TTL_SECONDS
     ):
         out = clone_jsonish(cached)
         out["summary_cache"] = "hit"
-        out["summary_cache_age_seconds"] = round(now - cached_at, 3)
+        out["summary_cache_age_seconds"] = round(now - built_at, 3)
         diag_ts = out.get("queue_diagnostic_cache_ts")
         out["queue_diagnostic_cache_age_seconds"] = round(max(0.0, now - diag_ts), 3) if diag_ts is not None else None
         return out
@@ -73308,15 +73890,26 @@ def state_view_summary(db_path, scope=STATE_SUMMARY_SCOPE_FULL):
                 },
             }
 
-    summary = with_db_lock_retry(_summary, attempts=3, initial_delay=0.35)
-    if isinstance(summary, dict) and summary.get("ok"):
+    summary = state_summary_single_flight(
+        ("state_view_summary", cache_key),
+        lambda: with_db_lock_retry(_summary, attempts=3, initial_delay=0.35),
+        stale_payload=cached,
+        stale_age_seconds=(now - built_at) if built_at else None,
+    )
+    # Only the caller that built it stores it. A follower already holds either a
+    # deliberately stale payload or a clone of the leader's; re-storing either
+    # would reset the entry's age to zero, which is the cache lying about its
+    # own freshness.
+    if isinstance(summary, dict) and summary.get("ok") and summary.get("summary_cache") is None:
         summary["summary_cache"] = "miss"
         summary["summary_cache_age_seconds"] = 0
         diag_ts = summary.get("queue_diagnostic_cache_ts")
         summary["queue_diagnostic_cache_age_seconds"] = round(max(0.0, time.time() - diag_ts), 3) if diag_ts is not None else None
+        stored_at = time.time()
         with STATE_SUMMARY_CACHE_LOCK:
             STATE_VIEW_SUMMARY_CACHE[cache_key] = {
-                "ts": time.time(),
+                "ts": stored_at,
+                "built_at": stored_at,
                 "summary": clone_jsonish(summary),
             }
     return summary
@@ -73332,12 +73925,23 @@ def state_view_operational_table_summary(db_path, view=None):
         return {"ok": False, "reason": "state_db_missing", "db_path": str(path)}
     view_key = str(view or "").strip().lower().replace("-", "_")
     cache_key = (str(path), view_key)
-    cached = OPERATIONAL_TABLE_SUMMARY_CACHE.get(cache_key)
-    cached_at = float(cached.get("ts") or 0) if cached else 0
-    if cached and time.time() - cached_at <= OPERATIONAL_TABLE_SUMMARY_TTL_SECONDS:
-        hit = clone_jsonish(cached.get("summary"))
+    # Under the same lock the other two summary caches use. This read was three
+    # separate lookups with nothing holding them together, so a concurrent
+    # store could land between them.
+    with STATE_SUMMARY_CACHE_LOCK:
+        cached = OPERATIONAL_TABLE_SUMMARY_CACHE.get(cache_key)
+        cached_payload = cached.get("summary") if isinstance(cached, dict) else None
+        cached_at = float(cached.get("ts") or 0) if isinstance(cached, dict) else 0.0
+        # built_at survives invalidation, ts does not. An invalidated entry can
+        # still be handed to a follower, and a payload served without its real
+        # age is a payload whose staleness nobody can bound.
+        built_at = float(cached.get("built_at") or cached_at) if isinstance(cached, dict) else 0.0
+    now = time.time()
+    cached_age = round(now - built_at, 1) if built_at else None
+    if cached_payload is not None and cached_at and now - cached_at <= OPERATIONAL_TABLE_SUMMARY_TTL_SECONDS:
+        hit = clone_jsonish(cached_payload)
         if isinstance(hit, dict):
-            hit["summary_cache_age_seconds"] = round(time.time() - cached_at, 1)
+            hit["summary_cache_age_seconds"] = cached_age
         return hit
 
     def _summary():
@@ -73458,11 +74062,25 @@ def state_view_operational_table_summary(db_path, view=None):
                 summary.update(duplicate_series_title_metrics(con, limit=5))
             return summary
 
-    summary = with_db_lock_retry(_summary, attempts=3, initial_delay=0.2)
-    if isinstance(summary, dict) and summary.get("ok"):
+    summary = state_summary_single_flight(
+        ("operational_table", cache_key),
+        lambda: with_db_lock_retry(_summary, attempts=3, initial_delay=0.2),
+        stale_payload=cached_payload,
+        stale_age_seconds=cached_age,
+    )
+    if isinstance(summary, dict) and summary.get("ok") and summary.get("summary_cache") is None:
+        # Only the caller that actually built it stores it. A follower's payload
+        # is already in the cache (or deliberately stale) and re-storing it would
+        # reset its age to zero, which is the cache lying about its own freshness.
         summary["summary_cache"] = "operational_table"
         summary["summary_cache_age_seconds"] = 0
-        OPERATIONAL_TABLE_SUMMARY_CACHE[cache_key] = {"ts": time.time(), "summary": summary}
+        stored_at = time.time()
+        with STATE_SUMMARY_CACHE_LOCK:
+            OPERATIONAL_TABLE_SUMMARY_CACHE[cache_key] = {
+                "ts": stored_at,
+                "built_at": stored_at,
+                "summary": summary,
+            }
     return summary
 
 

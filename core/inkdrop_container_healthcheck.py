@@ -40,7 +40,16 @@ def _probe_status_once(port, *, timeout):
     started = time.monotonic()
     conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=float(timeout))
     try:
-        conn.request("GET", "/status.json", headers={"Accept": "application/json"})
+        # This probe asks whether the process is answering, not for fresh
+        # numbers. Without the header a cache miss here arms the full status
+        # recompute -- process scan, manual review load, provider probes -- once
+        # a minute forever, on an install nobody is looking at.
+        #
+        # Kept on one line on purpose: inkdrop-public-docker-runtime-smoke greps
+        # this file for the literal `conn.request("GET", "/status.json"` to
+        # prove the healthcheck still probes that endpoint, and wrapping the
+        # call across lines breaks that needle without changing the behaviour.
+        conn.request("GET", "/status.json", headers={"Accept": "application/json", "X-InkDrop-Probe": "liveness"})
         response = conn.getresponse()
         body = response.read().decode("utf-8", errors="replace")
     except Exception as exc:

@@ -7,6 +7,7 @@ if str(_ROOT) not in _sys.path:
 
 import base64
 import contextlib
+import collections
 import functools
 import calendar
 import faulthandler
@@ -275,6 +276,14 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
     let packReviewLastEndpointState = null;
     let packReviewLastEndpointAt = 0;
     let packReviewFastPollTimer = null;
+    // Both fast polls ran at eight seconds, and they engage exactly when the
+    // server has reported it is struggling -- so the response to "I am
+    // overloaded" was more requests, sooner, from every open tab. Twenty
+    // seconds is still well inside the sixty-second base cadence these exist
+    // to beat, and it is above the server's own three-second retry hint by
+    // enough that a shed request's retry lands before the next poll rather
+    // than on top of it.
+    const INKDROP_FAST_POLL_MS = 20000;
     let statusFastPollTimer = null;
     let activeInkdropSectionPayload = null;
     let activeInkdropPrimarySection = "series";
@@ -5826,18 +5835,48 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
           const error = new Error(payload?.error || `HTTP ${res.status}`);
           error.httpStatus = Number(res.status || 0);
           error.responseWasJson = !!payload && typeof payload === "object";
+          // The state semaphore sheds a request with 503 + state_busy when both
+          // of its two slots are held. That is the server saying "come back
+          // shortly", not "this failed" -- and it tells us how shortly, in
+          // Retry-After and in the body. Reading both here is what lets a
+          // caller paint what it already has and retry once, instead of
+          // toasting over good data and letting an 8s timer close in on a
+          // server that has just said it has nothing to give.
+          error.stateBusy = payload?.state_busy === true || error.httpStatus === 503;
+          if (error.stateBusy) {
+            const headerSeconds = Number(res.headers?.get?.("Retry-After") || 0);
+            const bodySeconds = Number(payload?.retry_after_seconds || 0);
+            const seconds = headerSeconds > 0 ? headerSeconds : bodySeconds;
+            error.retryAfterMs = seconds > 0 ? Math.min(60000, seconds * 1000) : 3000;
+          }
           throw error;
         }
         return payload;
       } catch (err) {
         if (err?.name === "AbortError") {
           const seconds = Math.round(Math.max(1000, Number(timeoutMs || 12000)) / 1000);
-          throw new Error(`${label || "Request"} did not respond within ${seconds}s.`);
+          const error = new Error(`${label || "Request"} did not respond within ${seconds}s.`);
+          // A timeout is the other shape of "the server is behind": it earns
+          // the same one retry over cached data as an explicit shed.
+          error.timedOut = true;
+          throw error;
         }
         throw err;
       } finally {
         if (timeout) window.clearTimeout(timeout);
       }
+    }
+
+    // A jittered delay for the single retry a shed or timed-out first paint
+    // gets. Jittered because every open tab is told to come back at the same
+    // moment, and a synchronised retry is the same stampede one step later.
+    function inkdropBusyRetryDelayMs(err, fallbackMs=3000) {
+      const base = Math.max(500, Number(err?.retryAfterMs || fallbackMs));
+      return base + Math.floor(Math.random() * Math.min(2000, base));
+    }
+
+    function inkdropRequestIsBusyOrSlow(err) {
+      return !!(err?.stateBusy || err?.timedOut);
     }
 
 
@@ -6015,7 +6054,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
     function updatePackReviewFastPoll(state) {
       if (packReviewStateNeedsFastPoll(state)) {
         if (!packReviewFastPollTimer) {
-          packReviewFastPollTimer = setInterval(refreshPackReviewBannerState, 8000);
+          packReviewFastPollTimer = setInterval(refreshPackReviewBannerState, INKDROP_FAST_POLL_MS);
         }
       } else if (packReviewFastPollTimer) {
         clearInterval(packReviewFastPollTimer);
@@ -6039,7 +6078,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
     function updateStatusFastPoll(data) {
       if (statusNeedsFastPoll(data)) {
         if (!statusFastPollTimer) {
-          statusFastPollTimer = setInterval(refreshStatus, 8000);
+          statusFastPollTimer = setInterval(refreshStatus, INKDROP_FAST_POLL_MS);
         }
       } else if (statusFastPollTimer) {
         clearInterval(statusFastPollTimer);
@@ -22830,7 +22869,24 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
         if (requestId !== inkdropSectionRequestSeq) return false;
         const rawMessage = err?.message || "Could not load InkDrop section.";
         const message = compactInkdropErrorMessage(rawMessage, "Could not load InkDrop section.");
-        if (keepExisting || restoreCachedInkdropSectionPayload(endpoint)) renderInkdropSectionSoftError(key, message);
+        const restored = keepExisting || restoreCachedInkdropSectionPayload(endpoint);
+        // The server said it was busy, or took longer than the ten seconds this
+        // waits. Both mean "behind", not "broken". Paint what we have, come
+        // back once after the delay the server asked for, and only tell the
+        // person if that second attempt fails too -- a toast over data that is
+        // already on screen is noise, and the retry the person would otherwise
+        // trigger by hand is the same request again.
+        if (inkdropRequestIsBusyOrSlow(err) && !options?.isRetry) {
+          if (restored) renderInkdropSectionSoftError(key, message);
+          else renderInkdropSectionPending(key, focus);
+          const delay = inkdropBusyRetryDelayMs(err);
+          window.setTimeout(() => {
+            if (requestId !== inkdropSectionRequestSeq) return;
+            loadInkdropSection(key, focus, {...(options || {}), isRetry: true, scroll: false});
+          }, delay);
+          return false;
+        }
+        if (restored) renderInkdropSectionSoftError(key, message);
         else renderInkdropSectionError(key, message);
         toast(message, false, {section: key, focus, label: `${inkdropSectionTitle(key)} · Retry`});
         return false;
@@ -22980,14 +23036,43 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       box.hidden = false;
     }
 
-    async function loadInkdropCore(sync=false) {
+    // The last core summary that rendered. One object, not a map: there is one
+    // core summary and the only reason to keep it is so a shed request can
+    // repaint it instead of blanking the dashboard.
+    let lastInkdropCoreState = null;
+
+    function cacheInkdropCorePayload(state) {
+      if (state && typeof state === "object" && state.ok !== false) {
+        lastInkdropCoreState = state;
+      }
+    }
+
+    function restoreCachedInkdropCorePayload() {
+      if (!lastInkdropCoreState) return false;
+      renderInkdropCore({...lastInkdropCoreState, stale_snapshot: true});
+      return true;
+    }
+
+    async function loadInkdropCore(sync=false, options={}) {
       try {
         const data = sync
           ? await api("/api/inkdrop-state/sync", {})
           : await getJsonWithTimeout("/api/inkdrop-state/sections?summary=compact", 7000, "InkDrop core summary");
+        cacheInkdropCorePayload(data.state);
         renderInkdropCore(data.state);
         return data.state;
       } catch (err) {
+        // A shed or timed-out first paint used to go straight to "Could not
+        // load InkDrop's state", over a summary the page may already have had
+        // on screen a moment earlier. The server told us it was busy and how
+        // long to wait; honour that once before saying anything.
+        if (inkdropRequestIsBusyOrSlow(err) && !sync && !options?.isRetry) {
+          const painted = restoreCachedInkdropCorePayload();
+          const delay = inkdropBusyRetryDelayMs(err);
+          window.setTimeout(() => { loadInkdropCore(false, {isRetry: true}); }, delay);
+          if (painted) return lastInkdropCoreState;
+          return null;
+        }
         renderInkdropCore({ok: false});
         toast(err?.message || "Could not load InkDrop's state.", false);
         return null;
@@ -37376,12 +37461,18 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       if (inkdropLoadableSections.has(initialInkdropRoute || "series")) {
         renderInkdropSectionLoading(initialInkdropRoute || "series");
       }
-      refreshStatus();
-      if (initialInkdropRoute) {
-        openInkdropRouteFromHash().catch(err => console.warn("InkDrop initial route load failed", err));
-      } else {
-        loadInkdropSection("series");
-      }
+      // The section the person is waiting for goes first. refreshStatus() used
+      // to be the very first thing boot did, and /status.json is the expensive
+      // one -- the process scan, load_manual_review(200), the provider state --
+      // so the first paint was queued behind it and, with only two state slots,
+      // could be shed outright by the page's own boot.
+      const initialPaint = initialInkdropRoute
+        ? openInkdropRouteFromHash().catch(err => console.warn("InkDrop initial route load failed", err))
+        : loadInkdropSection("series");
+      // .finally rather than .then: the status panel has to fill in whether or
+      // not the first paint succeeded, and a shed section now retries on its
+      // own rather than rejecting.
+      Promise.resolve(initialPaint).finally(() => { refreshStatus(); });
       // Masthead stats (Events/Imports/Downloads on History, etc.) read from
       // state.sections, which only loadInkdropCore() populates -- deep-linking
       // or refreshing directly into a non-default route used to skip this
@@ -37432,6 +37523,86 @@ HTML = HTML.replace("__INKDROP_UI_CSS_VERSION__", INKDROP_UI_CSS_VERSION)
 HTML = HTML.replace("__INKDROP_UI_JS_VERSION__", INKDROP_UI_JS_VERSION)
 HTML = HTML.replace("__INKDROP_UI_REACT_VERSION__", INKDROP_UI_REACT_VERSION)
 HTML = HTML.replace("__INKDROP_SOURCE_DISPLAY_JSON__", INKDROP_SOURCE_DISPLAY_JSON)
+
+# --------------------------------------------------------------------------
+# The app script, lifted out of the document and served as a static asset.
+#
+# WHY. The whole desktop application is the string literal above: 1,908,460
+# bytes of script inside a 1,963,471-byte document, 402,547 after gzip. The
+# document is no-store -- it embeds the per-request setup flag -- so a browser
+# re-downloaded every byte of it on every visit, and the server re-ran a 1.9MB
+# str.replace and a level-6 gzip per request under the GIL to produce it.
+#
+# None of that script is per-request: it carries no substitution placeholder and
+# never reads document.currentScript. Both are asserted by the smoke rather than
+# assumed here.
+#
+# HTML STAYS THE ORACLE. 87 Python and 27 JS tests read this module's source,
+# about 28 extract JS function bodies by indentation, and ten assert on
+# inkdrop_web.HTML. HTML remains the complete document text; HTML_DOCUMENT is
+# what is served, and the smoke proves the two are byte-identical with the tag
+# swapped back. Renaming the oracle is a separate, labelled change.
+#
+# A CLASSIC TAG, NOT defer. The inline script ran during parse, before the
+# head's six deferred scripts fire inkdrop-auth-ready. Its top-level bindings --
+# window.InkDropSeriesNav, the click handlers, the auth-ready listener with its
+# already-ready fallback -- have to keep running at that same point, so the
+# replacement is a plain <script src> at the identical position. No defer, no
+# async, no type. The CSP already permits 'self' scripts: the static JS assets
+# below load the same way.
+_APP_SCRIPT_OPEN = "  <script>\n    const $ = (id) => document.getElementById(id);"
+_APP_SCRIPT_CLOSE = '  </script>\n  <script src="/static/js/inkdrop-activity-ui.js'
+
+
+def _extract_inkdrop_app_script(document):
+    """(script_text, whole_block) for the inline app script, or ("", "").
+
+    Anchored on both ends rather than on a single marker: a one-ended match that
+    silently took the wrong slice would ship a truncated application, and an
+    empty result here is caught by the smoke rather than served.
+    """
+    start = document.find(_APP_SCRIPT_OPEN)
+    if start < 0:
+        return "", ""
+    end = document.find(_APP_SCRIPT_CLOSE, start)
+    if end < 0:
+        return "", ""
+    block = document[start:end + len("  </script>\n")]
+    return block[len("  <script>\n"):-len("  </script>\n")], block
+
+
+INKDROP_APP_JS, _INKDROP_APP_SCRIPT_BLOCK = _extract_inkdrop_app_script(HTML)
+INKDROP_APP_JS_VERSION = hashlib.sha256(INKDROP_APP_JS.encode("utf-8")).hexdigest()[:12]
+INKDROP_APP_JS_PATH = "/static/app/inkdrop-app.js"
+INKDROP_APP_JS_TAG = f'  <script src="{INKDROP_APP_JS_PATH}?v={INKDROP_APP_JS_VERSION}"></script>\n'
+INKDROP_APP_JS_BYTES = INKDROP_APP_JS.encode("utf-8")
+INKDROP_APP_JS_ETAG = f'"{INKDROP_APP_JS_VERSION}"'
+# Compressed once at import, at maximum level, because this body never changes
+# for the life of the process. It used to be recompressed at level 6 on every
+# page load.
+INKDROP_APP_JS_GZIP = gzip.compress(INKDROP_APP_JS_BYTES, compresslevel=9) if INKDROP_APP_JS_BYTES else b""
+
+HTML_DOCUMENT = (
+    HTML.replace(_INKDROP_APP_SCRIPT_BLOCK, INKDROP_APP_JS_TAG, 1)
+    if _INKDROP_APP_SCRIPT_BLOCK
+    else HTML
+)
+
+# The only per-request substitution left in the document, and it has exactly two
+# values, so both are rendered and compressed once at import instead of per
+# request. The document stays no-store because of this flag; what changes is
+# that it is now ~12KB rather than 402KB.
+_HTML_DOCUMENT_RENDERED = {}
+for _setup_flag in ("true", "false"):
+    _rendered = HTML_DOCUMENT.replace("__INKDROP_SETUP_REQUIRED_JSON__", _setup_flag).encode("utf-8")
+    _HTML_DOCUMENT_RENDERED[_setup_flag] = (_rendered, gzip.compress(_rendered, compresslevel=9))
+del _setup_flag, _rendered
+
+
+def inkdrop_app_script_inline_requested():
+    """Kill switch: INKDROP_UI_INLINE_APP_SCRIPT=1 puts the script back in the page."""
+    value = str(os.environ.get("INKDROP_UI_INLINE_APP_SCRIPT", "0") or "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 # Standalone lightweight mobile status view. Deliberately its own tiny HTML
 # document rather than a responsive mode of the desktop shell above -- a
@@ -46021,9 +46192,21 @@ def queue_runner_once():
         )
         or 0
     ) if isinstance(reconcile_status, dict) else 0
+    # The live sweep is its own thread now (source_health_live_sweep_loop) on a
+    # fixed 120s cadence. This runner's own cycle was measured at 685-954s
+    # against a 60s sleep, so probing here meant provider health was refreshed
+    # whenever this cycle happened to reach this line -- which is neither often
+    # nor predictable. It reads what the sweep left instead.
+    # INKDROP_WEB_QUEUE_RUNNER_LIVE_HEALTH=1 restores the old behaviour.
+    runner_live_health = str(
+        os.environ.get("INKDROP_WEB_QUEUE_RUNNER_LIVE_HEALTH", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     source_health = source_health_summary(
         reconcile_status=reconcile_status if isinstance(reconcile_status, dict) else {},
         slskd_probe_status=slskd_status if isinstance(slskd_status, dict) else {},
+        live_slskd=runner_live_health,
+        live_prowlarr=runner_live_health,
+        live_download_clients=runner_live_health,
     )
     try:
         provider_health_history = record_source_health_history(source_health)
@@ -48712,10 +48895,33 @@ def source_health_summary(
     reconcile_status = reconcile_status if isinstance(reconcile_status, dict) else read_json_file(RECONCILE_STATUS_FILE, {}) or {}
     slskd_probe_status = slskd_probe_status if isinstance(slskd_probe_status, dict) else read_json_file(SLSKD_SOURCE_PROBE_STATUS_FILE, {}) or {}
     slskd_probe_status = stale_guarded_slskd_probe_status(slskd_probe_status)
+    # Ages of every cached live answer used below, so the payload can say how
+    # long ago a provider was actually reached rather than implying "just now".
+    health_ages = {}
+
+    def _cached_live(key):
+        """The last live answer for one provider, stamped with its age.
+
+        A page render is asking what a provider's state IS; the last sweep
+        established that. Only Test provider is asking what it is RIGHT NOW, and
+        that path still probes. Returning an aged entry rather than nothing is
+        deliberate: an old live answer is the most recent thing anyone knows, and
+        replacing it with "unavailable" would be a worse report, not a more
+        honest one -- so the age goes out with it.
+        """
+        cached, age = cached_live_source_health(key)
+        if not cached:
+            return None
+        health_ages[key] = age
+        out = dict(cached)
+        out["health_age_seconds"] = age
+        return out
+
     if live_prowlarr:
         prowlarr_health = prowlarr_api_health(timeout=2.5)
+        remember_live_source_health("prowlarr", prowlarr_health)
     else:
-        prowlarr_health = {
+        prowlarr_health = _cached_live("prowlarr") or {
             "state": "configured" if MISSING_ACQUIRE_SCRIPT.exists() else "unavailable",
             "label": "configured" if MISSING_ACQUIRE_SCRIPT.exists() else "unavailable",
             "detail": "Set up in InkDrop. Run Test provider to check Prowlarr right now.",
@@ -48723,9 +48929,13 @@ def source_health_summary(
         }
     if live_slskd:
         slskd_health = slskd_api_health()
+        remember_live_source_health("slskd", slskd_health)
     else:
         status_value = str(slskd_probe_status.get("status") or slskd_probe_status.get("state") or "").strip().lower()
-        slskd_health = {
+        # The root-reachability block below is local filesystem work, not a
+        # network probe, so it still runs and still overrides -- a cached live
+        # answer about the API says nothing about whether the roots are mounted.
+        slskd_health = _cached_live("slskd") or {
             "state": "watch" if status_value in {"error", "failed", "unavailable"} else "configured",
             "label": status_value or "configured",
             "detail": "This is what the worker last reported. Run Test provider to check SLSKD right now.",
@@ -48747,14 +48957,16 @@ def source_health_summary(
     if live_download_clients:
         qbit_health = qbittorrent_api_health(timeout=2.5)
         sab_health = sabnzbd_api_health(timeout=2.5)
+        remember_live_source_health("qbittorrent", qbit_health)
+        remember_live_source_health("sabnzbd", sab_health)
     else:
-        qbit_health = {
+        qbit_health = _cached_live("qbittorrent") or {
             "state": "configured",
             "label": "configured",
             "detail": "Set up in InkDrop. Run Test provider to check qBittorrent right now.",
             "api_reachable": None,
         }
-        sab_health = {
+        sab_health = _cached_live("sabnzbd") or {
             "state": "configured",
             "label": "configured",
             "detail": "Set up in InkDrop. Run Test provider to check SABnzbd right now.",
@@ -48936,6 +49148,14 @@ def source_health_summary(
         "completed_pack_manifest_cache_archives": int(pack_cache.get("archive_count") or 0),
         "completed_pack_manifest_cache_truncated": int(pack_cache.get("truncated_count") or 0),
         "completed_pack_manifest_cache_age_minutes": pack_cache.get("newest_age_minutes"),
+        # How long ago each provider was actually reached, and the worst of them.
+        # Zero means every value here came from a probe run during this call. A
+        # payload that reports provider state without reporting this cannot be
+        # told apart from one checked a moment ago, which is the whole reason
+        # the probes could be moved off the request path at all.
+        "health_age_seconds": max(health_ages.values()) if health_ages else 0,
+        "health_age_seconds_by_provider": dict(health_ages),
+        "health_live_checked": not health_ages,
     }
 
 
@@ -49207,9 +49427,22 @@ def apply_source_health_to_rows(view_payload, source_health=None):
     view = str(view_payload.get("view") or "")
     if view not in {"queue", "wanted"}:
         return view_payload
-    notes = queue_source_health_notes(source_health or source_health_summary())
+    source_health = source_health or source_health_summary()
+    # Attached before the no-notes early return, and whether or not any note
+    # matched a row. These routes no longer probe providers on the request path,
+    # so how long ago each one was actually reached is part of what the payload
+    # says -- a page that shows provider state without it cannot be told apart
+    # from one checked a moment ago.
+    freshness = {
+        "source_health_age_seconds": source_health.get("health_age_seconds"),
+        "source_health_age_seconds_by_provider": source_health.get("health_age_seconds_by_provider") or {},
+        "source_health_live_checked": bool(source_health.get("health_live_checked")),
+    }
+    notes = queue_source_health_notes(source_health)
     if not notes:
-        return view_payload
+        out = dict(view_payload)
+        out.update(freshness)
+        return out
     rows = []
     for row in view_payload.get("rows") or []:
         if not isinstance(row, dict):
@@ -49230,6 +49463,7 @@ def apply_source_health_to_rows(view_payload, source_health=None):
         rows.append(patched)
     out = dict(view_payload)
     out["rows"] = rows
+    out.update(freshness)
     if view in {"queue", "wanted"}:
         out["source_health_notes"] = notes
     return out
@@ -49370,12 +49604,24 @@ def inkdrop_state_dashboard_public():
             dashboard["queue_settlement"] = settlement
         elif settlement.get("skipped"):
             dashboard["queue_settlement"] = settlement
-        health = source_health_summary()
+        # Same reason as the ?view=queue|wanted route above: this one is the
+        # no-view dashboard, it runs inside the state semaphore, and it was
+        # calling every live probe with the defaults.
+        health = source_health_summary(
+            live_slskd=False,
+            live_prowlarr=False,
+            live_download_clients=False,
+        )
         for key in ("queue_preview", "wanted_preview"):
             rows = dashboard.get(key)
             if isinstance(rows, list):
                 wrapped = apply_source_health_to_rows({"view": "queue" if key == "queue_preview" else "wanted", "rows": rows}, health)
                 dashboard[key] = wrapped.get("rows", rows)
+        # Same contract as the state views: this dashboard reports provider
+        # state without having probed for it, so it says how old that state is.
+        dashboard["source_health_age_seconds"] = health.get("health_age_seconds")
+        dashboard["source_health_age_seconds_by_provider"] = health.get("health_age_seconds_by_provider") or {}
+        dashboard["source_health_live_checked"] = bool(health.get("health_live_checked"))
         return dashboard
     except Exception as exc:
         return {
@@ -50912,12 +51158,21 @@ def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filte
         if isinstance(settlement, dict) and settlement.get("skipped"):
             payload["queue_settlement"] = settlement
         if view in {"queue", "wanted"}:
+            # No live probe on a request path, whatever the policy says. The
+            # non-compact form of this route used to run the whole set --
+            # Prowlarr, SLSKD twice, qBittorrent twice, SABnzbd, about 12.5s
+            # worst case -- while holding one of two state slots, so two of
+            # these requests shed the rest of the page as 503.
+            #
+            # queue_wanted_compact_policy's live_* keys keep their names and
+            # still describe this route in state_view_performance, but they now
+            # mean "attach the health we have", never "go and ask".
             payload = apply_source_health_to_rows(
                 payload,
                 source_health_summary(
-                    live_slskd=bool(queue_wanted_policy.get("live_slskd")),
-                    live_prowlarr=bool(queue_wanted_policy.get("live_prowlarr")),
-                    live_download_clients=bool(queue_wanted_policy.get("live_download_clients")),
+                    live_slskd=False,
+                    live_prowlarr=False,
+                    live_download_clients=False,
                 ),
             )
         return attach_performance(payload, route="state_view")
@@ -62363,7 +62618,16 @@ def manual_review_reconciler_loop():
     time.sleep(20)
     while True:
         try:
-            sync_legacy_manual_review_exceptions(force=True, allow_write=True)
+            # force=False, deliberately. force=True meant this loop re-ran the
+            # whole reconcile on every interval whether or not the legacy
+            # journal had changed -- and it does that holding
+            # MANUAL_REVIEW_NATIVE_SYNC_LOCK across a write to the state
+            # database, which is the lock every other caller then queues behind.
+            # The signature cache this function already maintains exists to
+            # answer exactly "has anything changed"; forcing past it made the
+            # cache decorative. When the journal has changed the signature
+            # differs and the reconcile runs, which is the whole job.
+            sync_legacy_manual_review_exceptions(allow_write=True)
         except Exception as exc:
             print(f"Warning: manual review reconcile failed: {exc}", flush=True)
         time.sleep(MANUAL_REVIEW_RECONCILE_INTERVAL_SECONDS)
@@ -62425,6 +62689,53 @@ def write_web_thread_roster():
             })
         except Exception:
             pass
+
+
+def source_health_live_sweep_once():
+    """Reach every provider once and leave the answers in the live-health cache.
+
+    source_health_summary() records each live probe as it runs, so this is the
+    whole writer: one call with the flags on. Returns the ages it produced so a
+    caller can tell a sweep that reached something from one that reached nothing.
+    """
+    health = source_health_summary(
+        live_slskd=True,
+        live_prowlarr=True,
+        live_download_clients=True,
+    )
+    return {
+        "ok": True,
+        "checked_at": time.time(),
+        "live_checked": bool(health.get("health_live_checked")),
+    }
+
+
+def source_health_live_sweep_loop():
+    """The only place live provider probes belong: off every request path.
+
+    The probes cost about 12.5 seconds worst case and they used to run inside
+    the two-slot state semaphore on two different routes, so a second browser
+    tab was enough to shed the rest of the page as 503. A page render is asking
+    what a provider's state IS, and this loop is what establishes that.
+
+    Low cadence on purpose: provider reachability does not change on a
+    second-by-second basis, and every sweep is real network work against someone
+    else's service. SOURCE_HEALTH_LIVE_TTL_SECONDS is what a page may claim
+    without comment; this runs often enough to keep entries near it.
+    """
+    time.sleep(SOURCE_HEALTH_LIVE_SWEEP_START_DELAY_SECONDS)
+    failures = 0
+    while True:
+        write_web_thread_roster()
+        try:
+            source_health_live_sweep_once()
+            failures = 0
+        except Exception as exc:
+            failures += 1
+            print(f"Warning: source health sweep failed ({failures}): {exc}", flush=True)
+            time.sleep(worker_failure_sleep_seconds(SOURCE_HEALTH_LIVE_SWEEP_SECONDS, failures))
+            continue
+        time.sleep(SOURCE_HEALTH_LIVE_SWEEP_SECONDS)
 
 
 def auto_pack_import_loop():
@@ -64285,8 +64596,112 @@ def file_age_minutes(path):
         return None
 
 
-def python_script_process_status(script_path, ignored_tokens=None):
-    ignored_tokens = tuple(ignored_tokens or ())
+# One read of the process table, shared by every question asked about it during
+# a single status compute.
+#
+# python_script_process_status() used to answer each question by forking
+# `pgrep -af <name>` and then `ps -p <pid>`. light_script_status() asks about
+# seven scripts and two other callers ask about two more, so one /status.json
+# compute forked up to eighteen short-lived processes to read a table that was
+# already sitting in /proc. That compute is not driven by a browser either: the
+# container healthcheck fetches /status.json every sixty seconds with no cache
+# bypass, so it cycled on an idle install with nobody looking at the UI.
+#
+# The TTL is short on purpose -- it is not a cache of what is running, it is a
+# way for the nine questions in one compute to share one answer.
+PROCESS_TABLE_CACHE = {"ts": 0.0, "rows": None}
+PROCESS_TABLE_CACHE_LOCK = threading.Lock()
+PROCESS_TABLE_CACHE_TTL_SECONDS = 2.0
+PROC_ROOT = Path("/proc")
+
+
+def clear_process_table_cache():
+    with PROCESS_TABLE_CACHE_LOCK:
+        PROCESS_TABLE_CACHE.update({"ts": 0.0, "rows": None})
+
+
+def _read_proc_process(pid_dir, clock_ticks, uptime_seconds):
+    """One process's pid, command line, parent, state, wait channel and age.
+
+    Every read is guarded: a process can exit between listing /proc and reading
+    its files, and that has to be "this one is gone", not an exception that
+    loses the whole scan.
+    """
+    try:
+        cmdline = (pid_dir / "cmdline").read_bytes()
+    except OSError:
+        return None
+    cmd = cmdline.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    if not cmd:
+        # A kernel thread. It has no command line, so it can never match a
+        # script name, and reading further would only cost time.
+        return None
+    row = {"pid": int(pid_dir.name), "cmd": cmd}
+    try:
+        stat = (pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
+        # comm sits in parentheses and may itself contain spaces or a ')', so
+        # the fields are taken after the LAST ')' rather than by splitting the
+        # whole line.
+        tail = stat[stat.rindex(")") + 1:].split()
+        row["stat"] = tail[0]
+        row["ppid"] = int(tail[1])
+        if clock_ticks and uptime_seconds is not None:
+            starttime_ticks = float(tail[19])
+            row["elapsed_seconds"] = max(0, int(uptime_seconds - (starttime_ticks / clock_ticks)))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        row["wait_channel"] = (pid_dir / "wchan").read_text(encoding="utf-8", errors="replace").strip() or "-"
+    except OSError:
+        row["wait_channel"] = "-"
+    return row
+
+
+def process_table_rows(max_age_seconds=None):
+    """Every process on this host, or None where /proc is not a process table.
+
+    None is a real answer, not a failure: the development host is Windows, where
+    /proc does not exist and pgrep returns nothing either. Callers fall back.
+    """
+    max_age = PROCESS_TABLE_CACHE_TTL_SECONDS if max_age_seconds is None else max_age_seconds
+    now = time.time()
+    with PROCESS_TABLE_CACHE_LOCK:
+        cached = PROCESS_TABLE_CACHE.get("rows")
+        cached_at = float(PROCESS_TABLE_CACHE.get("ts") or 0)
+    if cached is not None and now - cached_at <= max_age:
+        return cached
+    if not PROC_ROOT.is_dir():
+        return None
+    try:
+        clock_ticks = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, ValueError, OSError):
+        clock_ticks = 0
+    try:
+        uptime_seconds = float((PROC_ROOT / "uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        uptime_seconds = None
+    rows = []
+    try:
+        entries = list(PROC_ROOT.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        row = _read_proc_process(entry, clock_ticks, uptime_seconds)
+        if row:
+            rows.append(row)
+    if not rows:
+        # A /proc that lists no processes is not a process table; say so rather
+        # than reporting that nothing on this machine is running.
+        return None
+    with PROCESS_TABLE_CACHE_LOCK:
+        PROCESS_TABLE_CACHE.update({"ts": time.time(), "rows": rows})
+    return rows
+
+
+def _script_process_status_from_forks(script_path, ignored_tokens):
+    """The original pgrep/ps path, kept for hosts where /proc is not readable."""
     try:
         proc = inkdrop_process_lifecycle.run_tracked(
             ["pgrep", "-af", str(Path(script_path).name)],
@@ -64340,6 +64755,35 @@ def python_script_process_status(script_path, ignored_tokens=None):
                 "wait_channel": parts[4],
                 "cmd": parts[5],
             })
+    return status
+
+
+def python_script_process_status(script_path, ignored_tokens=None):
+    ignored_tokens = tuple(ignored_tokens or ())
+    rows = process_table_rows()
+    if rows is None:
+        return _script_process_status_from_forks(script_path, ignored_tokens)
+    script_name = str(Path(script_path).name)
+    script_text = str(script_path)
+    candidates = []
+    for row in rows:
+        cmd = row.get("cmd") or ""
+        if any(token in cmd for token in ignored_tokens):
+            continue
+        if script_text not in cmd and script_name not in cmd:
+            continue
+        # Same ranking as the pgrep path: an explicit python invocation beats a
+        # shell wrapper or an editor that happens to have the name on its
+        # command line.
+        rank = 3 if cmd.startswith("/usr/bin/python3 ") or cmd.startswith("python3 ") else 1
+        candidates.append((rank, row))
+    if not candidates:
+        return {"running": False}
+    _rank, row = max(candidates, key=lambda item: item[0])
+    status = {"running": True, "pid": int(row.get("pid") or 0), "cmd": row.get("cmd") or ""}
+    for key in ("ppid", "elapsed_seconds", "stat", "wait_channel"):
+        if row.get(key) is not None:
+            status[key] = row[key]
     return status
 
 
@@ -65761,6 +66205,12 @@ def light_script_status():
         slskd_status if isinstance(slskd_status, dict) else {},
         live_slskd=False,
         live_prowlarr=False,
+        # The download-client probes were the one live pair left on this path,
+        # and they defaulted on: qBittorrent (auth plus version) and SABnzbd,
+        # every fifteen-second status compute. The container healthcheck polls
+        # /status.json every sixty seconds with no cache bypass, so that was
+        # four probe pairs a minute against an install nobody was looking at.
+        live_download_clients=False,
     )
     system_health = system_health_summary()
     runtime_paths = inkdrop_runtime_paths()
@@ -66218,6 +66668,8 @@ def quick_script_status():
             slskd_status if isinstance(slskd_status, dict) else {},
             live_slskd=False,
             live_prowlarr=False,
+            # Same reason as light_script_status: these defaulted on.
+            live_download_clients=False,
         ),
         "system_health": system_health,
         "pack_review_state": pack_review_status_snapshot(),
@@ -66366,6 +66818,8 @@ def warming_script_status(cache_state="warming", error=None):
             slskd_status if isinstance(slskd_status, dict) else {},
             live_slskd=False,
             live_prowlarr=False,
+            # Same reason as light_script_status: these defaulted on.
+            live_download_clients=False,
         ),
         "system_health": system_health,
         "pack_review_state": pack_review_status_snapshot(),
@@ -66493,7 +66947,16 @@ def setup_required_status_payload():
     }
 
 
-def cached_script_status():
+def cached_script_status(allow_refresh=True):
+    """The status payload, refreshing the cache behind it unless told not to.
+
+    allow_refresh=False is for a caller that only wants to know the process is
+    alive. The container healthcheck fetches this every sixty seconds with no
+    cache bypass, and a miss arms a full recompute -- so on an install with
+    nobody watching the UI, the healthcheck alone kept the expensive status work
+    cycling forever. A liveness probe asks "are you answering", and a stale
+    payload answers that completely.
+    """
     now = time.time()
     with STATUS_CACHE_LOCK:
         cached = STATUS_CACHE.get("data")
@@ -66503,7 +66966,7 @@ def cached_script_status():
             payload["status_cache"] = "hit"
             payload["status_cache_age_seconds"] = round(now - cached_at, 1)
             return attach_web_runtime_status(payload)
-    refresh_started = start_status_cache_refresh()
+    refresh_started = start_status_cache_refresh() if allow_refresh else False
     with STATUS_CACHE_LOCK:
         cached = STATUS_CACHE.get("data")
         cached_at = float(STATUS_CACHE.get("ts") or 0)
@@ -66994,6 +67457,29 @@ def file_entity_validators(stat_result):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = inkdrop_version.server_version()
+    # HTTP/1.1, so a connection can carry more than one request. A cold page
+    # load asks for the document, the stylesheet, the app script, thirteen
+    # static JS files and the React bundle; under HTTP/1.0 with Connection:
+    # close that was a dozen TCP connections and a dozen threads for one page.
+    # Every response that can be reused sets Content-Length, which is what makes
+    # this safe; the streamed-file paths keep closing deliberately.
+    # INKDROP_WEB_KEEP_ALIVE=0 puts it back to HTTP/1.0.
+    protocol_version = "HTTP/1.1" if str(
+        os.environ.get("INKDROP_WEB_KEEP_ALIVE", "1") or "1"
+    ).strip().lower() not in {"0", "false", "no", "off"} else "HTTP/1.0"
+
+    # Set per request and, until reuse existed, never reset -- a handler
+    # instance used to serve exactly one. With reuse, the second request on a
+    # connection would inherit the first's "a response is already on the wire"
+    # flag, so an error on it would be swallowed instead of answered, and it
+    # would inherit the first's semaphore bookkeeping and slow-request
+    # attribution too.
+    PER_REQUEST_STATE = {
+        "_inkdrop_response_started": False,
+        "_state_endpoint_acquired": False,
+        "_state_endpoint_wait_seconds": 0.0,
+        "_active_request_id": None,
+    }
 
     def setup(self):
         super().setup()
@@ -67001,6 +67487,10 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(WEB_SOCKET_TIMEOUT_SECONDS)
         except Exception:
             pass
+
+    def reset_per_request_state(self):
+        for name, value in self.PER_REQUEST_STATE.items():
+            setattr(self, name, value)
 
     def handle_one_request(self):
         """Answer every request with a status, even the ones that go wrong.
@@ -67018,6 +67508,9 @@ class Handler(BaseHTTPRequestHandler):
         block, and does not depend on each new route remembering to catch.
         """
         started = time.time()
+        # Before anything else on this request, because with keep-alive the
+        # values left by the previous one are still on this instance.
+        self.reset_per_request_state()
         try:
             super().handle_one_request()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
@@ -67149,19 +67642,78 @@ class Handler(BaseHTTPRequestHandler):
     # the delivery-budget smoke honest as the day's styles accumulate.
     # Dynamic bodies (no ETag) keep per-request level 6: they never repeat,
     # so a cache would only leak and level 9 would tax every API response.
-    STATIC_GZIP_CACHE = {}
+    #
+    # An OrderedDict used as an LRU rather than a plain dict cleared at 64: the
+    # clear threw away every warm entry including the ones being requested right
+    # then, so crossing the threshold meant recompressing the whole asset set at
+    # level 9 on the next page load. Evicting the least recently used one keeps
+    # the entries that are actually being asked for.
+    STATIC_GZIP_CACHE = collections.OrderedDict()
+    STATIC_GZIP_CACHE_MAX_ENTRIES = 64
 
     @classmethod
     def cached_static_gzip(cls, etag, body):
         cached = cls.STATIC_GZIP_CACHE.get(etag)
         if cached is None:
             cached = gzip.compress(body, compresslevel=9)
-            if len(cls.STATIC_GZIP_CACHE) >= 64:
-                cls.STATIC_GZIP_CACHE.clear()
+            while len(cls.STATIC_GZIP_CACHE) >= cls.STATIC_GZIP_CACHE_MAX_ENTRIES:
+                cls.STATIC_GZIP_CACHE.popitem(last=False)
             cls.STATIC_GZIP_CACHE[etag] = cached
+        else:
+            cls.STATIC_GZIP_CACHE.move_to_end(etag)
         return cached
 
-    def send_bytes(self, body, content_type, status=200, headers=None):
+    # (path, size, mtime_ns) -> (body, etag). Every static asset sender read its
+    # file and ran sha256 over the whole body on EVERY request to build an ETag
+    # that, for an immutable asset, cannot change until the file does. The React
+    # bundle and the CSS bundle are the large ones; a cold page load hashed
+    # about half a megabyte for values already determined by the deploy.
+    #
+    # Keyed on (size, mtime_ns) rather than on the path alone so that replacing
+    # a file -- a rebuild, a deploy, an operator editing the CSS source and
+    # running the build -- is picked up immediately rather than needing a
+    # restart. That is what makes this a cache and not a pin.
+    STATIC_ASSET_CACHE = collections.OrderedDict()
+    STATIC_ASSET_CACHE_MAX_ENTRIES = 64
+
+    @classmethod
+    def cached_static_asset(cls, path, etag_value=None):
+        """(body, etag) for a file, re-read and re-hashed only when it changes.
+
+        Returns (None, None) when the file cannot be read, so callers keep their
+        existing 404 behaviour instead of turning a missing asset into a 500.
+        """
+        path = Path(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None, None
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+        cached = cls.STATIC_ASSET_CACHE.get(key)
+        if cached is not None:
+            cls.STATIC_ASSET_CACHE.move_to_end(key)
+            return cached
+        try:
+            body = path.read_bytes()
+        except OSError:
+            return None, None
+        etag = f'"{etag_value}"' if etag_value else f'"{hashlib.sha256(body).hexdigest()[:12]}"'
+        while len(cls.STATIC_ASSET_CACHE) >= cls.STATIC_ASSET_CACHE_MAX_ENTRIES:
+            cls.STATIC_ASSET_CACHE.popitem(last=False)
+        cls.STATIC_ASSET_CACHE[key] = (body, etag)
+        return body, etag
+        return cached
+
+    def send_bytes(self, body, content_type, status=200, headers=None, precompressed_gzip=None):
+        """Send one response.
+
+        precompressed_gzip is the gzip of `body`, already computed. It exists for
+        bodies that never change for the life of the process -- the app script
+        and the two renderings of the document -- which were otherwise
+        recompressed per request under the GIL. Passing it does not change what
+        is sent, only when the work happened; a client that did not ask for gzip
+        still gets the plain body.
+        """
         try:
             headers = dict(headers or {})
             base_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
@@ -67179,12 +67731,16 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_header("Vary", "Accept-Encoding")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
-                    self.close_connection = True
                     return
             accept_encoding = str(self.headers.get("Accept-Encoding") or "").lower()
             content_encoding = None
             if compressible and status == 200 and len(body) > 256 and "gzip" in accept_encoding:
-                body = self.cached_static_gzip(etag, body) if etag else gzip.compress(body, compresslevel=6)
+                if precompressed_gzip is not None:
+                    body = precompressed_gzip
+                elif etag:
+                    body = self.cached_static_gzip(etag, body)
+                else:
+                    body = gzip.compress(body, compresslevel=6)
                 content_encoding = "gzip"
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -67193,7 +67749,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Encoding", content_encoding)
             if compressible:
                 self.send_header("Vary", "Accept-Encoding")
-            self.send_header("Connection", "close")
             explicit_cache_control = any(str(name).strip().lower() == "cache-control" for name in headers)
             if str(content_type or "").startswith(("application/json", "text/html")) and not explicit_cache_control:
                 self.send_header("Cache-Control", "no-store, max-age=0")
@@ -67211,7 +67766,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header(str(name), str(item))
             self.end_headers()
             self.wfile.write(body)
-            self.close_connection = True
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
         finally:
@@ -67318,8 +67872,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_html(self):
         setup_flag = "true" if inkdrop_status_setup_required() else "false"
-        body = HTML.replace("__INKDROP_SETUP_REQUIRED_JSON__", setup_flag).encode("utf-8")
-        self.send_bytes(body, "text/html; charset=utf-8")
+        if inkdrop_app_script_inline_requested():
+            # The kill switch. A regression on the QA host is a .env change
+            # rather than a rollback, and this path is byte-for-byte what used
+            # to ship, 1.9MB replace and per-request gzip included.
+            body = HTML.replace("__INKDROP_SETUP_REQUIRED_JSON__", setup_flag).encode("utf-8")
+            self.send_bytes(body, "text/html; charset=utf-8")
+            return
+        # Both renderings were produced and compressed at import: the document
+        # has exactly two forms, and re-running a str.replace plus a level-6
+        # gzip per page load was measured at 8ms and 62ms respectively, under
+        # the GIL, for a result that could never differ.
+        body, compressed = _HTML_DOCUMENT_RENDERED[setup_flag]
+        self.send_bytes(body, "text/html; charset=utf-8", precompressed_gzip=compressed)
+
+    def send_app_javascript(self):
+        """The desktop application, as a normal content-fingerprinted asset.
+
+        Immutable and ETag'd, unlike the document that used to carry it: the
+        document is no-store because of its per-request setup flag, so inlining
+        the script meant re-sending 402KB on every visit for bytes that had not
+        changed since the deploy.
+        """
+        self.send_bytes(
+            INKDROP_APP_JS_BYTES,
+            "application/javascript; charset=utf-8",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "ETag": INKDROP_APP_JS_ETAG,
+            },
+            precompressed_gzip=INKDROP_APP_JS_GZIP,
+        )
 
     def send_mobile_html(self):
         setup_flag = "true" if inkdrop_status_setup_required() else "false"
@@ -67391,9 +67974,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def send_ui_stylesheet(self):
-        try:
-            body = INKDROP_UI_CSS_FILE.read_bytes()
-        except OSError:
+        body, _etag = self.cached_static_asset(INKDROP_UI_CSS_FILE, etag_value=INKDROP_UI_CSS_VERSION)
+        if body is None:
             self.send_bytes(b"", "text/css; charset=utf-8", status=404)
             return
         self.send_bytes(
@@ -67406,9 +67988,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def send_auth_backdrop(self):
-        try:
-            body = INKDROP_AUTH_BACKDROP_FILE.read_bytes()
-        except OSError:
+        body, etag = self.cached_static_asset(INKDROP_AUTH_BACKDROP_FILE)
+        if body is None:
             self.send_bytes(b"", "image/webp", status=404)
             return
         self.send_bytes(
@@ -67416,7 +67997,7 @@ class Handler(BaseHTTPRequestHandler):
             "image/webp",
             headers={
                 "Cache-Control": "public, max-age=86400, immutable",
-                "ETag": f'"{hashlib.sha256(body).hexdigest()[:12]}"',
+                "ETag": etag,
             },
         )
 
@@ -67424,9 +68005,8 @@ class Handler(BaseHTTPRequestHandler):
         if asset_name not in INKDROP_UI_JS_ASSETS:
             self.send_bytes(b"", "application/javascript; charset=utf-8", status=404)
             return
-        try:
-            body = (INKDROP_UI_JS_DIR / asset_name).read_bytes()
-        except OSError:
+        body, etag = self.cached_static_asset(INKDROP_UI_JS_DIR / asset_name)
+        if body is None:
             self.send_bytes(b"", "application/javascript; charset=utf-8", status=404)
             return
         self.send_bytes(
@@ -67434,7 +68014,7 @@ class Handler(BaseHTTPRequestHandler):
             "application/javascript; charset=utf-8",
             headers={
                 "Cache-Control": "public, max-age=31536000, immutable",
-                "ETag": f'"{hashlib.sha256(body).hexdigest()[:12]}"',
+                "ETag": etag,
             },
         )
 
@@ -67447,9 +68027,8 @@ class Handler(BaseHTTPRequestHandler):
         if asset_name not in INKDROP_UI_REACT_ASSETS:
             self.send_bytes(b"", "application/javascript; charset=utf-8", status=404)
             return
-        try:
-            body = (INKDROP_UI_REACT_DIR / asset_name).read_bytes()
-        except OSError:
+        body, etag = self.cached_static_asset(INKDROP_UI_REACT_DIR / asset_name)
+        if body is None:
             self.send_bytes(b"", "application/javascript; charset=utf-8", status=404)
             return
         self.send_bytes(
@@ -67457,7 +68036,7 @@ class Handler(BaseHTTPRequestHandler):
             "application/javascript; charset=utf-8",
             headers={
                 "Cache-Control": "public, max-age=31536000, immutable",
-                "ETag": f'"{hashlib.sha256(body).hexdigest()[:12]}"',
+                "ETag": etag,
             },
         )
 
@@ -67589,7 +68168,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", payload.get("content_type") or "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Connection", "close")
             if payload.get("ok"):
                 self.send_header(
                     "Cache-Control",
@@ -67601,7 +68179,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("X-InkDrop-Cover-Reason", str(payload.get("reason") or "cover_fetch_failed"))
             self.end_headers()
             self.wfile.write(body)
-            self.close_connection = True
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
         finally:
@@ -67734,18 +68311,27 @@ class Handler(BaseHTTPRequestHandler):
             # ten seconds building a payload look identical from outside, and
             # they need completely different fixes.
             _slot_wait_started = time.time()
-            _acquired = STATE_ENDPOINT_SEMAPHORE.acquire(timeout=12)
+            _acquired = STATE_ENDPOINT_SEMAPHORE.acquire(timeout=STATE_ENDPOINT_ACQUIRE_TIMEOUT_SECONDS)
             self._state_endpoint_wait_seconds = time.time() - _slot_wait_started
             if not _acquired:
                 self._state_endpoint_acquired = False
+                # "Retry shortly" is not an instruction a client can follow. It
+                # left the delay to the caller, and the caller's own fast-poll
+                # timers set it to eight seconds -- more load, aimed at a server
+                # that has just said it has none to give. Retry-After is the
+                # standard signal for exactly this; the body repeats it so a
+                # client that already parses this JSON needs no header access.
+                retry_after = int(STATE_ENDPOINT_RETRY_AFTER_SECONDS)
                 self.send_json(
                     {
                         "ok": False,
                         "error": "InkDrop state is still busy after waiting; retry shortly.",
                         "state_busy": True,
+                        "retry_after_seconds": retry_after,
                         "state_endpoint_concurrency": STATE_ENDPOINT_CONCURRENCY,
                     },
                     status=503,
+                    headers={"Retry-After": str(retry_after)},
                 )
                 return
             self._state_endpoint_acquired = True
@@ -67761,6 +68347,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_ui_stylesheet()
         elif path == "/static/img/inkdrop-auth-backdrop.webp":
             self.send_auth_backdrop()
+        elif path == INKDROP_APP_JS_PATH:
+            # Before the /static/js/ prefix branch, and its own path rather than
+            # a file in that directory: this body comes from this module, not
+            # from web/static/js/, so send_ui_javascript would look for a file
+            # that does not exist.
+            self.send_app_javascript()
         elif path.startswith("/static/js/"):
             self.send_ui_javascript(path.removeprefix("/static/js/"))
         elif path.startswith("/static/dist/"):
@@ -68040,10 +68632,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/status.json":
             # Reachable before setup so liveness works, but it says nothing
             # about the library until someone has claimed the install.
+            #
+            # A caller that identifies itself as a liveness probe does not arm a
+            # cache refresh. The container healthcheck polls this every sixty
+            # seconds; without the header, that poll alone kept the full status
+            # recompute -- the process scan, the manual review load, the
+            # provider probes -- cycling on an install nobody was looking at.
+            liveness_probe = str(self.headers.get("X-InkDrop-Probe") or "").strip().lower() == "liveness"
             self.send_json(
                 setup_required_status_payload()
                 if inkdrop_status_setup_required()
-                else cached_script_status()
+                else cached_script_status(allow_refresh=not liveness_probe)
             )
         elif path == "/api/watches":
             data = load_watches()
@@ -69633,6 +70232,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
 
 
+def web_embedded_loops_enabled(environ=None):
+    """Whether the web process runs the queue runner and the review reconciler.
+
+    Default on, so a lone `docker run` of this image is unchanged and still does
+    background work. A deployment with a dedicated scheduler container sets
+    INKDROP_WEB_EMBEDDED_LOOPS=0 and gets a web process that only serves.
+    """
+    env = os.environ if environ is None else environ
+    value = str(env.get("INKDROP_WEB_EMBEDDED_LOOPS") or "").strip().lower()
+    return value not in {"0", "false", "no", "off", "disabled"}
+
+
 def _web_background_bootstrap():
     try:
         cleanup_stale_inkdrop_state_sync_processes()
@@ -69678,14 +70289,37 @@ def _web_background_bootstrap():
     # 2026-08-28 three of six threads were each burning ~65% of a core and the
     # only way to tell which loop was which was to predict a sleep signature
     # from this file and match it against /proc sampling from the host.
-    threading.Thread(target=manual_review_reconciler_loop, name="inkdrop-manual-review-reconciler", daemon=True).start()
+    # The two expensive loops. series_queue_runner_loop's own docstring records
+    # 685-954s per cycle against a 60s sleep, inside the process that is also
+    # serving page loads, and manual_review_reconciler_loop writes to the state
+    # database under a lock every interval. INKDROP_WEB_EMBEDDED_LOOPS=0 moves
+    # them to the scheduler process, for a deployment that runs one.
+    #
+    # Wrapped rather than rewritten: inkdrop-web-background-threads-smoke greps
+    # this file for the literal `threading.Thread(target=<loop>, name="<label>"`
+    # of each, so the lines themselves have to stay exactly as they are.
+    if web_embedded_loops_enabled():
+        threading.Thread(target=manual_review_reconciler_loop, name="inkdrop-manual-review-reconciler", daemon=True).start()
+        threading.Thread(target=series_queue_runner_loop, name="inkdrop-series-queue-runner", daemon=True).start()
+    # Always in the web process. It is cheap (about 1.7% duty), and
+    # inkdrop-web-thread-roster-smoke drives one of its turns in-process.
     threading.Thread(target=auto_pack_import_loop, name="inkdrop-auto-pack-import", daemon=True).start()
-    threading.Thread(target=series_queue_runner_loop, name="inkdrop-series-queue-runner", daemon=True).start()
+    # The only thread allowed to reach a provider. Every request path now reads
+    # the cache this fills; see source_health_live_sweep_loop. It stays here
+    # whatever the flag says: the cache it fills is read by the request paths in
+    # THIS process, and a cache filled in another process fills nothing here.
+    threading.Thread(target=source_health_live_sweep_loop, name="inkdrop-source-health-sweep", daemon=True).start()
 
 
 class InkDropThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
+    # The stdlib default is 5. A cold page load opens more parallel connections
+    # than that -- the document, the stylesheet, the app script, thirteen static
+    # JS files and the React bundle -- so a burst could be refused by the kernel
+    # before the server ever accepted it, which looks to the browser like the
+    # server being down rather than being busy.
+    request_queue_size = 128
 
 
 def main():

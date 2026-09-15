@@ -105,6 +105,21 @@ def open_connection(
     con.execute("pragma foreign_keys=on")
     if readonly:
         con.execute("pragma query_only=1")
+        # Read connections are opened per call and thrown away, and they had no
+        # page cache worth the name: the default is 2MB, so a read that touches
+        # a large index re-fetches the same pages from the OS on every query
+        # within the same connection, and a temp B-tree for an ORDER BY the
+        # planner cannot serve from an index spills to a file.
+        #
+        # 16MB of page cache (negative = KiB, not pages, so the size does not
+        # change with page_size), sorts and temp tables in memory, and 256MB of
+        # mmap so the hot pages of a multi-gigabyte state database are read
+        # through the page cache the kernel already has rather than copied.
+        # All three are per-connection and read-only here: none of them changes
+        # what is in the file, and none is reachable from a write handle.
+        con.execute("pragma cache_size=-16384")
+        con.execute("pragma temp_store=memory")
+        con.execute("pragma mmap_size=268435456")
     elif configure_wal:
         # Give a brand-new database incremental auto-vacuum before it has any
         # pages. SQLite only ever reclaims freed pages when something asks it

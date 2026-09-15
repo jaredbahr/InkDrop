@@ -337,6 +337,70 @@ try:
 except (TypeError, ValueError):
     WEB_SOCKET_TIMEOUT_SECONDS = 30.0
 STATE_ENDPOINT_SEMAPHORE = threading.BoundedSemaphore(STATE_ENDPOINT_CONCURRENCY)
+# How long a state request waits for a slot before it is shed, and what the shed
+# response tells the caller to wait. Both were literals inside do_GET: the wait
+# as a bare 12 in the acquire, the delay nowhere at all -- the 503 body said
+# "retry shortly" and left the client to invent a number, which its own
+# fast-poll timers then set to eight seconds. Named here so a smoke can shorten
+# the wait without spending twelve seconds proving a header, and so the delay
+# the client is told is one value rather than a guess per call site.
+STATE_ENDPOINT_ACQUIRE_TIMEOUT_SECONDS = 12.0
+STATE_ENDPOINT_RETRY_AFTER_SECONDS = 3
+
+# The last live answer each provider probe gave, so a page render can report what
+# a provider's state IS without asking the network again.
+#
+# The probes are Prowlarr, SLSKD (twice), qBittorrent (auth plus version) and
+# SABnzbd, run sequentially with their own timeouts -- about 12.5s worst case.
+# Two state routes ran the full set INSIDE the two-slot state semaphore, so two
+# such requests held both slots and everything else on the page waited twelve
+# seconds and was shed as 503. That is the "InkDrop state is still busy" toast
+# caused by the page's own second tab rather than by any real load.
+#
+# A page render is asking what the state is, which the last sweep established.
+# Only an operator pressing Test provider is asking what it is RIGHT NOW, and
+# that path still probes. Whoever does run a live probe fills this on the way
+# past, so the cache needs no separate writer.
+#
+# The TTL is what a rendered page may claim without saying otherwise; past it,
+# the cached value is still handed over but its age goes with it, because "we
+# have not checked in a while" is information and an empty field is not.
+SOURCE_HEALTH_LIVE_TTL_SECONDS = 60
+SOURCE_HEALTH_LIVE_CACHE = {}
+SOURCE_HEALTH_LIVE_CACHE_LOCK = threading.Lock()
+# How often the one thread that is allowed to probe does so, and how long it
+# waits before its first sweep so a cold start serves the page before it starts
+# reaching out to other people's services.
+SOURCE_HEALTH_LIVE_SWEEP_SECONDS = 120
+SOURCE_HEALTH_LIVE_SWEEP_START_DELAY_SECONDS = 20
+
+
+def remember_live_source_health(key, health):
+    """Record one provider's live probe result. Called by whoever probed."""
+    if not key or not isinstance(health, dict):
+        return
+    with SOURCE_HEALTH_LIVE_CACHE_LOCK:
+        SOURCE_HEALTH_LIVE_CACHE[str(key)] = {"ts": time.time(), "health": dict(health)}
+
+
+def cached_live_source_health(key):
+    """(health, age_seconds) for one provider, or (None, None).
+
+    Returns the entry whatever its age. A caller that needs the TTL compares the
+    age itself -- an expired live answer is still the most recent thing anyone
+    knows, and throwing it away to show "unavailable" would be a worse report,
+    not a more honest one.
+    """
+    with SOURCE_HEALTH_LIVE_CACHE_LOCK:
+        slot = SOURCE_HEALTH_LIVE_CACHE.get(str(key))
+    if not isinstance(slot, dict) or not isinstance(slot.get("health"), dict):
+        return None, None
+    return dict(slot["health"]), round(max(0.0, time.time() - float(slot.get("ts") or 0)), 1)
+
+
+def clear_source_health_live_cache():
+    with SOURCE_HEALTH_LIVE_CACHE_LOCK:
+        SOURCE_HEALTH_LIVE_CACHE.clear()
 # Log any request that takes longer than this. Low enough to catch what a
 # person would call slow, high enough that a healthy install stays quiet.
 # Both neighbouring constants wrap their parse; this one did not. A typo in
@@ -978,9 +1042,19 @@ __all__ = [
     "SLSKD_SOURCE_PROBE_STATUS_FILE",
     "SLSKD_WEB_URL",
     "SOURCE_HEALTH_GATE_RETRY_AFTER_MINUTES",
+    "SOURCE_HEALTH_LIVE_CACHE",
+    "SOURCE_HEALTH_LIVE_CACHE_LOCK",
+    "SOURCE_HEALTH_LIVE_SWEEP_SECONDS",
+    "SOURCE_HEALTH_LIVE_SWEEP_START_DELAY_SECONDS",
+    "SOURCE_HEALTH_LIVE_TTL_SECONDS",
+    "cached_live_source_health",
+    "clear_source_health_live_cache",
+    "remember_live_source_health",
     "STAGING_DIR",
     "STATE_DIR",
+    "STATE_ENDPOINT_ACQUIRE_TIMEOUT_SECONDS",
     "STATE_ENDPOINT_CONCURRENCY",
+    "STATE_ENDPOINT_RETRY_AFTER_SECONDS",
     "STATE_ENDPOINT_SEMAPHORE",
     "STATUS_CACHE",
     "STATUS_CACHE_LOCK",

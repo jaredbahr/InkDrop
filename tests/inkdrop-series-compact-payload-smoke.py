@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from core import inkdrop_state
+from core import inkdrop_web_config
 from core import inkdrop_web_state_views
 
 
@@ -146,8 +147,43 @@ def main() -> int:
     assert "series_filter=duplicate_titles&limit=5000" not in web_source, "duplicate workload fetch regressed to the full heavy Series path"
     assert 'variant === "poster" || variant === "table"' in web_source, "poster/table covers should prefer direct trusted images instead of hammering the web proxy"
     assert "STATE_ENDPOINT_SEMAPHORE" in web_source, "state endpoints should be concurrency-gated to protect SQLite from UI request stampedes"
-    assert "STATE_ENDPOINT_SEMAPHORE.acquire(timeout=12)" in web_source, "state endpoint gate should briefly wait instead of immediately bouncing UI requests"
-    assert "self.send_header(\"Connection\", \"close\")" in web_source, "web responses should close connections after each request"
+    # Was `acquire(timeout=12)`. The literal moved into a named constant so a
+    # smoke can shorten the wait to prove the shed path without spending twelve
+    # seconds on it; the bar this line states -- wait briefly rather than bounce
+    # immediately -- is unchanged, and is now asserted on the value instead of
+    # on the spelling.
+    assert "STATE_ENDPOINT_SEMAPHORE.acquire(timeout=STATE_ENDPOINT_ACQUIRE_TIMEOUT_SECONDS)" in web_source, "state endpoint gate should briefly wait instead of immediately bouncing UI requests"
+    assert 1 <= inkdrop_web_config.STATE_ENDPOINT_ACQUIRE_TIMEOUT_SECONDS <= 30, (
+        f"the state-slot wait is {inkdrop_web_config.STATE_ENDPOINT_ACQUIRE_TIMEOUT_SECONDS}s -- "
+        "too short is bouncing UI requests, too long is holding them past any useful deadline"
+    )
+    # This asserted `self.send_header("Connection", "close")`, i.e. that every
+    # response closed its connection. That is now deliberately false: the
+    # handler speaks HTTP/1.1 and reuses connections, because a cold page load
+    # otherwise paid one TCP connection and one thread per asset. The property
+    # is owned by inkdrop-web-keep-alive-smoke, which drives two requests down
+    # one connection and proves the per-request state reset that makes reuse
+    # safe. INKDROP_WEB_KEEP_ALIVE=0 restores the old behaviour.
+    #
+    # What stays asserted here is the exception: a streamed file still closes.
+    # So this reads the two senders rather than the whole module -- the header is
+    # gone from the one every JSON, HTML and asset response goes through, and
+    # still there on the one that streams a multi-gigabyte archive.
+    def handler_method_body(name: str) -> str:
+        start = web_source.index(f"    def {name}(")
+        rest = web_source[start + 1:]
+        end = rest.index("\n    def ")
+        return rest[:end]
+
+    assert "self.send_header(\"Connection\", \"close\")" not in handler_method_body("send_bytes"), (
+        "send_bytes still closes every connection; keep-alive is deliberate and "
+        "inkdrop-web-keep-alive-smoke owns that property now"
+    )
+    assert "self.send_header(\"Connection\", \"close\")" in handler_method_body("send_file_stream"), (
+        "send_file_stream stopped closing its connection -- a streamed archive shares the "
+        "range and length bookkeeping least well with reuse and was deliberately left alone"
+    )
+    assert 'protocol_version = "HTTP/1.1"' in web_source, "connection reuse needs HTTP/1.1"
     assert "self.send_redirect(direct_url)" not in web_source, "cover endpoint should serve the disk-backed cover cache instead of redirecting trusted covers"
     assert "X-InkDrop-Cover-Cache" in web_source, "cover endpoint should expose disk-cache hit/miss diagnostics"
     assert "def public_comic_watches_fast_payload" in web_source, "legacy ComicVine watch reads should use compact InkDrop Series rows"

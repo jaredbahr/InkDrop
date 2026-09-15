@@ -72,6 +72,21 @@
     });
   }
 
+  // Every asset is appended now, and they execute in order regardless.
+  //
+  // This used to chain: append one, wait for its onload, append the next. Six
+  // assets meant six sequential round trips before the last one even started
+  // downloading, on a page that had already spent its budget getting here.
+  // Appending them together lets the browser fetch all six at once;
+  // appendScript sets script.async = false, which is exactly the flag that
+  // makes dynamically inserted scripts still execute in insertion order, so the
+  // ordering ASSET_ORDER encodes is preserved by the DOM rather than by the
+  // promise chain.
+  //
+  // allSettled rather than all: a failure used to abandon every asset after it
+  // in the chain. Now one that fails takes only itself out, the rest still
+  // load, and the returned promise still rejects so an existing caller's catch
+  // behaves as it did.
   function loadAssets(options) {
     options = options || {};
     var documentRef = asDocument(options.document);
@@ -79,18 +94,33 @@
       return name !== "inkdrop-operational-bootstrap.js";
     });
     var summary = { loaded: [], skipped: [] };
-    return assets.reduce(function (chain, assetName) {
-      return chain.then(function () {
-        if (assetLoaded(documentRef, assetName)) {
-          summary.skipped.push(assetName);
-          return summary;
-        }
-        return appendScript(documentRef, assetName, options).then(function () {
-          summary.loaded.push(assetName);
-          return summary;
-        });
+    var pending = [];
+    assets.forEach(function (assetName) {
+      if (assetLoaded(documentRef, assetName)) {
+        summary.skipped.push(assetName);
+        return;
+      }
+      pending.push(
+        appendScript(documentRef, assetName, options).then(
+          function () { return { asset: assetName, ok: true }; },
+          function (error) { return { asset: assetName, ok: false, error: error }; }
+        )
+      );
+    });
+    return Promise.all(pending).then(function (results) {
+      var failures = [];
+      results.forEach(function (result) {
+        if (result.ok) summary.loaded.push(result.asset);
+        else failures.push(result.error || new Error("Failed to load " + result.asset));
       });
-    }, Promise.resolve(summary));
+      // Reported in ASSET_ORDER rather than in completion order, so the summary
+      // says what was loaded and not which happened to finish downloading first.
+      summary.loaded.sort(function (left, right) {
+        return ASSET_ORDER.indexOf(left) - ASSET_ORDER.indexOf(right);
+      });
+      if (failures.length) throw failures[0];
+      return summary;
+    });
   }
 
   function parseJson(value, fallback) {
