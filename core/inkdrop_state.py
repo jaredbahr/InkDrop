@@ -33335,6 +33335,139 @@ def verified_import_for_queue(
     return None
 
 
+def satisfied_import_evidence_resweep(db_path, *, limit=500, series_id=None):
+    """Re-ask the CURRENT destination gate about wants that are already satisfied.
+
+    THE GAP THIS ANSWERS. `settle_queue_items_with_verified_imports()` selects
+    `where q.state not in ('verified','satisfied','superseded_duplicate')`, so
+    the scheduled sweep only ever promotes rows INTO satisfied. Nothing
+    re-examines one already there. The single demotion path lives inside
+    `sync_queue()` and is reachable only while something is processing the row.
+
+    So a credit the gate would refuse today survives indefinitely on a quiet
+    row, and whether a wrong credit is ever caught depends on activity rather
+    than on correctness. Measured 2026-08-26: `The Spectre #003 (1992).cbz`
+    credited to issue 28 is refused when the gate is asked, and never is.
+
+    THIS VERSION REPORTS AND CANNOT WRITE. There is no apply flag and no write
+    path -- the property is structural, not a promise, because a flag that
+    defaults to off is one careless caller away from silently un-satisfying
+    books. Turning a report into a decision is a separate change needing its
+    own review, and it has to move BOTH inputs together: `wanted_items.status`
+    is re-derived from the queue state at every queue write, and a sibling
+    cleanup terminates active queue rows whose wanted status is terminal, so a
+    one-sided change undoes itself from either direction.
+
+    THE GRAIN IS PER-WANT. A want can carry many verified `import_results` rows
+    for one destination -- seventeen in a live example, two of which pass.
+    `verified_import_for_queue()` returns the first that passes, so asking it
+    once per want is the question that matters. Asking per row reports correct
+    wants as broken.
+
+    Returns a dict: `examined`, `would_unsatisfy` (a row per want, with the
+    evidence that failed), and `unreadable` for rows the gate could not judge.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return {"examined": 0, "would_unsatisfy": [], "unreadable": [], "reason": "missing_db"}
+    limit_value = max(1, min(int(limit or 500), 5000))
+    params = []
+    series_clause = ""
+    if series_id:
+        series_clause = " and w.series_id = ?"
+        params.append(str(series_id))
+    examined = 0
+    flagged = []
+    unreadable = []
+    # A READ-ONLY connection, not `connect()` + `init_schema()`. The schema call
+    # opens a write transaction to run its CREATE-IF-NOT-EXISTS statements, so a
+    # diagnostic that used it would be writing to prove it does not write. Opening
+    # readonly makes the property enforced by SQLite rather than by this function
+    # being careful.
+    from core import inkdrop_db
+
+    con = inkdrop_db.open_connection(
+        str(path), readonly=True, operation="satisfied_import_evidence_resweep"
+    )
+    try:
+        con.row_factory = sqlite3.Row
+        roots = media_management_roots_from_connection(con)
+        # ONE ROW PER WANT. Joining queue_items directly asks the question once
+        # per (want, queue) PAIR: measured on the live library 2026-08-26, 3,635
+        # satisfied wants produce 4,751 pairs because 1,112 of them carry two or
+        # three queue rows. Since verified_import_for_queue() keys on
+        # `series_id=? and issue_id=?` whenever both are supplied -- which they
+        # are here -- every queue row of a want returns the SAME answer, so the
+        # duplication inflated `examined` and repeated wants in the report
+        # rather than inventing false positives. Collapsing here makes the
+        # returned counts mean what the docstring says they mean.
+        rows = con.execute(
+            f"""
+            select w.id as wanted_id, w.series_id, w.issue_id,
+                   group_concat(q.id) as queue_ids,
+                   min(q.state) as queue_state, i.issue_number
+            from wanted_items w
+            join queue_items q on q.wanted_id = w.id
+            left join issues i on i.id = w.issue_id
+            where lower(coalesce(w.status, '')) = 'satisfied'{series_clause}
+            group by w.id
+            order by w.id
+            limit ?
+            """,
+            (*params, limit_value),
+        ).fetchall()
+        for row in rows:
+            examined += 1
+            queue_ids = [part for part in str(row["queue_ids"] or "").split(",") if part]
+            # ANY queue row that still satisfies the want settles it. Asking all
+            # of them is what makes "flagged" mean "nothing here holds this unit
+            # any more" rather than "one of its rows did not".
+            proof = None
+            failures = []
+            for queue_id in queue_ids:
+                try:
+                    proof = verified_import_for_queue(
+                        con,
+                        queue_id,
+                        row["series_id"],
+                        row["issue_id"],
+                        require_existing_destination=True,
+                        managed_roots=roots,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{type(exc).__name__}: {exc}")
+                    continue
+                if proof:
+                    break
+            if proof:
+                continue
+            if failures and len(failures) == len(queue_ids):
+                # Every row raised, so the gate never got to judge this want.
+                # Reporting it as a wrong credit would be a guess.
+                unreadable.append(
+                    {
+                        "wanted_id": row["wanted_id"],
+                        "series_id": row["series_id"],
+                        "issue_id": row["issue_id"],
+                        "error": failures[0],
+                    }
+                )
+                continue
+            flagged.append(
+                {
+                    "wanted_id": row["wanted_id"],
+                    "series_id": row["series_id"],
+                    "issue_id": row["issue_id"],
+                    "issue_number": row["issue_number"],
+                    "queue_ids": queue_ids,
+                    "queue_state": row["queue_state"],
+                }
+            )
+    finally:
+        con.close()
+    return {"examined": examined, "would_unsatisfy": flagged, "unreadable": unreadable}
+
+
 def verified_import_by_sibling_normalized_number(
     con, series_id, issue_id, managed_roots=None, *, require_linkage_consistent=False
 ):
