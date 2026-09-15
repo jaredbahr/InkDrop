@@ -129,11 +129,32 @@ def matching_contract():
         {**target, "canonical_issue_count": 2, "metadata_issue_count": 2},
     )
     require(real_series["status"] == "review", f"multi-issue series bypassed unit gate: {real_series}")
+    # This arm used to read "non-comic target used singleton comic proof" and
+    # required review. It was asserting the defect: the producer grants
+    # singleton_issue_proof from durable ComicVine identity and never asks
+    # about media type, so a manga one-shot earned the proof and the matcher
+    # threw it away. Measured on snapshot
+    # inkdrop-state-20260913T023528Z-b4a3bb1f228c (as_of 2026-09-13T02:35:28Z):
+    # 4 of 3,887 live queue rows carried the producer's proof and lost it here,
+    # all 4 manga, all parked at missing_required_unit_number. What keeps a
+    # numbered manga run out is the count evidence, asserted immediately below
+    # and unchanged.
     non_comic = matching.candidate_compatibility(
         {"title": "The Last Signal (1988) (Digital)"},
         {**target, "media_type": "manga"},
     )
-    require(non_comic["status"] == "review", f"non-comic target used singleton comic proof: {non_comic}")
+    require(
+        non_comic["status"] == "compatible",
+        f"proven one-shot refused for its shelf: {non_comic}",
+    )
+    non_comic_unproven = matching.candidate_compatibility(
+        {"title": "The Last Signal (1988) (Digital)"},
+        {**target, "media_type": "manga", "canonical_issue_count": 2, "metadata_issue_count": 2},
+    )
+    require(
+        non_comic_unproven["status"] == "review",
+        f"multi-issue manga series bypassed unit gate: {non_comic_unproven}",
+    )
 
     negative_cases = (
         ({"title": "The Last Signal (1989) (Digital)"}, "wrong year"),

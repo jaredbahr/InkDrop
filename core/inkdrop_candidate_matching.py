@@ -918,7 +918,22 @@ def target_context(wanted_item=None, *, settings):
         and canonical_issue_count == 1
         and singleton_count_supported
         and issue == "1"
-        and ("comic" in media_type or "graphic novel" in media_type)
+        # Deliberately no media test. The producer --
+        # _singleton_issue_context_from_rows() in the source worker
+        # coordinator -- grants this proof from durable identity alone:
+        # ComicVine identity matching the series id, fresh metadata, one
+        # canonical issue row carrying one positive ComicVine issue id, a
+        # declared count of one, and no other issue in the series. Every other
+        # conjunct here mirrors one of those terms; the media clause mirrored
+        # nothing, so a ComicVine-backed manga one-shot earned the proof and
+        # could not spend it -- 4 live rows, all manga, parked at
+        # missing_required_unit_number asking a human for a unit number that
+        # cannot exist. ("graphic novel" never appeared in the series table at
+        # all, so that half of the disjunct never fired.) What keeps a
+        # numbered manga run out is the count evidence above, not the shelf
+        # the work sits on. The identical clause on collected_singleton_proof
+        # below stays -- that one does mirror its producer, which asks for
+        # "comic" in the series media type itself.
     )
     try:
         collected_singleton_wanted_count = int(wanted.get("collected_singleton_wanted_count") or 0)

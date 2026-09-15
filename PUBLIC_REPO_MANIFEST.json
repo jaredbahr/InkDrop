@@ -123,8 +123,8 @@
     },
     {
       "path": "core/inkdrop_candidate_matching.py",
-      "sha256": "280b6b2567a1f59d39f4a49763515a3ff48d5dec303fd5c5cd2adb5743419236",
-      "size_bytes": 121785
+      "sha256": "bff81733db9c6cc487bdd6fb3014ec1a4c3a28967beb7ef7e5f19166bbf183df",
+      "size_bytes": 122864
     },
     {
       "path": "core/inkdrop_candidate_replay.py",
@@ -1353,8 +1353,8 @@
     },
     {
       "path": "tests/inkdrop-singleton-search-coverage-smoke.py",
-      "sha256": "508b70af1a102d08aacd094300edc95908fb359bcbdd80ebfda2adf3e9db3342",
-      "size_bytes": 68695
+      "sha256": "55aae89fca6afb6fe00148aea705fbbbb72eef99b1a9d6630e1474ed4920178f",
+      "size_bytes": 69761
     },
     {
       "path": "tests/inkdrop-slskd-absolute-edition-gate-smoke.py",
@@ -2024,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "5ee582891f73db9c34660a9e9fc658b21fb7f0a7",
-  "total_size_bytes": 21391880
+  "source_commit": "bfb737efd60e3fecde6b3e115b9d03ea51ce8bb1",
+  "total_size_bytes": 21394025
 }
