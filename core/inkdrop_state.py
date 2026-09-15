@@ -35502,7 +35502,8 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
         select ir.id, ir.queue_id, q.wanted_id, ir.source_attempt_id,
                ir.series_id, ir.issue_id, ir.source_path, ir.dest_path,
                ir.status, ir.outcome, ir.display_phase, ir.completion_truth,
-               ir.folder_imported, ir.verified, ir.imported_count, ir.raw_json as import_raw_json,
+               ir.folder_imported, ir.library_visibility_status,
+               ir.verified, ir.imported_count, ir.raw_json as import_raw_json,
                s.title as series_title, s.media_type as series_media_type,
                s.publisher, s.metadata_provider as series_metadata_provider,
                s.metadata_id as series_metadata_id, s.raw_json as series_raw_json,
@@ -35670,6 +35671,15 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                 "previous_outcome": row["outcome"],
                 "previous_display_phase": row["display_phase"],
                 "previous_completion_truth": row["completion_truth"],
+                # The update below also overwrites these two, and until row #1125
+                # nothing recorded them -- the same silence #1055 fixed in the
+                # stale-folder sweep. Measured on the 2026-09-13T02:35:28Z snapshot:
+                # 0 of 737 page-pack retractions carry either key, and on 36 of 737
+                # the original payload holds neither value, so they are gone.
+                # library_visibility_status had to be added to the SELECT above;
+                # indexing the row (not row_value) keeps a dropped column loud.
+                "previous_folder_imported": row["folder_imported"],
+                "previous_library_visibility_status": row["library_visibility_status"],
                 "repair_status": WRONG_UNIT_PAGE_PACK_PROOF_STATUS,
             }
         )
@@ -35933,6 +35943,7 @@ def mark_import_wrong(db_path, import_result_id, *, reason=None, marked_by="inkd
             """
             select ir.id, ir.queue_id, ir.series_id, ir.issue_id, ir.source_path, ir.dest_path,
                    ir.status, ir.outcome, ir.display_phase, ir.completion_truth, ir.verified,
+                   ir.folder_imported, ir.library_visibility_status,
                    ir.raw_json as import_raw_json, ir.source_attempt_id,
                    q.wanted_id, q.state as queue_state, q.active as queue_active,
                    q.current_source, q.last_event as queue_last_event, q.raw_json as queue_raw_json,
@@ -35968,6 +35979,12 @@ def mark_import_wrong(db_path, import_result_id, *, reason=None, marked_by="inkd
                 "previous_outcome": row["outcome"],
                 "previous_display_phase": row["display_phase"],
                 "previous_completion_truth": row["completion_truth"],
+                # The update below overwrites these two as well; recording them is
+                # what lets a mistaken Mark Wrong be undone from the row itself
+                # (row #1125, the rule #1055 settled). Neither column was selected
+                # before, so the SELECT above had to widen with the stamp.
+                "previous_folder_imported": row["folder_imported"],
+                "previous_library_visibility_status": row["library_visibility_status"],
             }
         )
         con.execute(
