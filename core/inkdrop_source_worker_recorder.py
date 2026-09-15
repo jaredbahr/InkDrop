@@ -1377,6 +1377,61 @@ def prepare_source_job_result_for_recording(
     return result
 
 
+# WHETHER A FIX ENGAGED MUST BE ANSWERABLE FROM STATE, NOT FROM ARGUMENT.
+# Prowlarr category resolution degrades silently by design: an unreachable
+# capabilities probe returns {}, `resolve_categories` reads that as "change
+# nothing", and the search goes out exactly as it would have before. That is
+# the right behaviour and it emitted nothing at all, so a measurement taken
+# while the probe was failing looked identical to one taken while it worked --
+# which is what made the whole question unfalsifiable from durable state.
+#
+# Two DISTINCT event types, never one with a flag. "It ran and changed nothing"
+# and "it could not look" are different facts about the system, and a single
+# event type with a field is exactly how they get folded back together by the
+# next person writing a count.
+CATEGORY_RESOLUTION_EVENT_TYPES = {
+    True: "prowlarr_category_resolution_engaged",
+    False: "prowlarr_category_resolution_degraded",
+}
+
+
+def _record_category_resolution_event(db_path, queue_id, job_result, job, now):
+    """Emit one durable event describing whether category resolution ran.
+
+    Returns the event type emitted, or None. Never raises: a trace that can
+    break the thing it traces is worse than no trace, and this runs inside the
+    recording path for every source job.
+    """
+    try:
+        fetch = (job_result or {}).get("fetch")
+        status = (fetch or {}).get("category_resolution_status")
+        if not isinstance(status, dict) or not status.get("status"):
+            return None
+        engaged = bool(status.get("engaged"))
+        event_type = CATEGORY_RESOLUTION_EVENT_TYPES[engaged]
+        message = (
+            "Prowlarr category resolution ran against %s indexer capability set(s)"
+            % status.get("indexers_with_capabilities", 0)
+            if engaged
+            else "Prowlarr category resolution was skipped: indexer capabilities "
+                 "unavailable, so the search went out with its configured categories"
+        )
+        return inkdrop_state.record_history_event(
+            db_path,
+            event_type=event_type,
+            entity_type="queue_item",
+            entity_id=str(queue_id),
+            series_id=(job or {}).get("series_id"),
+            issue_id=(job or {}).get("issue_id"),
+            source="source_worker_recorder",
+            message=message,
+            raw=dict(status),
+            created_at=now,
+        ) and event_type or event_type
+    except Exception:
+        return None
+
+
 def record_source_job_result(
     db_path,
     queue_id,
@@ -1413,6 +1468,15 @@ def record_source_job_result(
             now=now,
         )
     )
+    # Emitted before the attempt rows so the trace survives even when the
+    # attempt recording below refuses -- the question "did the fix run" is not
+    # conditional on whether the search produced anything worth recording.
+    category_resolution_event = None
+    if not dry_run:
+        category_resolution_event = _record_category_resolution_event(
+            db_path, queue_id, job_result, job, now
+        )
+
     attempts = list(prepared.get("attempts") or [])
     if max_attempts not in (None, ""):
         attempts = attempts[: max(0, int(max_attempts or 0))]
@@ -1429,6 +1493,7 @@ def record_source_job_result(
         "source_memory_applied": bool(prepared.get("source_memory_applied")),
         "attempts_available": len(prepared.get("attempts") or []),
         "attempts_selected": len(attempts),
+        "category_resolution_event": category_resolution_event,
         "attempts_recorded": 0,
         "pending_pack_records_created": 0,
         "download_tasks_before": before_tasks,

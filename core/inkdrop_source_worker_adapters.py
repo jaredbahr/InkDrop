@@ -4249,9 +4249,28 @@ def _apply_resolved_categories(row, requests, http_get, fetch_result):
         and (request.get("params") or {}).get("categories")
     ]
     if not search_requests:
+        # Nothing asked for a category, so there is no resolution to report and
+        # no silence to explain. Deliberately not stamped.
         return
     capabilities = _prowlarr_indexer_capabilities(row, http_get)
     if not capabilities:
+        # THE FIX THAT NO-OPS SILENTLY. `_prowlarr_indexer_capabilities` returns
+        # {} on any probe error without logging, this returns without logging,
+        # and `resolve_categories` reads an empty map as "change nothing". The
+        # search then goes out exactly as before and NOTHING anywhere records
+        # that the resolution was skipped -- so a measurement taken while the
+        # probe was failing is indistinguishable from one taken while it worked,
+        # and "did this fix ever engage?" cannot be answered from state at all.
+        #
+        # The degrade itself is correct and is kept. What is added is that it
+        # says so. Recorded as a DISTINCT status from a successful pass, because
+        # "engaged and changed nothing" and "could not look" are different facts
+        # and folding them is what made this unfalsifiable.
+        fetch_result["category_resolution_status"] = {
+            "status": "degraded_no_capabilities",
+            "engaged": False,
+            "search_request_count": len(search_requests),
+        }
         return
     applied = None
     for request in search_requests:
@@ -4273,6 +4292,17 @@ def _apply_resolved_categories(row, requests, http_get, fetch_result):
         applied = {"resolved_categories": resolved, "substitutions": substitutions}
     if applied:
         fetch_result["category_resolution"] = applied
+    # Set on EVERY path that got as far as reading capabilities, including the
+    # one where nothing needed substituting. A status written only on success
+    # answers "did it change anything", which is not the question -- the question
+    # is whether it ran, and a fix that silently does not run is the defect here.
+    fetch_result["category_resolution_status"] = {
+        "status": "applied" if applied else "no_substitutions_needed",
+        "engaged": True,
+        "search_request_count": len(search_requests),
+        "indexers_with_capabilities": len(capabilities),
+        "substitution_count": len((applied or {}).get("substitutions") or []),
+    }
 
 
 def _prowlarr_indexer_coverage(row, requests, combined_results, http_get, fetch_result):
@@ -5869,6 +5899,11 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
         }
         if result.get("indexer_coverage"):
             payload["indexer_coverage"] = result["indexer_coverage"]
+        if result.get("category_resolution_status"):
+            # Unconditional, unlike `category_resolution` below, which is set
+            # only when a substitution happened. This is the key that lets a
+            # later reader tell "ran and changed nothing" from "never ran".
+            payload["category_resolution_status"] = result["category_resolution_status"]
         if result.get("category_resolution"):
             # Carried onto the payload so the candidate gate can admit releases
             # under the categories we actually asked for. Without this the gate
