@@ -537,6 +537,30 @@ def process_one_file(path):
     return {"decision": "skipped", "reason": "no_decision_returned", "dest": None}
 
 
+# What process_one_file() can hand back without the child having judged the
+# file under any acceptance rule. A run counts judgements, not calls to the
+# child. A staged comic that matches no monitored series, or is younger than
+# the child's minimum age, comes back with no decision; a timeout or a crashed
+# child decides nothing; and the child's known-bad content memory and its
+# qBittorrent completion waits skip a file before import_files() matches it to
+# a target, so no acceptance rule sees it. Counted as judgements, any of these
+# let a run that re-judged nothing read as all_candidates_processed while the
+# checkpoint window held the rest back (row #961). lock_busy is never counted
+# as processed in the first place.
+NOT_A_JUDGEMENT_REASONS = frozenset({
+    "no_decision_returned",
+    "known_bad_artifact_content",
+    "source_file_incomplete_qbit_download",
+    "qbit_completion_unverifiable",
+})
+
+
+def result_is_a_judgement(result):
+    if result["decision"] == "imported":
+        return True
+    return result["decision"] == "skipped" and result["reason"] not in NOT_A_JUDGEMENT_REASONS
+
+
 def main():
     started = time.time()
     con = sqlite3.connect(LEDGER_DB, timeout=30)
@@ -551,7 +575,15 @@ def main():
         "converted_this_run": 0,
         "skipped_this_run": 0,
         "errors_this_run": 0,
+        "skipped_via_checkpoint": 0,
     }
+    # checked_at of everything held back by the checkpoint window at either
+    # site below. Its newest entry is what turns "N files were skipped"
+    # into "nothing held back this run can be re-judged before T" -- the one
+    # fact a person verifying an acceptance-rule change needs to exclude those
+    # files or wait them out, instead of reading a pass over files the run
+    # never showed to acceptance code (row #961).
+    held_checked_at = []
     if page_directory_summary["enabled"]:
         page_directory_started = time.time()
         eligible_directories = enumerate_page_directories(SLSKD_ROOT)
@@ -566,6 +598,8 @@ def main():
             key = (path, image_count, mtime)
             checked_at = checkpoints.get(key)
             if checked_at is not None and (time.time() - checked_at) < CHECKPOINT_MAX_AGE_SECONDS:
+                page_directory_summary["skipped_via_checkpoint"] += 1
+                held_checked_at.append(checked_at)
                 continue
             err_count, last_error_at = error_counts.get(path, (0, None))
             if err_count >= MAX_CONSECUTIVE_ERRORS and last_error_at is not None and (time.time() - last_error_at) < ERROR_COOLDOWN_SECONDS:
@@ -606,6 +640,7 @@ def main():
         checked_at = checkpoints.get(key)
         if checked_at is not None and (now - checked_at) < CHECKPOINT_MAX_AGE_SECONDS:
             skipped_via_checkpoint += 1
+            held_checked_at.append(checked_at)
             continue
         err_count, last_error_at = error_counts.get(path, (0, None))
         if err_count >= MAX_CONSECUTIVE_ERRORS and last_error_at is not None and (now - last_error_at) < ERROR_COOLDOWN_SECONDS:
@@ -640,6 +675,7 @@ def main():
         "priority_candidates_this_run": len(priority_paths) + len(priority_filenames),
         "candidates_to_process_this_run": len(to_process),
         "processed_this_run": 0,
+        "judged_this_run": 0,
         "imported_this_run": 0,
         "skipped_this_run": 0,
         "errors_this_run": 0,
@@ -668,6 +704,8 @@ def main():
             continue
 
         summary["processed_this_run"] += 1
+        if result_is_a_judgement(result):
+            summary["judged_this_run"] += 1
         if result["decision"] == "imported":
             summary["imported_this_run"] += 1
             imports_done += 1
@@ -695,8 +733,37 @@ def main():
         )
         con.commit()
 
+    rejudgeable_at = (max(held_checked_at) + CHECKPOINT_MAX_AGE_SECONDS) if held_checked_at else None
+    summary["checkpoint_window"] = {
+        "window_seconds": CHECKPOINT_MAX_AGE_SECONDS,
+        "inside_window": len(held_checked_at),
+        "all_rejudgeable_at": rejudgeable_at,
+        "all_rejudgeable_at_utc": (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(rejudgeable_at)) if rejudgeable_at is not None else None
+        ),
+    }
     if summary["stopped_reason"] is None:
-        summary["stopped_reason"] = "all_candidates_processed"
+        # A run that reached no acceptance code while the window held files
+        # back is not a clean pass: every acceptance rule runs in the child
+        # process_one_file() starts, so nothing checkpointed was judged against
+        # the code now deployed. Measured on the live host 2026-08-31: 2,258
+        # of 2,327 checkpoints inside the window, and PR #1078's fix reached
+        # none of the five files it was written for until the window lifted.
+        # This used to print all_candidates_processed with 0 processed and
+        # exit 0. The exit code is deliberately unchanged -- a run that judges
+        # nothing while the window holds files back is this job's steady state
+        # every 15 minutes, and a non-zero exit would put the scheduler into
+        # failure backoff; the reason and the counts above are what a verifier
+        # reads. The test is judged_this_run, not processed_this_run: a file
+        # the child returns no decision for is never checkpointed and comes
+        # back after every error cooldown, so counting calls to the child
+        # brought the clean reason back every hour without judging anything.
+        # A run that did judge a file keeps all_candidates_processed, and
+        # checkpoint_window says how many it held and until when.
+        if summary["judged_this_run"] == 0 and held_checked_at:
+            summary["stopped_reason"] = "nothing_rejudged_inside_checkpoint_window"
+        else:
+            summary["stopped_reason"] = "all_candidates_processed"
 
     summary["page_directories"] = page_directory_summary
     summary["elapsed_seconds"] = round(time.time() - started, 1)
