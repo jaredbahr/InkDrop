@@ -1725,6 +1725,13 @@ def inkdrop_terminal_queue_rows():
         return {}
 
 
+# The exact `last_event` the watch-absence branch writes when it grants a
+# verification. Named because two places now depend on it meaning the same
+# thing: the branch that writes it, and the retraction that reads it back to
+# decide whether a `verified` row is one this pass granted.
+WATCH_VERIFIED_EVENT = "no longer missing in watched series"
+
+
 def queue_ids_with_file_evidence(keys):
     """Of `keys`, those whose unit actually has a file we can point at.
 
@@ -1736,10 +1743,31 @@ def queue_ids_with_file_evidence(keys):
     Returns a set. On any failure it returns an EMPTY set, which makes the
     caller refuse rather than verify: the caller must not treat "I could not
     look" as "I looked and found nothing".
+
+    THAT COLLAPSE IS SAFE IN ONE DIRECTION ONLY, so anything that RETRACTS must
+    call `queue_ids_with_file_evidence_result()` instead and read its `ok`.
+    Refusing to grant on an empty set costs a re-search. Retracting on the same
+    empty set would demote every candidate at once the first time the database
+    is locked -- silently, completely, and looking exactly like a working pass.
+    """
+    return queue_ids_with_file_evidence_result(keys)["ids"]
+
+
+def queue_ids_with_file_evidence_result(keys):
+    """`queue_ids_with_file_evidence()` plus whether the lookup SUCCEEDED.
+
+    `{"ok": bool, "ids": set}`. `ok` is False when the state database is absent
+    or the read raised, and in that case `ids` is empty and means nothing --
+    "I could not look", not "nobody has a file". Callers that grant may ignore
+    `ok` and treat empty as refusal; callers that retract must not.
     """
     wanted = {str(key) for key in keys if str(key or "")}
-    if not wanted or inkdrop_state is None or not INKDROP_STATE_DB.exists():
-        return set()
+    if not wanted:
+        # Nothing was asked, so nothing failed. An empty question has an empty
+        # answer and that answer is trustworthy.
+        return {"ok": True, "ids": set()}
+    if inkdrop_state is None or not INKDROP_STATE_DB.exists():
+        return {"ok": False, "ids": set()}
     try:
         evidenced = set()
         ordered = list(wanted)
@@ -1784,10 +1812,10 @@ def queue_ids_with_file_evidence(keys):
                     confirmed.add(queue_id)
             except OSError:
                 continue
-        return confirmed
+        return {"ok": True, "ids": confirmed}
     except Exception as exc:
         log("queue_ids_with_file_evidence_failed", error=f"{type(exc).__name__}: {exc}")
-        return set()
+        return {"ok": False, "ids": set()}
 
 
 def retire_queue_items_from_inkdrop_state(queue):
@@ -8634,6 +8662,7 @@ def merge_current_queue(queue, current, *, file_evidence=None):
     created = 0
     verified = 0
     verify_refused = 0
+    verify_retracted = 0
     for key, entry in current.items():
         item = items.get(key)
         alternate_keys = entry.get("alternate_keys") if isinstance(entry.get("alternate_keys"), list) else []
@@ -8705,9 +8734,9 @@ def merge_current_queue(queue, current, *, file_evidence=None):
         if item.get("state") in {"", None}:
             item["state"] = "queued"
 
-    # Resolve evidence ONCE, and only for the units this pass could verify --
+    # Resolve evidence ONCE, and only for the units this pass could act on --
     # not per row, and not for the whole queue. `file_evidence` is injectable so
-    # a test can drive both arms without a database or a filesystem.
+    # a test can drive every arm without a database or a filesystem.
     verify_candidates = [
         key
         for key, item in items.items()
@@ -8716,12 +8745,42 @@ def merge_current_queue(queue, current, *, file_evidence=None):
         and item.get("state") != "verified"
         and not wrong_language_quarantine_active(item)
     ]
+    # THE RESIDUE #1095 COULD NOT SEE. That change put the evidence check inside
+    # `state != "verified"`, so it stopped the write and left every row already
+    # carrying it. On snapshot inkdrop-state-20260902T222706Z-383f7b167d00, 153
+    # queue rows still read `no longer missing in watched series` and 91 were
+    # still `verified`; a filesystem sweep found no file at all for 8 of them.
+    # A guard that only prevents new instances is half a guard, and the half it
+    # leaves behind is the half that costs the books.
+    #
+    # SCOPED BY THE ROW'S OWN LAST WORD. `last_event` is overwritten by whatever
+    # happened most recently, so a row still carrying the watch grant is a row
+    # where nothing has happened since -- and a verification an importer earned
+    # reads differently and is not this pass's to take back.
+    retract_candidates = [
+        key
+        for key, item in items.items()
+        if key not in current
+        and isinstance(item, dict)
+        and item.get("state") == "verified"
+        and str(item.get("last_event") or "") == WATCH_VERIFIED_EVENT
+        and not wrong_language_quarantine_active(item)
+    ]
+    asked = verify_candidates + [key for key in retract_candidates if key not in set(verify_candidates)]
     if file_evidence is None:
-        evidence_ids = queue_ids_with_file_evidence(verify_candidates)
+        evidence = queue_ids_with_file_evidence_result(asked)
     elif callable(file_evidence):
-        evidence_ids = set(file_evidence(verify_candidates))
+        evidence = file_evidence(asked)
     else:
-        evidence_ids = set(file_evidence)
+        evidence = file_evidence
+    # A plain set is the pre-change injection shape and still means "these, and
+    # the lookup worked" -- the sibling smoke test drives it that way.
+    if isinstance(evidence, dict):
+        evidence_ok = bool(evidence.get("ok"))
+        evidence_ids = set(evidence.get("ids") or ())
+    else:
+        evidence_ok = True
+        evidence_ids = set(evidence)
 
     for key, item in items.items():
         if key in current:
@@ -8762,9 +8821,47 @@ def merge_current_queue(queue, current, *, file_evidence=None):
             item["state"] = "verified"
             item["completed_at"] = now
             item["completed_at_iso"] = now_iso(now)
-            item["last_event"] = "no longer missing in watched series"
+            item["last_event"] = WATCH_VERIFIED_EVENT
             verified += 1
-    if created or verified or verify_refused:
+
+    # RETRACT THE RESIDUE -- but only if the lookup actually ran.
+    #
+    # `evidence_ok` is the whole safety of this block and it is not decoration.
+    # The grant path above may read an empty `evidence_ids` as "verify nobody",
+    # because refusing to grant costs a re-search. Here the same empty set would
+    # mean "nobody in the queue has a file" and would demote every watch-granted
+    # row at once -- on a locked database, a missing state file, or any raised
+    # read. Same value, opposite meaning, and the failure would look identical
+    # to a clean pass. So an unsuccessful lookup retracts NOTHING and says so.
+    if not evidence_ok:
+        if retract_candidates:
+            log(
+                "watch_verification_retraction_skipped",
+                reason="file_evidence_lookup_failed",
+                candidates=len(retract_candidates),
+            )
+    else:
+        for key in retract_candidates:
+            if key in evidence_ids:
+                continue
+            item = items.get(key)
+            if not isinstance(item, dict):
+                continue
+            item["state"] = "queued"
+            item.pop("completed_at", None)
+            item.pop("completed_at_iso", None)
+            item["current_source"] = None
+            item["retry_after"] = 0
+            item["retry_after_iso"] = "1970-01-01T00:00:00Z"
+            item["last_event"] = (
+                "verification withdrawn: it rested on the watched series going quiet and "
+                "no imported file was found for it -- searching again"
+            )
+            item["verify_retracted_at"] = now
+            item["verify_retracted_at_iso"] = now_iso(now)
+            verify_retracted += 1
+
+    if created or verified or verify_refused or verify_retracted:
         queue.setdefault("history", []).append(
             {
                 "ts": now,
@@ -8777,6 +8874,13 @@ def merge_current_queue(queue, current, *, file_evidence=None):
                 # say, and the whole point is to be able to see how often the
                 # watch-list signal is unsupported.
                 "verify_refused": verify_refused,
+                # Counted separately from the refusals. A refusal is a grant
+                # that never happened; a retraction is a grant being taken back,
+                # and the two answer different questions -- "how often is the
+                # signal unsupported" against "how much of the backlog was
+                # unsupported all along". Folding them would make the residue
+                # drain look like ordinary traffic.
+                "verify_retracted": verify_retracted,
                 "current_missing": len(current),
             }
         )
@@ -8784,6 +8888,7 @@ def merge_current_queue(queue, current, *, file_evidence=None):
         "created": created,
         "verified": verified,
         "verify_refused": verify_refused,
+        "verify_retracted": verify_retracted,
         "current_missing": len(current),
     }
 
