@@ -9608,6 +9608,29 @@ def auto_grab_candidate_verdict(candidate, item, *, settings=None):
     review_reasons = list(dict.fromkeys(str(value) for value in review_reasons if value))
     autopick_eligible = (
         not blockers
+        # An unresolved review reason means a human still has to look, so the
+        # candidate is not auto-pickable -- the two answers may not disagree.
+        # They did, at three sites that appended a review reason with no
+        # mirror in this expression:
+        #
+        #   * unit compatibility review_codes, mirrored only when
+        #     proof_bound_identity was ALSO true (the clause below);
+        #   * "soft series check: ..."; and
+        #   * the duplicate-identity gate's review reasons, whose BLOCKER was
+        #     mirrored while its review reasons were not.
+        #
+        # This is not only a reporting inconsistency. annotate_auto_grab_verdicts()
+        # builds its ranking pool from `autopick_eligible`, so a candidate that
+        # needed review but still read as eligible could WIN the ranking on
+        # score, then fail auto_grab_promotion_allowed() on its own unresolved
+        # reason -- and nothing reconsiders the runner-up. A genuinely safe,
+        # lower-scoring candidate was starved by one that could never be
+        # grabbed. Measured on "It Happened on Hyde Street: Devour" #1: a
+        # `(one-shot)` file scoring 90 with missing_required_unit_number
+        # outranked a `#001` file scoring 78 that was auto_grab_safe on its own,
+        # and the item sat at 48 attempts reporting "only low-confidence
+        # candidates" while both scores were above every threshold.
+        and not review_reasons
         and not (
             proof_bound_identity
             and (unit_compatibility or {}).get("review_codes")
