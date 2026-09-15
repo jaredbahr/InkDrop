@@ -9081,6 +9081,39 @@ def active_slskd_successor_for_terminal_attempt(con, queue_id, attempt):
 
 
 STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS = 12 * 60 * 60
+# A SABnzbd handoff that has never moved a byte does not start moving later.
+# Measured on the pinned snapshot inkdrop-state-20260830T162706Z-b5ce4120a97f
+# (as_of 2026-08-30T16:27:06Z), reconstructing each attempt's progress series
+# from its history_events: of 83 SABnzbd attempts, ZERO ever transitioned
+# 0% -> >0%, and 77 of 91 never exceeded 0% at all. The control that makes
+# that zero mean something is qBittorrent -- the identical check found 4 such
+# transitions there -- so the zero is a property of SABnzbd rather than of the
+# query.
+#
+# The window above is therefore ~11 hours of dead time for the dominant
+# SABnzbd failure shape. 45 minutes is chosen well above the observed
+# reconcile cadence (a few minutes) so a row is polled several times before it
+# is judged, and it had no false positives at any bound >= 30 minutes in the
+# observed set.
+#
+# NOTE ON WHAT THIS DATA CANNOT SAY: every observed no-progress run is
+# right-censored at 12h by the age rule above -- 0 attempts exceed 12.5h --
+# so this measurement supports lowering the bound and says nothing about
+# raising it.
+DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS = 45 * 60
+# Clients whose zero-progress state is genuinely terminal. qBittorrent is
+# deliberately absent: 2 of 2 qBittorrent attempts observed stuck at 0% for
+# >= 8h later recovered. A torrent at 0% is waiting for peers, which is
+# ordinary; an NZB at 0% is not downloading. Small n, so the exclusion is the
+# conservative reading rather than a measured bound of its own.
+DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_CLIENTS = frozenset({"sabnzbd"})
+# Guard against a client-wide pause (disk full, an operator pause, a scheduled
+# pause window) reading as many independent stalls at once and churning the
+# whole queue every 45 minutes. Observed on the same snapshot: Paused rows
+# arrive 1-5 at a time across many separate hours, never queue-wide, so this
+# is a precaution rather than a fitted bound. Above the cap the fast path
+# stands down for the pass and the slow age rule still applies.
+DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_MAX_PER_PASS = 8
 SLSKD_STAGED_SUPPRESSION_STATUSES = SLSKD_FAILED_IMPORT_MATCH_STATUSES | {
     "quality_rejected",
 }
@@ -9095,6 +9128,11 @@ STALL_CLEANUP_REASONS = frozenset({
     "SLSKD transfer never started and exceeded the pre-transfer wait timeout",
     "active SLSKD task exceeded stale timeout without transfer refresh",
     "stale download-client handoff had no local file after stale window",
+    # Same shape as the line above -- a transfer that never delivered -- just
+    # caught on the zero-progress window instead of the age one. It must count
+    # against the same per-queue stall-retry budget, or a client that keeps
+    # accepting handoffs and never moving bytes retries without a ceiling.
+    "download-client handoff reported no progress at all past the zero-progress window",
 })
 QUEUE_WATCHDOG_MAX_STALL_RETRIES_SETTING_KEY = "automation.queue_watchdog_max_stall_retries"
 QUEUE_WATCHDOG_MAX_STALL_RETRIES_DEFAULT = 3
@@ -22568,12 +22606,90 @@ def cleanup_local_pack_superseded_download_client_tasks(con, now):
     return retired
 
 
-def cleanup_stale_download_client_handoff_tasks(con, now, stale_seconds=STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS):
+def download_client_handoff_stall_verdict(task, now, stale_seconds, zero_progress_seconds=None):
+    """Decide whether a download-client handoff is stalled, and on which rule.
+
+    Returns None to keep the row, or (status, cleanup_reason, window_seconds).
+
+    Two rules, and the difference between them is what the row has been
+    OBSERVED doing rather than how old it is:
+
+    * zero-progress -- the reconciler has actually seen this handoff and it
+      reports no bytes at all. On SABnzbd that state is terminal (see
+      DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS for the measurement), so it
+      is judged on a short window.
+
+    * age -- everything else, on the pre-existing long window. It is anchored
+      on the last observed progress instead of started_at, so a transfer that
+      is still moving is not retired for having been alive a long time. The
+      age-anchored form retired three real SABnzbd attempts that had reached
+      66%, 96% and 98%; a row that HAS progressed and then stops still ages
+      out of the same 12h window, just measured from when it stopped.
+
+    A row the reconciler has never observed carries no progress evidence
+    either way, so it keeps the original started_at anchor rather than having
+    a stall inferred from the absence of a stamp.
+    """
+    task = task if isinstance(task, dict) else {}
+    now = safe_float(now, None) or time.time()
+    stale_seconds = safe_float(stale_seconds, STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS) or STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS
+    zero_progress_seconds = (
+        safe_float(zero_progress_seconds, DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS)
+        or DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS
+    )
+    raw = json_loads(task.get("raw_json") or "{}", {})
+    raw = raw if isinstance(raw, dict) else {}
+    observed = bool(raw.get("download_client_reconciled"))
+    progress = safe_float(raw.get("download_client_progress_observed"), None)
+    last_progress_at = safe_float(raw.get("download_client_last_progress_at"), None)
+    if (
+        observed
+        and progress is not None
+        and progress <= 0.001
+        and last_progress_at
+        and download_client_task_client(task) in DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_CLIENTS
+        and now - last_progress_at >= zero_progress_seconds
+    ):
+        return (
+            "stale_zero_progress",
+            "download-client handoff reported no progress at all past the zero-progress window",
+            zero_progress_seconds,
+        )
+    # started_at FIRST, deliberately. download_task_timestamp() prefers
+    # updated_at, and the reconciler refreshes updated_at on every poll -- so
+    # anchoring the age rule there would mean a row being polled every few
+    # minutes never ages out at all. The SQL this replaced gated on
+    # coalesce(dt.started_at, dt.updated_at, 0) for exactly that reason.
+    started_anchor = safe_float(task.get("started_at"), None) or safe_float(task.get("updated_at"), None) or 0
+    anchor = last_progress_at if (observed and last_progress_at) else started_anchor
+    if anchor and now - anchor >= stale_seconds:
+        return (
+            "stale_no_local_file",
+            "stale download-client handoff had no local file after stale window",
+            stale_seconds,
+        )
+    return None
+
+
+def cleanup_stale_download_client_handoff_tasks(
+    con,
+    now,
+    stale_seconds=STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS,
+    zero_progress_seconds=DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS,
+):
     if not con:
         return 0
     now = safe_float(now, None) or time.time()
     stale_seconds = safe_float(stale_seconds, STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS) or STALE_DOWNLOAD_CLIENT_HANDOFF_SECONDS
-    cutoff = now - stale_seconds
+    zero_progress_seconds = (
+        safe_float(zero_progress_seconds, DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS)
+        or DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_SECONDS
+    )
+    # Widen the candidate sweep to the SHORTER of the two windows and let the
+    # per-row verdict decide. Selecting on the long window alone would hide
+    # every zero-progress row until it was already 12h old, which is the whole
+    # defect.
+    cutoff = now - min(stale_seconds, zero_progress_seconds)
     rows = con.execute(
         """
         select dt.id, dt.queue_id, dt.wanted_id, dt.series_id, dt.issue_id,
@@ -22607,15 +22723,40 @@ def cleanup_stale_download_client_handoff_tasks(con, now, stale_seconds=STALE_DO
         """,
         (cutoff,),
     ).fetchall()
-    retired = 0
-    refreshed = set()
+    verdicts = []
     for row in rows:
         task = dict(row)
-        raw_payload = stale_download_client_handoff_payload(task, now, stale_seconds)
+        verdict = download_client_handoff_stall_verdict(task, now, stale_seconds, zero_progress_seconds)
+        if verdict:
+            verdicts.append((task, verdict))
+    # Client-wide pause guard. If a single client suddenly presents more
+    # zero-progress rows than any plausible number of independent stalls, the
+    # likely cause is the client itself being paused or wedged -- and retiring
+    # the whole batch would re-search every one of them, then do it again on
+    # the next pass. Stand the fast path down for this pass and let the long
+    # age rule keep handling them; a real pause resolves and the rows resume.
+    fast_by_client = {}
+    for task, verdict in verdicts:
+        if verdict[0] != "stale_zero_progress":
+            continue
+        client = download_client_task_client(task)
+        fast_by_client[client] = fast_by_client.get(client, 0) + 1
+    suppressed_clients = {
+        client
+        for client, count in fast_by_client.items()
+        if count > DOWNLOAD_CLIENT_ZERO_PROGRESS_STALL_MAX_PER_PASS
+    }
+    retired = 0
+    refreshed = set()
+    for task, (status, cleanup_reason, window_seconds) in verdicts:
+        if status == "stale_zero_progress" and download_client_task_client(task) in suppressed_clients:
+            continue
+        raw_payload = stale_download_client_handoff_payload(task, now, window_seconds)
+        raw_payload["cleanup_reason"] = cleanup_reason
         retire_download_task(
             con,
             task,
-            status="stale_no_local_file",
+            status=status,
             state="failed",
             ts=max(now, download_task_timestamp(task), safe_float(task.get("queue_updated_at"), 0) or 0),
             raw_payload=raw_payload,
@@ -22627,7 +22768,12 @@ def cleanup_stale_download_client_handoff_tasks(con, now, stale_seconds=STALE_DO
                 retry_eligible=1
             where id=?
             """,
-            ("download-client handoff went stale without a local file", task["id"]),
+            (
+                "download-client handoff reported no progress at all"
+                if status == "stale_zero_progress"
+                else "download-client handoff went stale without a local file",
+                task["id"],
+            ),
         )
         queue_id = str(task.get("queue_id") or "")
         if queue_id and queue_id not in refreshed:
