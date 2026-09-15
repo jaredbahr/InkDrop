@@ -14231,8 +14231,13 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       // Matched against coreStateLabel()'s rendered OUTPUT, so this list has
       // to move whenever that wording does or the tile selects nothing and
       // says nothing about it. Pinned by
-      // tests/inkdrop-one-state-name-for-needs-you-smoke.py.
-      needs_attention: ["Needs you", "Failed", "Blocked"],
+      // tests/inkdrop-one-state-name-for-needs-you-smoke.py and
+      // tests/inkdrop-scan-timeout-label-not-a-verdict-smoke.py.
+      //
+      // "Library Scan Timeout" is here so the same rows the tile selected when
+      // a timed-out scan rendered as "Failed" are still selected now that it
+      // does not. The tile's membership is unchanged; only the word is.
+      needs_attention: ["Needs you", "Failed", "Blocked", "Library Scan Timeout"],
     };
 
     function inkdropTableRowMatchesText(row, text) {
@@ -15991,7 +15996,18 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
         downloading: "Downloading", importing: "Importing", staged_or_importing: "Importing", ready_import: "Importing",
         verified: "Complete", complete: "Complete", completed: "Complete", copied_not_indexed: "Complete",
         folder_complete: "Complete", folder_verified: "Complete", library_visible: "Complete",
-        failed: "Failed", error: "Failed", library_scan_timeout: "Failed", scan_timeout: "Failed", kavita_scan_timeout: "Failed",
+        failed: "Failed", error: "Failed",
+        // We ran out of time waiting for the reader to answer. That is a fact
+        // about our wait, not a finding about the file, and these four used to
+        // be shown as "Failed" -- the same word this table gives a genuine
+        // verdict -- while completion_projection() had already stopped
+        // bucketing them with missing_file/wrong_library. The wording is the
+        // server's own name for the state (inkdrop_state.IMPORT_FILTERS
+        // ["scan_timeout"] and AUTOMATION_CAUSE_LABELS["library_scan_timeout"]),
+        // not a new one. `timeout` is listed because leaving it to the
+        // title-caser below gives one state two names.
+        library_scan_timeout: "Library Scan Timeout", kavita_scan_timeout: "Library Scan Timeout",
+        scan_timeout: "Library Scan Timeout", timeout: "Library Scan Timeout",
         blocked: "Blocked", policy_block: "Blocked", language_blocked: "Blocked",
         // The server names this state ("Needs you", sentence-cased onto
         // state_label by manual_review_canonical_snapshot) and mobile renders

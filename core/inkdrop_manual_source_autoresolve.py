@@ -3161,7 +3161,24 @@ def repeat_bad_candidate_park_reason(known_bad):
         # the expensive one: it tells him to stop looking for a book that may
         # well be findable. "No source found" is a search defect, never proof
         # that nothing exists -- and this was not even a search result.
-        return f"been rejected every time we re-checked it over the last {int(age_seconds // 3600)}h"
+        #
+        # The replacement carried over a second clause with no input: "rejected
+        # every time we re-checked it over the last {h}h" asserts a RUN of
+        # re-checks, and nothing here counts re-checks either. Worse, the run is
+        # claimed over precisely the window in which nothing happened. The path
+        # that re-encounters a known-bad candidate -- the `if known_bad:` arm of
+        # the waiting loop -- appends a `known_bad_candidate_skipped` row and
+        # continues; it never re-judges the file and never calls
+        # mark_manual_source_candidate_bad(), the only production writer of this
+        # record and the only thing that refreshes `ts` or increments
+        # `failure_count`. Under the `ts` fallback above, age_seconds is then
+        # measured from the LAST rejection, so the clause described a continuous
+        # run of re-checks across a stretch of silence.
+        #
+        # What this branch measured is the age of the record, and that is all it
+        # now says. `failure_count` is a real input and keeps its own clause
+        # above, where it can be false.
+        return f"been marked bad for {int(age_seconds // 3600)}h"
     return None
 
 

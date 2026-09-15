@@ -25,9 +25,13 @@ Two details in here are load-bearing and easy to get wrong:
   leaves the statement open holding a lock -- a later ``wal_checkpoint`` on the
   same connection fails with "database table is locked". Measured: one
   unexhausted call moved a 56.5MB database to 56.5MB (1 page); the same call
-  with the cursor exhausted moved it to 19.7MB (8,979 pages) in 204ms. Every
-  call here goes through ``_run_incremental_step`` so the cursor is always
-  drained.
+  with the cursor exhausted moved it to 19.7MB (8,979 pages) in 204ms.
+  Fetching the rows is NOT a reliable way to step it, which is the trap this
+  module fell into: the pragma yields a zero-column row per reclaimed page,
+  and a driver that reads "zero columns" as "no result set" stops after the
+  first step. Every call here goes through ``_run_incremental_step``, which
+  uses ``executescript`` -- that steps the statement to completion on every
+  supported interpreter.
 * ``auto_vacuum`` lives in the database header and can only be changed by a full
   ``VACUUM`` that runs *after* the pragma is set on the same connection. Setting
   the pragma alone on a populated database is silently a no-op. This is why the
@@ -173,16 +177,26 @@ def space_stats(con) -> dict:
 
 
 def _run_incremental_step(con, pages) -> None:
-    """Reclaim up to ``pages`` free pages, draining the cursor.
+    """Reclaim up to ``pages`` free pages in one bounded write transaction.
 
-    The drain is the entire point -- see this module's docstring. An
-    ``execute()`` without it reclaims one page and leaves a lock behind.
+    Stepping the statement to completion is the entire point -- see this
+    module's docstring -- and ``execute()`` + ``fetchall()`` does not do it.
+    ``PRAGMA incremental_vacuum(N)`` reclaims one page per step and yields a
+    zero-column row each time; a driver that treats zero columns as "no result
+    set" hands back an empty ``fetchall()`` after the first step, so the call
+    reclaims exactly ONE page and still reports success -- the batch size is
+    silently lost and the lock-hold bound with it.
+
+    Measured on identical SQLite 3.45.1, one call of ``incremental_vacuum(500)``
+    against a 745-page freelist: ``execute().fetchall()`` reclaimed 500 pages
+    under CPython 3.10.20, 3.12.3 and 3.13.12 but 1 page under 3.11.15;
+    ``executescript`` reclaimed 500 under all four. So the drain goes through
+    ``executescript``, which is not driver-dependent.
+
+    Callers must hold an autocommit connection: ``executescript`` commits an
+    open transaction before it runs the script.
     """
-    cursor = con.execute(f"pragma incremental_vacuum({int(pages)})")
-    try:
-        cursor.fetchall()
-    finally:
-        cursor.close()
+    con.executescript(f"pragma incremental_vacuum({int(pages)});")
 
 
 def run_incremental_vacuum(

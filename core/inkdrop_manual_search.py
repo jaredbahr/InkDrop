@@ -1091,6 +1091,25 @@ def _canonical_pack_target_safe(candidate: dict[str, Any], context: dict[str, An
         "edition_id": context.get("edition_id"),
         "edition_marker": context.get("edition_marker"),
         "publication_title": context.get("publication_title"),
+        # Explicit, and NOT the acquisition-settings-snapshot gap the slskd
+        # probe's loaders and entry points close (tracker #828). Two facts, in
+        # order. First, `settings` is None on every production call: the one
+        # caller is normalize_candidate() below, which passes nothing, and
+        # `context` comes from structured_search_input(), a fixed-key
+        # projection that does not carry the snapshot key. Second -- and this
+        # is why that does not matter -- the flag below is the narrowest source
+        # acquisition_policy.resolve() reads, so it decides collected_edition
+        # here whatever the instance setting says. Readings against this exact
+        # dict: settings=None -> refuse; settings={"collected_edition_policy":
+        # "admit"} -> refuse; a carried snapshot saying admit -> refuse; the
+        # same dict with this one key dropped and settings admit -> admit.
+        # Threading settings= through would therefore not move
+        # collected_edition at all, only pack_containment, unit_preference and
+        # unidentified_unit -- a different change from the one #828 asked for.
+        # The pin is the point: a pack is proof only when it contains the
+        # wanted unit itself, which is why a manifest member parsing as a
+        # collected edition is refused outright above, before any matcher call.
+        # Recorded rather than omitted -- relaxing it is a product decision.
         "allow_collected_edition": False,
     }
     bound_candidate = dict(candidate)

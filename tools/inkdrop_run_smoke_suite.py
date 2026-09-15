@@ -206,6 +206,48 @@ def _read_denial_effective():
         return False
 
 
+def _write_denial_effective():
+    """True when a read-only mode on our own file actually stops us writing it.
+
+    SEPARATE FROM _read_denial_effective ON PURPOSE. The two answers are not
+    the same answer, and the platform where they diverge is the one this suite
+    runs on most often after Linux: on Windows os.chmod moves only the
+    read-only attribute, so a 0444 file there is still READABLE but genuinely
+    NOT WRITABLE. Declaring a write-denial fixture against `read_denial` would
+    therefore mark it unrunnable on the one platform where its fault can still
+    be caused, and that is a lost test, not a saved one. As root on Linux both
+    checks are bypassed and both answer False, which is why one key looked
+    sufficient from a Linux host.
+
+    Asked by staging exactly what the fixtures stage -- the mode bits, then the
+    write -- rather than inferred from os.name or geteuid, for the same reason
+    the read probe is.
+    """
+    import stat
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory(prefix="inkdrop-write-denial-") as tmp:
+            probe = os.path.join(tmp, "probe")
+            with open(probe, "wb") as handle:
+                handle.write(b"x")
+            os.chmod(probe, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+            try:
+                with open(probe, "ab") as handle:
+                    handle.write(b"y")
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+            finally:
+                try:
+                    os.chmod(probe, stat.S_IRUSR | stat.S_IWUSR)
+                except OSError:
+                    pass
+    except OSError:
+        return False
+
+
 def _export_skip_reason(basename):
     """Why this test has no subject in the tree it is running from, or None.
 
@@ -335,6 +377,12 @@ REQUIREMENTS = {
         "needs an environment where chmod 0 actually denies a read -- Windows cannot, "
         "and root on Linux bypasses the check, so the EACCES under test cannot be caused here",
     ),
+    "write_denial": (
+        _write_denial_effective,
+        "needs an environment where a read-only mode actually denies a write -- root on "
+        "Linux bypasses the check, so the EACCES under test cannot be caused here "
+        "(Windows CAN cause it: os.chmod moves the read-only attribute there)",
+    ),
     "change_time": (
         _change_time_moves,
         "needs a filesystem whose st_ctime moves on an in-place rewrite -- Windows reports creation time there",
@@ -352,6 +400,65 @@ REQUIREMENTS = {
         "needs the fcntl module, which only POSIX Python provides; the staging sweep imports it for flock",
     ),
 }
+
+# requirement key -> who to ask when it stops holding. Printed on every run
+# beside the requirement's state, and again on each test it declines.
+#
+# WHY THIS SITS ON THE REQUIREMENT AND NOT ON EACH REQUIRES ENTRY. The question
+# that prompted it was whether a REQUIRES entry should carry an owner the way a
+# NON_QUALIFYING entry does. It should not, for two reasons.
+#
+# First, the two tables have different powers. A NON_QUALIFYING entry HIDES A
+# RED: the test runs, fails, and is kept out of the qualifying count, so it
+# needs a name and a deadline and the runner un-suppresses it at the deadline
+# automatically. A REQUIRES entry hides nothing -- it declines to produce a
+# result and prints that decision loudly, twice. So it needs no expiry either:
+# "root bypasses chmod" and "Windows has no fcntl" do not expire, and a date on
+# them would only manufacture churn.
+#
+# Second, an owner per entry would be the same fact written forty-odd times.
+# Playwright going missing is ONE event, not thirty; the thing that can stop
+# being true is the REQUIREMENT. One owner per requirement is the whole of it.
+#
+# Kept as a separate table rather than a third tuple slot because REQUIREMENTS
+# values are unpacked as (predicate, explanation) by this runner, by
+# conftest.py, and by the guard smokes that plant synthetic tables -- widening
+# the tuple would invalidate every one of them for no gain here.
+REQUIREMENT_OWNERS = {
+    "origin_qa": "release",
+    "playwright": "web",
+    "read_denial": "harness",
+    "write_denial": "harness",
+    "change_time": "harness",
+    "symlinks": "harness",
+    "wslpath": "harness",
+    "fcntl": "acquisition",
+}
+
+
+def unowned_requirements(requirements, owners):
+    """(requirements with no owner, owners naming no requirement), each sorted.
+
+    Not a refusal. An undeclared requirement KEY is refused before discovery
+    because it silently turns a test into a permanent non-result; a missing
+    owner costs nothing at run time and taking 939 tests off the board over a
+    missing string would be the larger harm. The banner says UNOWNED on every
+    run instead, and the guard smoke for this table is what keeps it at zero.
+
+    Both tables are arguments for the same reason validate_requirement_keys'
+    are: the guard that covers this swaps the module attributes, and a default
+    would bind the tables the caller replaced.
+    """
+    missing = sorted(key for key in requirements if not str(owners.get(key) or "").strip())
+    orphaned = sorted(key for key in owners if key not in requirements)
+    return missing, orphaned
+
+
+def requirement_owner(key, owners=None):
+    """The owner of `key`, or UNOWNED. Never raises: this is banner text."""
+    table = REQUIREMENT_OWNERS if owners is None else owners
+    return str(table.get(key) or "").strip() or "UNOWNED"
+
 
 # basename -> requirement key. A test listed here is never executed unless its
 # requirement holds; when it does hold the test runs for real and any failure
@@ -388,6 +495,13 @@ REQUIRES = {
     # web/tests/*.js has nothing that runs it. Each shells out to a playwright
     # smoke, so it runs for real wherever playwright is present.
     "inkdrop-archive-read-undetermined-not-a-content-verdict-smoke.py": "read_denial",
+    # Stages a 0444 archive and asserts the repair does not claim it wrote one
+    # it could not. Root bypasses that mode, so the archive IS writable, the
+    # repair IS honest, and the test reported FAILED for an environment it
+    # cannot construct the condition in. Gated on write_denial rather than
+    # read_denial so it keeps running on Windows, where the write denial is
+    # real and the read denial is not.
+    "inkdrop-metadata-guard-repair-truth-smoke.py": "write_denial",
     # Derives its probes from a diff against origin/qa; see _origin_qa_available().
     "inkdrop-qa-autodeploy-verifier-smoke.py": "origin_qa",
     "inkdrop-activity-backend-contract-browser-smoke.py": "playwright",
@@ -505,16 +619,18 @@ NON_QUALIFYING = {
         "issue": "tracker row #871",
     },
 
-    "inkdrop-slskd-failover-smoke.py": {
-        "reason": (
-            "times out at exactly the 420s per-test ceiling on GitHub Actions "
-            "ubuntu-latest runners (7/7 attempts on 2026-08-08), always in the "
-            "same flock/SQLite contention section; runs in 9.8s locally"
-        ),
-        "owner": "acquisition",
-        "expires": "2026-09-15",
-        "issue": "https://github.com/jaredbahr/InkDrop/issues/413",
-    },
+    # inkdrop-slskd-failover-smoke.py was quarantined here for the 420s CI
+    # timeout and is deliberately absent now: its cause was found and removed.
+    # It was never the flock/SQLite contention section the quarantine named --
+    # that section runs in 0.26s. AUTO_GRAB_STATE_LOCK resolves from
+    # INKDROP_LOCK_DIR at import, the suite points that at one directory for the
+    # whole run, and thirteen of the smoke's fourteen auto-grab call sites took
+    # that shared file; a sibling holding it made this test wait 60s at a time.
+    # The smoke now redirects every INKDROP_* path to a root of its own before
+    # its core imports, and this runner's own rule applies: a quarantined test
+    # that passes is removed from this table rather than left in it.
+    # tests/inkdrop-slskd-failover-does-not-wait-on-an-ambient-lock-smoke.py
+    # holds the fix in place.
     # Wiring these three up is what proved they had been dead for weeks. Each
     # needs a judgement this wiring pass deliberately did not make, so each runs
     # and prints its red rather than being hidden. Owner and expiry assigned by
@@ -735,7 +851,20 @@ def main():
         satisfied[key] = bool(predicate())
         state = "available" if satisfied[key] else "MISSING"
         suffix = "" if satisfied[key] else " -- " + explanation
-        print("requirement " + key + ": " + state + suffix)
+        print("requirement " + key + ": " + state
+              + " (owner=" + requirement_owner(key, REQUIREMENT_OWNERS) + ")" + suffix)
+
+    # Reported, never refused -- see unowned_requirements' docstring. The
+    # per-requirement line above already says UNOWNED for a requirement with no
+    # owner, but it can only speak about keys that still exist: an owner naming
+    # a requirement that has since been deleted appears on no line at all. That
+    # orphan is the shape a precondition leaves behind when it stops being true,
+    # so it is the one this banner has to say out loud.
+    missing_owner, orphaned_owner = unowned_requirements(REQUIREMENTS, REQUIREMENT_OWNERS)
+    for key in missing_owner:
+        print(f"requirement {key}: UNOWNED -- no entry in REQUIREMENT_OWNERS")
+    for key in orphaned_owner:
+        print(f"requirement owner {key}: ORPHANED -- names no requirement that exists")
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
 
@@ -823,7 +952,12 @@ def main():
         print("")
         print(f"unrunnable here ({len(unrunnable)}) -- NOT executed, NOT counted as passing:")
         for name, requirement in unrunnable:
-            print(f"  - {name} (requires {requirement})")
+            # `requirement` is a REQUIREMENTS key for a precondition and a
+            # free-text reason for an export decline; only the first has an
+            # owner, and inventing one for the second would be a lie.
+            owner = (f" owner={requirement_owner(requirement, REQUIREMENT_OWNERS)}"
+                     if requirement in REQUIREMENTS else "")
+            print(f"  - {name} (requires {requirement}){owner}")
         print("  These are an environment gap, not evidence of correctness.")
 
     if non_qualifying_fails:

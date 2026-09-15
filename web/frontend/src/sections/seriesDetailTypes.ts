@@ -154,7 +154,12 @@ const LIFECYCLE_ALIASES: Record<string, string> = {
   downloading: "Downloading", importing: "Importing", staged_or_importing: "Importing", ready_import: "Importing",
   verified: "Complete", complete: "Complete", completed: "Complete", copied_not_indexed: "Complete",
   folder_complete: "Complete", folder_verified: "Complete", library_visible: "Complete",
-  failed: "Failed", error: "Failed", library_scan_timeout: "Failed", scan_timeout: "Failed", kavita_scan_timeout: "Failed",
+  failed: "Failed", error: "Failed",
+  // Kept identical to the desktop table in core/inkdrop_web.py, which carries
+  // the reasoning: a scan we stopped waiting for is not a finding about the
+  // file, and the wording is the server's own name for the state.
+  library_scan_timeout: "Library Scan Timeout", kavita_scan_timeout: "Library Scan Timeout",
+  scan_timeout: "Library Scan Timeout", timeout: "Library Scan Timeout",
   blocked: "Blocked", policy_block: "Blocked", language_blocked: "Blocked",
   needs_you: "Needs you", needs_user: "Needs you", manual_exception: "Needs you", manual_review: "Needs you",
 };

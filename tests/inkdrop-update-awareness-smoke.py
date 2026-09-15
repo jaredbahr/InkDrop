@@ -329,10 +329,15 @@ with tempfile.TemporaryDirectory(prefix="inkdrop-update-awareness-") as temp:
 
     # PRODUCTION PASSES THE PRIVATE REPOSITORY HERE, NOT THIS ONE. The release
     # workflow calls the tool with --repository "$GITHUB_REPOSITORY", and the
-    # job that builds this manifest runs on jaredbahr/InkDrop. Passing REPO
-    # (the public release repository) exercises a call the consumer never
-    # makes, which is why this stayed green while every dispatch died on
-    # "release_url must identify the exact InkDrop release".
+    # job that builds this manifest runs on the private development repository
+    # -- `private_repo` below, which is assembled rather than spelled out. The
+    # export rewrites that name to the public one wherever it appears
+    # contiguously, and this file ships in the export, so spelling it here left
+    # the public tree carrying this same paragraph asserting that production
+    # runs on the PUBLIC repository, two lines above code proving it does not.
+    # Passing REPO (the public release repository) exercises a call the
+    # consumer never makes, which is why this stayed green while every dispatch
+    # died on "release_url must identify the exact InkDrop release".
     #
     # A manifest names its OWN release, so on the private prerelease path
     # release_url is the private one and the manifest must be validated against

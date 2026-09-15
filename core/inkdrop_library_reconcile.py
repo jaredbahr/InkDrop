@@ -4,7 +4,8 @@
 Composes the existing managed-library scan/ledger machinery in inkdrop_state.py
 (untracked files, dangling ledger rows, on-disk duplicate files) with checks that
 don't exist anywhere else yet: two active files claiming the same issue, a file
-that no longer sits under its series' current library folder, and settings rows
+that no longer sits under its series' current library folder, two series rows
+claiming one library folder or one provider identity, and settings rows
 still carrying the pre-fix personal readarr defaults. Report mode never writes.
 Repair mode only ever performs the one already-safe, idempotent action InkDrop's
 own scheduler already runs periodically (refreshing media_files present/missing
@@ -254,6 +255,276 @@ def duplicate_issue_number_rows(con, limit=2000, member_limit=MEMBER_DETAIL_LIMI
     )
 
 
+def _series_overlap_keys(row):
+    """The joins this repository can actually make between two series rows.
+
+    Not the title. `inkdrop_state.duplicate_series_title_metrics()` already
+    groups same-title rows and even names this shape in
+    `duplicate_series_triage_work()`, but a normalized title is the weakest
+    evidence there is -- it misses a pair whose titles were edited apart and it
+    says nothing about which physical files each row believes it owns. These
+    two keys are the ones a state DB can actually answer with:
+
+      library_path      -- both rows point their library at the same folder, so
+                           the same files on disk answer to both of them.
+      provider_identity -- both rows carry the same provider AND the same id on
+                           that provider, i.e. the catalog itself says they are
+                           one work.
+
+    Both are required non-empty: an absent library_path or an absent
+    metadata_id is not a match, it is an unknown, and grouping on it would
+    collapse every unpathed row in the catalog into one finding.
+
+    Deliberately an exact folder match rather than a containment test: the
+    Avatar sub-series sit side by side under one parent folder
+    (`.../Avatar The Last Airbender/The Rift`, `.../The Promise`), and they are
+    distinct works that must not be joined by their parent.
+    """
+    keys = []
+    folder = inkdrop_state.media_file_normalized_path(row.get("library_path"))
+    if folder:
+        keys.append(("library_path", folder))
+    provider = str(row.get("metadata_provider") or "").strip().lower()
+    metadata_id = str(row.get("metadata_id") or "").strip().lower()
+    if provider and metadata_id:
+        keys.append(("provider_identity", f"{provider}\x1f{metadata_id}"))
+    return keys
+
+
+def _ledger_folder_hits(con, folders):
+    """For each active ledger file, which of `folders` contains it.
+
+    Walks each path's own ancestors against a set of folders instead of testing
+    every folder against every file: the per-file cost is the path's depth, not
+    the number of series rows under review. The prefix rule is the one
+    `inkdrop_state._path_has_prefix` applies (exact match, or a match ending on
+    a `/` boundary), so this and `naming_scheme_drift` cannot drift apart about
+    what "under a folder" means.
+    """
+    folder_set = {folder for folder in folders if folder}
+    hits = []
+    if not folder_set:
+        return hits
+    rows = _rows(
+        con,
+        "select path, normalized_path from media_files where active = 1 and coalesce(normalized_path, '') != ''",
+    )
+    for row in rows:
+        normalized = str(row.get("normalized_path") or "")
+        parts = normalized.split("/")
+        matched = {normalized} & folder_set
+        for index in range(1, len(parts)):
+            prefix = "/".join(parts[:index])
+            if prefix in folder_set:
+                matched.add(prefix)
+        if matched:
+            hits.append((row.get("path"), normalized, matched))
+    return hits
+
+
+def cross_granularity_series_rows(con, limit=2000, member_limit=MEMBER_DETAIL_LIMIT):
+    """Two or more series rows covering one work, usually at different unit sizes.
+
+    `duplicate_issue_number_rows` finds duplicates *inside* one series;
+    `naming_scheme_drift` finds a file that wandered off its own series' folder.
+    Nothing here compared one series row with another, so the shape that made an
+    operator watch InkDrop search for books it already owns -- a chapter-
+    granularity row and a volume-granularity row over one library folder, the
+    chapter row's units permanently open because the volume row's files satisfy
+    them -- produced no finding at all.
+
+    Every row in a group is reported with the evidence needed to pick a keeper,
+    and none of it is acted on: which row owns ledger files (`owned_ledger_files`,
+    from media_files.series_id) versus which row merely has them sitting in its
+    library folder (`library_folder_ledger_files`), how many units each row
+    carries, and how many of those units are still open.
+
+    The bar -- what this refuses to report:
+      * rows sharing neither a library folder nor a provider identity;
+      * rows whose join key is empty on either side;
+      * a pair `manga_companion_links` deliberately holds apart. A linked
+        ComicVine/MangaDex companion IS one work at two granularities, on
+        purpose, so it is the one edition pair that must stay quiet. The same
+        exclusion, read from the same helper, is what
+        `inkdrop_state.classify_duplicate_series_relationship()` applies.
+
+    Unit granularity is reported, not inferred: `unit_counts` carries each row's
+    issue-row count and `unit_granularity_differs` says whether they disagree.
+    Nothing here decides which row is the chapter edition, and nothing merges.
+    """
+    not_removed = inkdrop_state.series_not_removed_sql("s")
+    series_rows = _rows(
+        con,
+        f"""
+        select s.id, s.title, s.media_type, s.year, s.publisher,
+               s.metadata_provider, s.metadata_id, s.library_path, s.monitored
+        from series s
+        where {not_removed}
+        """,
+    )
+    empty = {"items": [], "total": 0, "truncated": False}
+
+    key_members = {}
+    for row in series_rows:
+        series_id = str(row.get("id") or "")
+        if not series_id:
+            continue
+        for key in _series_overlap_keys(row):
+            key_members.setdefault(key, []).append(series_id)
+
+    parent = {}
+
+    def find(node):
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left, right):
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[left_root] = right_root
+
+    for members in key_members.values():
+        for other in members[1:]:
+            union(members[0], other)
+
+    components = {}
+    for row in series_rows:
+        series_id = str(row.get("id") or "")
+        if series_id in parent:
+            components.setdefault(find(series_id), []).append(row)
+    groups = [members for members in components.values() if len(members) > 1]
+    if not groups:
+        return empty
+
+    companion_pairs = inkdrop_state.linked_manga_companion_pair_keys(con)
+
+    def deliberately_distinct(members):
+        ids = {str(row.get("id") or "") for row in members}
+        covered = set()
+        for left in ids:
+            for right in ids:
+                if left != right and frozenset((left, right)) in companion_pairs:
+                    covered.update((left, right))
+        return bool(ids) and covered == ids
+
+    groups = [members for members in groups if not deliberately_distinct(members)]
+    if not groups:
+        return empty
+
+    unit_counts = {
+        str(row["series_id"] or ""): int(row["unit_count"] or 0)
+        for row in _rows(
+            con,
+            "select series_id, count(*) as unit_count from issues group by series_id",
+        )
+    }
+    satisfied_counts = {
+        str(row["series_id"] or ""): int(row["satisfied"] or 0)
+        for row in _rows(
+            con,
+            """
+            select i.series_id as series_id, count(distinct i.id) as satisfied
+            from issues i
+            join media_files mf on mf.issue_id = i.id and mf.active = 1
+            group by i.series_id
+            """,
+        )
+    }
+    owned_counts = {
+        str(row["series_id"] or ""): int(row["owned"] or 0)
+        for row in _rows(
+            con,
+            """
+            select series_id, count(*) as owned
+            from media_files
+            where active = 1 and coalesce(series_id, '') != ''
+            group by series_id
+            """,
+        )
+    }
+
+    folder_by_series = {}
+    for members in groups:
+        for row in members:
+            folder_by_series[str(row.get("id") or "")] = inkdrop_state.media_file_normalized_path(
+                row.get("library_path")
+            )
+    ledger_hits = _ledger_folder_hits(con, set(folder_by_series.values()))
+    folder_file_counts = {}
+    for _, _, matched in ledger_hits:
+        for folder in matched:
+            folder_file_counts[folder] = folder_file_counts.get(folder, 0) + 1
+
+    items = []
+    for members in sorted(groups, key=lambda rows: (-len(rows), str(rows[0].get("title") or ""))):
+        members = sorted(members, key=lambda row: str(row.get("id") or ""))
+        member_ids = [str(row.get("id") or "") for row in members]
+        bases = sorted(
+            {
+                key_type
+                for (key_type, _), key_ids in key_members.items()
+                if len([series_id for series_id in key_ids if series_id in member_ids]) > 1
+            }
+        )
+        # A file is "shared" when it sits in the library folder of two or more
+        # DIFFERENT rows in this group -- counted per row, not per distinct
+        # folder, because the whole point is that two rows claim it.
+        shared_paths = []
+        for path, normalized, matched in ledger_hits:
+            claimants = sum(1 for series_id in member_ids if folder_by_series.get(series_id) in matched)
+            if claimants > 1:
+                shared_paths.append(path or normalized)
+        series_detail = []
+        for row in members[:member_limit]:
+            series_id = str(row.get("id") or "")
+            unit_count = unit_counts.get(series_id, 0)
+            satisfied = satisfied_counts.get(series_id, 0)
+            folder = folder_by_series.get(series_id) or ""
+            series_detail.append(
+                {
+                    "series_id": series_id,
+                    "title": row.get("title"),
+                    "media_type": row.get("media_type"),
+                    "year": row.get("year"),
+                    "publisher": row.get("publisher"),
+                    "metadata_provider": row.get("metadata_provider"),
+                    "metadata_id": row.get("metadata_id"),
+                    "library_path": row.get("library_path"),
+                    "monitored": bool(row.get("monitored")),
+                    "unit_count": unit_count,
+                    "satisfied_unit_count": satisfied,
+                    "open_unit_count": max(0, unit_count - satisfied),
+                    "owned_ledger_files": owned_counts.get(series_id, 0),
+                    "library_folder_ledger_files": folder_file_counts.get(folder, 0) if folder else 0,
+                }
+            )
+        group_unit_counts = [unit_counts.get(series_id, 0) for series_id in member_ids]
+        items.append(
+            {
+                "category": "cross_granularity_series_rows",
+                "requires_human_review": True,
+                "overlap_basis": bases,
+                "series_count": len(members),
+                "monitored_row_count": sum(1 for row in members if row.get("monitored")),
+                "unit_counts": group_unit_counts,
+                "unit_granularity_differs": len(set(group_unit_counts)) > 1,
+                "shared_ledger_files": len(shared_paths),
+                "shared_ledger_file_sample": shared_paths[:member_limit],
+                "shared_ledger_files_truncated": len(shared_paths) > member_limit,
+                "series": series_detail,
+                "series_truncated": len(members) > len(series_detail),
+            }
+        )
+    return {
+        "items": items[:limit],
+        "total": len(items),
+        "truncated": len(items) > limit,
+    }
+
+
 def legacy_settings_drift(con):
     """Persisted settings still carrying the pre-fix personal readarr defaults.
 
@@ -319,6 +590,7 @@ def build_reconciliation_report(db_path, *, max_files=50000, sample_limit=50, in
         report["multi_file_issue_conflicts"] = multi_file_issue_conflicts(con)
         report["naming_scheme_drift"] = naming_scheme_drift(con)
         report["duplicate_issue_number_rows"] = duplicate_issue_number_rows(con)
+        report["cross_granularity_series_rows"] = cross_granularity_series_rows(con)
         report["legacy_settings_drift"] = legacy_settings_drift(con)
         report["summary"] = {
             "untracked_files_on_disk": report.get("disk_scan", {}).get("untracked_files", 0) if include_disk_scan else None,
@@ -327,11 +599,17 @@ def build_reconciliation_report(db_path, *, max_files=50000, sample_limit=50, in
             "multi_file_issue_conflicts": report["multi_file_issue_conflicts"]["total"],
             "naming_scheme_drift_files": report["naming_scheme_drift"]["total"],
             "duplicate_issue_number_groups": report["duplicate_issue_number_rows"]["total"],
+            "cross_granularity_series_groups": report["cross_granularity_series_rows"]["total"],
             "legacy_settings_findings": len(report["legacy_settings_drift"]),
         }
         truncated = [
             key
-            for key in ("multi_file_issue_conflicts", "naming_scheme_drift", "duplicate_issue_number_rows")
+            for key in (
+                "multi_file_issue_conflicts",
+                "naming_scheme_drift",
+                "duplicate_issue_number_rows",
+                "cross_granularity_series_rows",
+            )
             if report[key]["truncated"]
         ]
         report["known_gaps"] = [
@@ -352,9 +630,16 @@ def build_reconciliation_report(db_path, *, max_files=50000, sample_limit=50, in
             key: sum(
                 1
                 for item in report[key]["items"]
-                if item.get("files_truncated") or item.get("issues_truncated")
+                if item.get("files_truncated")
+                or item.get("issues_truncated")
+                or item.get("series_truncated")
+                or item.get("shared_ledger_files_truncated")
             )
-            for key in ("multi_file_issue_conflicts", "duplicate_issue_number_rows")
+            for key in (
+                "multi_file_issue_conflicts",
+                "duplicate_issue_number_rows",
+                "cross_granularity_series_rows",
+            )
         }
         member_truncated = {key: count for key, count in member_truncated.items() if count}
         report["summary"]["groups_with_truncated_members"] = sum(member_truncated.values())
@@ -420,6 +705,7 @@ def run_repair(db_path, *, apply=False, max_files=50000, sample_limit=50):
         "multi_file_issue_conflicts": report.get("summary", {}).get("multi_file_issue_conflicts"),
         "naming_scheme_drift_files": report.get("summary", {}).get("naming_scheme_drift_files"),
         "duplicate_issue_number_groups": report.get("summary", {}).get("duplicate_issue_number_groups"),
+        "cross_granularity_series_groups": report.get("summary", {}).get("cross_granularity_series_groups"),
         "legacy_settings_findings": report.get("summary", {}).get("legacy_settings_findings"),
     }
     return result

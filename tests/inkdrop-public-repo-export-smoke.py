@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import subprocess
 import sys
 import tempfile
+import tokenize
 from pathlib import Path
 
 from tools import inkdrop_docker_context_manifest, inkdrop_public_repo_export
@@ -117,6 +119,14 @@ HARDCODED_PROVIDER_SERIES_ID_RE = re.compile(
 # Word-bounded so the organization slug in ghcr.io/<owner>bahr/... and the
 # repository URLs in core/inkdrop_version.py -- project identity, not personal
 # attribution -- never match.
+#
+# Applied to comment and prose text only, never to a string literal or a dict
+# key: with IGNORECASE (which is what makes it useful, since attribution in
+# prose is not reliably capitalised) a bare tree-wide search matches the
+# lowercase auth-header principals in the exported auth fixtures. Those are
+# test data, not "the maintainer named as a decision-maker", which is this
+# rule's stated bar. Scoping the context resolves them by the rule rather than
+# by renaming shipped fixtures, which the next auth fixture would undo.
 MAINTAINER_ATTRIBUTION_RE = re.compile(r"\b" + "Jar" + r"ed\b", re.IGNORECASE)
 
 # Keep in step with SCANNED_SUFFIXES in tools/inkdrop_publish_public_repo.py;
@@ -665,8 +675,136 @@ def assert_open_placeholder_detection_works():
     )
 
 
-def install_specific_repair_findings(text):
-    """Install-specific repair residue in exported runtime source.
+# Which suffixes carry prose, and in what shape. Every suffix in TEXT_SUFFIXES
+# is classified here; anything unclassified (.json, which has no comment syntax
+# at all) yields no prose, because a name in a JSON value is data, not an
+# attribution.
+PROSE_WHOLE_FILE_SUFFIXES = {"", ".md", ".txt"}
+HASH_COMMENT_SUFFIXES = {
+    ".dockerignore",
+    ".env",
+    ".example",
+    ".gitignore",
+    ".sh",
+    ".yaml",
+    ".yml",
+}
+SLASH_COMMENT_SUFFIXES = {".css", ".js", ".ts", ".tsx"}
+HTML_COMMENT_SUFFIXES = {".html"}
+
+
+def hash_comment_prose(text):
+    """Text after the first unquoted '#' on each line."""
+    prose = []
+    for line in text.splitlines():
+        quote = None
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quote:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                quote = char
+            elif char == "#":
+                prose.append(line[index + 1:])
+                break
+            index += 1
+    return prose
+
+
+def python_comment_prose(text):
+    """Comments and docstrings, via the tokenizer rather than by hand.
+
+    A docstring counts as prose -- attribution reads the same in one as in a
+    '#' comment -- but an ordinary string literal or dict key does not, which
+    is the whole point of the scoping.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        # A fragment or a file this tokenizer cannot parse still has '#'
+        # comments worth reading.
+        return hash_comment_prose(text)
+    prose = []
+    statement_start = True
+    for token in tokens:
+        if token.type == tokenize.COMMENT:
+            prose.append(token.string.lstrip("#"))
+            continue
+        if token.type in (tokenize.NL, tokenize.NEWLINE):
+            statement_start = True
+            continue
+        if token.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING, tokenize.ENDMARKER):
+            continue
+        if token.type == tokenize.STRING and statement_start:
+            prose.append(token.string)
+        statement_start = False
+    return prose
+
+
+def slash_comment_prose(text):
+    """// line comments and /* */ block comments, skipping string literals."""
+    prose = []
+    quote = None
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote or char == "\n":
+                quote = None
+            index += 1
+            continue
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = length if end == -1 else end
+            prose.append(text[index + 2:end])
+            index = end
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end == -1:
+                prose.append(text[index + 2:])
+                break
+            prose.append(text[index + 2:end])
+            index = end + 2
+            continue
+        if char in "'\"`":
+            quote = char
+        index += 1
+    return prose
+
+
+def html_comment_prose(text):
+    """<!-- --> comments."""
+    return re.findall(r"<!--(.*?)(?:-->|\Z)", text, re.DOTALL)
+
+
+def prose_segments(text, suffix):
+    """The comment and prose regions of a file, by suffix."""
+    suffix = suffix.lower()
+    if suffix in PROSE_WHOLE_FILE_SUFFIXES:
+        return [text]
+    if suffix == ".py":
+        return python_comment_prose(text)
+    if suffix in SLASH_COMMENT_SUFFIXES:
+        return slash_comment_prose(text)
+    if suffix in HASH_COMMENT_SUFFIXES:
+        return hash_comment_prose(text)
+    if suffix in HTML_COMMENT_SUFFIXES:
+        return html_comment_prose(text)
+    return []
+
+
+def install_specific_repair_findings(text, suffix=".py", scan_provider_ids=True):
+    """Install-specific repair residue in exported source.
 
     Two shapes, both of which have actually shipped:
 
@@ -677,12 +815,23 @@ def install_specific_repair_findings(text):
       one person's private call published as product rationale.
 
     The organization slug in a repository or image URL is project identity,
-    not a personal attribution, and must not trip this.
+    not a personal attribution, and must not trip this. Neither is a name that
+    only ever appears inside a string literal or a dict key: the attribution
+    arm reads comment and prose text only, so it can run over the whole
+    exported tree instead of over core/ and tools/ alone.
+
+    The provider-id arm stays opt-in per caller, because a test fixture that
+    legitimately names a provider id is meant to stay legible -- that scoping
+    is the reason this function had a core/tools filter in the first place,
+    and it is deliberate rather than an oversight.
     """
     findings = []
-    findings.extend(sorted(set(HARDCODED_PROVIDER_SERIES_ID_RE.findall(text))))
-    if MAINTAINER_ATTRIBUTION_RE.search(text):
-        findings.append("maintainer attribution")
+    if scan_provider_ids:
+        findings.extend(sorted(set(HARDCODED_PROVIDER_SERIES_ID_RE.findall(text))))
+    for segment in prose_segments(text, suffix):
+        if MAINTAINER_ATTRIBUTION_RE.search(segment):
+            findings.append("maintainer attribution")
+            break
     return findings
 
 
@@ -708,20 +857,128 @@ def assert_install_specific_repair_detection_works():
         install_specific_repair_findings('provider_series_id="31022"') == [],
         "detector must not flag an ordinary provider id argument",
     )
+    # Prose scoping: same name, comment versus string literal, per suffix the
+    # export actually ships. The lowercase arms are the exact shape that made a
+    # tree-wide IGNORECASE search red on a clean export.
+    require(
+        install_specific_repair_findings(f'"""4 hours is {owner}\'s call."""\n', suffix=".py")
+        == ["maintainer attribution"],
+        "detector must flag a maintainer named as decision-maker in a docstring",
+    )
+    require(
+        install_specific_repair_findings('headers = {"X-Forwarded-User": "jared"}\n', suffix=".py") == [],
+        "detector must not flag an auth-header principal in a test fixture",
+    )
+    require(
+        install_specific_repair_findings(f"// 4 hours is {owner}'s call (2026-08-08)\n", suffix=".js")
+        == ["maintainer attribution"],
+        "detector must flag a maintainer named as decision-maker in a js line comment",
+    )
+    require(
+        install_specific_repair_findings(f"/* 4 hours is {owner}'s call */\n", suffix=".js")
+        == ["maintainer attribution"],
+        "detector must flag a maintainer named as decision-maker in a js block comment",
+    )
+    require(
+        install_specific_repair_findings('const headers = {"X-Forwarded-User": "jared"};\n', suffix=".js") == [],
+        "detector must not flag an auth-header principal in a js fixture",
+    )
+    require(
+        install_specific_repair_findings(f"4 hours is {owner}'s call (2026-08-08)\n", suffix=".md")
+        == ["maintainer attribution"],
+        "detector must flag a maintainer named as decision-maker in prose",
+    )
+    require(
+        install_specific_repair_findings(f"# 4 hours is {owner}'s call\n", suffix=".yml")
+        == ["maintainer attribution"],
+        "detector must flag a maintainer named as decision-maker in a yaml comment",
+    )
+    require(
+        install_specific_repair_findings(f'user: "{owner.lower()}"\n', suffix=".yml") == [],
+        "detector must not flag a yaml string value",
+    )
+
+
+def is_exported_text_file(relative):
+    """The same text filter assert_no_private_text_markers uses."""
+    path = Path(relative)
+    return path.suffix.lower() in TEXT_SUFFIXES or path.name in {".dockerignore", ".gitignore"}
+
+
+def install_specific_repair_scan(root):
+    """Findings per exported path, over every text file the export ships.
+
+    The attribution arm runs over the whole text tree -- tests/*.py and
+    web/tests/*.js are both on the allowlist and both in the applied export,
+    and neither was read before. The provider-id arm keeps its core/tools
+    scope so a test fixture that legitimately names a provider id stays
+    legible.
+    """
+    root = Path(root)
+    results = {}
+    for relative in sorted(exported_paths(root)):
+        if not is_exported_text_file(relative):
+            continue
+        path = Path(relative)
+        try:
+            text = (root / relative).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        findings = install_specific_repair_findings(
+            text,
+            suffix=path.suffix,
+            scan_provider_ids=path.suffix == ".py" and path.parts[0] in {"core", "tools"},
+        )
+        if findings:
+            results[relative] = findings
+    return results
 
 
 def assert_no_install_specific_repairs(root):
-    """Exported runtime source carries no install-specific repair. Scoped to
-    the shipped runtime modules and tools rather than the whole tree, so a
-    test fixture that legitimately names a provider id stays legible."""
+    """Exported source carries no install-specific repair."""
+    findings = install_specific_repair_scan(root)
+    require(not findings, f"install-specific repair residue exported: {findings}")
+
+
+# One arm per class the old core/tools filter could not reach, plus a core/
+# arm as the positive control: a widening that accidentally narrows fails
+# there first. tests/inkdrop-auth-enforcement-smoke.py is chosen deliberately
+# -- it is one of the files a tree-wide IGNORECASE search called a finding, so
+# its clean-before reading is the proof that the prose scoping resolved that
+# false positive by the rule rather than by renaming the fixture.
+ATTRIBUTION_SCAN_ARMS = (
+    ("web/tests/settings-backup-restore-browser-smoke.js", "\n// 4 hours is {owner}'s call (2026-08-08)\n"),
+    ("tests/inkdrop-auth-enforcement-smoke.py", "\n# 4 hours is {owner}'s call (2026-08-08)\n"),
+    ("core/inkdrop_web.py", "\n# 4 hours is {owner}'s call (2026-08-08)\n"),
+)
+
+
+def assert_attribution_scan_reaches_every_exported_class(root):
+    """The scan must refuse maintainer attribution wherever the export ships it.
+
+    Each arm copies one real exported file to its real exported path in a
+    scratch tree, reads the scan clean, appends the attribution comment, and
+    requires the scan to refuse it. Clean-before is the control: without it a
+    rule that flags everything would pass the red arm for the wrong reason.
+    """
+    owner = "Jar" + "ed"
     root = Path(root)
-    for relative in sorted(exported_paths(root)):
-        path = Path(relative)
-        if path.suffix != ".py" or path.parts[0] not in {"core", "tools"}:
-            continue
-        text = (root / relative).read_text(encoding="utf-8")
-        findings = install_specific_repair_findings(text)
-        require(not findings, f"install-specific repair residue exported in {relative}: {findings}")
+    for relative, injection in ATTRIBUTION_SCAN_ARMS:
+        source = root / relative
+        require(source.is_file(), f"attribution scan arm is absent from the export: {relative}")
+        original = source.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="inkdrop-attribution-arm-") as scratch:
+            target = Path(scratch) / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(original, encoding="utf-8")
+            clean = install_specific_repair_scan(scratch)
+            require(not clean, f"attribution scan arm {relative} is not clean before injection: {clean}")
+            target.write_text(original + injection.format(owner=owner), encoding="utf-8")
+            flagged = install_specific_repair_scan(scratch)
+            require(
+                flagged.get(relative) == ["maintainer attribution"],
+                f"attribution scan does not reach exported {relative}: {flagged}",
+            )
 
 
 def main():
@@ -755,6 +1012,7 @@ def main():
             require(not (parts & FORBIDDEN_PARTS), f"forbidden path part exported: {path}")
         assert_no_private_text_markers(tmp)
         assert_no_install_specific_repairs(tmp)
+        assert_attribution_scan_reaches_every_exported_class(tmp)
         manifest = json.loads((Path(tmp) / "PUBLIC_REPO_MANIFEST.json").read_text(encoding="utf-8"))
         require(manifest.get("schema") == "inkdrop.public_repo_export.v1", "export manifest schema should be stable")
         require(manifest.get("file_count") == len(paths) - 1, "manifest should count copied files, excluding itself")

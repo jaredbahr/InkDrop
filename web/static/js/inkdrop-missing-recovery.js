@@ -51,8 +51,10 @@
     complete: ["Complete"],
     // Matched against coreStateLabel()'s rendered OUTPUT (see the comment
     // above). The second copy of this table lives in core/inkdrop_web.py and
-    // both are load-bearing; a smoke pins them together.
-    needs_attention: ["Needs you", "Failed", "Blocked"],
+    // both are load-bearing; a smoke pins them together. "Library Scan Timeout"
+    // keeps the tile selecting the timed-out rows it selected when they
+    // rendered as "Failed".
+    needs_attention: ["Needs you", "Failed", "Blocked", "Library Scan Timeout"],
   });
 
   function element(tag, className, text) {
