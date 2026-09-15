@@ -14494,20 +14494,24 @@ def direct_import_destination_unit_gate(con, queue, dest_path, raw, *, already_s
     # assertion about the queue row, it is evidence and must be honoured. The
     # marker that tells them apart is already written onto the payload, so this
     # reads the marker instead of guessing from the filename's shape -- see
-    # payload_carries_volume_page_pack_coverage(). Source grading is unchanged:
-    # there the question really is "is this file what the payload says it is",
-    # and the payload IS the right reference.
-    trusted_issue = None
-    for item in iter_import_result_raw_sources(raw if isinstance(raw, dict) else {}):
-        if already_satisfied_destination and not payload_carries_volume_page_pack_coverage(item):
-            continue
-        for key in ("trusted_issue", "issue_number", "normalized_number"):
-            value = str(item.get(key) or "").strip()
-            if value:
-                trusted_issue = value
-                break
-        if trusted_issue:
-            break
+    # payload_carries_volume_page_pack_coverage().
+    #
+    # THAT TEST USED TO BE WIRED BEHIND already_satisfied_destination, AND THAT
+    # WAS THE SURVIVING HALF OF THE DEFECT. The reasoning for exempting the
+    # other arm was "there the question really is 'is this file what the payload
+    # says it is', and the payload IS the right reference". It is the right
+    # reference for THAT question, and this gate does not ask it. This gate asks
+    # DOES THIS FILE SATISFY THE QUEUE ROW, and for that only the row, or an
+    # independent assertion about the row, is a standard -- on either arm.
+    # Provenance decides, never which caller is asking, so the selection below
+    # is keyed on the marker alone and already_satisfied_destination keeps
+    # exactly one job: choosing identity_evidence_path further down.
+    #
+    # Measured through record_direct_import_result() before the change: a stale
+    # payload '7' quarantined a genuinely correct `Powers #028` import for issue
+    # 28 and reset its want to `wanted` -- nothing downstream contains that,
+    # because the armed second grade never runs on a row the first call already
+    # quarantined.
     row = con.execute(
         """
         select
@@ -14533,7 +14537,33 @@ def direct_import_destination_unit_gate(con, queue, dest_path, raw, *, already_s
     ).fetchone()
     if not row:
         return None
-    trusted_issue = trusted_issue or row_value(row, "normalized_number") or row_value(row, "issue_number")
+    row_issue = row_value(row, "normalized_number") or row_value(row, "issue_number")
+    coverage_issue = ""
+    unmarked_issue = ""
+    for item in iter_import_result_raw_sources(raw if isinstance(raw, dict) else {}):
+        value = ""
+        for key in ("trusted_issue", "issue_number", "normalized_number"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                break
+        if not value:
+            continue
+        if payload_carries_volume_page_pack_coverage(item):
+            coverage_issue = value
+            break
+        unmarked_issue = unmarked_issue or value
+    # A coverage assertion outranks the row because it is a statement ABOUT the
+    # row, made by an authority that never looked at the file being graded; the
+    # row outranks everything else because it is what the file has to satisfy.
+    #
+    # THE LAST RESORT IS THE ONE REMAINING CIRCULAR CASE, and it is kept
+    # deliberately. A queue row with a null issue_id leaves the left join with
+    # NULL issue fields, so there is no row number to prefer and the payload is
+    # the only thing gating that shape at all. Dropping the branch does not make
+    # the gate stricter, it turns the gate OFF for those rows -- measured: the
+    # same call then accepts `Powers #028` for a row that names no unit
+    # anywhere. It stays until such a row has an authority of its own.
+    trusted_issue = coverage_issue or row_issue or unmarked_issue
     if not trusted_issue:
         return None
     try:
@@ -24037,6 +24067,27 @@ INCONCLUSIVE_TRANSFER_STATUSES = frozenset({
 })
 
 
+def inconclusive_transfer_outcome(status, *, stalled_transfer=False):
+    """The INCONCLUSIVE_TRANSFER_STATUSES judgement, for the writer whose
+    status string cannot carry it.
+
+    sync_stale_download_task_bad_candidates() can read this judgement off the
+    status alone. apply_download_client_snapshots() cannot: it relabels a
+    merely stalled (or paused, or stopped) transfer as 'failed_download'
+    itself, so by the time the bad-candidate payload is built, an outcome
+    InkDrop simply stopped waiting for is indistinguishable by status from a
+    failure the download client actually reported. The relabel is the writer's
+    own admission of which one it saw, so the caller passes it in.
+
+    Same bar as the set above, not a new one: an outcome InkDrop could not
+    establish is not an observation about the candidate's content. A stalled
+    peer is a fact about the network.
+    """
+    if str(status or "").strip().lower() in INCONCLUSIVE_TRANSFER_STATUSES:
+        return True
+    return bool(stalled_transfer)
+
+
 def sync_stale_download_task_bad_candidates(con, now=None, limit=None):
     """Every row this scans is already terminal (dt.state='failed' with one
     of the four listed statuses) and, once seen, is recorded permanently in
@@ -24620,6 +24671,7 @@ def apply_download_client_snapshots(
                 snapshot = candidate
                 break
         status = download_client_snapshot_status(snapshot) if snapshot else None
+        stalled_transfer = False
         if (
             status == "downloading"
             and snapshot
@@ -24631,6 +24683,7 @@ def apply_download_client_snapshots(
             )
         ):
             status = "failed_download"
+            stalled_transfer = True
             snapshot = dict(snapshot)
             snapshot.setdefault("reason", "download_client_progress_stalled")
             snapshot.setdefault(
@@ -24810,7 +24863,9 @@ def apply_download_client_snapshots(
             failure_reason=failure_reason,
             seen_at=now,
         )
-        if bad_candidate_payload:
+        if bad_candidate_payload and not inconclusive_transfer_outcome(
+            status, stalled_transfer=stalled_transfer
+        ):
             bad_candidate_id = record_bad_source_candidate_row(con, bad_candidate_payload, increment=True)
             if bad_candidate_id:
                 task_raw["download_client_bad_source_candidate_id"] = bad_candidate_id
@@ -44797,6 +44852,47 @@ def duplicate_series_item_work(item):
     return wanted + active_queue + downloading + importing + needs_you + download_tasks
 
 
+def duplicate_series_triage_work(item):
+    """What a duplicate row is worth to triage: queued work AND the books.
+
+    duplicate_series_item_work() counts only work in flight, and that inverts
+    on the shape the Deadman Wonderland pair has: one work registered twice,
+    the chapter-granularity row carrying every open want and no files at all,
+    the volume-granularity row carrying the books. Scored on queued work alone
+    the row that owns the entire physical library scores zero, so triage called
+    it the inactive duplicate and pointed the operator at it for cleanup --
+    the wrong row, on the strongest evidence available that a row is real.
+
+    Every triage surface reaches its verdict through the two callers of this
+    (classify_duplicate_series_group() for the group class,
+    annotate_duplicate_series_rows() for the per-row recommendation), so
+    counting the ledger here moves series_rows(), series_compact_card_rows()
+    and series_merge_candidate_detail() together.
+
+    The row-builders spell ownership differently, so all their spellings are
+    read: series_rows()/series_compact_card_rows() carry verified_issue_count
+    (and its covered_issue_count alias) from series_issue_availability_rollup(),
+    _series_merge_side_metrics() carries verified_imports. An item with none of
+    them -- duplicate_series_title_metrics()'s payload, say -- reads exactly as
+    it did before.
+
+    Deliberately NOT used by the display collapse (series_display_row_score(),
+    series_display_manual_shadow_candidate(),
+    collapse_series_display_duplicate_rows()). Those hide an empty manual or
+    adapter shadow behind the real metadata row on the default Series list --
+    a separate, shipped decision, and one this measure would silently reverse
+    for every shadow that happens to own a file.
+    """
+    item = item if isinstance(item, dict) else {}
+    owned = int(
+        item.get("verified_issue_count")
+        or item.get("covered_issue_count")
+        or item.get("verified_imports")
+        or 0
+    )
+    return duplicate_series_item_work(item) + owned
+
+
 def duplicate_series_distinct_values(items, key):
     values = []
     seen = set()
@@ -44816,7 +44912,7 @@ def duplicate_series_distinct_values(items, key):
 def classify_duplicate_series_group(items):
     items = [dict(item or {}) for item in (items or [])]
     for item in items:
-        item["duplicate_series_row_work"] = duplicate_series_item_work(item)
+        item["duplicate_series_row_work"] = duplicate_series_triage_work(item)
     active_items = [item for item in items if int(item.get("duplicate_series_row_work") or 0) > 0]
     inactive_items = [item for item in items if int(item.get("duplicate_series_row_work") or 0) <= 0]
     inactive_adapter_items = [
@@ -44976,12 +45072,12 @@ def annotate_duplicate_series_rows(rows, con=None, companion_pairs=None):
         group_ids = [str(item.get("series_id") or item.get("id") or "") for item in group_rows if item.get("series_id") or item.get("id")]
         group_titles = [str(item.get("title") or "") for item in group_rows if item.get("title")]
         active_work = sum(
-            duplicate_series_item_work(item)
+            duplicate_series_triage_work(item)
             for item in group_rows
         )
         for item in group_rows:
             other_titles = [title for title in group_titles if title and title != item.get("title")]
-            row_work = duplicate_series_item_work(item)
+            row_work = duplicate_series_triage_work(item)
             row_ownership = str(item.get("ownership") or "").lower()
             item["duplicate_title_key"] = title_key
             item["duplicate_series_group_count"] = len(group_rows)

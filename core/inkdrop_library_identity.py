@@ -8,6 +8,21 @@ MANGA_MEDIA_TYPES = {"manga", "manhwa", "manhua"}
 COMIC_MEDIA_TYPES = {"comic", "comics", "western_comic"}
 UNIT_TYPES = {"issue", "chapter", "volume", "collected", "pack_member"}
 
+READER_VISIBLE_STATUSES = frozenset({"library_visible", "visible"})
+# The four members are copied from the two canonical sets the tree already
+# agrees on -- inkdrop_state.READER_VISIBILITY_TIMEOUT_STATUSES and
+# inkdrop_activity.VISIBILITY_TIMEOUT_STATUSES, which hold the same four. They
+# are duplicated rather than imported because this module is a leaf (re and
+# pathlib only) that both of those import from.
+READER_VISIBILITY_TIMEOUT_STATUSES = frozenset({"library_scan_timeout", "kavita_scan_timeout", "scan_timeout", "timeout"})
+# The reader answered about this file and the answer was adverse. Distinct from
+# the set above, which is us giving up on waiting rather than the reader
+# reporting anything at all.
+READER_VISIBILITY_ADVERSE_STATUSES = frozenset({
+    "failed", "missing_file", "wrong_library",
+    "wrong_file", "wrong_series_folder", "duplicate_series",
+})
+
 
 def canonical_library_classification(record):
     """Classify from durable work metadata; provider and filename are never evidence."""
@@ -174,12 +189,14 @@ def completion_projection(record):
         state = "reader_visibility_failed"
     elif not reader_configured:
         state = "imported"
-    elif visibility in {"library_visible", "visible"}:
+    elif visibility in READER_VISIBLE_STATUSES:
         state = "reader_visible"
-    elif visibility in {
-        "failed", "scan_timeout", "timeout", "missing_file", "wrong_library",
-        "wrong_file", "wrong_series_folder", "duplicate_series",
-    }:
+    elif visibility in READER_VISIBILITY_TIMEOUT_STATUSES:
+        # Tested before the adverse arm: a scan we stopped waiting for is not a
+        # verdict about the file, and it is the name inkdrop_activity already
+        # gives this input.
+        state = "reader_visibility_timeout"
+    elif visibility in READER_VISIBILITY_ADVERSE_STATUSES:
         state = "reader_visibility_failed"
     elif scan_requested or visibility in {"pending", "not_visible"}:
         state = "reader_scan_pending"

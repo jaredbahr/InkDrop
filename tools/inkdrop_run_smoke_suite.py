@@ -404,6 +404,29 @@ REQUIRES = {
     "inkdrop-series-poster-title-overflow-smoke.py": "playwright",
 }
 
+
+def validate_requirement_keys(requires, requirements):
+    """The REQUIRES entries whose requirement key is not defined, sorted.
+
+    Nothing else binds the two tables together, and an undefined key is the
+    worst outcome available: the resolution below treats "no such requirement"
+    as "the precondition is missing here", so a typo, a rename, or a
+    requirement deleted without its entries marks the test unrunnable on every
+    platform. It is then never executed, never counted, and never red, and no
+    requirement banner line is printed for it either -- the one table that
+    would show the mistake is built from `REQUIREMENTS`.
+
+    Both tables are arguments rather than defaults on purpose: defaults bind at
+    def time, and the guard that covers this swaps the module attributes, so a
+    default would keep validating the tables the caller replaced.
+    """
+    return sorted(
+        (basename, key)
+        for basename, key in requires.items()
+        if key not in requirements
+    )
+
+
 # Explicitly non-qualifying: the test still RUNS and its result is still
 # printed, but it does not gate a release. Every entry carries an owner and an
 # expiry, both printed on every run, and an expired entry becomes qualifying
@@ -645,6 +668,25 @@ def tracked_smokes():
 
 def main():
     ensure_isolated_state_env()
+
+    # Before discovery, so this refusal can never be mistaken for a test
+    # result. Passing both tables explicitly is what makes the check see the
+    # tables this call is actually using.
+    undeclared = validate_requirement_keys(REQUIRES, REQUIREMENTS)
+    if undeclared:
+        for basename, key in undeclared:
+            print(
+                f"REQUIRES[{basename}] names requirement {key!r}, which is not in "
+                "REQUIREMENTS -- that test would be marked unrunnable on every "
+                "platform, never executed and never counted as passing or failing"
+            )
+        print(
+            f"refusing to run: {len(undeclared)} precondition entries name a "
+            "requirement that does not exist. Fix the spelling in REQUIRES, or "
+            "delete the entry."
+        )
+        return 1
+
     names = tracked_smokes()
     present = smoke_like_files()
     expected = max(MIN_EXPECTED_SMOKE_COUNT, int(len(present) * MIN_SMOKE_DISCOVERY_RATIO))
@@ -703,8 +745,11 @@ def main():
 
         # Preconditions first: a test that cannot run here is NOT executed, and
         # says so. It never touches the pass count and never touches red.
+        # Indexed, not `.get(..., False)`: the gate at the top of main() has
+        # already refused every undeclared key, so a missing one here is a bug
+        # in this file and must say so rather than read as "unrunnable".
         requirement = REQUIRES.get(base)
-        if requirement is not None and not satisfied.get(requirement, False):
+        if requirement is not None and not satisfied[requirement]:
             unrunnable.append((name, requirement))
             print(f"{label}: UNRUNNABLE (requires {requirement}) -- not executed")
             continue

@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,11 +19,38 @@ from types import SimpleNamespace
 from unittest import mock
 from PIL import Image
 
-from core import inkdrop_manual_source_autoresolve as resolver
-from core import inkdrop_completed_import as completed_import
-from core import inkdrop_series_autopilot as autopilot
-from core import inkdrop_slskd_source_probe as probe
-from core import inkdrop_state
+# Every INKDROP_* path this file touches goes under one root of its own,
+# BEFORE the core imports below -- the probe resolves LOCK_DIR and
+# AUTO_GRAB_STATE_LOCK at import time. Fourteen call sites here reach the
+# auto-grab runners and exactly one redirected the state lock, so the rest
+# took the ambient lock file: shared by every test in a suite run, and created
+# there even on a passing run. A sibling that leaked a holder on it therefore
+# stalled this file toward its per-test ceiling -- measured here at 243 s with
+# a holder, against 9.5 s with this preamble in place. It also covers
+# replay_smoke()'s children, which inherit this environment through
+# os.environ.copy().
+_ISOLATED_ROOT = tempfile.mkdtemp(prefix="tmp-slskd-failover-smoke-")
+atexit.register(shutil.rmtree, _ISOLATED_ROOT, True)
+for _var, _rel in (
+    ("INKDROP_CONFIG_DIR", "config"),
+    ("INKDROP_STATE_DIR", "state"),
+    ("INKDROP_LOCK_DIR", "state/locks"),
+    ("INKDROP_LOG_DIR", "state/logs"),
+    ("INKDROP_CACHE_DIR", "state/cache"),
+    ("INKDROP_BACKUP_DIR", "state/backups"),
+    ("INKDROP_STAGING_DIR", "staging"),
+    ("INKDROP_MANUAL_INBOX_DIR", "manual-inbox"),
+    ("INKDROP_QUARANTINE_DIR", "state/quarantine"),
+):
+    _path = os.path.join(_ISOLATED_ROOT, _rel)
+    os.makedirs(_path, exist_ok=True)
+    os.environ[_var] = _path
+
+from core import inkdrop_manual_source_autoresolve as resolver  # noqa: E402
+from core import inkdrop_completed_import as completed_import  # noqa: E402
+from core import inkdrop_series_autopilot as autopilot  # noqa: E402
+from core import inkdrop_slskd_source_probe as probe  # noqa: E402
+from core import inkdrop_state  # noqa: E402
 
 
 def require(condition, message):

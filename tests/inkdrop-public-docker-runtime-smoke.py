@@ -585,6 +585,17 @@ def assert_public_release_runner_contract():
     require("tools/inkdrop_install_support_summary.py" in runner, "release runner should call the install support summary helper")
     require("inkdrop-release-notes-version-smoke.py" in runner, "release runner should include release-note/version alignment")
     require('("release_notes_version_smoke", 60' in runner, "release runner should bound release-note/version alignment runtime")
+    # The line above is the positive control for the two below: it names a
+    # LOCAL_CHECKS entry that is known to be registered, so if the reader or the
+    # tuple spelling ever changes it goes red first and the claim under it is
+    # read as broken rather than as reassurance. Both assertions are written
+    # against the tuple entry, not against the bare filename: the filename also
+    # appears in the py_compile argument list of LOCAL_CHECKS[0], so a substring
+    # search for it passes without any check being registered.
+    require(
+        '("about_release_limits_smoke", 60' in runner,
+        "release runner should register the About release-limits smoke as a gating check",
+    )
     require("tools/inkdrop_release_evidence_bundle.py" in runner, "release runner should compile the release evidence bundle helper")
     for label, text in (
         ("release runner", runner),

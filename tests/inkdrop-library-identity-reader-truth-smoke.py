@@ -45,7 +45,12 @@ states = {
     "imported": {"imported": True},
     "reader_scan_pending": {"imported": True, "reader_configured": True, "reader_required": True, "reader_scan_requested": True, "reader_visibility_status": "pending"},
     "reader_visible": {"imported": True, "reader_configured": True, "reader_required": True, "reader_visibility_status": "library_visible"},
-    "reader_visibility_failed": {"imported": True, "reader_configured": True, "reader_required": True, "reader_visibility_status": "scan_timeout"},
+    # This row used to read `scan_timeout -> reader_visibility_failed`, which pinned
+    # the defect rather than the behaviour: a scan we stopped waiting for is not a
+    # finding about the file. The two arms are now separate, and the adverse arm is
+    # driven by a status that IS a finding about the file.
+    "reader_visibility_timeout": {"imported": True, "reader_configured": True, "reader_required": True, "reader_visibility_status": "scan_timeout"},
+    "reader_visibility_failed": {"imported": True, "reader_configured": True, "reader_required": True, "reader_visibility_status": "wrong_library"},
 }
 for expected, record in states.items():
     projection = identity.completion_projection(record)

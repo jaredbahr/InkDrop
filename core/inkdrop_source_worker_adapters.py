@@ -19,6 +19,7 @@ from urllib.parse import quote, quote_plus, urlparse
 from core import inkdrop_prowlarr_indexer_health as indexer_health
 from core import inkdrop_sources
 from core import inkdrop_source_providers as providers
+from core import inkdrop_title_identity
 
 
 CONTRACT_VERSION = 1
@@ -297,6 +298,28 @@ def _leading_creator_possessive_name(query):
     if not match:
         return ""
     return providers.normalized_query(match.group(1))
+
+
+def _query_without_leading_branding_prefix(query):
+    """The query without a listed publisher branding prefix, or "".
+
+    Same shape as the creator-possessive and leading-article stems above, and
+    deliberately NOT folded into _series_query_aliases(): that list is read as
+    a control signal as well as a query source -- an empty alias_stems is what
+    selects the operator-supplied Manual Search progression, and alias_stems
+    leads the discovery_stems ladder -- so adding to it would displace the
+    canonical title from rung zero and disable the Manual Search contract for
+    exactly the titles this alias is for. The alias authority is
+    inkdrop_title_identity.branding_prefix_alias(), the same one the slskd
+    probe and the Prowlarr acceptance predicate already read.
+    """
+    text = providers.normalized_query(query)
+    if not text:
+        return ""
+    alias, _prefix = inkdrop_title_identity.branding_prefix_alias(text)
+    if not alias:
+        return ""
+    return providers.normalized_query(alias)
 
 
 def _query_without_leading_article(query):
@@ -729,6 +752,7 @@ def indexer_source_queries(wanted_item=None, *, max_queries=3, policy=None, incl
     base_without_creator = _query_without_leading_creator_possessive(base)
     series_without_creator = _query_without_leading_creator_possessive(series)
     series_without_article = _query_without_leading_article(series)
+    series_without_branding = _query_without_leading_branding_prefix(series)
     issue_variants = _issue_number_variants(issue_number)
     volume_variants = _volume_number_variants(_wanted_indexer_volume_number(wanted_item))
     is_volume_wanted = _is_volume_wanted_item(wanted_item)
@@ -894,6 +918,16 @@ def indexer_source_queries(wanted_item=None, *, max_queries=3, policy=None, incl
     if series_without_creator and issue_variants:
         for issue in issue_variants:
             add(f"{series_without_creator} {issue}", include_ascii=True)
+    # Placed here, after the canonical bare and canonical+issue rungs and
+    # ahead of the padded canonical spellings, because the automatic budget
+    # prowlarr_search_requests() passes is 3: a de-prefixed rung any later is
+    # generated and never emitted. It costs the padded canonical form its slot
+    # at that budget, which is the trade -- the acceptance predicate already
+    # admits this alias, so the only lane that could ever find such a release
+    # is the one that asks for it.
+    if series_without_branding and issue_variants:
+        for issue in issue_variants:
+            add(f"{series_without_branding} {issue}", include_ascii=True)
     if series_without_article and issue_variants:
         for issue in issue_variants:
             add(f"{series_without_article} {issue}", include_ascii=True)

@@ -50,6 +50,7 @@ from core import inkdrop_library_frontends
 from core import inkdrop_artifact_acceptance
 from core import inkdrop_library_identity
 from core import inkdrop_sources
+from core import inkdrop_title_identity
 
 
 STATE_DIR = inkdrop_runtime_config.state_dir()
@@ -8901,9 +8902,19 @@ def target_aliases(target):
     # them here, a release found under the byline-stripped or subtitle-only
     # title can still fail to match at import time unless that exact alias
     # happened to be persisted to the DB separately.
+    # A listed publisher branding prefix is the third family of the same
+    # shape (inkdrop_title_identity.branding_prefix_alias(), the authority the
+    # slskd probe and the Prowlarr acceptance predicate already read). Without
+    # it here, the de-prefixed release the search side now asks for arrives
+    # and the importer cannot bind it. Note this list also feeds
+    # inkdrop_artifact_acceptance.trusted_numeric_prefix_import_is_safe()
+    # below, so a shorter alias also lets "001 - <de-prefixed title>.cbz"
+    # earn the bare-leading-number exemption -- intended, and asserted.
+    branding_alias, _branding_prefix = inkdrop_title_identity.branding_prefix_alias(raw_title)
     for alias in (
         *inkdrop_sources.contributor_title_aliases(raw_title),
         *inkdrop_sources.collected_title_aliases(raw_title),
+        *([branding_alias] if branding_alias else []),
     ):
         cleaned = normalize(alias)
         if cleaned:

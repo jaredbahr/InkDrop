@@ -7,8 +7,10 @@ helpers mutate only when a caller explicitly passes a database path.
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
+import os
 import re
 import time
 
@@ -160,6 +162,90 @@ def _memo_put(memo_key, now, decision):
 # already used for the analogous artifact_bad_content_memory cache
 # (ARTIFACT_BAD_CONTENT_MEMORY_TTL_SECONDS, inkdrop_completed_import.py).
 DEFAULT_SOURCE_MEMORY_COOLDOWN_SECONDS = 7 * 24 * 3600
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# ONE ROW, ONE MEANING, WHICHEVER READER ASKS.
+#
+# bad_source_candidates is a single table with several readers. The SLSKD
+# probe's durable read applies a cooldown to the reasons below inside the
+# lookup itself, so a transfer, network or resolver outcome stops suppressing
+# once the window has passed. The acquire path reads the same table through
+# find_bad_source_candidate() directly -- durable_bad_source_result_match() and
+# known_bad_pack_archive_history() in inkdrop_missing_acquire -- and applied no
+# reason filter and no age check, so the identical row was retryable in one
+# reader and permanent in the other.
+#
+# None of these reasons is a verdict about the file. A peer stalling, a peer
+# forgetting a transfer, or our own resolver erroring says nothing about
+# whether the file is the right file, and releasing re-admits the candidate to
+# EVALUATION rather than to the library: every quality and identity gate still
+# runs in front of it. Every other reason -- the judgements that ARE about the
+# file -- is absent from this set and keeps suppressing exactly as before, as
+# does a row with no usable timestamp.
+#
+# This lives in a leaf module rather than in either consumer because both need
+# it and neither imports the other: inkdrop_manual_source_autoresolve loads the
+# probe by path (load_probe_module) instead of importing it, so deriving one
+# list from the other at import time would be a new hard dependency pointing
+# the opposite way from how those two are wired. The probe still holds its own
+# literal of this set and reads the same environment knob, so one variable
+# moves both windows; a follow-up should pin the two sets equal with a test.
+TRANSIENT_BAD_CANDIDATE_RETRY_SECONDS = _env_int(
+    "INKDROP_SLSKD_TRANSIENT_BAD_CANDIDATE_RETRY_SECONDS", 30 * 60
+)
+TRANSIENT_BAD_CANDIDATE_REASONS = frozenset({
+    "resolver_error",
+    "slskd_transfer_failed",
+    "slskd_transfer_missing_staged_file",
+    "slskd_transfer_stalled",
+    "slskd_transfer_evidence_expired",
+})
+
+
+def _row_seen_at(row):
+    """When this refusal was last sighted, as epoch seconds, or 0 if unknown.
+
+    Durable rows carry `last_seen_at`; the probe's per-review and shaped rows
+    carry `ts`, or only an ISO `ts_iso`. The predicate below has to answer for
+    every shape that reaches it, and 0 means "cannot tell", not "long ago".
+    """
+    for key in ("ts", "last_seen_at"):
+        try:
+            value = float(row.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    try:
+        return float(calendar.timegm(time.strptime(str(row.get("ts_iso") or ""), "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def transient_bad_candidate_retry_ready(row, *, now=None):
+    """May this remembered refusal be re-evaluated yet?
+
+    True only for a transient reason whose cooldown has passed. It fails
+    closed everywhere else: a reason outside the set, a row that is not a
+    mapping, and a row whose age cannot be established all keep suppressing.
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("reason") or "") not in TRANSIENT_BAD_CANDIDATE_REASONS:
+        return False
+    seen_at = _row_seen_at(row)
+    if seen_at <= 0:
+        return False
+    resolved_now = time.time() if now is None else float(now)
+    return (resolved_now - seen_at) >= TRANSIENT_BAD_CANDIDATE_RETRY_SECONDS
+
 
 LEGACY_DIRECT_DOWNLOAD_INFRASTRUCTURE_REASONS = {
     "download_write_failed",

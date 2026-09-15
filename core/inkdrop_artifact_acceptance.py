@@ -110,6 +110,23 @@ MAX_VERIFIED_IMAGE_MEMBERS = 2000
 SAMPLED_IMAGE_MEMBERS = 24
 SAMPLED_ARCHIVE_IMAGE_BYTES = 96 * 1024 * 1024
 MAX_VERIFIED_IMAGE_PIXELS = 40_000_000
+# A declared pixel count is a HEADER field. The bomb guard fires on it before a
+# single payload byte is validated, so "declines to open" must not be a free
+# pass that any corrupt or hostile member can buy by writing a large size into
+# its header: that would let it opt out of the durable bad-content memory and
+# have the importer re-acquire the same bytes forever, which is the opposite of
+# what the ceiling is for. So the decline is gated on the claim being credible
+# -- enough payload to plausibly hold the pixels claimed.
+#
+# Measured on this tree: a genuine 7667x5500 quality-30 JPEG (the dimensions
+# from the live report) carries 661,107 bytes for 42,168,500 pixels, which is
+# 1.6e-2 bytes per declared pixel. A 78-byte PNG whose IHDR was forged to
+# 60000x60000 with the CRC fixed, holding 8x8 of actual pixel data, carries
+# 2.2e-8. Six orders of magnitude apart, so the floor is sited between them
+# with room on both sides: one byte per 10,000 declared pixels, ~160x below the
+# real page and ~4,700x above the forgery. Expressed as pixels-per-byte to keep
+# the comparison in integers.
+MAX_DECLARED_PIXELS_PER_PAYLOAD_BYTE = 10_000
 # ComicInfo.xml is metadata: a handful of short tags. A megabyte is already
 # absurdly generous for that and still small enough that a hostile archive
 # cannot use it to exhaust memory. Without a cap this member was read whole
@@ -361,7 +378,25 @@ def comicinfo_target_conflicts(comicinfo, expected_series=None, expected_number=
     return conflicts
 
 
+def _declared_pixels_are_credible(data, declared_pixels):
+    """Could this payload plausibly hold the pixel count its header claims?
+
+    See MAX_DECLARED_PIXELS_PER_PAYLOAD_BYTE. False means the header is lying,
+    which is a statement about the bytes and must keep its content verdict.
+    """
+    return len(data) * MAX_DECLARED_PIXELS_PER_PAYLOAD_BYTE >= declared_pixels
+
+
 def _credible_image_dimensions(data, suffix):
+    """Dimensions, or None when the bytes themselves are the problem.
+
+    Returns None ONLY for a genuine decode failure. Our own pixel ceiling is
+    raised as ArchiveReadDeclined instead -- the same contract the per-image
+    byte ceiling already keeps -- so archive_read_fault_is_ours() can tell "we
+    would not look" from "we looked and it is bad" without parsing a message
+    string. A None here becomes ValueError("implausible_image") at the caller,
+    and that is a verdict we must only reach when we have actually judged.
+    """
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -369,10 +404,31 @@ def _credible_image_dimensions(data, suffix):
                 image.verify()
             with Image.open(io.BytesIO(data)) as image:
                 dimensions = image.size
-                if dimensions[0] * dimensions[1] > MAX_VERIFIED_IMAGE_PIXELS:
+                declared_pixels = dimensions[0] * dimensions[1]
+                if declared_pixels > MAX_VERIFIED_IMAGE_PIXELS:
+                    # Stated intent rather than the live path: Image.MAX_IMAGE_PIXELS
+                    # is assigned from our ceiling below, so PIL fires first for
+                    # anything it can open at all.
+                    if _declared_pixels_are_credible(data, declared_pixels):
+                        raise ArchiveReadDeclined("image_exceeds_bounded_pixel_limit")
                     return None
                 image.load()
                 return dimensions
+    except ArchiveReadDeclined:
+        raise
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError):
+        # OUR ceiling, not their page. Caught ahead of the bare handler below
+        # because DecompressionBombWarning subclasses Exception, and the Error
+        # is listed too: above twice the ceiling PIL raises it directly and the
+        # simplefilter above does not apply.
+        #
+        # All we know at this point is that the DECLARED count cleared the
+        # ceiling -- PIL refused before returning an image to measure -- so the
+        # credibility floor is applied against the ceiling itself, the one
+        # lower bound available without re-reading the header.
+        if _declared_pixels_are_credible(data, MAX_VERIFIED_IMAGE_PIXELS):
+            raise ArchiveReadDeclined("image_exceeds_bounded_pixel_limit") from None
+        return None
     except Exception:
         return None
 

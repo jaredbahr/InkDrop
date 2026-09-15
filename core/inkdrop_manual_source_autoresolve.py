@@ -1096,6 +1096,22 @@ def db_import_retry_records(min_age_seconds=120, limit=DB_IMPORT_RETRY_LIMIT):
             # drifts only when a genuinely new candidate row is minted.
             transfer.setdefault("endedAt", task_raw.get("transfer_ended_at"))
             transfer.setdefault("requestedAt", task_raw.get("transfer_requested_at"))
+            # The row records its progress flat too, and the projection dropped
+            # it: every consumer that reads percentComplete/bytesRemaining off
+            # this dict -- transfer_state_status() below, the Manual Review
+            # transfer_percentComplete column, transfer_field_map, and
+            # inkdrop_series_autopilot's last_slskd_transfer_percent -- saw
+            # nothing at all for every replayed historical row. Carry them the
+            # same way the timestamps above are carried.
+            #
+            # This is diagnostic fidelity, not a classification change. The
+            # state tokens are tested before the numbers, and with
+            # percent=100 / remaining=0 neither `remaining > 0` nor
+            # `0 < percent < 100` holds, so no status moves; the selector's
+            # second arm only admits percent>=100 with remaining=0 anyway.
+            transfer.setdefault("percentComplete", task_raw.get("transfer_percent"))
+            transfer.setdefault("bytesRemaining", task_raw.get("transfer_bytes_remaining"))
+            transfer.setdefault("bytesTransferred", task_raw.get("transfer_bytes_transferred"))
             transfer["recorded_snapshot"] = True
             snapshot_ts = numeric_ts(row["started_at"])
             if snapshot_ts >= PLAUSIBLE_EPOCH_FLOOR_SECONDS:
@@ -3149,7 +3165,7 @@ def repeat_bad_candidate_park_reason(known_bad):
     return None
 
 
-def repeat_bad_candidate_review_sentence(park_reason, known_bad):
+def repeat_bad_candidate_review_sentence(park_reason, known_bad, *, automation_stopped=None):
     """What this row can honestly say, and the thing it must not imply.
 
     The closing sentence is load-bearing rather than padding. A parked
@@ -3161,6 +3177,24 @@ def repeat_bad_candidate_review_sentence(park_reason, known_bad):
     The candidate's own rejection reason is included when there is one: it is
     the single most useful thing on the row for deciding what to do, and it was
     already being carried in the payload while the prose talked about timers.
+
+    `automation_stopped` is keyword-only and defaults to None so the retry
+    claim cannot be emitted by accident. It used to be an unconditional string
+    literal appended from two arguments that carry no queue state whatsoever --
+    `park_reason` is arithmetic this module just did, `known_bad` is one
+    bad-candidate memory record -- and nothing on the emitting path stops any
+    retrying: it appends a skip row, writes a review_exceptions row and
+    continues, leaving queue_items untouched. So the sentence was true or false
+    by luck. Reported live: the row said auto-retrying had stopped while the
+    queue row was actively downloading, which is the expensive direction -- it
+    asks the operator to intervene on something automation is still working,
+    and tells him it has finished looking when it has not.
+
+    Only True renders the claim. Everything else -- False, and the None that
+    means nobody looked -- renders no clause about retrying at all. Silence is
+    deliberate: absence of evidence that automation stopped is not evidence
+    that it stopped, and asserting the opposite instead would be the same
+    unfounded sentence pointed the other way.
     """
     reason = ""
     if isinstance(known_bad, dict):
@@ -3173,7 +3207,10 @@ def repeat_bad_candidate_review_sentence(park_reason, known_bad):
         # An identifier is still worth surfacing, but not dressed as a
         # sentence -- see the reason-vocabulary work on the same surface.
         parts.append(f"Rejection code: {reason}.")
-    parts.append("It's stopped auto-retrying and needs a decision from you.")
+    if automation_stopped is True:
+        parts.append("It's stopped auto-retrying and needs a decision from you.")
+    else:
+        parts.append("This needs a decision from you.")
     parts.append(
         "This is about this one file. It does not mean other sources were "
         "searched, or that nothing else is available."
@@ -3195,6 +3232,34 @@ def repeat_bad_candidate_review_row(
     db_path, review_id, record, known_bad, park_reason,
     *, reason_key="repeat_bad_slskd_candidate", review_reason=None, next_action=None,
 ):
+    # Read the queue BEFORE the row is built, not after: the sentence below
+    # needs the evidence, and this select was already here -- it just threw
+    # away the two columns that say whether anything is still working the item.
+    queue_row = None
+    queue_id = first_text(record.get("autopilot_queue_key"), record.get("queue_key"))
+    if queue_id and inkdrop_state is not None and db_path.exists():
+        try:
+            with inkdrop_state.connect_read(db_path) as con:
+                queue_row = con.execute(
+                    "select series_id, issue_id, state, active from queue_items where id=? limit 1",
+                    (queue_id,),
+                ).fetchone()
+        except Exception:
+            queue_row = None
+    # `active` is the queue's own record of whether this item is in flight, set
+    # from the state on every upsert. An inactive row is evidence that nothing
+    # more will be attempted automatically; anything else -- no queue key, no
+    # row, an unreadable flag, or an active row (which includes 'needs_you',
+    # already parked for a human) -- is not evidence either way, and falls to
+    # silence rather than to a guess in either direction.
+    automation_stopped = None
+    if queue_row is not None:
+        try:
+            queue_active = int(queue_row["active"] or 0)
+        except (TypeError, ValueError):
+            queue_active = 1
+        if not queue_active:
+            automation_stopped = True
     row = {
         "review_id": f"repeat_bad_candidate:{review_id}",
         "series": record.get("series"),
@@ -3203,7 +3268,9 @@ def repeat_bad_candidate_review_row(
         "state": "needs_you",
         "manual_review_actionable": True,
         "reason": reason_key,
-        "review_reason": review_reason or repeat_bad_candidate_review_sentence(park_reason, known_bad),
+        "review_reason": review_reason or repeat_bad_candidate_review_sentence(
+            park_reason, known_bad, automation_stopped=automation_stopped
+        ),
         "next_action": next_action or "Review the SLSKD candidate and either supply a different source or clear/ignore this one.",
         "activity_summary": known_bad.get("detail") or known_bad.get("reason"),
         "candidate_reason": known_bad.get("reason"),
@@ -3239,19 +3306,9 @@ def repeat_bad_candidate_review_row(
             known_bad.get("username"),
         ) or None,
     }
-    queue_id = first_text(record.get("autopilot_queue_key"), record.get("queue_key"))
-    if queue_id and inkdrop_state is not None and db_path.exists():
-        try:
-            with inkdrop_state.connect_read(db_path) as con:
-                queue_row = con.execute(
-                    "select series_id, issue_id from queue_items where id=? limit 1",
-                    (queue_id,),
-                ).fetchone()
-            if queue_row:
-                row["series_id"] = queue_row["series_id"]
-                row["issue_id"] = queue_row["issue_id"]
-        except Exception:
-            pass
+    if queue_row is not None:
+        row["series_id"] = queue_row["series_id"]
+        row["issue_id"] = queue_row["issue_id"]
     return row
 
 

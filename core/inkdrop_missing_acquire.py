@@ -1104,6 +1104,26 @@ def load_pack_bad_archive_counts():
     return counts
 
 
+def transient_source_memory_retry_ready(row):
+    """Has this remembered refusal earned a fresh look?
+
+    bad_source_candidates is one table with several readers, and the SLSKD
+    probe's durable read has honored a cooldown on transfer, network and
+    resolver reasons inside the lookup itself since it shipped. The two readers
+    below reach the same table through find_bad_source_candidate() directly, so
+    without this the identical row was retryable there and permanent here. The
+    set and the window live in inkdrop_source_suppression because both sides
+    need them and neither module imports the other.
+
+    Imported at call time, which is how the source-worker modules reach that
+    module too. Everything outside the transient set, and every row whose age
+    cannot be established, keeps suppressing exactly as before.
+    """
+    from core import inkdrop_source_suppression as source_suppression
+
+    return source_suppression.transient_bad_candidate_retry_ready(row)
+
+
 def known_bad_pack_archive_history(item):
     candidate = item.get("candidate") if isinstance(item, dict) else {}
     candidate_title = (candidate or {}).get("title") or (item or {}).get("title") or (item or {}).get("query")
@@ -1121,6 +1141,14 @@ def known_bad_pack_archive_history(item):
                 download_url_hash=result_download_url_hash(candidate),
             )
         except Exception:
+            db_bad = None
+        # This lookup passes neither source nor protocol, and
+        # find_bad_source_candidate() skips a filter whenever either side is
+        # empty, so a row minted by another source reaches this pack on title
+        # and series alone. A transfer outcome past its cooldown is not a
+        # verdict about the archive; fall through to the pack history below,
+        # which is a count of actually-bad archives.
+        if db_bad and transient_source_memory_retry_ready(db_bad):
             db_bad = None
         if db_bad:
             return {
@@ -1246,10 +1274,20 @@ def expanded_search_titles(title, alt_titles=()):
     # worker path (see inkdrop_slskd_source_probe.source_title_variants());
     # calling them here keeps this file's Prowlarr query builder on the same
     # identity rules instead of re-deriving a narrower, drifting copy.
+    # A listed publisher branding prefix is the third family of the same
+    # shape. inkdrop_title_identity.branding_prefix_alias() is the one shared
+    # authority for it -- the slskd probe and the Prowlarr *acceptance*
+    # predicate (inkdrop_source_providers.series_identity_aliases()) both
+    # already read it, so this path would accept a de-prefixed release it
+    # never asked for. Appended, never prepended: the canonical prefixed
+    # title stays the first rung, because releases do carry the branding.
     alias_names = []
     for name in seed_names:
         alias_names.extend(inkdrop_sources.contributor_title_aliases(name))
         alias_names.extend(inkdrop_sources.collected_title_aliases(name))
+        prefix_alias, _prefix = inkdrop_title_identity.branding_prefix_alias(name)
+        if prefix_alias:
+            alias_names.append(prefix_alias)
     values = []
     for name in [*seed_names, *alias_names]:
         for article_variant in leading_article_title_variants(name):
@@ -2928,7 +2966,7 @@ def durable_bad_source_result_match(series, issue_number, result):
     if not title and not download_url_hash and not source_path:
         return None
     try:
-        return inkdrop_state.find_bad_source_candidate(
+        row = inkdrop_state.find_bad_source_candidate(
             INKDROP_STATE_DB,
             title=title,
             series=series,
@@ -2949,6 +2987,16 @@ def durable_bad_source_result_match(series, issue_number, result):
             },
         )
         return None
+    # Outside the try on purpose: that handler answers "the lookup failed" with
+    # None, and a policy question must not be able to reach it. A transfer,
+    # network or resolver outcome is not a statement that this release is the
+    # wrong release, so past its cooldown the row stops refusing here, exactly
+    # as it already does in the probe's read of the same table. A released
+    # candidate is re-evaluated from scratch with every quality and identity
+    # gate still ahead of it.
+    if transient_source_memory_retry_ready(row):
+        return None
+    return row
 
 
 def known_bad_result_match(cache, series, issue_number, result):
@@ -4758,32 +4806,53 @@ def collected_unit_numbers_for_issue(issue_number):
     return out
 
 
+def series_pack_rungs(name, unit_model=None, issue_number=None):
+    """The pack query ladder for one title spelling, strongest rung first."""
+    queries = [name]
+    if (unit_model or "").lower() == "chapter":
+        queries.extend([f"{name} chapters", f"{name} complete"])
+    else:
+        queries.extend([
+            f"{name} book",
+            f"{name} complete",
+        ])
+        unit_numbers = [number for number in collected_unit_numbers_for_issue(issue_number) if number and number > 0]
+        for number in unit_numbers[:3]:
+            queries.extend([
+                f"{name} v{number:02d}",
+                f"{name} vol {number}",
+                f"{name} volume {number}",
+                f"{name} book {number}",
+            ])
+        queries.extend([
+            f"{name} tpb",
+            f"{name} trade paperback",
+            f"{name} hardcover",
+            f"{name} hc",
+            f"{name} omnibus",
+        ])
+    return queries
+
+
 def series_pack_queries(title, alt_titles=(), unit_model=None, issue_number=None):
+    # Round-robin across title spellings, not one whole ladder per spelling.
+    # This group is the only one with no clean-zero expansion tail -- unlike
+    # the per-issue pool, expansion_queries_beyond() never runs on it -- and
+    # the caller truncates it with limited_queries() at max_queries_per_issue,
+    # default 6. Ladder-per-spelling put every alias rung at index 16 or
+    # beyond, so a second title spelling was generated and then never emitted
+    # at any shipped budget. Interleaving keeps the canonical spelling's
+    # strongest rung first and gives each alias its own rung inside the
+    # budget, at the cost of the canonical ladder's weaker tail.
+    ladders = [
+        series_pack_rungs(name, unit_model=unit_model, issue_number=issue_number)
+        for name in expanded_search_titles(title, alt_titles)
+    ]
     queries = []
-    for name in expanded_search_titles(title, alt_titles):
-        queries.append(name)
-        if (unit_model or "").lower() == "chapter":
-            queries.extend([f"{name} chapters", f"{name} complete"])
-        else:
-            queries.extend([
-                f"{name} book",
-                f"{name} complete",
-            ])
-            unit_numbers = [number for number in collected_unit_numbers_for_issue(issue_number) if number and number > 0]
-            for number in unit_numbers[:3]:
-                queries.extend([
-                    f"{name} v{number:02d}",
-                    f"{name} vol {number}",
-                    f"{name} volume {number}",
-                    f"{name} book {number}",
-                ])
-            queries.extend([
-                f"{name} tpb",
-                f"{name} trade paperback",
-                f"{name} hardcover",
-                f"{name} hc",
-                f"{name} omnibus",
-            ])
+    for rung in range(max((len(ladder) for ladder in ladders), default=0)):
+        for ladder in ladders:
+            if rung < len(ladder):
+                queries.append(ladder[rung])
     return unique(queries)
 
 

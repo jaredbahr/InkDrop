@@ -182,6 +182,17 @@ SERIES_AUTOPILOT_LOCK = LOCK_DIR / "inkdrop-series-autopilot.lock"
 # production 2026-09-09: 1,306 grab summaries since 09-01, none with a started
 # row, against 34 handoffs in the same window.
 AUTO_GRAB_STATE_LOCK = LOCK_DIR / "inkdrop-slskd-auto-grab-state.lock"
+# How long a blocking acquire of that lock waits before it gives up and
+# degrades. The POSIX arm used to take a bare LOCK_EX with no deadline while
+# the Windows arm (msvcrt LK_LOCK) gives up after about ten seconds, so a stuck
+# holder hung a whole pass on Linux until the parent's timeout killed it --
+# 0.25 s of CPU over a 120 s wall clock, no status file, and no word about
+# which lock it was waiting on. Read through
+# auto_grab_state_lock_wait_seconds() at call time, never captured at import,
+# so a test can drive it down after importing this module. Kept well above the
+# few seconds a legitimate commit holds it for.
+AUTO_GRAB_STATE_LOCK_WAIT_SECONDS = 60.0
+AUTO_GRAB_STATE_LOCK_POLL_SECONDS = 0.1
 SLSKD_AUTO_GRAB_AUDIT_LOG = STATE_DIR / "slskd-auto-grab-audit.jsonl"
 SLSKD_PROVIDER_SETTINGS = {"source": "fallback"}
 QUALITY_LANGUAGE_RULES = {
@@ -2040,6 +2051,17 @@ def save_auto_grab_state(state):
     write_json(SLSKD_AUTO_GRAB_STATE_FILE, state)
 
 
+def auto_grab_state_lock_wait_seconds():
+    """The blocking-acquire deadline, read now rather than at import time."""
+    raw = str(os.environ.get("INKDROP_AUTO_GRAB_STATE_LOCK_WAIT_SECONDS") or "").strip()
+    if not raw:
+        return float(AUTO_GRAB_STATE_LOCK_WAIT_SECONDS)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(AUTO_GRAB_STATE_LOCK_WAIT_SECONDS)
+
+
 def acquire_auto_grab_state_lock(blocking=True):
     """Exclusive lock for the auto-grab state file; never the pass lock (see AUTO_GRAB_STATE_LOCK)."""
     try:
@@ -2056,10 +2078,26 @@ def acquire_auto_grab_state_lock(blocking=True):
         if os.name == "nt":
             import msvcrt
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-        return handle
+            return handle
+        import fcntl
+        if not blocking:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        # A bare LOCK_EX waits forever, so a stuck holder took the caller with
+        # it. Poll a non-blocking flock to a deadline instead, and give up the
+        # way the Windows arm above already does: close the handle, return
+        # None, and let the caller degrade.
+        deadline = time.monotonic() + auto_grab_state_lock_wait_seconds()
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except (BlockingIOError, PermissionError):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    handle.close()
+                    return None
+                time.sleep(min(AUTO_GRAB_STATE_LOCK_POLL_SECONDS, remaining))
     except (OSError, BlockingIOError, PermissionError):
         handle.close()
         return None
@@ -2082,9 +2120,17 @@ def release_auto_grab_state_lock(handle):
 
 def commit_auto_grab_state_changes(base_state, run_state):
     """Merge this probe run's local attempt deltas into freshly locked state."""
+    bound = auto_grab_state_lock_wait_seconds()
+    started = time.monotonic()
     handle = acquire_auto_grab_state_lock(blocking=True)
     if handle is None:
-        raise RuntimeError("auto-grab state lock unavailable for the state commit")
+        # Name the file and the wait: the failure this replaced was a mute hang,
+        # and the next occurrence has to be enough to find the holder with.
+        raise RuntimeError(
+            "auto-grab state lock unavailable for the state commit: "
+            f"{AUTO_GRAB_STATE_LOCK} not acquired after {time.monotonic() - started:.1f}s "
+            f"(bound {bound:.1f}s)"
+        )
     try:
         current = load_auto_grab_state()
         base_state = base_state if isinstance(base_state, dict) else {}
@@ -2119,6 +2165,36 @@ def commit_auto_grab_state_changes(base_state, run_state):
         return current
     finally:
         release_auto_grab_state_lock(handle)
+
+
+def uncommitted_auto_grab_attempt_deltas(base_state, run_state):
+    """What a state commit did not land, in the same terms the commit merges in."""
+    base_state = base_state if isinstance(base_state, dict) else {}
+    run_state = run_state if isinstance(run_state, dict) else {}
+    deltas = {}
+    for field in ("review_attempts", "candidate_attempts"):
+        base_counts = base_state.get(field) if isinstance(base_state.get(field), dict) else {}
+        run_counts = run_state.get(field) if isinstance(run_state.get(field), dict) else {}
+        counts = {}
+        for key in set(base_counts) | set(run_counts):
+            try:
+                delta = int(run_counts.get(key) or 0) - int(base_counts.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if delta:
+                counts[str(key)] = delta
+        if counts:
+            deltas[field] = counts
+    for field in ("last_attempts", "candidate_last_attempts"):
+        base_records = base_state.get(field) if isinstance(base_state.get(field), dict) else {}
+        run_records = run_state.get(field) if isinstance(run_state.get(field), dict) else {}
+        records = {
+            str(key): record for key, record in run_records.items()
+            if record != base_records.get(key)
+        }
+        if records:
+            deltas[field] = records
+    return deltas
 
 
 def retire_auto_grab_review_attempts(review_id, evidence_ids, reason=""):
@@ -12644,7 +12720,30 @@ def _run_auto_grab_with_ephemeral_candidates(args, result):
                 continue
             break
     if state_dirty:
-        commit_auto_grab_state_changes(base_state, state)
+        try:
+            commit_auto_grab_state_changes(base_state, state)
+        except RuntimeError as exc:
+            # Bounding the lock wait made contention a normal outcome rather
+            # than a hang, and nothing above this catches: run_auto_grab is
+            # try/finally, its caller in run() is unguarded, and both the
+            # status file the parent reads and the stdout summary are written
+            # AFTER this. Raising here would trade the hang for a lost pass --
+            # no status file, and the attempt accounting silently dropped for a
+            # row already started in slskd. Degrade instead: say so, carry the
+            # deltas that did not land, and let the pass report.
+            uncommitted = uncommitted_auto_grab_attempt_deltas(base_state, state)
+            outcome["state_commit_failed"] = True
+            outcome["state_commit_error"] = str(exc)
+            outcome["state_commit_lock"] = str(AUTO_GRAB_STATE_LOCK)
+            outcome["uncommitted_attempt_deltas"] = uncommitted
+            auto_grab_audit(
+                "state_commit_lock_unavailable",
+                live=live,
+                dry_run=dry_run,
+                error=str(exc),
+                state_commit_lock=str(AUTO_GRAB_STATE_LOCK),
+                uncommitted_attempt_deltas=uncommitted,
+            )
     log("slskd_auto_grab", live=live, dry_run=dry_run, candidate_count=len(rows), selected_count=len(selected), started_count=outcome["started_count"])
     return outcome
 
@@ -14670,6 +14769,16 @@ def manual_search_discovery(item, explicit_queries=None, *, wait_seconds=DEFAULT
 
     item = dict(item or {})
     item["manual_search_discovery"] = True
+    # Manual Search's item is built by inkdrop_manual_search_executor with no
+    # database in scope, so it can never carry the acquisition-settings
+    # snapshot the loaders stamp -- and every matcher call site below here
+    # defaults settings=None, leaving resolve() nothing to recover. Stamp at the
+    # entry point instead: the loaders cover what this module loads, this covers
+    # what callers hand it. setdefault, so a caller that supplied its own
+    # snapshot keeps resolve()'s documented precedence (tracker #828).
+    settings_snapshot = _acquisition_policy_settings_snapshot()
+    if settings_snapshot and inkdrop_acquisition_policy is not None:
+        item.setdefault(inkdrop_acquisition_policy.SETTINGS_SNAPSHOT_KEY, settings_snapshot)
     query_cap = max(1, min(int(max_queries or 1), 6))
     result_cap = max(1, min(int(candidate_limit or AUTO_GRAB_CANDIDATE_LIMIT), AUTO_GRAB_CANDIDATE_LIMIT))
     supplied = [str(row or "").strip() for row in (explicit_queries or []) if str(row or "").strip()]
@@ -15416,6 +15525,14 @@ def refresh_cached_candidate_verdicts(
     basis = dict(cache_entry)
     if isinstance(item, dict):
         basis.update({key: value for key, value in item.items() if value not in (None, "")})
+    # The series-autopilot cache refresh hands in a raw queue row, not a loader
+    # item, so nothing upstream stamped the acquisition-settings snapshot --
+    # same entry-point gap as manual_search_discovery() above (tracker #828).
+    # Stamp basis, never refreshed: refreshed is what gets written back to the
+    # cache, and a persisted snapshot would outlive the setting it copied.
+    settings_snapshot = _acquisition_policy_settings_snapshot()
+    if settings_snapshot and inkdrop_acquisition_policy is not None:
+        basis.setdefault(inkdrop_acquisition_policy.SETTINGS_SNAPSHOT_KEY, settings_snapshot)
     refreshed = copy_item_context(dict(refreshed), basis)
     refreshed_candidates = []
     for candidate in candidates:

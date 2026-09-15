@@ -309,6 +309,13 @@ LOCAL_CHECKS = (
     ("compose_deployment_plan_smoke", 60, [sys.executable, "-B", "inkdrop-compose-deployment-plan-smoke.py"]),
     ("public_release_safety_audit", 120, [sys.executable, "-B", "inkdrop-public-release-safety-audit.py"]),
     ("release_notes_version_smoke", 60, [sys.executable, "-B", "inkdrop-release-notes-version-smoke.py"]),
+    # The release-notes smoke above proves the About catalog loads, so it goes
+    # red for whichever RELEASE_LIMITS field throws first and no further. This
+    # one measures every field independently, over the same data, and was the
+    # only check that could tell an over-long title from an over-long summary --
+    # but it ran nightly only, so deleting a limit from the loader turned
+    # nothing red on the pull-request path.
+    ("about_release_limits_smoke", 60, [sys.executable, "-B", "inkdrop-about-release-limits-smoke.py"]),
     ("github_release_contract_smoke", 60, [sys.executable, "-B", "inkdrop-github-release-contract-smoke.py"]),
     ("closed_alpha_packet_smoke", 60, [sys.executable, "-B", "inkdrop-closed-alpha-packet-smoke.py"]),
     ("runtime_source_settings_smoke", 120, [sys.executable, "-B", "inkdrop-runtime-source-settings-smoke.py"]),
