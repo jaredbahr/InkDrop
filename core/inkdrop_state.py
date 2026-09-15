@@ -64200,15 +64200,70 @@ def series_image_from_raw(raw, prefer_small=False):
     return ""
 
 
-def series_thumb_image_from_raw(raw):
-    """Same resolver as series_image_from_raw(), preferring the small ComicVine
-    variant already present in the same payload (thumb_url/small_url) instead
-    of super_url. MangaDex covers are stored as a single already-256px string
-    (see mangadex_cover_url()), so this returns the identical value for those
-    regardless of the key order -- only ComicVine's nested image object, which
-    carries several sizes, is affected."""
+# ComicVine encodes the rendition size as a path segment:
+#   https://comicvine.gamespot.com/a/uploads/<size>/<dir>/<file>.jpg
+# Substituting the segment yields the same image at another size with no
+# re-fetch of the provider payload and no change to what is stored.
+_COMICVINE_UPLOAD_SIZE_RE = re.compile(
+    r"(?P<head>://comicvine\.gamespot\.com/a/uploads/)(?P<size>[a-z_]+)(?P<tail>/)",
+    re.IGNORECASE,
+)
+# square_avatar over scale_small: measured across a random sample of 8 live
+# series URLs, scale_large totalled 2,636,190 bytes and square_avatar 38,551 --
+# a 98.5% reduction, 8/8 returning HTTP 200 with a usable image.
+COMICVINE_THUMB_SIZE = "square_avatar"
 
-    return series_image_from_raw(raw, prefer_small=True)
+
+def comicvine_thumb_url_from_full(url, size=COMICVINE_THUMB_SIZE):
+    """A ComicVine upload URL rewritten to a thumbnail rendition.
+
+    Returns the input unchanged for anything that is not a ComicVine upload URL,
+    so MangaDex covers (already stored at 256px by mangadex_cover_url()) and any
+    other host pass through untouched.
+
+    This exists because the nested ComicVine image object -- the one carrying
+    thumb_url/small_url/super_url -- is collapsed to a single URL at ingest.
+    Measured across all 484 series on 2026-08-25: zero retain `thumb_url`,
+    against a control of 341 retaining `scale_large`. So the key-order resolver
+    below can never fire on stored data, and the size has to come from the URL
+    instead.
+
+    Every ComicVine URL in the live library follows the same
+    `/a/uploads/<size>/` shape -- 341 at `scale_large` and 14 already at
+    `scale_small`, which this leaves alone by rewriting whatever segment is
+    there to the target.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    return _COMICVINE_UPLOAD_SIZE_RE.sub(
+        lambda m: f"{m.group('head')}{size}{m.group('tail')}", text, count=1
+    )
+
+
+def series_thumb_image_from_raw(raw):
+    """The series image at thumbnail size.
+
+    Prefers a small variant already present in a nested payload
+    (thumb_url/small_url) when there is one, and otherwise rewrites ComicVine's
+    size path segment -- which is the case that actually occurs, because the
+    nested object does not survive ingest.
+
+    MangaDex covers are stored as a single already-256px string (see
+    mangadex_cover_url()) and are returned unchanged."""
+
+    small = series_image_from_raw(raw, prefer_small=True)
+    # Only rewrite the size segment when the payload did NOT supply a small
+    # variant of its own. If the nested object carried thumb_url/small_url, the
+    # provider has already told us the thumbnail URL and normalising it to a
+    # different rendition would be a change this row never asked for -- and one
+    # that tests/inkdrop-manual-review-cover-thumb-smoke.py correctly pins
+    # against. The rewrite exists solely for the case that actually occurs on
+    # stored data: a flat full-size string, where the two resolvers agree and
+    # the feature was therefore inert.
+    if small and small != series_image_from_raw(raw, prefer_small=False):
+        return small
+    return comicvine_thumb_url_from_full(small)
 
 
 def series_metadata_sources(raw):
