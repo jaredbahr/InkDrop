@@ -2961,6 +2961,122 @@ def retire_removed_series_work(con, series_id, now=None, message=None, source="i
     }
 
 
+RESTORED_SERIES_MESSAGE = "Series re-added; work restored from its removal."
+
+# The keys retirement writes and restoration must take back off. Listed rather
+# than pattern-matched: a stray `series_removed_*` key invented later should
+# surface as a leftover in the row, not be silently swallowed here.
+_REMOVED_SERIES_RESTORE_KEYS = (
+    "series_removed_guard",
+    "series_removed_guard_source",
+    "series_removed_guard_message",
+    "series_removed_guard_at",
+    "series_removed_guard_at_iso",
+    "previous_state",
+    "previous_event",
+    "parked_reason",
+    "parked_at",
+    "parked_at_iso",
+)
+
+
+def restore_removed_series_work(con, series_id, now=None, source="inkdrop_state"):
+    """Undo retire_removed_series_work() for a series that is no longer removed.
+
+    Retirement had no reversal anywhere in core/ (#729): `previous_state` was
+    written in ~25 places and read back in none, so a series removed and later
+    re-added kept its work retired for ever -- tracked, and not worked.
+
+    SELECTS ON STATE, NOT ON THE BREADCRUMB. `parked_reason` is never cleared
+    by anything, so it survives revival and marks rows that are already alive.
+    Selecting on it alone reported two false positives when this was measured
+    live. So the query is `state='stale_source_absent' AND active=0` and the
+    breadcrumb only narrows that set; a row that has since come back stays as
+    it is.
+
+    THE WANTED SIDE IS RE-DERIVED, NEVER CHOSEN. Retirement preserves
+    `previous_state`/`previous_event` on the queue row and preserves nothing at
+    all for the wanted row -- no previous-status column, no previous-status raw
+    key. So the restored wanted status is `wanted_status_for_queue_state()`
+    applied to the restored queue state: the mapper's own output, in the same
+    transaction as the queue write, so the two layers cannot disagree.
+
+    WHAT IT CANNOT RECOVER, STATED RATHER THAN HIDDEN. Retirement overwrites
+    `outcome`, `display_phase` and the `provider_status_*` fields without
+    preserving them, so their pre-removal values are already gone by the time
+    anything could restore them. They are cleared rather than guessed.
+    `provider_status_provider` is left alone because retirement only fills it
+    when it was empty.
+    """
+    series_id = str(series_id or "").strip()
+    if not series_id or series_id_user_removed(con, series_id):
+        return {"series_restored": False, "queue_restored": 0, "wanted_restored": 0}
+    now = float(now or time.time())
+    rows = con.execute(
+        """
+        select id, wanted_id, raw_json
+        from queue_items
+        where series_id=? and state='stale_source_absent' and active=0
+        """,
+        (series_id,),
+    ).fetchall()
+    queue_restored = 0
+    wanted_restored = 0
+    for row in rows:
+        raw = json_loads(row["raw_json"] or "{}", {})
+        raw = raw if isinstance(raw, dict) else {}
+        if str(raw.get("parked_reason") or "").strip().lower() != "user_removed":
+            continue
+        previous_state = str(raw.get("previous_state") or "").strip()
+        if not previous_state:
+            continue
+        previous_event = raw.get("previous_event")
+        for key in _REMOVED_SERIES_RESTORE_KEYS:
+            raw.pop(key, None)
+        raw.update(
+            {
+                "restored_from_removal": True,
+                "restored_from_removal_source": source,
+                "restored_from_removal_at": now,
+                "restored_from_removal_at_iso": utc_stamp(now),
+            }
+        )
+        active = 0 if wanted_status_for_queue_state(previous_state) == "inactive" else 1
+        cur = con.execute(
+            """
+            update queue_items
+            set state=?,
+                last_event=?,
+                active=?,
+                updated_at=?,
+                outcome=null,
+                display_phase=null,
+                provider_status_state=null,
+                provider_status_phase=null,
+                provider_status_actionability=null,
+                raw_json=?
+            where id=?
+            """,
+            (previous_state, previous_event, active, now, json_dumps(raw), row["id"]),
+        )
+        if not int(cur.rowcount or 0):
+            continue
+        queue_restored += 1
+        wanted_id = str(row["wanted_id"] or "").strip()
+        if not wanted_id:
+            continue
+        wanted_cur = con.execute(
+            "update wanted_items set status=?, updated_at=? where id=? and status='inactive'",
+            (wanted_status_for_queue_state(previous_state), now, wanted_id),
+        )
+        wanted_restored += int(wanted_cur.rowcount or 0)
+    return {
+        "series_restored": True,
+        "queue_restored": queue_restored,
+        "wanted_restored": wanted_restored,
+    }
+
+
 def retire_all_removed_series_work(con, now=None, source="inkdrop_state"):
     now = float(now or time.time())
     totals = {"removed_series": 0, "queue_retired": 0, "wanted_inactivated": 0}
@@ -5902,6 +6018,18 @@ def upsert_series(con, row, now):
             json_dumps(row_raw),
         ),
     )
+    if explicit_removed_reactivation:
+        # The counterpart to the eleven retire_removed_series_work() call
+        # sites. Removal retires the series' queue and wanted rows; nothing
+        # brought them back, so a series removed and later re-added stayed
+        # tracked and unworked for ever (#729).
+        #
+        # AFTER the series write, not before: restore_removed_series_work()
+        # asks series_id_user_removed(), which reads the series row, and would
+        # refuse against the pre-update value. Same connection and therefore
+        # the same transaction, so the series row, its queue rows and its
+        # wanted rows move together or not at all.
+        restore_removed_series_work(con, sid, now=now)
     return sid
 
 
@@ -39088,6 +39216,22 @@ def _restore_manga_companion_discovery_locked(
         "update series set monitored=1, monitor_new=1, updated_at=?, raw_json=? where id=?",
         (now, json_dumps(new_raw), mangadex_series_id),
     )
+    if was_user_removed:
+        # The SECOND door that clears `removed_by_user`. There are exactly two
+        # in core/ -- upsert_series()'s reactivation branch and this one -- and
+        # only this one can be reached without going through upsert_series at
+        # all, so a companion restored here would come back un-removed with its
+        # retired queue and wanted rows still retired. That is #729's defect
+        # through a path the other hook does not cover.
+        #
+        # Only under `allow_reactivating_user_removal`: the guard above returns
+        # early otherwise, so a companion carrying a genuine removal is not
+        # silently revived by this call.
+        #
+        # After the series write for the same reason as the other call site:
+        # restore_removed_series_work() asks series_id_user_removed(), which
+        # reads the series row, and would refuse against the pre-update value.
+        restore_removed_series_work(con, mangadex_series_id, now=now, source=source)
     con.execute(
         "update manga_companion_links set discovery_mode='discovery_only', updated_at=? where id=?",
         (now, link["id"]),
