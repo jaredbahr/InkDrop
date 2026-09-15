@@ -273,23 +273,32 @@ def cached_candidate(filename, *, username="peer-safe", verdict="auto_grab_safe"
     }
 
 
+# Every entry carries checked_at, relative to the mocked clock below, because
+# every writer of the probe cache stamps one: probe_item()
+# (core/inkdrop_slskd_source_probe.py) sets checked_at=now(). An entry with no
+# clock is a shape no writer produces, and the cache now refuses to treat an
+# undatable verdict as current. ALL five are stamped, not just the two safe ones,
+# so the three zero-count entries read zero for their blockers and not for age.
 parity_cache = {
     "review-safe-a": {
         "review_id": "review-safe-a",
         "series": "Safe A",
         "issue": "1",
+        "checked_at": NOW - 60,
         "candidates": [cached_candidate("Safe A 001.cbz")],
     },
     "review-safe-b": {
         "review_id": "review-safe-b",
         "series": "Safe B",
         "issue": "1",
+        "checked_at": NOW - 60,
         "candidates": [cached_candidate("Safe B 001.cbz")],
     },
     "review-review-pack": {
         "review_id": "review-review-pack",
         "series": "Review Pack",
         "issue": "1",
+        "checked_at": NOW - 60,
         "candidates": [
             cached_candidate(
                 "Review Pack 001-012.cbz",
@@ -302,12 +311,14 @@ parity_cache = {
         "review_id": "review-failed-collision",
         "series": "Failed Collision",
         "issue": "1",
+        "checked_at": NOW - 60,
         "candidates": [cached_candidate("Failed Collision 001.cbz", username="peer-collision")],
     },
     "review-unavailable": {
         "review_id": "review-unavailable",
         "series": "Unavailable",
         "issue": "1",
+        "checked_at": NOW - 60,
         "candidates": [cached_candidate("Unavailable 001.cbz", blockers=["candidate_unavailable"])],
     },
 }
@@ -329,6 +340,21 @@ require(parity_safe_counts == {
     "failed-collision": 0,
     "unavailable": 0,
 }, parity_safe_counts)
+
+# Age arm: the same cache with safe-a's verdict past the freshness window. safe-a
+# must leave the hot lane and count zero, while safe-b stays -- so the parity
+# assertions above cannot pass merely because the lane ignores age.
+stale_parity_cache = {key: dict(value) for key, value in parity_cache.items()}
+stale_parity_cache["review-safe-a"]["checked_at"] = (
+    NOW - autopilot.SLSKD_SAFE_CANDIDATE_CACHE_TTL_SECONDS - 3600
+)
+with mock.patch.object(autopilot, "slskd_source_probe_cache", return_value=stale_parity_cache), mock.patch.object(
+    autopilot.time, "time", return_value=NOW
+):
+    stale_hot_rows = autopilot.slskd_hot_retry_rows(parity_queue, hot_args)
+    stale_safe_a = autopilot.cached_safe_slskd_candidate_count(parity_items["safe-a"])
+require([item["key"] for item in stale_hot_rows] == ["safe-b"], stale_hot_rows)
+require(stale_safe_a == 0, stale_safe_a)
 
 # Automatic-only parity: stale empty/transient/orphan SLSKD signatures rotate
 # back to the front of their source ladder after bounded backoff. No Manual

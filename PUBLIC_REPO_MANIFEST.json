@@ -513,8 +513,8 @@
     },
     {
       "path": "core/inkdrop_series_autopilot.py",
-      "sha256": "cd424fa23133ec0fdcae7ccb7bc998fcd5b5b21f16ac45340f45441e3d61cefe",
-      "size_bytes": 752522
+      "sha256": "d39d9621629602751b311b3babaa40ff4b6ec49f3d2f6871179fefc73885969c",
+      "size_bytes": 755088
     },
     {
       "path": "core/inkdrop_series_eligibility.py",
@@ -838,8 +838,8 @@
     },
     {
       "path": "tests/inkdrop-autopilot-fairness-smoke.py",
-      "sha256": "1a1f1fe02d91e08dcbf6367d07d12b269bda79adbf01093833b6ef0a1757e341",
-      "size_bytes": 50705
+      "sha256": "e2f9c844f68096a1baa1d4c7b5f4235c0fd2518c47b397390d4d3fa30d925926",
+      "size_bytes": 52197
     },
     {
       "path": "tests/inkdrop-autopilot-provider-budget-smoke.py",
@@ -2024,6 +2024,6 @@
   ],
   "schema": "inkdrop.public_repo_export.v1",
   "schema_version": 1,
-  "source_commit": "63175c8c2e2a11a1021cb875fa955e11015790bc",
-  "total_size_bytes": 21387822
+  "source_commit": "5ee582891f73db9c34660a9e9fc658b21fb7f0a7",
+  "total_size_bytes": 21391880
 }

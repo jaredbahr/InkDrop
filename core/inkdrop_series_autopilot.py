@@ -383,6 +383,15 @@ SLSKD_USER_LOAD_RETRY_SECONDS = 3 * 60
 SLSKD_TRANSIENT_RETRY_SECONDS = 5 * 60
 SLSKD_CACHED_RETRY_LOOKAHEAD_SECONDS = 5 * 60
 SLSKD_ZERO_RESULT_REPROBE_SECONDS = 60 * 60
+# How long a cached SLSKD probe verdict may still be treated as a pickable
+# candidate. A Soulseek peer's availability is volatile and the probe cadence is
+# DEFAULT_SLSKD_COOLDOWN_HOURS (45 minutes), so six hours is several cadences of
+# grace and still far short of the staleness measured in production on
+# 2026-09-13: of 405 active queued units pinned by a "safe" cache entry, 387 were
+# pinned by one older than a day and 300 by one older than a week, the oldest at
+# 29.3 days. Anything past this reads as evidence missing, which is what
+# has_cached_safe_slskd_candidate()'s docstring already says expired entries do.
+SLSKD_SAFE_CANDIDATE_CACHE_TTL_SECONDS = 6 * 3600
 DEFAULT_SLSKD_MAX_TOTAL = 20
 DEFAULT_SLSKD_MAX_PER_SERIES = 12
 DEFAULT_SLSKD_WAIT_SECONDS = 8
@@ -6381,6 +6390,43 @@ def slskd_cache_entry_matches_item(entry, item):
     return True
 
 
+def slskd_cache_entry_is_fresh(entry, now=None):
+    """True only when the entry can be PROVED recent enough to still be pickable.
+
+    The cache is scheduling authority: has_cached_safe_slskd_candidate() gates
+    slskd_source_result_reprobe_due() and the Prowlarr/RSS/ComicsCodes/hot-retry
+    lanes, so an entry that reads pickable suppresses the reprobe AND every
+    alternate source for that unit. There was no clock on it, so an entry from
+    weeks earlier kept a unit parked on "SLSKD candidates available for autopick"
+    pointing at a peer long gone.
+
+    Undatable reads as stale on purpose. Being wrong towards "expired" costs one
+    reprobe; being wrong towards "pickable" costs the unit indefinitely.
+
+    The age is checked_at ALONE, deliberately not slskd_row_checked_at(). That
+    helper takes the max of every clock on the row, including staged_scan_at,
+    which attach_staged_detection() and autoresolve refresh_probe_rows() re-stamp
+    without searching again -- so a month-old verdict would read fresh after any
+    staged scan. checked_at is the verdict's own clock, and the one the producer
+    ages by in cache_entry_inactive_reason() and evict_stale_cache_entries().
+    Measured live 2026-09-13: 0 of 412 safe entries lack it, so this loses no grab.
+    """
+
+    if not isinstance(entry, dict):
+        return False
+    try:
+        checked_at = float(entry.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        checked_at = 0.0
+    if checked_at <= 0:
+        return False
+    try:
+        moment = float(now) if now is not None else time.time()
+    except (TypeError, ValueError):
+        moment = time.time()
+    return (moment - checked_at) < SLSKD_SAFE_CANDIDATE_CACHE_TTL_SECONDS
+
+
 def cached_safe_slskd_entry_for_item(item):
     if not isinstance(item, dict):
         return "", None
@@ -6392,13 +6438,19 @@ def cached_safe_slskd_entry_for_item(item):
     ]
     for review_id in dict.fromkeys(value for value in review_ids if value):
         entry = cache.get(review_id)
-        if isinstance(entry, dict) and effective_safe_slskd_candidate_count(entry, item=item) > 0:
+        if (
+            isinstance(entry, dict)
+            and slskd_cache_entry_is_fresh(entry)
+            and effective_safe_slskd_candidate_count(entry, item=item) > 0
+        ):
             return review_id, entry
     best_review_id = ""
     best_entry = None
     best_rank = (-1, 0.0)
     for review_id, entry in cache.items():
         if not slskd_cache_entry_matches_item(entry, item):
+            continue
+        if not slskd_cache_entry_is_fresh(entry):
             continue
         safe_count = effective_safe_slskd_candidate_count(entry, item=item)
         if safe_count <= 0:
