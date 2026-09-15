@@ -149,19 +149,29 @@ def _worker_healthy(env, now):
         return False
     problem_jobs = failed_jobs + [row for row in late_jobs if row not in failed_jobs]
     problem_counts_match = len(failed_jobs) == failure_count and len(late_jobs) == late_job_count
-    # Criticality is a SEVERITY; failed-versus-late is a KIND, and the two are
-    # independent. These used to be merged into problem_jobs and asked a single
-    # question, so a critical job that was merely running behind -- zero
-    # failures -- gated every acquisition handoff exactly as hard as one that
-    # had actually failed. Only failed_jobs is judged here; lateness on its own
-    # never makes the worker unhealthy, which is what the System page already
-    # tells the operator ("Behind schedule ... will catch up on its own", as
-    # against "Failing"). Every reconciliation guard below is untouched: a
-    # payload whose counts contradict its rows, or that claims `healthy` while
-    # carrying a problem row, still fails closed.
-    tolerable_degradation = bool(problem_jobs) and problem_counts_match and all(
-        row.get("critical") is False for row in failed_jobs
-    )
+    # `degraded` is tolerable exactly when every problem is LATENESS. A job that
+    # has actually failed makes the worker unhealthy; a job that is merely
+    # running behind does not. Criticality is not consulted at all.
+    #
+    # This predicate used to ask whether the problem jobs were marked
+    # `critical`, which is a SEVERITY. What decides whether a scheduler is
+    # working is a KIND -- failed, or behind -- and the two are independent, so
+    # keying on the wrong one was wrong in both directions at once: a
+    # non-critical job that had actually failed reported HEALTHY while the
+    # scheduler was visibly failing, and a merely-late critical job reported
+    # UNHEALTHY and halted acquisition over a job the System page describes as
+    # "will catch up on its own". A signal wrong in both directions is worse
+    # than no signal, because it is trusted.
+    #
+    # No reason for keying on `critical` was ever recorded, and the maintainer
+    # was asked and had none. The smoke assertion that pinned the old behaviour was
+    # removed deliberately rather than by accident -- see
+    # tests/inkdrop-worker-health-failure-not-criticality-smoke.py.
+    #
+    # Every reconciliation guard below is untouched: a payload whose counts
+    # contradict its rows, or that claims `healthy` while carrying a problem
+    # row, still fails closed.
+    tolerable_degradation = bool(problem_jobs) and problem_counts_match and not failed_jobs
     return bool(
         payload.get("ok") is True
         and state in {"healthy", "degraded"}
