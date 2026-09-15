@@ -18774,6 +18774,15 @@ MIXED_MARKER_CHAPTER_SUFFIX_PATTERN = re.compile(
     r"(?:^|[^a-z0-9])(?:chapter|chap|ch|c)[\s._-]*0*\d{1,5}(?:\.\d+)?(?=$|[^0-9a-z])",
     re.I,
 )
+# The chapter number a name or a target text CLAIMS, captured rather than only
+# detected. MIXED_MARKER_CHAPTER_SUFFIX_PATTERN answers "is there a chapter
+# suffix"; the proofs below need "which chapter", so that the wanted chapter
+# number and the one on the file can be compared instead of merely both
+# existing.
+COLLECTION_GUARD_CHAPTER_NUMBER_PATTERN = re.compile(
+    r"(?:^|[^a-z0-9])(?:chapter|chap|ch|c)[\s._-]*0*(\d{1,5})(?=$|[^0-9a-z])",
+    re.I,
+)
 # "v15 c015-020", "v15 c015-c020", "v15 c015 to 020": a chapter RANGE, which is
 # a partial-volume claim, not a redundant single-chapter label. Ill-formed for
 # the mixed-marker proof below, which refuses to guess.
@@ -18979,6 +18988,76 @@ def collection_guard_chapter_satisfied_by_declared_volume(queue, raw, record, is
     # provably contain this exact wanted chapter" -- and the overwhelming
     # majority of chapter-managed manga is chapter_native by policy, which
     # would make the gate reject every real case this proof exists to fix.
+    return True
+
+
+def collection_guard_chapter_tokens(*values):
+    """The chapter numbers a text claims, normalized the same way issue tokens
+    are, so a file's "Ch.007" and a unit's issue_number "7" compare equal."""
+    tokens = set()
+    for value in values:
+        for match in COLLECTION_GUARD_CHAPTER_NUMBER_PATTERN.finditer(str(value or "")):
+            tokens |= collection_guard_issue_tokens(match.group(1))
+    return tokens
+
+
+def collection_guard_chapter_satisfied_by_own_chapter_file(queue, raw, record, issue_tokens):
+    """A wanted CHAPTER is satisfied by the archive of that same chapter.
+
+    This is the ordinary case and it had no path through this guard. The
+    auto-generated query for a chapter-managed item embeds the volume the
+    chapter sits in -- "Holyland Chapter 177 Volume 18" -- and
+    COLLECTION_TARGET_PATTERN matches that "Volume 18" half, so the unit is
+    classified as a collection target and the single-part scan then refuses
+    "Holyland - Chapter 177 - Vol.18 Ch.177 - Letter.cbz" for naming a chapter.
+
+    The source half of this same hazard was already fixed: the single-part scan
+    stopped reading record["query"] because that field is copied off the wanted
+    target. The target half was left, and it is the half that decides whether
+    the guard runs at all. Measured against snapshot
+    inkdrop-state-20260829T102706Z-0015e38302fa: 42 of 66 live refusals were
+    this shape, and 40 of them held a file whose chapter number equalled the
+    unit's own issue_number.
+
+    Two conditions keep the real refusals firing. The target must name this
+    number as a CHAPTER and not as a volume, so a genuine volume want
+    ("Berserk Volume 1" handed "Berserk c001.cbz") is untouched. And the source
+    must name that same chapter, so a wrong-unit file still falls through --
+    "Chainsaw Man v23 (2026).cbz" against chapter 23 of volume 3 names no
+    chapter at all and is refused below, which is the correct verdict.
+    """
+    media_type = str(queue.get("media_type") or raw.get("media_type") or "").strip().lower()
+    if media_type not in MANGA_MEDIA_TYPES or len(issue_tokens) != 1:
+        return False
+    explicit_unit_type = str(
+        raw.get("unitType") or raw.get("unit_type") or queue.get("unit_type") or ""
+    ).strip().lower()
+    if explicit_unit_type in {"volume", "pack", "mixed_volume_preferred"}:
+        return False
+    target_text = collection_guard_text(
+        queue.get("query"),
+        queue.get("issue_title"),
+        raw.get("query"),
+        raw.get("issue_title"),
+    )
+    if collection_guard_chapter_tokens(target_text) != issue_tokens:
+        return False
+    if collection_guard_explicit_volume_tokens(target_text) & issue_tokens:
+        # The same number is claimed as a volume somewhere in the target text,
+        # so which unit is wanted is ambiguous. This proof refuses to guess.
+        return False
+    source_path = str(record.get("matched_local_path") or "").strip()
+    if not re.search(r"\.(?:cbz|cbr|pdf)$", source_path, re.I):
+        return False
+    source_name = Path(source_path).name
+    if collection_guard_chapter_tokens(source_name) != issue_tokens:
+        return False
+    source_volumes = collection_guard_explicit_volume_tokens(source_name)
+    target_volumes = collection_guard_explicit_volume_tokens(target_text)
+    if source_volumes and target_volumes and source_volumes != target_volumes:
+        # The file says it belongs to a different volume than the one this
+        # chapter sits in. That disagreement is evidence, not noise.
+        return False
     return True
 
 
@@ -19236,6 +19315,17 @@ def collection_target_single_part_block_reason(
         # after it would never be reached. The archive itself proved this is
         # the wanted volume; see collection_guard_source_volume_archive_evidence().
         return ""
+    if collection_guard_chapter_satisfied_by_own_chapter_file(
+        queue,
+        raw,
+        record,
+        collection_guard_target_issue_tokens(queue, raw),
+    ):
+        # Must run before the single-part scan below for the same reason the
+        # archive proof above does: that scan matches the file's own "Chapter
+        # 177" and returns on the first hit, so a proof placed after it would
+        # never be reached for the case it exists to answer.
+        return ""
     # Scanned over source identity only -- never record["query"] or
     # record["matched_series"], which are copied off the WANTED TARGET rather
     # than off the artifact (collection_guard_record_from_import_result() fills
@@ -19343,6 +19433,28 @@ def collection_guard_queue_context(wanted_item):
         ) if value
     )
     return context
+
+
+def collection_guard_record_is_import_source(record, import_row):
+    """Whether this guard record is standing on the import's own SOURCE file.
+
+    Archive evidence is scoped to the source for the reason
+    import_result_strict_completion_valid() states: InkDrop's canonical output
+    is volume-only naming, so a mixed-token file already sitting at the
+    destination is unexplained foreign content and stays strictly gated.
+    collection_guard_record_from_import_result() prefers source_path and falls
+    back to dest_path, so the two have to be told apart here rather than
+    assumed. A file adopted in place -- where source_path and dest_path are the
+    same path -- is still the source of its own import and keeps the evidence.
+    """
+    # dict() rather than .get(): callers hand this a sqlite3.Row as often as a
+    # dict, and Row has no .get.
+    import_row = dict(import_row or {})
+    record = dict(record or {})
+    source_path = str(import_row.get("source_path") or "").strip()
+    if not source_path:
+        return False
+    return str(record.get("matched_local_path") or "").strip() == source_path
 
 
 def collection_guard_record_from_import_result(import_row, queue=None):
@@ -19997,6 +20109,10 @@ def cleanup_collection_single_part_verified_queue_rows(con, now, limit=5000):
         ).fetchall()
     except sqlite3.OperationalError:
         return 0
+
+    def archive_semantics(path):
+        return cached_archive_member_semantics(con, path)
+
     reopened = 0
     for row in rows:
         queue = dict(row)
@@ -20035,7 +20151,22 @@ def cleanup_collection_single_part_verified_queue_rows(con, now, limit=5000):
         good_import_seen = False
         for import_row in import_rows:
             import_record = collection_guard_record_from_import_result(import_row, queue)
-            import_reason = collection_target_single_part_block_reason(queue, import_record)
+            import_reason = collection_target_single_part_block_reason(
+                queue,
+                import_record,
+                # This sweep REVERSES an admission, so it must not be stricter
+                # than the gate that granted it. import_result_strict_completion_valid()
+                # clears this same guard with the archive's own proof
+                # (allow_source_archive_evidence on the "source" role), and
+                # re-running it here without that reader made the proof
+                # unreachable -- so a file admitted on evidence was un-verified
+                # by a weaker test than the one that let it in, while staying
+                # active and present in the library.
+                allow_source_archive_evidence=collection_guard_record_is_import_source(
+                    import_record, import_row
+                ),
+                archive_semantics_reader=archive_semantics,
+            )
             if import_reason:
                 bad_import_rows.append((import_row, import_reason))
             else:
@@ -33985,7 +34116,15 @@ def settle_queue_items_with_optional_folder_imports(con, now):
         ):
             continue
         import_record = collection_guard_record_from_import_result(row, row)
-        reason = collection_target_single_part_block_reason(row, import_record)
+        reason = collection_target_single_part_block_reason(
+            row,
+            import_record,
+            # Same rule as the reopen sweep above: import_result_strict_completion_valid()
+            # has just cleared this row with the archive's own proof, so
+            # re-asking the guard without that reader can only contradict it.
+            allow_source_archive_evidence=collection_guard_record_is_import_source(row, row),
+            archive_semantics_reader=lambda path: cached_archive_member_semantics(con, path),
+        )
         if reason:
             mark_import_result_single_part_mismatch(con, row, reason, now)
             continue
