@@ -62986,7 +62986,7 @@ def manual_review_legacy_row(item, slskd_probe_status=None):
     actionable = manual_review_requires_human_decision(item, slskd_probe_status)
     is_manual_source = review_allows_manual_source(item)
     manual_source_stage = manual_review_source_stage(item, slskd_probe_status) if is_manual_source else ""
-    return {
+    row = {
         "legacy_manual_review": True,
         "review_id": item.get("review_id") or review_id_for(item),
         # `source` before the literal. A row produced by the import or
@@ -63016,6 +63016,12 @@ def manual_review_legacy_row(item, slskd_probe_status=None):
         "manual_review_bucket": "source_hints" if is_manual_source else "",
         "manual_source_stage": manual_source_stage,
     }
+    # The series the sweep actually matched, by id. Without it the review row
+    # binds by title, which cannot tell a series from its unmonitored twin, and
+    # inkdrop_state.unwanted_file_review_retirement() refuses to guess.
+    if str(item.get("native_series_id") or "").strip():
+        row["native_series_id"] = str(item.get("native_series_id")).strip()
+    return row
 
 
 def manual_review_legacy_snapshot(limit=200):

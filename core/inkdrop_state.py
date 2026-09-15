@@ -1595,6 +1595,22 @@ def init_schema_uncached(con):
             semantics_json text,
             derived_at real not null
         );
+        -- The archive reading that proved a satisfied unit's file for a Manual
+        -- Review retirement, one row per unit. Keyed on the unit rather than the
+        -- path, and kept apart from the per-path caches above, because those each
+        -- hold one validator's verdict per file and a second verdict under the
+        -- same key would evict theirs on every pass.
+        create table if not exists review_exception_file_proof_cache (
+            series_id text not null,
+            issue_id text not null,
+            path text not null,
+            size integer not null,
+            mtime real not null,
+            ctime real not null,
+            reader_key text not null,
+            proved_at real not null,
+            primary key (series_id, issue_id)
+        );
         -- Long library scans (CBZ conversion check, adoption folder scan) used to
         -- live only in a process-local dict, so a reload or a container restart
         -- threw away a scan that can take hours on a real library. One row per
@@ -48554,9 +48570,90 @@ REVIEW_EXCEPTION_FILE_PROOF_MAX_LEDGER_ROWS = 8
 REVIEW_EXCEPTION_FILE_PROOF_ARCHIVE_READ_BUDGET = max(
     1, int(os.environ.get("INKDROP_REVIEW_EXCEPTION_ARCHIVE_READ_BUDGET") or 25)
 )
+# Stored on every cached reading and compared on every read. Bump it when what
+# archive_output_refusal() refuses changes, so readings taken under the old rules
+# are misses rather than answers.
+REVIEW_EXCEPTION_FILE_PROOF_CACHE_READER_KEY = "output-refusal-v1"
 
 
-def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=None, budget=None):
+def review_exception_file_proof_cache_hit(con, cache, series_id, issue_id, path, stat, now=None):
+    """True when this unit's file was read sound before and is unchanged since.
+
+    A retired weak-filename row is decided again on every reconcile, which is
+    every 60 s, and without this every pass read the same archives again. The
+    reading is reused only for the same unit, the same path, and the same size,
+    mtime and ctime -- ctime for the reason cached_strict_archive_validation()
+    gives: restores and utime() put an old mtime back, and nothing sets ctime --
+    under the current reader key and inside the archive-validation max age.
+    Anything else is a miss, and a miss reads the file. Only readings that passed
+    are stored, so a miss can never serve a refusal either.
+    """
+    if not isinstance(cache, dict):
+        return False
+    try:
+        row = con.execute(
+            "select path, size, mtime, ctime, reader_key, proved_at from review_exception_file_proof_cache"
+            " where series_id=? and issue_id=?",
+            (str(series_id or ""), str(issue_id or "")),
+        ).fetchone()
+        now = time.time() if now is None else now
+        return bool(
+            row is not None
+            and str(row_value(row, "path") or "") == str(path)
+            and row_value(row, "reader_key") == REVIEW_EXCEPTION_FILE_PROOF_CACHE_READER_KEY
+            and int(row_value(row, "size")) == int(stat.st_size)
+            and float(row_value(row, "mtime")) == float(stat.st_mtime)
+            and float(row_value(row, "ctime")) == float(stat.st_ctime)
+            and now - float(row_value(row, "proved_at") or 0) < QUEUE_ARCHIVE_VALIDATION_CACHE_MAX_AGE_SECONDS
+        )
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def store_review_exception_file_proofs(con, cache):
+    """Write a pass's readings inside the sync's write transaction, then forget reopened units.
+
+    The readings were taken on a read connection before the write lock; this
+    only records them. Best-effort: a reading that cannot be stored costs one
+    more archive read next pass, never a different answer.
+    """
+    cache = cache if isinstance(cache, dict) else {}
+    try:
+        for (series_id, issue_id), (path, size, mtime, ctime, proved_at) in (cache.get("writes") or {}).items():
+            con.execute(
+                "insert into review_exception_file_proof_cache"
+                "(series_id, issue_id, path, size, mtime, ctime, reader_key, proved_at) values(?,?,?,?,?,?,?,?)"
+                " on conflict(series_id, issue_id) do update set path=excluded.path, size=excluded.size,"
+                " mtime=excluded.mtime, ctime=excluded.ctime, reader_key=excluded.reader_key,"
+                " proved_at=excluded.proved_at",
+                (series_id, issue_id, path, size, mtime, ctime, REVIEW_EXCEPTION_FILE_PROOF_CACHE_READER_KEY, proved_at),
+            )
+        for series_id, issue_id in cache.get("drops") or ():
+            con.execute(
+                "delete from review_exception_file_proof_cache where series_id=? and issue_id=?",
+                (series_id, issue_id),
+            )
+        forget_reopened_unit_file_proofs(con)
+    except sqlite3.Error:
+        pass
+
+
+def forget_reopened_unit_file_proofs(con):
+    """Drop the reading for every unit that is no longer satisfied.
+
+    A unit that opens again has to earn its retirement again from a fresh read,
+    even if its file never changed.
+    """
+    con.execute(
+        "delete from review_exception_file_proof_cache where not exists ("
+        " select 1 from wanted_items w where w.issue_id = review_exception_file_proof_cache.issue_id"
+        " and lower(coalesce(w.status, '')) = 'satisfied')"
+        " or exists (select 1 from wanted_items w where w.issue_id = review_exception_file_proof_cache.issue_id"
+        " and lower(coalesce(w.status, '')) <> 'satisfied')"
+    )
+
+
+def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=None, budget=None, cache=None):
     """The file that may retire this unit's review exception, or why none does.
 
     `media_files` is DURABLE SCAN METADATA, not a live reading. On snapshot
@@ -48587,6 +48684,12 @@ def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=Non
     is already the safe direction. The sweep that retracts proofs needs that
     gate because its failure direction destroys evidence; this one only leaves
     a review row where it was.
+
+    With `cache` (a dict, passed only by the weak-filename retirement) a `.cbz`
+    whose reading is still good per review_exception_file_proof_cache_hit()
+    skips the archive read and the budget, a new passing reading is queued in
+    cache["writes"], and a unit that ends in a refusal is queued in
+    cache["drops"]. Without it nothing changes.
     """
 
     issue_id = str(issue_id or "").strip()
@@ -48630,7 +48733,8 @@ def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=Non
             reason = "not_a_managed_library_archive"
             continue
         try:
-            size_bytes = int(canonical.stat().st_size)
+            stat = canonical.stat()
+            size_bytes = int(stat.st_size)
         except OSError:
             reason = "file_not_readable"
             continue
@@ -48638,6 +48742,8 @@ def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=Non
             reason = "file_is_empty"
             continue
         if inkdrop_artifact_acceptance.comic_archive_suffix(canonical) == ".cbz":
+            if review_exception_file_proof_cache_hit(con, cache, series_id, issue_id, canonical, stat):
+                return {"ok": True, "reason": "file_verified", "path": str(canonical), "cached": True}
             if isinstance(budget, dict):
                 if int(budget.get("archive_reads") or 0) <= 0:
                     reason = "soundness_budget_exhausted"
@@ -48647,8 +48753,258 @@ def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=Non
             if refusal is not None:
                 reason = str(refusal.get("reason") or "archive_refused")
                 continue
+            if isinstance(cache, dict):
+                cache.setdefault("writes", {})[(series_id, issue_id)] = (
+                    str(canonical), size_bytes, float(stat.st_mtime), float(stat.st_ctime), time.time()
+                )
         return {"ok": True, "reason": "file_verified", "path": str(canonical)}
+    if isinstance(cache, dict):
+        cache.setdefault("writes", {}).pop((series_id, issue_id), None)
+        cache.setdefault("drops", set()).add((series_id, issue_id))
     return {"ok": False, "reason": reason}
+
+
+# The two refusals the untrusted SLSKD staging sweep files when it cannot place a
+# staged file (inkdrop_completed_import.classify_import_filename_safety). The file
+# stays in staging, the sweep files the row again on every pass, and so the
+# journal tail that feeds the legacy sync never lets the row age out. None of
+# these rows carries a unit, so the satisfied-unit clause in
+# sync_review_exceptions() cannot reach them either. On snapshot
+# inkdrop-state-20260913T162706Z-3c933295dc08 (as_of_utc 2026-09-13T16:27:06Z),
+# 13 of the 55 open rows for multi-unit series were for a series that wanted
+# nothing and 15 named a unit already satisfied.
+UNWANTED_FILE_REVIEW_REASONS = frozenset({"weak_filename_unit_evidence", "filename_confidence_too_low"})
+# A wanted row in one of these is not asking for a book. superseded_duplicate is
+# deliberately absent: that want moved to a twin record, it did not go away.
+UNWANTED_FILE_CLOSED_WANTED_STATUSES = frozenset({"satisfied", "inactive", "removed_by_user"})
+# A title-only file names no unit, so for a series that wants nothing every
+# satisfied unit must show its file. Past this many units the row stays.
+UNWANTED_FILE_TITLE_ONLY_MAX_UNITS = 8
+
+
+def review_source_numbers(source):
+    """Every number a staged file's name could be read as, or None for a range.
+
+    Deliberately wider than any unit parser: "30 - Powers 28 (2003).cbr" is
+    [30, 28, 2003], because a parser that picks one of them is how a wanted
+    unit's file gets hidden behind a satisfied one. The parent folder counts too.
+    Only the SLSKD duplicate-name tick (`_639214959054165153`) is dropped, since it
+    is never a unit. A range cannot be listed number by number, so it is None.
+    """
+    parts = [part for part in str(source or "").replace("\\", "/").split("/") if part]
+    leaf = parts[-1] if parts else ""
+    parent = parts[-2] if len(parts) > 1 else ""
+    stem = re.sub(r"_\d{15,}$", "", re.sub(r"\.[A-Za-z0-9]{1,5}$", "", leaf))
+    numbers = []
+    for text in (stem, parent):
+        spaced = text.replace("_", " ")
+        if re.search(r"\d[\s.]*(?:[-\u2013\u2014~+]|\bto\b|\bthru\b)[\s.]*\d", spaced, re.I):
+            return None
+        for token in re.findall(r"\d+(?:\.\d+)?", spaced):
+            value = float(token)
+            if value not in numbers:
+                numbers.append(value)
+    return numbers
+
+
+def _review_issue_number_value(value):
+    match = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+    return float(match.group(0)) if match else None
+
+
+def _review_title_word_keys(title):
+    words = normalize_key(title).split()
+    keys = [tuple(words)] if words else []
+    if len(words) > 1 and words[0] in {"a", "an", "the"}:
+        keys.append(tuple(words[1:]))
+    return keys
+
+
+def _review_words_contain(words, sequence):
+    width = len(sequence)
+    return bool(width) and any(tuple(words[index:index + width]) == sequence for index in range(len(words) - width + 1))
+
+
+def unwanted_file_review_retirement(con, row, context=None, budget=None):
+    """Whether a weak-filename review row names a file nothing still wants.
+
+    Hiding such a row wrongly parks a book nobody goes looking for, so this
+    answers retire only when every doubt is closed, and otherwise returns
+    retire=False with the doubt as `reason`:
+
+    * The series is bound by the row's native_series_id, never by title. A title
+      binds to the unmonitored `kapowarr:` twin as readily as to the real record.
+    * No other series that still wants units has its title in the file or folder
+      name. The want may live on that record.
+    * No unit of this series that is still open has its title in the file or
+      folder name. "Lieutenant Blueberry 3" names unit 3, but on snapshot
+      inkdrop-state-20260913T162706Z-3c933295dc08 the Moebius series it was
+      filed under calls four of its open units "Blueberry".
+    * The series wants nothing (every wanted row satisfied, inactive or removed
+      by the user, and no numbered unit lacks a wanted row), OR every number the
+      name could be read as names a satisfied unit. A number naming an open unit,
+      a unit with no wanted row, or no known unit at all keeps the row, and so
+      does a title-only file.
+    * Every satisfied unit relied on shows its file through
+      review_exception_unit_file_proof(). A unit marked satisfied with no file
+      is exactly the unit this staged file might be.
+
+    A year-shaped number (1900 to 2099) is not read as a unit when the series has
+    no unit numbered 1000 or more. Nothing here writes.
+    """
+    row = row if isinstance(row, dict) else {}
+    context = context if isinstance(context, dict) else {}
+
+    def keep(reason, **extra):
+        return {"retire": False, "reason": reason, **extra}
+
+    review_reason = str(row.get("review_reason") or row.get("reason") or "").strip()
+    if review_reason not in UNWANTED_FILE_REVIEW_REASONS:
+        return keep("reason_out_of_scope")
+    series_id = str(row.get("native_series_id") or "").strip()
+    if not series_id or not con.execute("select 1 from series where id=?", (series_id,)).fetchone():
+        return keep("series_not_bound_by_id")
+    source = str(row.get("source") or "").replace("\\", "/")
+    leaf = source.rstrip("/").rsplit("/", 1)[-1]
+    if "/" not in source or not re.search(r"\.[A-Za-z0-9]{1,5}$", leaf):
+        return keep("source_is_not_a_file_path")
+    numbers = review_source_numbers(source)
+    if numbers is None:
+        return keep("file_names_a_range")
+
+    closed = sorted(UNWANTED_FILE_CLOSED_WANTED_STATUSES)
+    if "open_wanted_titles" not in context:
+        context["open_wanted_titles"] = [
+            (str(found["id"]), _review_title_word_keys(found["title"]))
+            for found in con.execute(
+                "select s.id, s.title from series s where exists ("
+                " select 1 from wanted_items w where w.series_id = s.id"
+                f" and lower(coalesce(w.status, '')) not in ({','.join('?' * len(closed))}))",
+                closed,
+            ).fetchall()
+        ]
+    name_words = [normalize_key(leaf).split(), normalize_key(source.rstrip("/").rsplit("/", 2)[-2]).split()]
+    for other_id, keys in context["open_wanted_titles"]:
+        if other_id != series_id and any(_review_words_contain(words, key) for key in keys for words in name_words):
+            return keep("file_names_another_wanted_series", other_series_id=other_id)
+
+    issues = con.execute(
+        "select id, issue_number, normalized_number, title, coalesce(monitored, 1) as monitored"
+        " from issues where series_id=?",
+        (series_id,),
+    ).fetchall()
+    wanted_by_issue = {}
+    statuses = []
+    for wanted in con.execute(
+        "select issue_id, lower(coalesce(status, '')) as status from wanted_items"
+        " where series_id=? or issue_id in (select id from issues where series_id=?)",
+        (series_id, series_id),
+    ).fetchall():
+        statuses.append(str(wanted["status"]))
+        wanted_by_issue.setdefault(str(wanted["issue_id"] or ""), []).append(str(wanted["status"]))
+    if not statuses:
+        return keep("series_has_no_wanted_rows")
+    series_open = any(status not in UNWANTED_FILE_CLOSED_WANTED_STATUSES for status in statuses)
+    for issue in issues:
+        issue_statuses = wanted_by_issue.get(str(issue["id"])) or []
+        if issue_statuses and all(status in UNWANTED_FILE_CLOSED_WANTED_STATUSES for status in issue_statuses):
+            continue
+        if any(_review_words_contain(words, key) for key in _review_title_word_keys(issue["title"]) for words in name_words):
+            return keep("file_names_an_open_unit_title", issue_id=str(issue["id"]))
+
+    def issue_value(issue):
+        return _review_issue_number_value(issue["issue_number"] if str(issue["issue_number"] or "").strip() else issue["normalized_number"])
+
+    has_four_digit_unit = any((issue_value(issue) or 0) >= 1000 for issue in issues)
+    to_prove = []
+    for number in numbers:
+        matched = [issue for issue in issues if issue_value(issue) == number]
+        if not matched:
+            if number.is_integer() and 1900 <= number <= 2099 and not has_four_digit_unit:
+                continue
+            if series_open:
+                return keep("number_names_no_known_unit", number=number)
+            continue
+        for issue in matched:
+            issue_statuses = wanted_by_issue.get(str(issue["id"])) or []
+            if not issue_statuses:
+                return keep("number_names_a_unit_with_no_wanted_row", number=number)
+            if any(status not in UNWANTED_FILE_CLOSED_WANTED_STATUSES for status in issue_statuses):
+                return keep("number_names_an_open_unit", number=number)
+            if series_open and any(status != "satisfied" for status in issue_statuses):
+                return keep("number_names_a_unit_that_is_not_satisfied", number=number)
+            if "satisfied" in issue_statuses:
+                to_prove.append(str(issue["id"]))
+    if series_open and not to_prove:
+        return keep("file_names_no_satisfied_unit")
+    if not series_open:
+        if any(
+            int(issue["monitored"] or 0) and issue_value(issue) is not None and not wanted_by_issue.get(str(issue["id"]))
+            for issue in issues
+        ):
+            return keep("series_has_a_unit_with_no_wanted_row")
+        if not to_prove:
+            to_prove = [str(issue["id"]) for issue in issues if "satisfied" in (wanted_by_issue.get(str(issue["id"])) or [])]
+            if len(to_prove) > UNWANTED_FILE_TITLE_ONLY_MAX_UNITS:
+                return keep("title_only_file_series_too_large_to_prove")
+
+    if "managed_roots" not in context:
+        context["managed_roots"] = media_management_roots_from_connection(con)
+    proofs = context.setdefault("proofs", {})
+    proof_paths = []
+    for issue_id in dict.fromkeys(to_prove):
+        # One reading per unit per pass: several staged copies name the same
+        # unit, and each archive read costs real time on a network mount.
+        if (series_id, issue_id) not in proofs:
+            proofs[(series_id, issue_id)] = review_exception_unit_file_proof(
+                con, series_id, issue_id, managed_roots=context["managed_roots"], budget=budget,
+                cache=context.get("proof_cache"),
+            )
+        proof = proofs[(series_id, issue_id)]
+        if not proof.get("ok"):
+            return keep("satisfied_unit_file_not_shown", issue_id=issue_id, proof_reason=proof.get("reason"))
+        proof_paths.append(proof.get("path"))
+    return {
+        "retire": True,
+        "reason": "named_units_satisfied" if series_open else "series_wants_nothing",
+        "series_id": series_id,
+        "numbers": numbers,
+        "proof_paths": proof_paths,
+    }
+
+
+def unwanted_file_review_retirements(db_path, rows, origin, proof_cache=None):
+    """Retirement decisions for a sync batch, read before the write lock is taken.
+
+    The file proofs read archives. Taking them inside the sync's write
+    transaction would put those reads under the state write lock on every
+    reconcile, so they run on a read connection first, reusing a unit's stored
+    reading while its file is unchanged. New readings are queued in
+    `proof_cache` for the caller to store under its write lock. Any failure
+    keeps every row: a pass that cannot decide leaves the rows open, it never
+    hides them.
+    """
+    candidates = [
+        row for row in rows or []
+        if isinstance(row, dict)
+        and str(row.get("review_reason") or row.get("reason") or "").strip() in UNWANTED_FILE_REVIEW_REASONS
+        and str(row.get("native_series_id") or "").strip()
+    ]
+    if not candidates:
+        return {}
+    decisions = {}
+    context = {"proof_cache": proof_cache if isinstance(proof_cache, dict) else None}
+    budget = {"archive_reads": REVIEW_EXCEPTION_FILE_PROOF_ARCHIVE_READ_BUDGET}
+    try:
+        with connect_read(db_path, timeout_seconds=10.0, busy_timeout_ms=10000) as con:
+            con.row_factory = sqlite3.Row
+            for row in candidates:
+                decision = unwanted_file_review_retirement(con, row, context=context, budget=budget)
+                if decision.get("retire"):
+                    decisions[f"review:{origin}:{normalize_review_exception_id(row)}"] = decision
+    except (sqlite3.Error, OSError):
+        return {}
+    return decisions
 
 
 def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
@@ -48661,13 +49017,44 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
         retired = 0
         actionable = 0
         parked = 0
+        proof_cache = {"writes": {}, "drops": set()}
+        unwanted = unwanted_file_review_retirements(path, rows, origin, proof_cache=proof_cache) if path.exists() else {}
         with connect(path) as con:
             init_schema(con)
+            store_review_exception_file_proofs(con, proof_cache)
             for row in rows or []:
                 if not isinstance(row, dict):
                     continue
                 review_id = normalize_review_exception_id(row)
                 exception_id = f"review:{origin}:{review_id}"
+                decision = unwanted.get(exception_id)
+                if decision:
+                    # Left out of active_ids, so an open row retires below with
+                    # the rest, and a row that was never open is not written.
+                    # Re-read on every pass: once the unit is wanted again, the
+                    # same journal line opens the row.
+                    con.execute(
+                        """
+                        insert or ignore into history_events(
+                            id, entity_type, entity_id, series_id, issue_id, event_type,
+                            source, message, created_at, raw_json
+                        ) values(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            stable_id("review_exception_unwanted_file", exception_id, decision.get("reason")),
+                            "review_exception",
+                            exception_id,
+                            decision.get("series_id"),
+                            None,
+                            "manual_review_resolved",
+                            row.get("source") or origin,
+                            "Manual review exception retired: the file is not wanted"
+                            f" ({decision.get('reason')})",
+                            now,
+                            json_dumps({**row, "unwanted_file_retirement": decision}),
+                        ),
+                    )
+                    continue
                 active_ids.add(exception_id)
                 state = str(row.get("state") or "needs_you").strip().lower()
                 is_actionable = bool(row.get("manual_review_actionable") or state in {"needs_you", "failed", "blocked"})
