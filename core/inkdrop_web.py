@@ -51982,7 +51982,7 @@ def update_inkdrop_series_manga_unit_override(payload):
 
 def update_inkdrop_series_media_type(payload):
     """Manually reclassify a series (comic <-> manga/manhwa/manhua) and lock
-    it so the next ComicVine/Kapowarr watch sync doesn't silently revert it.
+    it so the next ComicVine/MangaDex watch sync doesn't silently revert it.
 
     No UI wired to this yet -- see the reclassify-endpoint follow-up flagged
     alongside the Akira/Ghost in the Shell classification fix. The existing

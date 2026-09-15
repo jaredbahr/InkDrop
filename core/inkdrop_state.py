@@ -6016,8 +6016,8 @@ def set_issue_monitored(db_path, issue_id, monitored):
     """User-facing per-issue monitor toggle ("I already own this one, stop re-acquiring it").
 
     Distinct from the plain `monitored` column upsert_issue writes on every metadata
-    sync: this also stamps `monitored_user_override` so the next ComicVine/Kapowarr/
-    MangaDex sync doesn't silently stomp the user's choice back to the provider's value.
+    sync: this also stamps `monitored_user_override` so the next ComicVine/MangaDex
+    sync doesn't silently stomp the user's choice back to the provider's value.
     """
     issue_id = str(issue_id or "").strip()
     if not issue_id:
@@ -40300,10 +40300,10 @@ def standalone_readiness_audit(
     checks.append(
         readiness_check(
             "kapowarr_adapter",
-            "Optional legacy integration",
+            "Retired legacy vocabulary",
             kapowarr_state,
             "optional" if adapter_series == 0 else f"{adapter_series} adapter-backed series",
-            "Kapowarr is not the current source of truth." if adapter_series == 0 else "Continue reducing live Kapowarr dependence.",
+            "No series carries retired Kapowarr vocabulary." if adapter_series == 0 else "Backfill native metadata on these series; the Kapowarr fields on them are stored local vocabulary, not a live integration.",
             adapter_series,
         )
     )
@@ -41160,8 +41160,10 @@ def first_run_setup_status(db_path=None, environ=None):
     folder naming, library adapter choices, metadata providers, source
     providers, download clients, manual staging, security summary, backup export,
     and local folder only mode. It intentionally treats external adapters as
-    optional so Docker-first installs can start without Kapowarr, Kavita, Komga,
+    optional so Docker-first installs can start without Kavita, Komga,
     qBittorrent, SABnzbd, SLSKD, Suwayomi, Prowlarr, or ComicVine credentials.
+    Kapowarr is not in that list because it is retired: nothing reads a Kapowarr
+    URL or key, so there is no credential for an install to go without.
     """
     env = environ if environ is not None else os.environ
     effective_health = {}
@@ -69474,7 +69476,7 @@ SOURCE_PROVIDER_CONSUMERS = {
     "comicvine": ("Add Series", "Metadata sync"),
     "metron": ("Add Series search",),
     "mangadex": ("Add Series search", "MangaDex feed", "MangaDex direct downloader"),
-    "kapowarr": ("Adapter sync", "Legacy fallback"),
+    "kapowarr": ("Stored legacy identity",),
     "prowlarr": ("Autopilot", "Failed retry", "Download clients"),
     "rss": ("Autopilot", "Direct discovery"),
     "comicscodes": ("Autopilot", "Direct discovery"),
@@ -74743,7 +74745,7 @@ def series_watch_readiness_row_from_record(row):
         next_action = "No wanted rows are recorded; verify missing scan or library coverage if this should backfill"
     elif kapowarr_dependency:
         state = "kapowarr_dependency"
-        next_action = "Backfill native metadata/issues/wanted/queue rows so Kapowarr is only an adapter"
+        next_action = "Backfill native metadata/issues/wanted/queue rows; the Kapowarr fields on this series are retired local vocabulary that resolves nowhere"
     elif "queue_rows_missing" in blockers:
         state = "queue_missing"
         next_action = "Create active InkDrop queue rows for wanted issues"
