@@ -7265,6 +7265,23 @@ def bare_issue_numbers(filename, item):
         # false negative.
         if volume_present and previous in {"part", "pt"}:
             continue
+        # A SCENE RUN LENGTH IS NOT A SECOND UNIT NUMBER. Limited series are
+        # named "04 (of 06)", so without this the run length is harvested
+        # alongside the real unit and, in an M-issue run, the unit numbered M
+        # matches EVERY file at identical score -- measured on the deployed
+        # build, "...Tempest 01 (of 06)..." returned [1, 6] and "...04 (of 06)..."
+        # returned [4, 6], and the live library had the file named "Tempest #004"
+        # bound to Tempest issue SIX with status present. That is a wrong "you
+        # have it", which costs the book rather than a search.
+        #
+        # `and numbers` is the whole guard. Dropping every number after "of"
+        # would strip the only unit evidence from a filename whose sole number
+        # happens to sit there; requiring one already-collected number means
+        # this can only ever REFUSE a match it used to make, never accept a new
+        # one. The last issue of a run keeps its own number from the LEADING
+        # token, so "06 (of 06)" still matches unit 6.
+        if previous == "of" and (numbers or volume_present):
+            continue
         if number in title_numbers and index <= 1:
             continue
         numbers.append(number)
