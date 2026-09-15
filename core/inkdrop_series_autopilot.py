@@ -14541,7 +14541,50 @@ def broad_group_service_key(rows):
     return latest
 
 
-def due_group_sort_key(series, rows, series_activity=None):
+SEARCH_STARVATION_PROMOTION_SECONDS = 14 * 24 * 60 * 60
+
+
+def search_starvation_promotion_seconds():
+    """How long a series may go unserved before it is promoted one tier.
+
+    Env-overridable for operators, but the SAFETY of this change does not rest on
+    the value -- it rests on where the tier sits in the sort tuple. A threshold of
+    zero would promote every series and still could not displace active work or new
+    content, because those are ordered above it. Tuning changes how many series are
+    promoted, never what a promotion can outrank.
+    """
+    raw = os.environ.get("INKDROP_SEARCH_STARVATION_PROMOTION_SECONDS")
+    if raw in (None, ""):
+        return SEARCH_STARVATION_PROMOTION_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return SEARCH_STARVATION_PROMOTION_SECONDS
+
+
+def series_starvation_tier(last_service_at, now=None):
+    """0 when this series has gone unserved past the promotion window, else 1.
+
+    `last_service_at` is the per-series SERVICE clock, not a row's updated_at --
+    generic observations refresh row timestamps without anything having searched
+    the series, which is the same masking defect #225 records for
+    wanted_items.updated_at.
+
+    A series with no recorded service at all is treated as starved: never served
+    is the most starved state there is, and reading it as "just served" is how a
+    row disappears from a fairness pass forever.
+    """
+    now = time.time() if now is None else float(now)
+    try:
+        last = float(last_service_at or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last <= 0:
+        return 0
+    return 0 if (now - last) > search_starvation_promotion_seconds() else 1
+
+
+def due_group_sort_key(series, rows, series_activity=None, now=None):
     group_key = series
     identity = ""
     lane = ""
@@ -14550,7 +14593,7 @@ def due_group_sort_key(series, rows, series_activity=None):
         lane = str(series[2] if len(series) > 2 else "")
         series = series[0]
     if not rows:
-        return (999999, 999999999999, 999999, normalize(series), normalize(identity), normalize(lane))
+        return (999999, 999999999999, 999999, 999999, normalize(series), normalize(identity), normalize(lane))
     recent_series_activity = numeric_timestamp((series_activity or {}).get(group_key))
     if recent_series_activity <= 0:
         recent_series_activity = max(queue_last_activity_ts(row) for row in rows)
@@ -14579,12 +14622,43 @@ def due_group_sort_key(series, rows, series_activity=None):
     # before row attempt count so large runs do not monopolize every pass. For
     # first-pass groups, oldest untouched rows go first so runtime-budget skips
     # do not sit behind every fresh add forever.
+    # STARVATION TERM. Everything above orders on recency and readiness, so a
+    # series that keeps generating activity keeps re-qualifying and a quiet one is
+    # never promoted by getting older. Measured 2026-08-24: 212 of 232 series
+    # holding open units received ZERO search requests in 30 days (2,415 units)
+    # while five series took ~27,500 of them. That is an absent property, not a
+    # bug in any one branch.
+    #
+    # `recent_series_activity` was already computed here from the per-series
+    # service clock the caller builds -- and then discarded. This is the term it
+    # was for.
+    #
+    # WHY IT SITS AT INDEX 5 AND NOWHERE ELSE. Its position IS the safety
+    # argument, and it is structural rather than tuned:
+    #   0-2  cached SLSKD / stale downloader / runtime budget -- ACTIVE WORK
+    #   3    first_pass_priority -- NEW CONTENT
+    #   4    missing_result_priority
+    #   5    starvation_tier  <- promotion lives only here
+    # Because first_pass_priority is at 3, a series added today outranks the whole
+    # aged backlog no matter how starved it is -- the maintainer's standing
+    # condition on bounded ageing, held by ordering, so NO threshold value can
+    # violate it.
+    # Because the three active lanes are at 0-2, an idle series can never displace
+    # in-flight work; the failure where every series gets one turn and nothing
+    # finishes is unreachable from here.
+    #
+    # BOUNDED: one binary promotion, not a second age sort. Two starved series
+    # land in the same tier and then order by their existing fairness clock, so
+    # the oldest-starved series cannot win forever -- that would rebuild the same
+    # monopoly with a different winner.
+    starvation_tier = series_starvation_tier(recent_series_activity, now=now)
     return (
         cached_slskd_priority,
         stale_downloader_priority,
         runtime_budget_priority,
         first_pass_priority,
         missing_result_priority,
+        starvation_tier,
         fairness_sort,
         min(queue_attempt_count(row) for row in rows),
         normalize(series),
@@ -14593,7 +14667,7 @@ def due_group_sort_key(series, rows, series_activity=None):
     )
 
 
-def due_group_key(item):
+def due_group_key(item, work_keys=None):
     # Every other due-row category (retry_due, first_pass, stale_downloader,
     # ...) folds a series' rows into one group here. Splitting out a
     # "missing_provider:<source>" suffix just for the missing-provider-result
@@ -14604,6 +14678,26 @@ def due_group_key(item):
     # per-series admission count it's used for below.
     series = item.get("series") or ""
     identity = series_summary_identity(item) or f"title:{normalize(series)}"
+    # One work registered under two identities is two group keys, so it bids
+    # twice and displaces somebody else -- the same "multiple max_series slots"
+    # failure this function's own note above is about, arriving through the
+    # identity instead of through a suffix. `work_keys` maps an identity onto
+    # the canonical work it provably belongs to (see
+    # inkdrop_state.canonical_work_key), folding those into one slot.
+    #
+    # OPT-IN BY CONSTRUCTION. Absent or empty map means the key is exactly what
+    # it was, so wiring this cannot change a pass that does not pass a map. An
+    # identity the map does not mention falls through unchanged -- the map only
+    # ever folds what it can PROVE, never what merely looks alike.
+    #
+    # Deliberately keyed on provable provider identity and never on the title:
+    # of 128 multi-row title groups on production, 125 disagree on year or
+    # publisher, and among them are genuinely distinct works (Batman Beyond 2016
+    # and 2012). Merging those makes one starve the other -- the defect this
+    # removes, reintroduced in the opposite direction, where a wrongly merged
+    # bidder looks exactly like a correctly fixed one.
+    if work_keys:
+        identity = work_keys.get(identity) or identity
     return (series, identity)
 
 

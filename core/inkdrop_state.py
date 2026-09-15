@@ -2858,6 +2858,59 @@ def series_identity(row):
     return f"title:{series_title_identity_key(row.get('name') or row.get('series') or row.get('title'))}"
 
 
+def canonical_work_key(row):
+    """The work a series row belongs to, for capacity allocation ONLY.
+
+    NOT an identity and never a primary key. `series_identity()` above mints the
+    id a row is stored under and must keep doing so; this answers a different
+    question -- when two rows compete for search capacity, are they the same
+    work? Keeping them separate is why this is a predicate change with no schema
+    change and nothing to migrate.
+
+    KEYED ON PROVABLE PROVIDER IDENTITY, NEVER ON THE TITLE, and the reason is
+    measured. `series.sort_title` is populated 484/484 and visibly collapses
+    every known duplicate, which makes it the obvious key and the wrong one: of
+    128 multi-row sort_title groups on production (2026-08-24), **125 disagree on
+    year or publisher**, and among them sit records that are genuinely different
+    works -- `batman beyond` comicvine:95201 [2016] against comicvine:45872
+    [2012], `absolute batman` comicvine:160294 [2024] against comicvine:167340
+    [2025]. Two distinct ComicVine series ARE two distinct works in ComicVine's
+    model. Merging them makes one starve the other, which is the defect this
+    exists to remove, reintroduced in the opposite direction and harder to see --
+    a wrongly merged bidder looks exactly like a correctly fixed one.
+
+    What a shared `metadata_provider` + `metadata_id` proves needs no judgement:
+    `kapowarr:122` carries `comicvine/160294`, so it IS `comicvine:160294`,
+    registered twice. Measured: **37 of 37** kapowarr-scoped series are a second
+    registration of an already-registered work -- a census, not a sample. That is
+    the population this key folds, and folding it is provably safe.
+
+    Absolute Batman is the case that shows why the title cannot be the key: within
+    that one title, `kapowarr:122` must fold into `comicvine:160294` while
+    `comicvine:167340` must stay apart. A key that gets both right is not keying
+    on the title.
+
+    WHERE THE OUTSTANDING DECISION CHANGES THIS. Whether a ComicVine record and a
+    MangaDex record for the same story are one work is a product judgement that
+    has not been made. Until it is, this refuses to merge them -- a split bidder
+    wastes capacity, a wrongly merged one loses a series, and the second is the
+    error that costs a book. If the decision comes back "same work", the change is
+    confined to this function: add a cross-provider resolution here, and every
+    caller inherits it. Nothing else moves.
+    """
+
+    row = row if isinstance(row, dict) else {}
+    provider = str(row.get("metadata_provider") or "").strip().lower()
+    metadata_id = str(row.get("metadata_id") or "").strip()
+    if provider and metadata_id:
+        return f"work:{provider}:{metadata_id}"
+    # No provable identity. Fall back to the row's OWN id so the row is its own
+    # work -- absence of identity is not evidence of sameness, and defaulting to
+    # the title here would smuggle the eager behaviour back in through the gap.
+    own_id = str(row.get("id") or "").strip()
+    return f"work:row:{own_id}" if own_id else "work:row:<unidentified>"
+
+
 def series_raw_user_removed(raw):
     raw = raw if isinstance(raw, dict) else {}
     return bool(raw.get("removed_by_user")) or str(raw.get("automation_parked_reason") or "") == "user_removed"
