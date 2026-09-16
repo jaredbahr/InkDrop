@@ -67814,7 +67814,6 @@ class Handler(BaseHTTPRequestHandler):
             cls.STATIC_ASSET_CACHE.popitem(last=False)
         cls.STATIC_ASSET_CACHE[key] = (body, etag)
         return body, etag
-        return cached
 
     def send_bytes(self, body, content_type, status=200, headers=None, precompressed_gzip=None):
         """Send one response.
