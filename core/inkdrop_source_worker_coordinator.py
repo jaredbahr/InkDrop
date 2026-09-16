@@ -2781,6 +2781,7 @@ def run_source_worker_for_queue(
     record_lock_retry_attempts=None,
     record_lock_retry_initial_delay=None,
     fetch_deadline=None,
+    provider_concurrency=1,
     now=None,
 ):
     # Phase spans for this item. The accumulator is inert when phase timing is
@@ -2819,6 +2820,7 @@ def run_source_worker_for_queue(
             staging_root=staging_root,
             fetch_deadline=fetch_deadline,
             phase_accumulator=phases,
+            max_concurrency=provider_concurrency,
             now=now,
         )
     with _phase(phases, "record"):

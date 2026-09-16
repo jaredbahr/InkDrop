@@ -286,18 +286,32 @@ def _utc_date(epoch_seconds):
         return "1970-01-01"
 
 
-def _queue_rows(
-    db_path,
+def schedulable_queue_clauses(
     *,
-    limit=50,
     queue_ids=None,
     states=None,
     media_types=None,
     excluded_media_types=None,
     due_only=False,
     now=None,
-    con=None,
 ):
+    """The WHERE clauses that define "a row the source worker may schedule".
+
+    Extracted from _queue_rows() so the shipping scan and anything that
+    measures it answer "which rows are in the population" from one place, the
+    way real_attempt_predicate_sql() is the one authority for "a real attempt".
+    A coverage figure computed over a hand-written population is a figure about
+    that population, not about what the worker actually has to get through; the
+    instrument in core/inkdrop_search_coverage.py composes this instead.
+
+    Returns (clauses, params). The caller joins the clauses with " and " and
+    binds the params once per interpolation -- _queue_rows() interpolates the
+    set twice and therefore binds it twice, in that order.
+
+    The aliases the clauses assume are `q` (queue_items), `s` (series) and `w`
+    (wanted_items); `due_only` additionally reads download_tasks through a
+    correlated EXISTS, which needs no alias from the caller.
+    """
     now = time.time() if now is None else now
     queue_ids = [str(value).strip() for value in _list(queue_ids) if str(value or "").strip()]
     states = [str(value).strip() for value in _list(states) if str(value or "").strip()]
@@ -344,6 +358,34 @@ def _queue_rows(
         params.extend(retryable_statuses)
         params.extend(retryable_clients)
         params.append(now - RETRYABLE_FAILED_HANDOFF_RECOVERY_SECONDS)
+    return clauses, params
+
+
+def _queue_rows(
+    db_path,
+    *,
+    limit=50,
+    queue_ids=None,
+    states=None,
+    media_types=None,
+    excluded_media_types=None,
+    due_only=False,
+    now=None,
+    con=None,
+):
+    now = time.time() if now is None else now
+    clauses, params = schedulable_queue_clauses(
+        queue_ids=queue_ids,
+        states=states,
+        media_types=media_types,
+        excluded_media_types=excluded_media_types,
+        due_only=due_only,
+        now=now,
+    )
+    # Normalised the same way the clause builder does it, because the reserve
+    # below gates on "no explicit id filter" and a caller passing whitespace
+    # means the same thing as a caller passing nothing.
+    queue_ids = [str(value).strip() for value in _list(queue_ids) if str(value or "").strip()]
     bounded_limit = _bounded_limit(limit)
     lane_quotas = inkdrop_queue_fairness.lane_quotas(bounded_limit)
     fast_quota = max(1, int(lane_quotas[inkdrop_queue_fairness.LANE_FAST]))
@@ -518,16 +560,71 @@ def _queue_rows(
                  order by real_attempt_count asc, stall_seconds desc,
                           coalesce(created_at, 0) asc, id asc
                ) as fast_series_round,
+               -- Least recently served, rotating series inside a day band.
+               --
+               -- This used to lead on series_queue_round -- a row_number()
+               -- per series -- and break ties on coalesce(retry_after,
+               -- updated_at, created_at). Both halves were wrong in the same
+               -- way: neither is a clock the pass's own work moves. A deep
+               -- series surfaced exactly one row per pass however long its
+               -- other 267 had waited, and updated_at is refreshed by
+               -- bookkeeping, which the stall CASE above already refuses to
+               -- read for precisely this reason. Nothing tracked "least
+               -- recently served", so every pass re-offered its own head and
+               -- the tail was reached only by luck: 55.6% of 2,172 rows had
+               -- no real attempt in a week (2026-08-15), and service degraded
+               -- monotonically with round -- 73.2% served at round 1, 29.0%
+               -- at round 21+.
+               --
+               -- The sweep key is the service clock itself, and it is the one
+               -- thing an executed search moves: a served row drops to band 0
+               -- and goes to the back. That makes any prefix convergent --
+               -- the set of unserved rows only shrinks between passes -- which
+               -- is the guarantee the lane never had, and it is the same
+               -- property the maintenance sweep gets from oldest-first plus a
+               -- limit.
+               --
+               -- Whole days, not seconds, because the interleaving has to
+               -- survive the key. At second granularity the oldest rows are a
+               -- total order and one deep series' backlog takes the lane --
+               -- the head-of-line failure relocated, which is the mistake the
+               -- aged lane's own ranking already had to avoid. Inside a band
+               -- the per-series round breaks ties, so bands rotate across
+               -- series and drain as whole cohorts. A row served an hour ago
+               -- cannot re-enter a band above 0 for a day, so it cannot
+               -- outrank a row that has been waiting since before it.
+               -- Deliberately NOT keyed on "never searched" first. A row that
+               -- has never been searched already carries its whole life as
+               -- stall, so the bands rank it without a separate cohort -- and
+               -- adding one puts brand-new rows at the head of the steady lane
+               -- too, which makes the fast lane's quota redundant. New content
+               -- is the fast lane's job, and the new-content guard's own
+               -- control depends on that staying true: with the fast lane's
+               -- share removed, new rows must starve, and they do not if this
+               -- lane is also rescuing them.
                row_number() over (
                  order by
+                   -- The same state gate the other two lanes apply to their
+                   -- scores, and for a sharper reason here. A row in a state
+                   -- nothing searches -- blocked, superseded_duplicate -- has
+                   -- a stall that only ever grows, so under an age key it does
+                   -- not merely rank high, it colonises the head of the lane
+                   -- permanently: it can never be served, so it can never drop
+                   -- to band 0 and make way. That is precisely "ageing hands
+                   -- the most capacity to the items least likely to succeed",
+                   -- and the whole sweep would have been spent on rows that
+                   -- cannot be searched at all. Ranked last instead, where
+                   -- they stay visible to the scan without costing it a seat.
+                   case when lower(coalesce(state, '')) in {LANE_ELIGIBLE_STATES_SQL}
+                        then 0 else 1 end asc,
+                   cast(stall_seconds / 86400.0 as integer) desc,
                    series_queue_round asc,
                    case
                      when retry_after<=? then 0
                      when retry_after is null then 1
                      else 2
                    end asc,
-                   coalesce(retry_after, updated_at, created_at, 0) asc,
-                   coalesce(updated_at, created_at, 0) asc,
+                   stall_seconds desc,
                    id asc
                ) as steady_lane_rank
         from aged_queue

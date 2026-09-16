@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -2110,7 +2111,8 @@ def _plan_request_count(plan, provider_ids=None):
     return max(1, total)
 
 
-def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None, provider_request_seconds=None):
+def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None, provider_request_seconds=None,
+                           provider_concurrency=1):
     provider_ids = _selected_provider_ids(plan)
     provider_plan_by_id = {
         str((row or {}).get("provider_id") or "").strip().lower(): row
@@ -2129,7 +2131,7 @@ def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None, provider_r
             unique.append(provider_id)
     if not unique:
         return 60
-    estimate = sum(
+    per_provider = [
         _provider_runtime_estimate(
             provider_id,
             provider_plan_by_id.get(provider_id),
@@ -2137,7 +2139,26 @@ def _plan_runtime_estimate(plan, *, source_http_timeout_seconds=None, provider_r
             provider_request_seconds=provider_request_seconds,
         )
         for provider_id in unique
-    )
+    ]
+    try:
+        concurrency = max(1, int(provider_concurrency))
+    except (TypeError, ValueError):
+        concurrency = 1
+    if concurrency <= 1:
+        estimate = sum(per_provider)
+    else:
+        # Wall clock, not total work: with c providers in flight the item
+        # costs roughly the slowest provider times the number of waves.
+        #
+        # max(), never the mean. An even split -- total/c -- underprices a
+        # plan whose providers differ, which is every plan that mixes an
+        # aggregate lane with a direct one: Suwayomi and MangaDex measure
+        # 0.03-0.85s per request while slskd is priced at 240s, so the mean
+        # would admit a plan whose real cost is the slowest member alone.
+        # Underpricing admission is how a pass overruns its budget and
+        # writes budget-skip rows for everything behind it.
+        waves = math.ceil(len(per_provider) / float(concurrency))
+        estimate = max(per_provider) * waves
     if _plan_looks_comic_pack_eligible(plan) and _has_trusted_comic_pack_lane(plan):
         estimate = min(estimate, COMIC_PACK_TRUSTED_PAIR_RUNTIME_MAX_SECONDS)
     return estimate
@@ -2658,6 +2679,36 @@ def _source_retry_starved_age_priority(plan, head_plan_ids, *, now=None):
     return -_source_retry_starved_age_seconds(plan, now=now)
 
 
+def _sweep_never_served_priority(plan):
+    """-1 for a row no genuine search has ever touched, 0 for the rest.
+
+    The scan's steady lane leads on the same distinction. It has to be
+    restated here because this function re-sorts the funded prefix from
+    scratch: a convergent scan whose prefix is then re-ordered by a key that
+    does not move with service is a scan whose convergence never reaches the
+    providers.
+    """
+    try:
+        return 0 if int((plan or {}).get(queue_fairness.REAL_ATTEMPT_FIELD) or 0) > 0 else -1
+    except (TypeError, ValueError):
+        return -1
+
+
+def _sweep_stall_band_priority(plan):
+    """Whole days waited, negated, so the oldest band sorts first.
+
+    Day granularity for the same reason the scan uses it: at second
+    granularity this becomes a total order on age and one deep series' backlog
+    takes the prefix, which is the head-of-line failure the lanes exist to
+    prevent. Inside a band _series_round_index() still rotates across series.
+    """
+    try:
+        stall = float((plan or {}).get(queue_fairness.STALL_SECONDS_FIELD) or 0.0)
+    except (TypeError, ValueError):
+        return 0
+    return -int(max(0.0, stall) // queue_fairness.DAY_SECONDS)
+
+
 def _local_page_pack_fast_lane_priority(plan):
     if _is_local_page_pack_sibling_rotation_plan(plan):
         return 0
@@ -2797,7 +2848,7 @@ def _runtime_remaining_seconds(started_monotonic, max_run_seconds, *, reserved_s
     return max(0.0, budget - elapsed - _float(reserved_seconds, 0.0) - RUNTIME_CLEANUP_SECONDS)
 
 
-def _source_floor_head_plan_ids(plans, *, source_http_timeout_seconds=None, max_run_seconds=None, now=None, provider_request_seconds=None):
+def _source_floor_head_plan_ids(plans, *, source_http_timeout_seconds=None, max_run_seconds=None, now=None, provider_request_seconds=None, provider_concurrency=1):
     """One guaranteed head-of-line slot per distinct source lane, per pass.
 
     Without this, _runtime_budget_order sorts strictly by estimate bucket, so
@@ -2839,6 +2890,7 @@ def _source_floor_head_plan_ids(plans, *, source_http_timeout_seconds=None, max_
             plan,
             source_http_timeout_seconds=source_http_timeout_seconds,
             provider_request_seconds=provider_request_seconds,
+            provider_concurrency=provider_concurrency,
         )
         starved = _runtime_budget_starved_age_seconds(plan, now=now) > 0
         current = lane_head.get(lane)
@@ -2901,7 +2953,7 @@ def _source_floor_head_priority(plan, head_plan_ranks):
     return rank if rank is not None else len(head_plan_ranks)
 
 
-def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_seconds=None, now=None, provider_request_seconds=None):
+def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_seconds=None, now=None, provider_request_seconds=None, provider_concurrency=1):
     plans = list(plans or [])
     if _runtime_budget(max_run_seconds) <= 0 or len(plans) <= 1:
         return plans
@@ -2917,6 +2969,7 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
         max_run_seconds=max_run_seconds,
         now=now,
         provider_request_seconds=provider_request_seconds,
+        provider_concurrency=provider_concurrency,
     )
     direct_local_page_pack_head_ids = {
         id(plan)
@@ -2925,7 +2978,7 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
     }
     return [
         row
-        for _initial_search, _ageing_lane, _comic_head, _runtime_starved, _runtime_starved_age, _source_floor, _direct_local_head, _local_head, _source_retry_starved, _source_retry_starved_age, _round, _fast_lane, _coverage, _bucket, _backlog_priority, _impact, _index, row in sorted(
+        for _initial_search, _ageing_lane, _comic_head, _runtime_starved, _runtime_starved_age, _source_floor, _direct_local_head, _local_head, _source_retry_starved, _source_retry_starved_age, _sweep_never, _sweep_band, _round, _fast_lane, _coverage, _bucket, _backlog_priority, _impact, _index, row in sorted(
             (
                 (
                     0 if (plan or {}).get(INITIAL_SEARCH_PRIORITY_FIELD) else 1,
@@ -2938,10 +2991,21 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
                     _runtime_local_page_pack_head_priority(plan, local_page_pack_head_ids),
                     _source_retry_starved_priority(plan, source_retry_starved_head_ids),
                     _source_retry_starved_age_priority(plan, source_retry_starved_head_ids, now=now),
+                    # The sweep keys sit above _series_round_index() and below
+                    # every starvation head slot. Above, because a per-series
+                    # round index leading this sort is the same non-convergent
+                    # key the scan's steady lane used to lead on, and re-sorting
+                    # a convergent prefix by it hands the seats straight back to
+                    # whichever series is deepest. Below, because the head slots
+                    # are liveness reservations with their own guards, and a
+                    # sweep that outranked them would starve the rows those
+                    # exist to rescue.
+                    _sweep_never_served_priority(plan),
+                    _sweep_stall_band_priority(plan),
                     _series_round_index(plan),
                     _local_page_pack_fast_lane_priority(plan),
                     0 if int((plan or {}).get(AUTOMATED_ATTEMPT_COUNT_FIELD) or 0) <= 0 else 1,
-                    int(_plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds, provider_request_seconds=provider_request_seconds) // bucket_seconds),
+                    int(_plan_runtime_estimate(plan, source_http_timeout_seconds=source_http_timeout_seconds, provider_request_seconds=provider_request_seconds, provider_concurrency=provider_concurrency) // bucket_seconds),
                     -int((plan or {}).get(COMIC_PACK_BACKLOG_PRIORITY_FIELD) or 0),
                     -_series_backlog_count(plan),
                     index,
@@ -2949,17 +3013,18 @@ def _runtime_budget_order(plans, *, max_run_seconds=None, source_http_timeout_se
                 )
                 for index, plan in enumerate(plans)
             ),
-            key=lambda item: item[:17],
+            key=lambda item: item[:19],
         )
     ]
 
 
-def _apply_runtime_budget(plans, *, max_run_seconds=None, started_monotonic=None, source_http_timeout_seconds=None, provider_request_seconds=None):
+def _apply_runtime_budget(plans, *, max_run_seconds=None, started_monotonic=None, source_http_timeout_seconds=None, provider_request_seconds=None, provider_concurrency=1):
     selected = []
     skipped = []
     reserved = 0.0
     ordered = _runtime_budget_order(
         plans,
+        provider_concurrency=provider_concurrency,
         max_run_seconds=max_run_seconds,
         source_http_timeout_seconds=source_http_timeout_seconds,
         provider_request_seconds=provider_request_seconds,
@@ -2975,6 +3040,7 @@ def _apply_runtime_budget(plans, *, max_run_seconds=None, started_monotonic=None
             plan,
             source_http_timeout_seconds=source_http_timeout_seconds,
             provider_request_seconds=provider_request_seconds,
+            provider_concurrency=provider_concurrency,
         )
         remaining = _runtime_remaining_seconds(
             started_monotonic,
@@ -3513,6 +3579,7 @@ def run_source_worker_batch(
     provider_ids=None,
     queue_limit=50,
     job_limit=20,
+    provider_concurrency=1,
     attempt_cooldown_seconds=0,
     provider_timeout_window_seconds=0,
     provider_timeout_threshold=0,
@@ -3727,6 +3794,7 @@ def run_source_worker_batch(
                 max_run_seconds=max_run_seconds,
                 source_http_timeout_seconds=source_http_timeout_seconds,
                 provider_request_seconds=provider_request_seconds,
+                provider_concurrency=provider_concurrency,
             )
             eligible = []
             budget_skipped = []
@@ -3737,6 +3805,7 @@ def run_source_worker_batch(
                 started_monotonic=started_monotonic,
                 source_http_timeout_seconds=source_http_timeout_seconds,
                 provider_request_seconds=provider_request_seconds,
+                provider_concurrency=provider_concurrency,
             )
             execution_candidates = eligible
 
@@ -3850,6 +3919,7 @@ def run_source_worker_batch(
                 plan,
                 source_http_timeout_seconds=source_http_timeout_seconds,
                 provider_request_seconds=provider_request_seconds,
+                provider_concurrency=provider_concurrency,
             )
             if remaining is not None and remaining < estimate:
                 rotated_plan = _rotate_local_page_pack_fast_lane_for_runtime_budget(plan)
@@ -3858,6 +3928,7 @@ def run_source_worker_batch(
                         rotated_plan,
                         source_http_timeout_seconds=source_http_timeout_seconds,
                         provider_request_seconds=provider_request_seconds,
+                        provider_concurrency=provider_concurrency,
                     )
                     if rotated_plan is not None
                     else None
@@ -3975,6 +4046,7 @@ def run_source_worker_batch(
                     record_lock_retry_attempts=record_lock_retry_attempts,
                     record_lock_retry_initial_delay=record_lock_retry_initial_delay,
                     fetch_deadline=fetch_deadline,
+                    provider_concurrency=provider_concurrency,
                     now=now,
                 )
             finally:
@@ -3994,14 +4066,32 @@ def run_source_worker_batch(
                 run_truncated = (
                     fetch_deadline is not None and time.time() >= fetch_deadline
                 )
-                runtime_calibration.record_observation(
-                    db_path,
-                    selected_provider_ids,
-                    request_count=_plan_request_count(plan, selected_provider_ids),
-                    elapsed_seconds=run_elapsed_seconds,
-                    truncated=run_truncated,
-                    now=now,
+                # Real per-provider spans when the phase timers are on. They
+                # are what makes calibration survive concurrency: with c
+                # providers in flight the run's wall clock is roughly the
+                # slowest one, so the even split credits each provider with
+                # slowest/c -- not an approximation of anything, and wrong in
+                # the dangerous direction, because underpriced plans are the
+                # ones admission lets in and the pass then overruns.
+                measured_provider_seconds = dict(
+                    ((result or {}).get("phase_timing") or {}).get("provider_phases") or {}
                 )
+                if int(provider_concurrency or 1) > 1 and not measured_provider_seconds:
+                    # No measurement and no honest way to split: record nothing
+                    # rather than teach the gate a number that is too small.
+                    # The estimate stays at its PROVIDER_RUNTIME_ESTIMATES
+                    # default, which errs high, which is the safe direction.
+                    pass
+                else:
+                    runtime_calibration.record_observation(
+                        db_path,
+                        selected_provider_ids,
+                        request_count=_plan_request_count(plan, selected_provider_ids),
+                        elapsed_seconds=run_elapsed_seconds,
+                        truncated=run_truncated,
+                        provider_elapsed_seconds=measured_provider_seconds or None,
+                        now=now,
+                    )
                 # Same boundary, same rules: one flush per item, and a failure
                 # here reports itself rather than failing the pass.
                 phase_timing_result = phase_timing.record_item_phases(

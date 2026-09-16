@@ -235,6 +235,10 @@ def build_parser():
     parser.add_argument("--state", action="append", default=[], help="Queue state to include. Repeat or comma-separate.")
     parser.add_argument("--queue-limit", type=int, default=50)
     parser.add_argument("--job-limit", type=int, default=20)
+    # How many of one item's providers may be in flight at once. 1 keeps
+    # the serial loop the worker has always run; the bound lives in
+    # inkdrop_source_worker_jobs so every caller narrows the same way.
+    parser.add_argument("--provider-concurrency", type=int, default=1)
     parser.add_argument("--attempt-cooldown-seconds", type=float, default=0)
     parser.add_argument("--provider-timeout-window-seconds", type=float, default=0)
     parser.add_argument("--provider-timeout-threshold", type=int, default=0)
@@ -931,6 +935,7 @@ def run_source_worker_cli(
             provider_ids=split_csv_values(args.provider_id),
             queue_limit=args.queue_limit,
             job_limit=args.job_limit,
+            provider_concurrency=args.provider_concurrency,
             attempt_cooldown_seconds=args.attempt_cooldown_seconds,
             provider_timeout_window_seconds=args.provider_timeout_window_seconds,
             provider_timeout_threshold=args.provider_timeout_threshold,

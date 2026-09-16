@@ -25,6 +25,12 @@ export INKDROP_SOURCE_WORKER_DIRECT_ALLOWED_HOSTS="${INKDROP_SOURCE_WORKER_DIREC
 export INKDROP_SOURCE_WORKER_STAGING_ROOT="${INKDROP_SOURCE_WORKER_STAGING_ROOT:-${INKDROP_STAGING_DIR:-/staging}/source-worker}"
 export INKDROP_SOURCE_WORKER_QUEUE_LIMIT="${INKDROP_SOURCE_WORKER_QUEUE_LIMIT:-80}"
 export INKDROP_SOURCE_WORKER_JOB_LIMIT="${INKDROP_SOURCE_WORKER_JOB_LIMIT:-3}"
+# One in-flight provider per job this pass may select, so an item costs about
+# its slowest provider rather than the sum of all three. Deliberately equal to
+# JOB_LIMIT: above it the extra workers have nothing to run, and below it the
+# item serialises again for no saving. Manual search has run providers in a
+# pool against these same hosts since #599, at up to 8.
+export INKDROP_SOURCE_WORKER_PROVIDER_CONCURRENCY="${INKDROP_SOURCE_WORKER_PROVIDER_CONCURRENCY:-3}"
 export INKDROP_SOURCE_WORKER_ELIGIBLE_LIMIT="${INKDROP_SOURCE_WORKER_ELIGIBLE_LIMIT:-80}"
 export INKDROP_SOURCE_WORKER_IMPORT_BACKLOG_PRIORITY_MIN="${INKDROP_SOURCE_WORKER_IMPORT_BACKLOG_PRIORITY_MIN:-24}"
 export INKDROP_SOURCE_WORKER_ATTEMPT_COOLDOWN_SECONDS="${INKDROP_SOURCE_WORKER_ATTEMPT_COOLDOWN_SECONDS:-21600}"

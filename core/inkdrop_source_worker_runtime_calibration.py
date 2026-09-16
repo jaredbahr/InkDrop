@@ -117,6 +117,7 @@ def record_observation(
     request_count,
     elapsed_seconds,
     truncated=False,
+    provider_elapsed_seconds=None,
     now=None,
 ):
     """Attribute one executed run's elapsed time across the providers it ran.
@@ -133,6 +134,14 @@ def record_observation(
     an item. Admission still prices off this even split, because changing what
     the gate reads is a behavioural change and this is a measurement change;
     the phase table is the place to look before making that call.
+
+    ``provider_elapsed_seconds`` overrides the split per provider where a real
+    measurement exists. It has to, once providers run concurrently: the run's
+    wall clock is then roughly the SLOWEST provider rather than the sum, so
+    dividing it evenly credits every provider with the slowest one's time
+    divided by the count -- a number that is not an approximation of anything.
+    A provider missing from the mapping still falls back to the even split, so
+    a partial measurement is usable rather than all-or-nothing.
     """
 
     if not enabled():
@@ -156,13 +165,29 @@ def record_observation(
         requests = 1
     now = time.time() if now is None else float(now)
     share = elapsed / float(len(providers))
+    measured = {}
+    if isinstance(provider_elapsed_seconds, dict):
+        for key, value in provider_elapsed_seconds.items():
+            provider_id = str(key or "").strip().lower()
+            if not provider_id:
+                continue
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            if seconds >= 0:
+                measured[provider_id] = seconds
+
+    def provider_seconds(provider_id):
+        return measured.get(provider_id, share)
+
     rows = [
         (
             uuid.uuid4().hex,
             provider_id,
             requests,
-            round(share, 4),
-            round(share / float(requests), 6),
+            round(provider_seconds(provider_id), 4),
+            round(provider_seconds(provider_id) / float(requests), 6),
             1 if truncated else 0,
             now,
         )

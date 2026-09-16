@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, timedelta
 
 from core import inkdrop_prowlarr_indexer_health as indexer_health
@@ -2555,6 +2557,47 @@ def run_source_job(
     return result
 
 
+MAX_PROVIDER_CONCURRENCY = 8
+
+
+def _provider_concurrency_bound(value):
+    """1..MAX_PROVIDER_CONCURRENCY, with anything unparseable meaning serial.
+
+    1 is the default everywhere and keeps the serial loop. A bad value must
+    not silently widen the fan-out against someone's indexer, so it narrows.
+    """
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(value, MAX_PROVIDER_CONCURRENCY))
+
+
+def _timed_out_source_job_result(job, *, provider_id, elapsed_seconds):
+    """What a provider that did not come back before the deadline leaves.
+
+    Deliberately not `searched_no_candidates`: that is a content verdict, and
+    a provider that never answered has said nothing about content. The same
+    distinction the budget-skip honesty guard exists for.
+    """
+    return {
+        "provider_id": provider_id,
+        "queue_id": (job or {}).get("queue_id"),
+        "result_status": "provider_timeout",
+        "status": "provider_timeout",
+        "failure_reason": (
+            "the provider did not answer before the worker fetch deadline"
+        ),
+        "elapsed_seconds": round(float(elapsed_seconds or 0.0), 4),
+        "attempts": [],
+        "runtime_results": [],
+        "candidate_count": 0,
+        "safe_candidate_count": 0,
+        "review_candidate_count": 0,
+        "blocked_candidate_count": 0,
+    }
+
+
 def run_source_jobs(
     jobs,
     *,
@@ -2567,39 +2610,113 @@ def run_source_jobs(
     staging_root=None,
     fetch_deadline=None,
     phase_accumulator=None,
+    max_concurrency=1,
     now=None,
 ):
+    """Run one item's provider jobs, serially by default.
+
+    The whole automatic search is one process, one item at a time, one provider
+    at a time, one request at a time: nothing in the source worker has ever
+    overlapped. Manual search has run its providers in a pool since #599 and is
+    5-20x faster per item against the same hosts, so the precedent for the fan-
+    out and its shutdown is in-repo rather than invented here.
+
+    `max_concurrency=1` keeps the serial loop byte-for-byte -- it is the
+    default, and the smoke asserts the serial arm before the concurrent one,
+    because a fan-out that quietly changes results when it is switched off is
+    worse than no fan-out.
+
+    What crosses the thread boundary is only the provider call. The phase
+    accumulator is written on the calling thread after each future is
+    collected, results come back in job order rather than completion order, and
+    nothing here touches the state database: record_source_job_results() runs
+    after this returns, so the fetch phase has no sqlite writes to serialise.
+    """
     operator_payloads = operator_payloads if isinstance(operator_payloads, dict) else {}
     headers_by_provider = candidate_headers_by_provider if isinstance(candidate_headers_by_provider, dict) else {}
-    results = []
-    for job in jobs or []:
-        provider_id = (job or {}).get("provider_id")
-        # One job is one provider, so this loop is the only place a
-        # per-provider timer can exist -- the calibration module splits a
-        # run's elapsed time evenly across providers precisely because it had
-        # no such timer to read.
-        job_started = time.monotonic() if phase_accumulator is not None else None
-        try:
-            results.append(
-                run_source_job(
-                    job,
-                    http_get=http_get,
-                    tool_runner=tool_runner,
-                    operator_payload=operator_payloads.get(provider_id),
-                    candidate_headers=headers_by_provider.get(provider_id),
-                    source_memory_db_path=source_memory_db_path,
-                    source_memory_cooldown_seconds=source_memory_cooldown_seconds,
-                    staging_root=staging_root,
-                    fetch_deadline=fetch_deadline,
-                    now=now,
+    jobs = list(jobs or [])
+
+    def invoke(job):
+        return run_source_job(
+            job,
+            http_get=http_get,
+            tool_runner=tool_runner,
+            operator_payload=operator_payloads.get((job or {}).get("provider_id")),
+            candidate_headers=headers_by_provider.get((job or {}).get("provider_id")),
+            source_memory_db_path=source_memory_db_path,
+            source_memory_cooldown_seconds=source_memory_cooldown_seconds,
+            staging_root=staging_root,
+            fetch_deadline=fetch_deadline,
+            now=now,
+        )
+
+    concurrency = _provider_concurrency_bound(max_concurrency)
+    if concurrency <= 1 or len(jobs) <= 1:
+        results = []
+        for job in jobs:
+            provider_id = (job or {}).get("provider_id")
+            # One job is one provider, so this loop is the only place a
+            # per-provider timer can exist -- the calibration module splits a
+            # run's elapsed time evenly across providers precisely because it
+            # had no such timer to read.
+            job_started = time.monotonic() if phase_accumulator is not None else None
+            try:
+                results.append(invoke(job))
+            finally:
+                if job_started is not None:
+                    phase_accumulator.add_provider(
+                        provider_id, time.monotonic() - job_started
+                    )
+        return results
+
+    def timed(job):
+        """Time the provider inside the worker, read it on the owning thread.
+
+        The elapsed span has to be measured around the call itself. Measured
+        from submit() it would include queueing behind a busy pool and report
+        a fast provider as slow, which is exactly the number the calibration
+        module would then price the next pass with.
+        """
+        began = time.monotonic()
+        return invoke(job), time.monotonic() - began
+
+    pool = ThreadPoolExecutor(
+        max_workers=min(concurrency, len(jobs)),
+        thread_name_prefix="inkdrop-source-provider",
+    )
+    try:
+        submitted_at = time.monotonic()
+        futures = [(job, pool.submit(timed, job)) for job in jobs]
+        results = []
+        for job, future in futures:
+            provider_id = (job or {}).get("provider_id")
+            remaining = None
+            if fetch_deadline is not None:
+                # fetch_deadline is a wall-clock stamp (time.time() + budget),
+                # set by the batch before the item starts -- not a monotonic
+                # one. Subtracting time.monotonic() from it yields an
+                # arbitrary number, usually enormous, which would make the
+                # timeout never fire.
+                remaining = max(0.0, float(fetch_deadline) - time.time())
+            try:
+                result, elapsed = future.result(timeout=remaining)
+            except FuturesTimeoutError:
+                # How long the pass actually waited, which is what the budget
+                # spent. The provider is still running and is abandoned below.
+                elapsed = time.monotonic() - submitted_at
+                result = _timed_out_source_job_result(
+                    job, provider_id=provider_id, elapsed_seconds=elapsed
                 )
-            )
-        finally:
-            if job_started is not None:
-                phase_accumulator.add_provider(
-                    provider_id, time.monotonic() - job_started
-                )
-    return results
+            results.append(result)
+            if phase_accumulator is not None:
+                phase_accumulator.add_provider(provider_id, elapsed)
+        return results
+    finally:
+        # Abandon anything still running rather than waiting it out: the
+        # wrapper's COMMAND_TIMEOUT kills the process at the end of the pass,
+        # so a wedged provider cannot leak into the next one. Manual search
+        # stops its pool the same way.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def source_job_result_summary(results):

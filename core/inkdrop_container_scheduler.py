@@ -537,7 +537,14 @@ def all_jobs() -> list[ScheduledJob]:
             # of twelve. source-worker-suwayomi below is the genuinely
             # manga-scoped job and keeps its provider name.
             "source-worker",
-            int_env("INKDROP_SCHEDULER_SOURCE_WORKER_INTERVAL_SECONDS", 1800),
+            # 300s, not 1800s. The interval is measured from COMPLETION
+            # (completion_schedule), so the real period is runtime + interval:
+            # at 1800s with a ~600s pass the lane fired about 27 times a day
+            # and funded a median of 9 rows each, which is ~243 rows/day
+            # against a ~2,000-row schedulable backlog -- 8 days a sweep
+            # before selection is even considered. This is the throughput half
+            # of that; the convergence half is the steady lane's sweep key.
+            int_env("INKDROP_SCHEDULER_SOURCE_WORKER_INTERVAL_SECONDS", 300),
             ("/app/inkdrop-source-worker-cron.sh",),
             initial_delay_seconds=360,
             timeout_seconds=900,

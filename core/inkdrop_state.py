@@ -69001,13 +69001,22 @@ def _reliability_percentile(values, fraction):
     return ordered[index]
 
 
-def reliability_health_signals(items, now):
-    """The four numbers that turn a wall of counts into a judgment.
+def reliability_health_signals(items, now, coverage=None):
+    """The numbers that turn a wall of counts into a judgment.
 
     Computed from the rows already in hand -- no extra queries. Every age here
     comes from wanted_items.created_at, download_tasks.completed_at, or the
     last real provider attempt. None of them comes from queue_items.updated_at,
     which is what made the old page report a 47-day stall as fresh.
+
+    `coverage` is the one exception and stays an argument for that reason: the
+    two sweep signals need the schedulable population and the attempt ledger,
+    which are queries, so the caller that already has a db_path runs
+    inkdrop_search_coverage.search_coverage_report() and hands the result in.
+    Omitted, the strip is exactly the four it always was -- the four answer
+    "how stale is the tail", which is not the same question as "how long does
+    a full sweep take", and the page kept only the first for want of the
+    second.
     """
     items = [item for item in (items or []) if item]
     now = float(now or time.time())
@@ -69040,6 +69049,41 @@ def reliability_health_signals(items, now):
     worst_wait = max(wait_gaps) if wait_gaps else None
     median_wait = _reliability_percentile(wait_gaps, 0.5)
 
+    coverage = coverage if isinstance(coverage, dict) and coverage.get("ok") else None
+    sweep_signals = []
+    if coverage is not None:
+        target_days = float(coverage.get("target_days") or RELIABILITY_SIGNAL_WAIT_ALERT_DAYS)
+        days_to_cover = coverage.get("estimated_days_to_cover")
+        oldest_unserved = coverage.get("oldest_unserved_age_days")
+        unserved = int(coverage.get("unserved_in_window") or 0)
+        schedulable = int(coverage.get("schedulable_rows") or 0)
+        window_days = float(coverage.get("window_days") or target_days)
+        sweep_signals = [
+            signal(
+                "days_to_cover", "Days to search the whole backlog",
+                f"{days_to_cover:.1f}d" if days_to_cover is not None else "—",
+                # A coverage statement, not a result: the denominator is rows
+                # genuinely served in the window, so a reader can see what the
+                # estimate was divided by rather than take the number on faith.
+                (
+                    f"{schedulable:,} rows at {coverage.get('funded_per_day_window') or 0:.0f}/day"
+                    if days_to_cover is not None
+                    else "nothing was searched in the window"
+                ),
+                bool(days_to_cover is None or days_to_cover > target_days),
+            ),
+            signal(
+                "oldest_unserved", "Longest a row has gone unsearched",
+                f"{oldest_unserved:.0f}d" if oldest_unserved is not None else "—",
+                (
+                    f"{unserved:,} of {schedulable:,} had no real search in {window_days:.0f}d"
+                    if schedulable
+                    else "no schedulable rows"
+                ),
+                bool(oldest_unserved is not None and oldest_unserved > target_days),
+            ),
+        ]
+
     return [
         # A count, never a share: the never-searched percentage is unreconciled
         # across three independent measurements and does not ship until it is.
@@ -69065,6 +69109,7 @@ def reliability_health_signals(items, now):
             f"half of them past {median_wait:.1f}d" if median_wait is not None else "nothing is waiting on a slot",
             bool(worst_wait is not None and worst_wait > RELIABILITY_SIGNAL_WAIT_ALERT_DAYS),
         ),
+        *sweep_signals,
     ]
 
 
@@ -69163,12 +69208,40 @@ def reliability_health_signals_view(db_path, statuses=None, now=None):
     now = time.time() if now is None else float(now)
     items = reliability_view_rows(path, statuses=statuses, now=now)
     attach_last_provider_attempt(path, items)
+    coverage = search_coverage_signals_source(path, now=now)
     return {
         "ok": True,
         "generated_at": now,
         "total": len(items),
-        "signals": reliability_health_signals(items, now),
+        "coverage": coverage,
+        "signals": reliability_health_signals(items, now, coverage=coverage),
     }
+
+
+def search_coverage_signals_source(db_path, *, now=None):
+    """The sweep-coverage figures the strip's last two signals are read from.
+
+    Imported lazily, the same way retry_ceiling_real_attempts() is: the
+    coverage module composes this module's real-attempt predicate and the
+    scheduler's schedulable clauses, so a module-level import here would close
+    the loop. Failures are swallowed to None rather than raised -- the strip is
+    diagnostic, and a page that 500s because a new signal could not be computed
+    is worse than a page missing the signal, which is visible as an absence.
+    """
+    try:
+        from core import inkdrop_search_coverage
+    except ImportError:  # pragma: no cover - standalone execution
+        try:
+            import inkdrop_search_coverage
+        except ImportError:
+            return None
+    try:
+        with connect_read(Path(db_path)) as con:
+            if not table_exists(con, "queue_items"):
+                return None
+            return inkdrop_search_coverage.search_coverage_report(con, now=now)
+    except Exception:
+        return None
 
 
 def reliability_state_view(db_path, limit=80, offset=0, statuses=None, bucket_filter=None, focus=None):

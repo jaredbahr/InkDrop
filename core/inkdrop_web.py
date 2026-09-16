@@ -63629,6 +63629,65 @@ def grab_watched(payload):
     raise ValueError("watch not found")
 
 
+AUTOMATIC_SEARCH_SCHEDULER_JOB = "source-worker"
+
+
+def automatic_search_cadence(scheduler_jobs=None):
+    """How often the automatic search actually runs, read off the scheduler.
+
+    The status payload reported `automatic_search_interval_seconds: 45`, which
+    is SERIES_QUEUE_RUNNER_AUTOPILOT_MIN_SECONDS -- a throttle on a web-thread
+    helper, not a cadence. The thing that actually searches is the
+    `source-worker` scheduled job, and it ran every 1800s. A reader of the API
+    was told the search runs 40x more often than it does, and the number was
+    not off by a little: it described a different mechanism.
+
+    Three figures rather than one, because the obvious one is still a trap:
+    the scheduler is fixed-delay measured from COMPLETION, so `interval` is
+    the gap BETWEEN passes and the real start-to-start period is
+    `interval + elapsed`. A 900s interval measured 1611s start-to-start
+    (2026-07-27). `period` is the number anyone reasoning about throughput
+    wants; `interval` is the knob they would set.
+
+    Returns None for a figure the scheduler has not reported yet rather than a
+    default -- an absent cadence is visible, a plausible wrong one is not.
+    """
+    row = None
+    for candidate in scheduler_jobs or []:
+        if isinstance(candidate, dict) and str(candidate.get("name") or "") == AUTOMATIC_SEARCH_SCHEDULER_JOB:
+            row = candidate
+            break
+
+    def number(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    interval = number((row or {}).get("interval_seconds"))
+    elapsed = number((row or {}).get("last_elapsed_seconds"))
+    return {
+        "automatic_search_engine": AUTOMATIC_SEARCH_SCHEDULER_JOB.replace("-", "_"),
+        "automatic_search_interval_seconds": int(interval) if interval is not None else None,
+        "automatic_search_last_pass_seconds": int(elapsed) if elapsed is not None else None,
+        # Named for what it is. Calling the last pass's elapsed time
+        # "max_run_seconds" would repeat the mistake above with a different
+        # word: max_run_seconds is a budget the operator sets, this is a
+        # measurement of one pass.
+        "automatic_search_period_seconds": (
+            int(interval + elapsed) if interval is not None and elapsed is not None else None
+        ),
+    }
+
+
+def automatic_search_scheduler_jobs(now=None):
+    """The scheduler's job rows, straight from the status file it writes."""
+    scheduler_path = Path(os.environ.get("INKDROP_WORKER_STATUS_FILE") or STATE_DIR / "worker-scheduler-status.json")
+    scheduler = read_json_file(scheduler_path, {}) or {}
+    return [row for row in (scheduler.get("jobs") or []) if isinstance(row, dict)]
+
+
 def automatic_search_runtime_state(*, monitored_series=0, in_progress=False, active_work=0, setup=None, now=None):
     """Expose Automatic Search configuration and runtime facts independently."""
     now = time.time() if now is None else float(now)
@@ -63841,7 +63900,12 @@ def script_status():
         "default_auto_future": inkdrop_bool_setting("automation.default_auto_future", True),
         "queue_mode": inkdrop_bool_setting("automation.queue_mode", True),
         "automatic_search_enabled": SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED,
-        "automatic_search_interval_seconds": SERIES_QUEUE_RUNNER_AUTOPILOT_MIN_SECONDS,
+        # The autopilot flag, under a name that says which mechanism it is.
+        # `automatic_search_enabled` stays for the front-end, which reads it.
+        "autopilot_enabled": SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED,
+        # Read from the scheduler rather than from the web-thread throttle it
+        # used to report -- see automatic_search_cadence().
+        **automatic_search_cadence(automatic_search_scheduler_jobs()),
         "source_order": configured_series_autopilot_source_order(),
     }
     manual_comics_inbox = runtime_paths["manual_comics_inbox"]
@@ -66214,7 +66278,12 @@ def light_script_status():
         "default_auto_future": inkdrop_bool_setting("automation.default_auto_future", True),
         "queue_mode": inkdrop_bool_setting("automation.queue_mode", True),
         "automatic_search_enabled": SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED,
-        "automatic_search_interval_seconds": SERIES_QUEUE_RUNNER_AUTOPILOT_MIN_SECONDS,
+        # The autopilot flag, under a name that says which mechanism it is.
+        # `automatic_search_enabled` stays for the front-end, which reads it.
+        "autopilot_enabled": SERIES_QUEUE_RUNNER_AUTOPILOT_ENABLED,
+        # Read from the scheduler rather than from the web-thread throttle it
+        # used to report -- see automatic_search_cadence().
+        **automatic_search_cadence(automatic_search_scheduler_jobs()),
         "source_order": configured_series_autopilot_source_order(),
     }
     active_downloads = int(reconcile_status.get("active_downloads") or 0) if isinstance(reconcile_status, dict) else 0

@@ -451,6 +451,7 @@ def build_source_worker_cli_argv_from_env(environ=None, *, db_path=None, full_ou
     for env_key, flag in (
         ("INKDROP_SOURCE_WORKER_QUEUE_LIMIT", "--queue-limit"),
         ("INKDROP_SOURCE_WORKER_JOB_LIMIT", "--job-limit"),
+        ("INKDROP_SOURCE_WORKER_PROVIDER_CONCURRENCY", "--provider-concurrency"),
         ("INKDROP_SOURCE_WORKER_ATTEMPT_COOLDOWN_SECONDS", "--attempt-cooldown-seconds"),
         ("INKDROP_SOURCE_WORKER_PROVIDER_TIMEOUT_WINDOW_SECONDS", "--provider-timeout-window-seconds"),
         ("INKDROP_SOURCE_WORKER_PROVIDER_TIMEOUT_THRESHOLD", "--provider-timeout-threshold"),

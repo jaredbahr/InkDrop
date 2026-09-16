@@ -22,10 +22,37 @@ Three lanes share every pass:
   fast    new work: a newly added series, or a newly released issue, that has
           not been tried yet. Pre-empts everything, self-empties (membership
           requires a low real-attempt count), and is idle on most passes.
-  steady  the existing per-series round-robin, guaranteed at least half the
-          pass so neither of the other lanes can take it over.
+  steady  least recently served, rotating series within a day band, guaranteed
+          at least half the pass so neither of the other lanes can take it
+          over.
   aged    rows ranked by bounded ageing score, capped so old-and-failing work
           can never consume the whole pass.
+
+The steady lane was itself the per-series round-robin described above until it
+was found to have no convergence at all. Ordering on `series_queue_round` made
+a deep series surface exactly one row per pass however long its others had
+waited, and the tiebreak underneath it read `queue_items.updated_at`, which
+bookkeeping refreshes -- so nothing in the lane was a clock the pass's own work
+moved, and every pass re-offered its own head. It now leads on whole days since
+a real search, descending, with the per-series round as the tiebreak INSIDE a
+band. That keeps the interleaving this module exists for (a single deep backlog
+still cannot take the lane) while making any prefix convergent: a served row
+drops to band 0, so the unserved set only shrinks between passes.
+
+Two things the sweep key deliberately does not do, each learned from a guard
+that went red:
+
+  * It does not rank never-searched rows as their own leading cohort. Doing so
+    puts brand-new rows at the head of the steady lane, which makes the fast
+    lane's quota redundant -- and the new-content guard proves its own
+    relevance by removing that quota and requiring starvation to reappear.
+    New content is the fast lane's job.
+  * It does not rank rows in states nothing searches. A blocked or superseded
+    row's stall only ever grows, and it can never be served, so it can never
+    drop a band and make way: under a bare age key it does not merely rank
+    high, it holds the head of the lane forever. That is the failure the next
+    paragraph describes, in its sharpest form, so the lane applies the same
+    state gate the other two already apply to their scores.
 
 Every constant below is read off the live distribution rather than picked round;
 the justification is in the comment beside it.
