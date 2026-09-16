@@ -2077,8 +2077,25 @@ def acquire_auto_grab_state_lock(blocking=True):
         handle.seek(0)
         if os.name == "nt":
             import msvcrt
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
-            return handle
+            if not blocking:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return handle
+            # LK_LOCK does its own retrying -- ten attempts a second apart --
+            # and then raises, so the configured bound never reached this arm:
+            # a 2 s bound waited 9 s and a 600 s bound would still give up at
+            # 10. Poll LK_NBLCK to the deadline instead, which is what the
+            # POSIX arm below does, so both platforms give up when asked to.
+            deadline = time.monotonic() + auto_grab_state_lock_wait_seconds()
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    return handle
+                except OSError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        handle.close()
+                        return None
+                    time.sleep(min(AUTO_GRAB_STATE_LOCK_POLL_SECONDS, remaining))
         import fcntl
         if not blocking:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
