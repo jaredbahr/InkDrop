@@ -49,6 +49,23 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.17",
+      slug: "v0-1-17",
+      released_at: "2026-09-16",
+      title: "The review queue explains itself",
+      summary: "Files that had already downloaded correctly were being held for a decision, often the same file every hour, because the check that refused them could not say what it wanted and nothing retired the row once the question stopped making sense.",
+      highlights: [
+        "A review row says which check refused the file",
+        "Rows about files that cannot be anything you still want retire themselves",
+        "A review row is retired on the file, not on a memory of it",
+        "A one-issue work grabbed from Soulseek is judged by the same proof once it lands",
+        "A file named only for its work is imported as that work's single issue",
+        "A download sitting at 0% is no longer treated as slow",
+        "A fault inside InkDrop is not reported as the download client being down",
+        "A second copy of a book already on the shelf binds to its own series and unit",
+      ],
+    }),
+    publicRelease({
       version: "v0.1.16",
       slug: "v0-1-16",
       released_at: "2026-09-06",
@@ -195,23 +212,6 @@
         "Fixed a long-running import verification bug that could leave successfully imported files stuck for weeks."
       ]
     }),
-    publicRelease({
-      version: "v0.1.07",
-      slug: "v0-1-07",
-      released_at: "2026-08-05",
-      title: "Acquisition, search, and importing get more reliable",
-      summary: "This build focused mainly on making acquisition, search, and importing more reliable. It also includes a security pass, several performance improvements, and some lighter UI work.",
-      highlights: [
-        "Manual Search no longer fails across every provider at once — a locking issue meant one slow provider could block the other three from starting; providers now run independently again.",
-        "\"Use this candidate\" in Manual Review now works for downloaded files instead of silently doing nothing, while still checking for corruption and duplicates.",
-        "Fixed a cleanup crash that could break search, imports, and queue processing at the same time.",
-        "Fixed an issue that could import a release into the wrong series when two MangaDex titles shared an alias or creator credit.",
-        "Fixed Roman numeral parsing, unnecessary search cooldowns, and several causes of stuck or silently failed downloads, including a new 48-hour Soulseek timeout.",
-        "Search matching is more accurate, and several import problems (ordering, stuck-in-queue, duplicate imports, multi-series packs) are fixed.",
-        "Security improvements: provider credentials are no longer written to persistent storage, and a script-injection issue in search-result data has been fixed.",
-        "Wanted, Queue, History, Blocklist, and Manual Review now use a new page-rendering system — pagination is noticeably faster on larger libraries."
-      ]
-    })
   ]);
 
   var PUBLIC_RELEASES = Object.freeze(DETAILED_RELEASES.slice(0, DETAILED_RELEASE_LIMIT));
