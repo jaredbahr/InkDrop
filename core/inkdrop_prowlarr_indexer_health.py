@@ -323,6 +323,62 @@ def declared_category_ids(indexer_row):
     return out
 
 
+def _declared_host(value):
+    text = _text(value).lower()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(text).hostname or ""
+    except ValueError:
+        return ""
+    return host.strip().strip("[]").lower()
+
+
+def declared_hosts(indexer_row):
+    """The hosts an indexer definition itself points at.
+
+    A Prowlarr indexer row carries ``indexerUrls`` (the site URLs the
+    definition currently uses) and ``legacyUrls`` (ones it used to). These are
+    the operator's own configuration as Prowlarr reports it, so a pack-detail
+    fetch that follows a result's ``infoUrl`` to one of them is going where the
+    operator already sends every search -- not to an arbitrary host a release
+    named. Order is kept, duplicates dropped.
+    """
+    row = indexer_row if isinstance(indexer_row, dict) else {}
+    out = []
+    seen = set()
+    for key in ("indexerUrls", "indexer_urls", "legacyUrls", "legacy_urls"):
+        values = row.get(key)
+        if isinstance(values, str):
+            values = [values]
+        for value in values or []:
+            host = _declared_host(value)
+            if host and host not in seen:
+                seen.add(host)
+                out.append(host)
+    return out
+
+
+def hosts_by_indexer_id(indexer_list_payload):
+    """Map indexer id -> declared hosts, from a /api/v1/indexer payload."""
+    out = {}
+    rows = indexer_list_payload if isinstance(indexer_list_payload, list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        indexer_id = _text(row.get("id"))
+        if not indexer_id:
+            continue
+        hosts = declared_hosts(row)
+        if hosts:
+            out[indexer_id] = hosts
+    return out
+
+
 def capabilities_by_indexer_id(indexer_list_payload):
     """Map indexer id -> declared category ids, from a /api/v1/indexer payload."""
     out = {}

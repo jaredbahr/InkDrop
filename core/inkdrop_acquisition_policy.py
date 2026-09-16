@@ -39,21 +39,20 @@ on the shipping bytes (run 2026-09-04, ``Berserk v01-40`` reading
 ``title_match`` as the control), and the proof declines any candidate whose
 confidence is a mismatch or a related series.
 
-This constant is narrower than that ruling. It governs one branch only: a
-*collected edition* that spans a range, reached in
-:func:`inkdrop_candidate_matching.candidate_compatibility` when the edition
-itself is acceptable. There the edition question is settled and containment
-is not, so the stricter answer is kept and the release is REFUSED, not
-reviewed -- ``tests/inkdrop-acquisition-policy-authority-smoke.py`` arm B2
-pins exactly that with ``Geiger Omnibus 001-010`` against issue 5. For
-seventeen days this paragraph said ``review`` while the constant and that
-test said ``refuse``; all three were written in one commit (#751). The code
-and the test were the intent; the prose was the error, and it is the prose
-that is corrected here. Measured on the 2026-09-04T22:27Z snapshot, 44
-outstanding units carry ``collected_edition_disallowed`` at their latest
-verdict and 0 of them carry range evidence in that verdict. Moving this to
-``review`` or ``admit`` is a one-line, reviewable decision for the owner,
-not a side effect of tidying the gates.
+Decided 2026-09-16 by the owner: the hold is lifted. ``pack_containment`` is
+ADMIT, and so is ``collected_edition`` -- content first -- but only where the
+release has PROVED it holds the wanted unit: a file manifest naming it, a
+declared range holding it, or (for an issue or chapter target) the release
+naming that exact number. A collected edition that cannot prove its contents
+-- a bare ``Omnibus`` with no range, no manifest and no unit number -- takes
+``unidentified_unit`` (REVIEW) instead, so an unproven release is shown to an
+operator and never admitted on a claim. The branch that composes these lives
+in :func:`inkdrop_candidate_matching.candidate_compatibility`, and
+``tests/inkdrop-acquisition-policy-authority-smoke.py`` arm B2 pins both
+halves with ``Geiger Omnibus 001-010`` against issue 5 (proven: admitted) and
+``Geiger Omnibus`` against issue 5 (unproven: review). The operator setting
+still wins in the strict direction: a stored ``review`` or ``refuse`` applies
+to the proven case too.
 """
 
 from __future__ import annotations
@@ -99,17 +98,19 @@ SETTING_COLLECTED_EDITION_SHORT = "collected_edition_policy"
 SETTINGS_SNAPSHOT_KEY = "acquisition_settings_snapshot"
 
 # A collected edition that contains the wanted unit is content, and content
-# comes first. It is `review` rather than `admit` only because an operator has
-# never been shown these -- 127 items were refused in silence -- and seeing
-# them is the prerequisite for deciding whether they should auto-grab.
-COLLECTED_EDITION_DEFAULT = REVIEW
+# comes first (owner ruling 2026-09-16, tracker #209). The matcher applies
+# this only once containment is proven -- manifest, range or exact unit
+# number -- and composes an unproven edition with UNIDENTIFIED_UNIT_DEFAULT
+# below, so "admit" never grabs a release on the strength of its title alone.
+COLLECTED_EDITION_DEFAULT = ADMIT
 
-# Tracker #209, on hold, so this stays at the strict end. It is separate from
-# the edition question on purpose: whether an omnibus is an acceptable EDITION
-# is settled (it is), while whether a range-spanning release actually CONTAINS
-# the wanted unit is not -- the range proof that would answer it is known to
-# accept the wrong series. Flipping this is the #209 decision.
-PACK_CONTAINMENT_DEFAULT = REFUSE
+# Tracker #209, decided 2026-09-16: a range that provably holds the wanted
+# unit justifies the whole pack. Kept separate from the edition question on
+# purpose: whether an omnibus is an acceptable EDITION and whether a
+# range-spanning release CONTAINS the wanted unit are two answers, and the
+# proof for the second (pack_title_range_membership) declines any candidate
+# whose series confidence is a mismatch or a related series.
+PACK_CONTAINMENT_DEFAULT = ADMIT
 
 # A release that names no unit at all is not an edition question -- there is
 # no evidence of what it contains. It stays a review rather than a refusal so

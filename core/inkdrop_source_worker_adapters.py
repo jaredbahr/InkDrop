@@ -4228,6 +4228,8 @@ def _indexer_error_should_try_ascii_fallback(query, requests, request_offset):
 # the provider, because every child provider points at the same instance.
 _INDEXER_CAPABILITIES_CACHE = {}
 INDEXER_CAPABILITIES_TTL_SECONDS = 900
+# Same probe, second reading: the hosts each indexer definition declares.
+_INDEXER_DECLARED_HOSTS_CACHE = {}
 
 
 def _prowlarr_indexer_capabilities(row, http_get):
@@ -4255,12 +4257,43 @@ def _prowlarr_indexer_capabilities(row, http_get):
         # failed probe degrades to today's behaviour rather than to a guess.
         return {}
     capabilities = indexer_health.capabilities_by_indexer_id(response.get("payload"))
+    declared_hosts = indexer_health.hosts_by_indexer_id(response.get("payload"))
+    if declared_hosts:
+        _INDEXER_DECLARED_HOSTS_CACHE[list_url] = (time.time(), declared_hosts)
     if capabilities:
         # Only positive results are cached. Caching an empty map would pin the
         # no-op behaviour in place for the whole TTL after one bad answer, and
         # would let one caller's empty result leak into another's.
         _INDEXER_CAPABILITIES_CACHE[list_url] = (time.time(), capabilities)
     return capabilities
+
+
+def _prowlarr_indexer_declared_hosts(row, http_get):
+    """Declared hosts per indexer id, from the cached indexer list. Empty when unknown."""
+    list_url = indexer_health.indexer_list_request_path(_base_url(row))
+    if not list_url:
+        return {}
+    cached = _INDEXER_DECLARED_HOSTS_CACHE.get(list_url)
+    if cached and (time.time() - cached[0]) <= INDEXER_CAPABILITIES_TTL_SECONDS:
+        return cached[1]
+    _prowlarr_indexer_capabilities(row, http_get)
+    cached = _INDEXER_DECLARED_HOSTS_CACHE.get(list_url)
+    return cached[1] if cached else {}
+
+
+def _pack_detail_declared_hosts(row, result_row, http_get):
+    """Hosts the result's own indexer declares, registered for pack-detail fetches."""
+    result_row = result_row if isinstance(result_row, dict) else {}
+    indexer_id = providers.first_text(result_row.get("indexerId"), result_row.get("indexer_id"))
+    if not indexer_id:
+        return []
+    declared = _prowlarr_indexer_declared_hosts(row, http_get).get(str(indexer_id).strip()) or []
+    if not declared:
+        return []
+    from core import inkdrop_source_worker_http as source_http
+
+    source_http.register_indexer_declared_hosts(declared, indexer_id=indexer_id)
+    return list(declared)
 
 
 def _apply_resolved_categories(row, requests, http_get, fetch_result):
@@ -5308,7 +5341,10 @@ def _enrich_indexer_result_with_pack_detail(row, result_row, http_get, fetch_res
         INDEXER_PACK_DETAIL_SIDECAR_MAX_BYTES,
     )
     sidecar_max_bytes = max(1024, min(sidecar_max_bytes, 16 * 1024 * 1024))
-    allowed_hosts = _indexer_pack_detail_allowed_hosts(row)
+    allowed_hosts = _normalized_request_hosts([
+        *_indexer_pack_detail_allowed_hosts(row),
+        *_pack_detail_declared_hosts(row, result_row, http_get),
+    ])
     last_error = ""
     for source, detail_url in _indexer_pack_detail_urls(result_row):
         if int(fetch_state.get("count") or 0) >= max_fetches:

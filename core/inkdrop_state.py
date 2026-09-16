@@ -27131,7 +27131,7 @@ MEDIA_MANAGEMENT_SETTING_DEFAULTS = {
     "manga_companion_folder_convergence": True,
     "cover_injection_enabled": False,
     "unit_preference": "both",
-    "collected_edition_policy": "review",
+    "collected_edition_policy": "admit",
 }
 
 
@@ -27149,7 +27149,7 @@ MEDIA_MANAGEMENT_SETTING_HELP = {
     "unmonitor_deleted_issues": "If an issue's file disappears from the library, stop monitoring that issue instead of hunting for a replacement. Turn this on if deleting a file is how you say \"I don't want this one.\"",
     "folder_completion_policy": "Choose whether managed-folder proof is sufficient or frontend visibility is also required.",
     "unit_preference": "Which unit you want a series in. Issues, volumes, chapters, or both. This is never a reason to refuse a download -- InkDrop still takes whatever fills a gap, and applies your preference later by replacing what it already has. Changing it does not revisit anything already in your library.",
-    "collected_edition_policy": "What to do with an omnibus, trade paperback or other collected edition that holds an issue you want. \"Review\" shows it to you, \"Admit\" lets it grab automatically, \"Refuse\" hides it. Collected editions were silently refused before this setting existed.",
+    "collected_edition_policy": "What to do with an omnibus, trade paperback or other collected edition that holds an issue you want. \"Admit\" grabs it automatically once the release proves it holds the issue -- a file list naming it, a declared range holding it, or the issue number in its own name -- and shows one that cannot prove it for review. \"Review\" shows every collected edition to you first. \"Refuse\" hides them. Collected editions were silently refused before this setting existed.",
     "library_visibility_required": "Require a configured library frontend to see the file before final verification.",
     "library_visibility_checks_enabled": "Collect optional frontend visibility evidence after folder completion.",
     "frontend_sync_after_import": "Ask enabled library frontends to rescan after a managed import.",

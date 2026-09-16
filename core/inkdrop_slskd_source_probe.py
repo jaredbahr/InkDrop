@@ -498,6 +498,27 @@ SERIES_RUN_EVALUATION_SECONDS = max(8, min(env_int("INKDROP_SLSKD_SERIES_RUN_EVA
 # apply_series_pack_complete_opportunities.
 SERIES_PACK_COMPLETE_MIN_COVERAGE = max(2, min(env_int("INKDROP_SLSKD_SERIES_PACK_COMPLETE_MIN_COVERAGE", 3), 200))
 SERIES_PACK_COMPLETE_MIN_RATIO_PCT = max(10, min(env_int("INKDROP_SLSKD_SERIES_PACK_COMPLETE_MIN_RATIO_PCT", 75), 100))
+# A range archive ("Spawn 001-010.zip") in a directory that exactly matches
+# the wanted series is one download that settles every wanted issue inside
+# its declared range. The series-run gate used to refuse it on extension
+# alone and, for a .cbz, as "not an individual handoff", so a peer holding a
+# whole run as thirty range archives was never selectable (live-measured
+# 2026-07-27: 300 Spawn issues, one peer, nothing grabbed). One handoff is
+# made for the lowest covered wanted issue; the other covered rows get a
+# covered attempt and the pending-pack record carries them, so the pack
+# import splits the archive and settles each row on its own verified file.
+SLSKD_RANGE_ARCHIVE_HANDOFF_ENV = "INKDROP_SLSKD_RANGE_ARCHIVE_HANDOFF"
+SLSKD_RANGE_ARCHIVE_COVERAGE_SOURCE = "slskd_range_archive"
+SLSKD_RANGE_ARCHIVE_PENDING_PACK_SOURCE = "slskd_range_archive_handoff"
+SLSKD_RANGE_ARCHIVE_COVERED_KIND = "slskd_range_archive_covered"
+SLSKD_RANGE_ARCHIVE_REASONS = frozenset({"numeric range marker", "volume range marker", "explicit range marker"})
+
+
+def slskd_range_archive_handoff_enabled():
+    value = str(os.environ.get(SLSKD_RANGE_ARCHIVE_HANDOFF_ENV, "1") or "").strip().lower()
+    return value not in {"0", "false", "off", "no", "disabled"}
+
+
 SERIES_PACK_COMPLETE_MAX_DIRECTORIES = max(1, min(env_int("INKDROP_SLSKD_SERIES_PACK_COMPLETE_MAX_DIRECTORIES", 3), 25))
 DEFAULT_PROBE_BUDGET_SECONDS = 5 * 60
 STAGED_SCAN_MAX_SECONDS = max(1, env_int("INKDROP_SLSKD_STAGED_SCAN_MAX_SECONDS", 8))
@@ -7297,12 +7318,43 @@ def labeled_issue_numbers(text):
     return numbers
 
 
-def issue_range_match(filename, item):
-    wanted = wanted_issue_number(item)
-    if wanted is None:
-        return {"matched": False, "reason": "", "penalty": ""}
-    ranges = []
-    for match in re.finditer(r"\b0*(\d{1,4})\s*[-–—]\s*0*(\d{1,4})\b", issue_match_text(filename)):
+UNIT_RANGE_PAIR_RE = re.compile(r"\b0*(\d{1,4})\s*[-–—]\s*0*(\d{1,4})\b")
+
+
+def filename_unit_range_bounds(filename):
+    """The (low, high) unit ranges a filename declares, date stamps excluded.
+
+    Two scans, because the date scrub in issue_match_text() is right for
+    every ordinary name and wrong for exactly one shape. First the raw stem,
+    keeping only pairs a unit word announces ("progs 2013-2019", "issues
+    1900-1950"): those are real ranges that happen to sit inside the year
+    band, and the scrub would have deleted them. Then the scrubbed text, where
+    year-month stamps, bracketed year spans and bare year spans are already
+    gone, so what is left is a unit range or shelf noise. A year-band pair
+    without a unit word is never a range in either scan.
+    """
+    bounds = []
+    seen = set()
+
+    def add(left, right):
+        if left == right:
+            return
+        low, high = sorted((left, right))
+        if (low, high) in seen:
+            return
+        seen.add((low, high))
+        bounds.append((low, high))
+
+    raw_stem = filename_stem(filename)
+    for match in UNIT_RANGE_PAIR_RE.finditer(raw_stem):
+        try:
+            left = int(match.group(1))
+            right = int(match.group(2))
+        except (TypeError, ValueError):
+            continue
+        if 1900 <= left <= 2099 and 1900 <= right <= 2099 and _range_is_unit_marked(raw_stem, match.start()):
+            add(left, right)
+    for match in UNIT_RANGE_PAIR_RE.finditer(issue_match_text(filename)):
         try:
             left = int(match.group(1))
             right = int(match.group(2))
@@ -7310,9 +7362,20 @@ def issue_range_match(filename, item):
             continue
         if 1900 <= left <= 2099 and 1 <= right <= 12:
             continue
-        if left == right:
+        if 1900 <= left <= 2099 and 1900 <= right <= 2099:
+            # A year span that survived the scrub (no brackets, no unit word)
+            # is still a date stamp, never issues 2013 through 2019.
             continue
-        low, high = sorted((left, right))
+        add(left, right)
+    return bounds
+
+
+def issue_range_match(filename, item):
+    wanted = wanted_issue_number(item)
+    if wanted is None:
+        return {"matched": False, "reason": "", "penalty": ""}
+    ranges = []
+    for low, high in filename_unit_range_bounds(filename):
         ranges.append((low, high))
         if low <= wanted <= high:
             return {"matched": True, "reason": f"issue range {low}-{high} contains {wanted}", "penalty": ""}
@@ -12581,6 +12644,10 @@ def _run_auto_grab_with_ephemeral_candidates(args, result):
                             continue
                     except Exception:
                         raise
+                    if transfer_candidate.get("series_range_archive") and live and not dry_run:
+                        row["range_archive_pending_pack"] = record_slskd_range_archive_pending_pack(
+                            entry, transfer_candidate, enqueue_match
+                        )
                     row["enqueue"] = privacy_safe_handoff_enqueue(enqueue) if redact_handoff else enqueue
                     row["enqueue_transfer_match"] = {
                         key: value
@@ -14317,6 +14384,13 @@ def series_run_candidate_for_item(file_row, item, observation):
         identity_filename, identity_reason, parent_dependent = series_run_leaf_identity_filename(file_row, item)
         if not identity_filename or parent_dependent:
             return None, "directory parent does not exactly match the wanted series metadata"
+    range_candidate, range_reason = series_range_archive_candidate_for_item(
+        file_row, item, observation, directory_matches=bool(directory_matches)
+    )
+    if range_candidate:
+        return range_candidate, range_reason
+    if range_reason:
+        return None, range_reason
     if extension_for(filename) not in AUTO_GRAB_EXTENSIONS:
         return None, "unsupported or pack archive extension"
     malformed_reason = malformed_unit_syntax_reason(
@@ -14365,6 +14439,266 @@ def series_run_candidate_for_item(file_row, item, observation):
         reason = (gate.get("blockers") or gate.get("review_reasons") or ["candidate did not meet automatic safety policy"])[0]
         return None, str(reason)
     return candidate, "exact series/issue file passed existing safety policy"
+
+
+def series_range_archive_candidate_for_item(file_row, item, observation, *, directory_matches):
+    """A range archive in an exactly matching directory that holds the wanted unit.
+
+    Returns (candidate, reason) when the leaf is a range archive and the
+    verdict admits it, (None, reason) when it is a range archive that does not
+    hold this unit or fails the verdict, and (None, "") when the leaf is not a
+    range archive at all so the caller's individual-file gates decide. Only
+    an exactly matching parent qualifies: a neutral directory proves nothing
+    about what a range inside it collects.
+    """
+    if not slskd_range_archive_handoff_enabled() or not directory_matches:
+        return None, ""
+    filename = str((file_row or {}).get("filename") or "")
+    ext = extension_for(filename)
+    # Only a real archive: the pack import splits .zip/.rar/.7z members against
+    # the missing map. A range-named .cbz is one container the importer reads
+    # as a single book, so it stays "not an individual handoff".
+    if ext not in ARCHIVE_EXTENSIONS:
+        return None, ""
+    leaf = filename_leaf(filename)
+    is_pack, pack_reason = filename_has_pack_or_range(leaf, item=item, validated_series_directory=True)
+    if not is_pack or pack_reason not in SLSKD_RANGE_ARCHIVE_REASONS:
+        return None, ""
+    wanted = wanted_issue_number(item)
+    if wanted is None:
+        return None, "range archive cannot be matched to a row with no unit number"
+    holding = [(low, high) for low, high in filename_unit_range_bounds(leaf) if low <= wanted <= high]
+    if not holding:
+        return None, f"range archive does not hold #{item_issue_token(item) or wanted}"
+    malformed_reason = malformed_unit_syntax_reason(leaf, item=item, validated_series_directory=True)
+    if malformed_reason:
+        return None, malformed_reason
+    low, high = holding[0]
+    unit_type = str((item or {}).get("unit_type") or "issue").strip().lower() or "issue"
+    candidate = dict(file_row or {})
+    candidate.update({
+        "series_directory_handoff": True,
+        "series_directory_exact_series": True,
+        "series_directory_neutral_parent": False,
+        "series_directory_file_count": int((observation or {}).get("file_count") or 0),
+        "series_directory_identity_filename": leaf,
+        # The provider-layer pack flag: the shared matcher reads a declared
+        # range as membership evidence only for a candidate marked as a pack
+        # acquisition, never for a file that merely looks like one.
+        "pack": True,
+        "series_range_archive": {
+            "archive": leaf,
+            "start": low,
+            "end": high,
+            "unit": unit_type,
+            "coverage_source": SLSKD_RANGE_ARCHIVE_COVERAGE_SOURCE,
+        },
+    })
+    review_id = str((item or {}).get("review_id") or review_id_for(item or {}))
+    if review_id and bad_candidate_match(review_id, candidate):
+        return None, "candidate was already rejected or failed for this wanted issue"
+    candidate = attach_match_explanation(candidate, item, match_filename=leaf)
+    gate = auto_grab_candidate_verdict(candidate, item, settings=None)
+    candidate["auto_grab"] = gate
+    if gate.get("verdict") != "auto_grab_safe" or not gate.get("autopick_eligible"):
+        reason = (gate.get("blockers") or gate.get("review_reasons") or ["range archive did not meet automatic safety policy"])[0]
+        return None, str(reason)
+    return candidate, f"range archive {low}-{high} holds #{item_issue_token(item) or wanted}; one handoff for every covered wanted unit"
+
+
+def _range_archive_group_key(candidate):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    return (normalize(candidate.get("username")), normalize(candidate.get("filename")))
+
+
+def _item_queue_key(item):
+    item = item if isinstance(item, dict) else {}
+    return str(item.get("autopilot_queue_key") or item.get("queue_key") or item.get("key") or "").strip()
+
+
+def collapse_range_archive_selections(selected):
+    """One handoff per range archive: the lowest covered unit owns it.
+
+    ``selected`` maps review id to a tuple whose first two members are the
+    wanted item and its candidate. Every rid served by the same archive file
+    is folded onto the owner's candidate as ``covered_review_ids`` /
+    ``covered_queue_ids`` / ``covered_units`` and dropped from the map, so the
+    owner is the only selection the archive produces and its bytes count
+    once. Returns (collapsed map, number of rids folded away).
+    """
+    groups = {}
+    for rid, selection in (selected or {}).items():
+        candidate = selection[1] if isinstance(selection, tuple) and len(selection) > 1 else {}
+        if not isinstance(candidate, dict) or not candidate.get("series_range_archive"):
+            continue
+        groups.setdefault(_range_archive_group_key(candidate), []).append(rid)
+    folded = 0
+    out = dict(selected or {})
+    for rids in groups.values():
+        def unit_of(rid):
+            number = token_number(out[rid][0].get("issue"))
+            return number if number is not None else 999999
+        owner = min(rids, key=lambda rid: (unit_of(rid), rid))
+        selection = out[owner]
+        candidate = dict(selection[1])
+        archive = dict(candidate.get("series_range_archive") or {})
+        ordered = sorted(rids, key=lambda rid: (unit_of(rid), rid))
+        archive["owner_review_id"] = owner
+        archive["covered_review_ids"] = ordered
+        archive["covered_queue_ids"] = [key for key in (_item_queue_key(out[rid][0]) for rid in ordered) if key]
+        archive["covered_units"] = [
+            {"review_id": rid, "queue_id": _item_queue_key(out[rid][0]), "issue": out[rid][0].get("issue"),
+             "series": out[rid][0].get("series") or out[rid][0].get("query")}
+            for rid in ordered
+        ]
+        candidate["series_range_archive"] = archive
+        out[owner] = (selection[0], candidate, *selection[2:])
+        for rid in rids:
+            if rid != owner:
+                del out[rid]
+                folded += 1
+    return out, folded
+
+
+def record_slskd_range_archive_pending_pack(entry, candidate, enqueue_match=None):
+    """After a range archive is enqueued, register it as a pending pack.
+
+    The pack import loop reads pending-pack-imports.jsonl, finds the landed
+    archive, splits it against the series' currently missing map and settles
+    each row on its own verified file; rows the archive turns out not to hold
+    are re-opened by record_native_pack_no_match. The other covered rows get a
+    covered attempt now so they leave the searching pool while the transfer
+    runs, exactly as the coordinator does for a Prowlarr pack.
+    """
+    from core import inkdrop_source_worker_recorder as recorder
+
+    entry = entry if isinstance(entry, dict) else {}
+    candidate = candidate if isinstance(candidate, dict) else {}
+    archive = dict(candidate.get("series_range_archive") or {})
+    if not archive or inkdrop_state is None:
+        return {"ok": False, "reason": "not_a_range_archive"}
+    leaf = filename_leaf(candidate.get("filename"))
+    queue_id = _item_queue_key(entry)
+    owner_review_id = str(entry.get("review_id") or archive.get("owner_review_id") or "")
+    covered_units = [dict(row) for row in (archive.get("covered_units") or []) if isinstance(row, dict)]
+    if not covered_units:
+        covered_units = [{"review_id": owner_review_id, "queue_id": queue_id, "issue": entry.get("issue"),
+                          "series": entry.get("series") or entry.get("query")}]
+    covered_queue_ids = []
+    for row in covered_units:
+        key = str(row.get("queue_id") or "").strip()
+        if key and key not in covered_queue_ids:
+            covered_queue_ids.append(key)
+    if queue_id and queue_id not in covered_queue_ids:
+        covered_queue_ids.insert(0, queue_id)
+    series = entry.get("series") or entry.get("query")
+    review_id = inkdrop_state.stable_id("slskd_range_archive", queue_id or owner_review_id, leaf)
+    created_at = now()
+    sample = [
+        {"series": row.get("series") or series, "issue": row.get("issue"), "queue_id": row.get("queue_id"),
+         "review_id": row.get("review_id"), "presence": "inkdrop_wanted"}
+        for row in covered_units
+    ]
+    record = {
+        "event": "pending_pack_import",
+        "source": SLSKD_RANGE_ARCHIVE_PENDING_PACK_SOURCE,
+        "pack_handoff_contract_version": 1,
+        "created_at": created_at,
+        "created_at_iso": utc_stamp(created_at),
+        "review_id": review_id,
+        "status": "sent",
+        "queue_id": queue_id,
+        "series_id": entry.get("series_id"),
+        "series": series,
+        "issue": entry.get("issue"),
+        "query": entry.get("query") or series,
+        "title": leaf,
+        "candidate": {"title": leaf, "size": candidate.get("size"), "protocol": "soulseek"},
+        "pack_info": {
+            "source": "slskd",
+            "summary": leaf,
+            "coverage_source": SLSKD_RANGE_ARCHIVE_COVERAGE_SOURCE,
+            "download_client": "SLSKD",
+            "protocol": "soulseek",
+            "range": {"start": archive.get("start"), "end": archive.get("end"), "unit": archive.get("unit")},
+            "local_basename": leaf,
+        },
+        "pack_match": {
+            "coverage_source": SLSKD_RANGE_ARCHIVE_COVERAGE_SOURCE,
+            "useful_missing_sample": sample,
+            "useful_missing_count": len(sample),
+            "covered_queue_ids": covered_queue_ids,
+            "covered_review_ids": [row.get("review_id") for row in covered_units if row.get("review_id")],
+            "covered_series": [series] if series else [],
+            "multi_series": False,
+            "range": {"start": archive.get("start"), "end": archive.get("end"), "unit": archive.get("unit")},
+        },
+        "outcome": {"protocol": "soulseek"},
+    }
+    transfer_id = ""
+    if isinstance(enqueue_match, dict):
+        transfer = enqueue_match.get("transfer") if isinstance(enqueue_match.get("transfer"), dict) else {}
+        transfer_id = str(transfer.get("id") or enqueue_match.get("transfer_id") or "").strip()
+    if transfer_id:
+        record["outcome"]["slskd_transfer_id"] = transfer_id
+    appended = recorder.append_pending_pack_record(record)
+    covered_attempts = []
+    # The covered attempts follow the record's idempotence: a duplicate
+    # registration (the same archive enqueued again for the same owner) must
+    # not stamp every covered row a second time.
+    for row in covered_units if appended.get("created") else []:
+        covered_queue_id = str(row.get("queue_id") or "").strip()
+        if not covered_queue_id or covered_queue_id == queue_id:
+            continue
+        attempt = {
+            "source": "slskd",
+            "provider_id": "slskd",
+            "provider": "SLSKD",
+            "protocol": "soulseek",
+            "download_client": "SLSKD",
+            "download_client_instance_id": SLSKD_PROVIDER_SETTINGS.get("download_client_instance_id"),
+            "status": "waiting_for_transfer",
+            "lifecycle_phase": "provider_wait",
+            "reason": (
+                f"SLSKD range archive {leaf} was handed off for #{entry.get('issue')}; "
+                "this wanted issue is covered by the same archive"
+            ),
+            "query": entry.get("query") or series,
+            "title": leaf,
+            "filename": leaf,
+            "candidate_identity": inkdrop_state.stable_id("slskd_range_archive_covered", covered_queue_id, leaf),
+            "series": row.get("series") or series,
+            "issue": row.get("issue"),
+            "kind": SLSKD_RANGE_ARCHIVE_COVERED_KIND,
+            "retry_eligible": False,
+            "ts": created_at,
+            "raw": {
+                "kind": SLSKD_RANGE_ARCHIVE_COVERED_KIND,
+                "primary_queue_id": queue_id,
+                "pack_review_id": review_id,
+                "pack_match_summary": {
+                    "coverage_source": SLSKD_RANGE_ARCHIVE_COVERAGE_SOURCE,
+                    "covered_queue_ids": covered_queue_ids,
+                    "covered_series": [series] if series else [],
+                    "multi_series": False,
+                },
+            },
+        }
+        try:
+            recorded = inkdrop_state.record_queue_source_attempt(
+                INKDROP_STATE_DB, covered_queue_id, attempt, started_at=created_at, completed_at=created_at,
+            )
+        except Exception as exc:
+            recorded = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        covered_attempts.append({"queue_id": covered_queue_id, "ok": bool((recorded or {}).get("ok"))})
+    return {
+        "ok": bool(appended.get("ok")),
+        "created": bool(appended.get("created")),
+        "review_id": review_id,
+        "title": leaf,
+        "covered_queue_ids": covered_queue_ids,
+        "covered_attempts": covered_attempts,
+    }
 
 
 def series_directory_candidate_rank(candidate):
@@ -14483,6 +14817,9 @@ def apply_series_directory_opportunities(entries, items, cache, *, deadline=None
             coverage = len(safe_by_review)
             for _rid, (_item, candidate, _observation) in safe_by_review.items():
                 candidate["series_directory_active_wanted_coverage"] = coverage
+            safe_by_review, folded = collapse_range_archive_selections(safe_by_review)
+            if folded:
+                skipped["covered by a selected range archive"] = skipped.get("covered by a selected range archive", 0) + folded
             ranked_observations.append((observation, safe_by_review))
         if summary["deadline_exhausted"]:
             break
@@ -14547,12 +14884,20 @@ def apply_series_directory_opportunities(entries, items, cache, *, deadline=None
             "candidates": merged,
             "series_directory_opportunity": {
                 "status": "selected",
-                "mode": "individual_file_handoff_only",
+                "mode": (
+                    "series_range_archive_handoff"
+                    if candidate.get("series_range_archive") else "individual_file_handoff_only"
+                ),
                 "directory_file_count": int(observation.get("file_count") or 0),
                 "selected_filename": filename_leaf(candidate.get("filename")),
                 "selected_size": int(candidate.get("size") or 0),
                 "active_wanted_coverage": int(candidate.get("series_directory_active_wanted_coverage") or 0),
-                "reason": "active wanted issue intersected with exact safe numbered sibling file",
+                "reason": (
+                    "range archive holds this and other active wanted units; one handoff covers them all"
+                    if candidate.get("series_range_archive")
+                    else "active wanted issue intersected with exact safe numbered sibling file"
+                ),
+                **({"range_archive": dict(candidate.get("series_range_archive") or {})} if candidate.get("series_range_archive") else {}),
             },
         })
         cache[rid] = entry
@@ -14726,7 +15071,10 @@ def apply_series_pack_complete_opportunities(items, cache, *, observations=None,
             skipped["series-pack directory cap reached"] = skipped.get("series-pack directory cap reached", 0) + 1
             continue
         directory_selected = 0
-        for rid, (item, candidate) in completeness["covered"].items():
+        covered, folded = collapse_range_archive_selections(completeness["covered"])
+        if folded:
+            skipped["covered by a selected range archive"] = skipped.get("covered by a selected range archive", 0) + folded
+        for rid, (item, candidate) in covered.items():
             if rid in selected_by_review:
                 continue
             size = int(candidate.get("size") or 0)
@@ -14771,6 +15119,7 @@ def apply_series_pack_complete_opportunities(items, cache, *, observations=None,
                 "selected_size": int(candidate.get("size") or 0),
                 "active_wanted_coverage": int(candidate.get("series_directory_active_wanted_coverage") or 0),
                 "reason": "directory alone covers the bulk of the series' currently open wanted range",
+                **({"range_archive": dict(candidate.get("series_range_archive") or {})} if candidate.get("series_range_archive") else {}),
             },
         })
         cache[rid] = entry

@@ -2261,25 +2261,52 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
             severity = inkdrop_acquisition_policy.severity_for(
                 target["acquisition_policy"], "collected_edition"
             )
-            # A collected edition that spans a range is two questions, not
-            # one: "is this edition acceptable" and "does it actually contain
-            # the wanted unit". Only the first is settled -- the second is the
-            # pack-containment proof still on hold, and its range evidence is
-            # known to accept the wrong series. So a range-spanning release
-            # keeps the stricter of the two answers, and only a collected
-            # edition that IS the exact wanted unit follows the edition
-            # policy.
+            # A collected edition is two questions, not one: "is this edition
+            # acceptable" and "does it actually contain the wanted unit". The
+            # edition policy answers the first. The second is answered by
+            # proof, never by the title: a manifest naming the unit, a
+            # declared range holding it, or -- for an issue or chapter target
+            # -- the release naming that exact number. A volume target gets no
+            # number proof: an omnibus or deluxe "Vol 3" collects several
+            # regular volumes and its 3 is on a different scale from the
+            # wanted run's 3. Proven containment composes with the
+            # pack-containment policy (tracker #209, decided 2026-09-16:
+            # admit); unproven contents compose with unidentified_unit, so a
+            # release that only claims to hold the unit is shown for review
+            # and never admitted on that claim.
             spans_a_range = bool(
                 evidence.get("pack_marker")
                 or evidence.get("coverage_start")
                 or evidence.get("coverage_end")
             )
-            if spans_a_range:
+            exact_unit_named = bool(
+                (
+                    target_unit in ISSUE_UNITS
+                    and target.get("issue_number")
+                    and evidence.get("issue_number") == target.get("issue_number")
+                    and not spans_a_range
+                )
+                or (
+                    target_unit in CHAPTER_UNITS
+                    and target.get("chapter_number")
+                    and evidence.get("chapter_number") == target.get("chapter_number")
+                    and not spans_a_range
+                )
+            )
+            containment_proven = bool(manifest_exact_member or range_exact_member or exact_unit_named)
+            if containment_proven:
                 severity = inkdrop_acquisition_policy.stricter(
                     severity,
-                    inkdrop_acquisition_policy.severity_for(
-                        target["acquisition_policy"], "pack_containment"
-                    ),
+                    inkdrop_acquisition_policy.severity_for(target["acquisition_policy"], "pack_containment"),
+                )
+            elif not _strict_bool_flag(target.get("edition_indifferent")):
+                # A row the operator marked edition-indifferent has already
+                # answered "is this edition fine for this row"; it is not
+                # asked again here. Every other row composes an unproven
+                # edition with the unidentified-unit answer.
+                severity = inkdrop_acquisition_policy.stricter(
+                    severity,
+                    inkdrop_acquisition_policy.severity_for(target["acquisition_policy"], "unidentified_unit"),
                 )
             if severity == inkdrop_acquisition_policy.REFUSE:
                 blocked.append("collected_edition_disallowed")

@@ -71,6 +71,7 @@ PHASE_ORDER = (
     "replay_check",
     "fetch",
     "record",
+    "sibling_fanout",
     "direct_stage",
     "handoff",
 )

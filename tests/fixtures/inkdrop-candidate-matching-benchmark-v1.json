@@ -2,14 +2,14 @@
   "schema": "inkdrop.candidate-matching-benchmark",
   "schema_version": 1,
   "benchmark_id": "adversarial-candidate-matching",
-  "benchmark_version": "1.5.0",
+  "benchmark_version": "1.6.0",
   "normalization_pipelines": [
     "direct",
     "prowlarr",
     "mangadex"
   ],
   "matcher_contract_version": 2,
-  "case_count": 91,
+  "case_count": 94,
   "cases": [
     {
       "id": "pack-001-issue-range-proves-the-member",
@@ -733,9 +733,9 @@
       }
     },
     {
-      "id": "edition-004-omnibus-reviewed-for-issue-by-default",
+      "id": "edition-004-omnibus-naming-the-exact-issue-is-admitted",
       "category": "editions_reprints",
-      "description": "With no explicit policy, an omnibus carrying the exact wanted issue is surfaced for review rather than silently refused. Edition alone is not a refusal reason; the shipped default is review.",
+      "description": "An omnibus that names the exact wanted issue has proved it holds it, and content comes first: admitted on the shipped default (tracker #209, owner ruling 2026-09-16). Re-pinned from review at 1.6.0: the 1.5.0 gold said 'the shipped default is review', which was the pre-ruling policy.",
       "wanted": {
         "series": "Hawkeye",
         "series_title": "Hawkeye",
@@ -745,6 +745,68 @@
       },
       "candidate": {
         "title": "Hawkeye Omnibus Issue 005.cbz"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "edition-006-range-proven-omnibus-is-admitted",
+      "category": "editions_reprints",
+      "description": "An omnibus whose own title declares a range holding the wanted issue has proved containment; the pack-containment policy admits it (tracker #209, 2026-09-16).",
+      "wanted": {
+        "series": "Hawkeye",
+        "series_title": "Hawkeye",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5"
+      },
+      "candidate": {
+        "title": "Hawkeye Omnibus 001-010.cbz",
+        "filename": "Hawkeye Omnibus 001-010.cbz",
+        "pack": true,
+        "match_confidence": "title_match"
+      },
+      "expected": {
+        "status": "compatible",
+        "code": null
+      }
+    },
+    {
+      "id": "edition-007-bare-omnibus-proves-nothing-and-is-reviewed",
+      "category": "editions_reprints",
+      "description": "An omnibus with no range, no manifest and no unit number is a claim, not proof; it is shown for review and never admitted on the default, even though the edition itself is acceptable.",
+      "wanted": {
+        "series": "Hawkeye",
+        "series_title": "Hawkeye",
+        "media_type": "comic",
+        "unit_type": "issue",
+        "issue_number": "5"
+      },
+      "candidate": {
+        "title": "Hawkeye Omnibus.cbz",
+        "filename": "Hawkeye Omnibus.cbz"
+      },
+      "expected": {
+        "status": "review",
+        "code": "collected_edition_disallowed"
+      }
+    },
+    {
+      "id": "edition-008-omnibus-volume-number-is-not-the-run-volume",
+      "category": "editions_reprints",
+      "description": "An omnibus 'Vol 03' collects several regular volumes; its 3 is on a different scale from the wanted run's volume 3, so a volume number in a collected edition is not containment proof and the release stays a review.",
+      "wanted": {
+        "series": "Berserk",
+        "series_title": "Berserk",
+        "media_type": "manga",
+        "unit_type": "volume",
+        "volume_number": "3"
+      },
+      "candidate": {
+        "title": "Berserk Omnibus Vol 03.cbz",
+        "filename": "Berserk Omnibus Vol 03.cbz"
       },
       "expected": {
         "status": "review",

@@ -55574,6 +55574,7 @@ COMMON_PROVIDER_FIELD_SCHEMA = {
     "max_weekly_pack_queries": {"label": "Max Weekly Pack Queries", "kind": "number", "min": 0, "max": 8},
     "disable_weekly_pack_queries": {"label": "Disable Weekly Pack Queries", "kind": "boolean"},
     "pack_detail_fetch": {"label": "Fetch Pack Detail Manifests", "kind": "boolean"},
+    "sibling_unit_fanout": {"label": "Seed Sibling Units From Search Results", "kind": "boolean"},
     "disable_pack_detail_fetch": {"label": "Disable Pack Detail Fetch", "kind": "boolean"},
     "pack_detail_max_fetches": {"label": "Pack Detail Fetch Cap", "kind": "number", "min": 0, "max": 20},
     "max_pack_detail_fetches": {"label": "Max Pack Detail Fetches", "kind": "number", "min": 0, "max": 20},
@@ -61584,6 +61585,47 @@ def dated_weekly_pack_name_score(identity, name, parent_name="", archive_count=0
     return score + min(int(archive_count or 0), 20)
 
 
+SLSKD_RANGE_ARCHIVE_PENDING_PACK_SOURCE = "slskd_range_archive_handoff"
+SLSKD_RANGE_ARCHIVE_LOCAL_SCAN_MAX_ENTRIES = 20000
+
+
+def slskd_range_archive_local_candidates(record, *, root=None, max_entries=SLSKD_RANGE_ARCHIVE_LOCAL_SCAN_MAX_ENTRIES):
+    """Where an SLSKD range archive landed, by its basename under the download root.
+
+    SLSKD keeps the peer's folder layout under its download root and moves a
+    file out of the incomplete root only once it is whole, so a basename
+    match under the root (never under incomplete) is a finished archive. The
+    unmatched/direct roots pack_local_candidates() reads never hold an SLSKD
+    download, which is why that search found nothing for these records.
+    """
+    record = record if isinstance(record, dict) else {}
+    if str(record.get("source") or "") != SLSKD_RANGE_ARCHIVE_PENDING_PACK_SOURCE:
+        return []
+    pack_info = record.get("pack_info") if isinstance(record.get("pack_info"), dict) else {}
+    basename = str(pack_info.get("local_basename") or record.get("title") or "").strip()
+    if not basename:
+        return []
+    wanted_key = normalize_key(basename)
+    root = Path(root or SLSKD_DOWNLOAD_ROOT)
+    incomplete = Path(SLSKD_INCOMPLETE_ROOT)
+    if not root.exists():
+        return []
+    found = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        if current == incomplete or incomplete in current.parents:
+            dirnames[:] = []
+            continue
+        for name in filenames:
+            scanned += 1
+            if scanned > max_entries:
+                return found
+            if normalize_key(name) == wanted_key:
+                found.append(str(current / name))
+    return found
+
+
 def pack_local_candidates(title):
     title_text = str(title or "")
     title_norm = normalize_key(re.sub(r"^\[[^\]]+\]\s*", "", title_text))
@@ -62447,7 +62489,7 @@ def ready_pending_pack_for_auto_import():
             continue
         seen.add(review_id)
         title = record.get("title") or record.get("query")
-        local = pack_local_candidates(title)
+        local = slskd_range_archive_local_candidates(record) or pack_local_candidates(title)
         local = [path for path in local if not terminal_path(path)]
         if not local:
             continue

@@ -453,7 +453,41 @@ def load_priority_paths():
     return paths, filenames
 
 
+SLSKD_RANGE_ARCHIVE_PENDING_PACK_SOURCE = "slskd_range_archive_handoff"
+
+
+def pending_range_archive_claims(basename):
+    """True when a pending range-archive pack names this file.
+
+    Such an archive holds several issues and is split by the pack import loop
+    against the series' missing map; handing it to the single-file child
+    would only produce a refusal (a multi-issue archive is never one issue's
+    artifact) and a checkpoint that hides the file from the pack import.
+    """
+    try:
+        from core import inkdrop_pack_import
+    except Exception:
+        return False
+    wanted = re.sub(r"[^a-z0-9]+", " ", str(basename or "").lower()).strip()
+    if not wanted:
+        return False
+    try:
+        records = inkdrop_pack_import.pending_pack_records()
+    except Exception:
+        return False
+    for record in records or []:
+        if not isinstance(record, dict) or str(record.get("source") or "") != SLSKD_RANGE_ARCHIVE_PENDING_PACK_SOURCE:
+            continue
+        pack_info = record.get("pack_info") if isinstance(record.get("pack_info"), dict) else {}
+        title = str(pack_info.get("local_basename") or record.get("title") or "")
+        if re.sub(r"[^a-z0-9]+", " ", title.lower()).strip() == wanted:
+            return True
+    return False
+
+
 def process_one_file(path):
+    if pending_range_archive_claims(os.path.basename(path)):
+        return {"decision": "skipped", "reason": "claimed_by_pending_range_archive_pack", "dest": None}
     cmd = [
         PYTHON_BIN,
         "-B",
@@ -549,6 +583,7 @@ def process_one_file(path):
 # as processed in the first place.
 NOT_A_JUDGEMENT_REASONS = frozenset({
     "no_decision_returned",
+    "claimed_by_pending_range_archive_pack",
     "known_bad_artifact_content",
     "source_file_incomplete_qbit_download",
     "qbit_completion_unverifiable",

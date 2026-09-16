@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import math
 import re
 import sqlite3
@@ -24,6 +25,7 @@ from core import inkdrop_source_providers
 from core import inkdrop_source_worker_jobs as source_jobs
 from core import inkdrop_source_worker_phase_timing as phase_timing
 from core import inkdrop_source_worker_recorder as recorder
+from core import inkdrop_source_worker_runtime as runtime
 from core import inkdrop_source_registry
 from core import inkdrop_sources
 from core import inkdrop_state
@@ -2554,6 +2556,481 @@ def stage_direct_download_tasks(
     return out
 
 
+# Sibling-unit fan-out.
+#
+# A job is planned for one queue row, and every result it brings back was
+# judged against that one row. A search for Watchmen #1 returns #1..#12; the
+# 007 release is refused for #1 as wrong_issue_number and then forgotten, even
+# though #7 sits active in the same series. Packs had cross-row coverage
+# (_record_covered_pack_handoffs); single-unit releases had none. This phase
+# re-judges each same-work, other-unit result against the series' other active
+# rows with the production chain unchanged, and records a hit against the
+# sibling row so the ordinary download-task and handoff pipeline carries it.
+# Nothing here settles a row: only the verified import does.
+SIBLING_UNIT_FANOUT_ROW_LIMIT = 500
+SIBLING_UNIT_FANOUT_VERDICT_LIMIT = 200
+SIBLING_UNIT_FANOUT_MAX_HANDOFFS = 10
+SIBLING_UNIT_FANOUT_CLAIM_LEASE_SECONDS = 120
+SIBLING_UNIT_HANDOFF_KIND = "source_worker_sibling_unit_handoff"
+SIBLING_UNIT_FANOUT_ENV = "INKDROP_SOURCE_WORKER_SIBLING_UNIT_FANOUT"
+# Row states a sibling can never be seeded from: terminal ones, and the ones the
+# pending-handoff scan (pending_download_client_handoff_queue_ids) refuses, so a
+# seeded task never sits behind a state that would strand it. Rows already in
+# flight (downloading, importing) are loaded and then skipped by name, so the
+# run report says why a sibling was passed over instead of omitting it.
+SIBLING_UNIT_EXCLUDED_QUEUE_STATES = (
+    "verified",
+    "satisfied",
+    "superseded_duplicate",
+    "ignored",
+    "removed",
+    "inactive",
+    "blocked",
+    "needs_you",
+)
+SIBLING_UNIT_IN_FLIGHT_QUEUE_STATES = ("downloading", "importing", "verified")
+SIBLING_UNIT_ACCEPTED_CONFIDENCE = {"title_issue_match", "title_chapter_match", "title_volume_match"}
+_SIBLING_UNIT_ACTIVE_TASK_STATES = ("queued", "source_wait", "downloading", "import_ready", "importing")
+
+
+def sibling_unit_fanout_enabled(job=None):
+    """Env switch and provider policy both have to allow it; default on."""
+    value = str(os.environ.get(SIBLING_UNIT_FANOUT_ENV, "1") or "").strip().lower()
+    if value in {"0", "false", "off", "no", "disabled"}:
+        return False
+    job = _dict(job)
+    row = _dict(job.get("registry_row"))
+    policy = inkdrop_source_providers.provider_policy(row)
+    for source in (policy, row):
+        for key in ("sibling_unit_fanout", "sibling_unit_fanout_enabled"):
+            if key in source and source.get(key) not in (None, ""):
+                raw = source.get(key)
+                if isinstance(raw, bool):
+                    return raw
+                return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return True
+
+
+def sibling_queue_items_for_series(db_path, series_id, *, exclude_queue_id=None, limit=SIBLING_UNIT_FANOUT_ROW_LIMIT, con=None):
+    """The series' other active queue rows, in the shape wanted_item_from_queue reads.
+
+    Same SELECT as queue_items_by_id plus the series raw_json, because the
+    wanted-item builder reads manga unit overrides from there. Not the pack
+    coverage loader in the recorder: that one lacks the release date, year and
+    query columns the builder projects.
+    """
+    series_id = str(series_id or "").strip()
+    if not series_id:
+        return []
+    if con is None and not Path(db_path).exists():
+        return []
+    exclude_queue_id = str(exclude_queue_id or "").strip()
+    try:
+        row_limit = max(1, min(int(limit or SIBLING_UNIT_FANOUT_ROW_LIMIT), SIBLING_UNIT_FANOUT_ROW_LIMIT))
+    except (TypeError, ValueError):
+        row_limit = SIBLING_UNIT_FANOUT_ROW_LIMIT
+    placeholders = ",".join("?" for _ in SIBLING_UNIT_EXCLUDED_QUEUE_STATES)
+    with _borrowed_or_read_con(db_path, con) as lookup_con:
+        rows = lookup_con.execute(
+            f"""
+            select q.id, q.wanted_id, q.series_id, q.issue_id,
+                   q.state, q.current_source, q.query, q.last_event, q.active,
+                   q.created_at, q.updated_at, q.source_order_json,
+                   q.recovery_steps_json, q.raw_json, w.status as wanted_status,
+                   s.title as series, s.media_type, s.year, s.publisher,
+                   s.metadata_provider, s.metadata_id, s.kapowarr_id, s.source as series_source,
+                   s.raw_json as series_raw_json,
+                   i.issue_number, i.title as issue_title, i.release_date,
+                   i.metadata_provider as issue_metadata_provider,
+                   i.metadata_id as issue_metadata_id, i.kapowarr_issue_id
+            from queue_items q
+            left join wanted_items w on w.id = q.wanted_id
+            left join series s on s.id = q.series_id
+            left join issues i on i.id = q.issue_id
+            where q.series_id = ?
+              and q.id <> ?
+              and coalesce(q.active, 1) = 1
+              and lower(coalesce(q.state, 'queued')) not in ({placeholders})
+              and lower(coalesce(w.status, 'wanted')) in ('wanted', 'in_progress')
+              and coalesce(i.issue_number, '') <> ''
+            order by coalesce(q.updated_at, q.created_at, 0) desc, q.id
+            limit ?
+            """,
+            (series_id, exclude_queue_id, *SIBLING_UNIT_EXCLUDED_QUEUE_STATES, row_limit),
+        ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["active"] = bool(item.get("active"))
+        raw = inkdrop_state.json_loads(item.get("raw_json") or "{}", {})
+        inkdrop_state.apply_ownership_evidence(item, raw if isinstance(raw, dict) else {})
+        out.append(item)
+    return out
+
+
+def _sibling_verdict_identities(verdict):
+    verdict = _dict(verdict)
+    raw = _dict(verdict.get("raw"))
+    values = (
+        verdict.get("indexer_candidate_key"),
+        verdict.get("candidate_identity"),
+        verdict.get("info_hash"),
+        verdict.get("guid"),
+        verdict.get("download_url_hash"),
+        verdict.get("external_id"),
+        _dict(raw.get("indexer")).get("info_hash"),
+        _dict(raw.get("indexer")).get("guid"),
+    )
+    return {str(value or "").strip().lower() for value in values if str(value or "").strip()}
+
+
+def _sibling_verdict_is_pack_shaped(verdict):
+    verdict = _dict(verdict)
+    return bool(
+        verdict.get("pack")
+        or verdict.get("pack_contents_match")
+        or verdict.get("pack_range_match")
+        or verdict.get("pack_contents_coverage_source")
+        or verdict.get("pack_range_coverage_source")
+    )
+
+
+def _sibling_pool_from_job_results(job_results, jobs_by_provider_id, *, limit=SIBLING_UNIT_FANOUT_VERDICT_LIMIT):
+    """Same-work, other-unit results the trigger row could not use itself."""
+    owned = set()
+    for result in job_results or []:
+        for attempt in _dict(result).get("attempts") or []:
+            attempt = _dict(attempt)
+            if str(attempt.get("status") or "").strip().lower() == "sent":
+                owned |= _sibling_verdict_identities(attempt)
+                owned |= _sibling_verdict_identities(_dict(_dict(attempt.get("raw")).get("candidate")))
+    pool = []
+    seen = set()
+    for result in job_results or []:
+        result = _dict(result)
+        provider_id = result.get("provider_id")
+        job = _dict(jobs_by_provider_id.get(provider_id))
+        plan = _dict(job.get("worker_plan"))
+        if str(plan.get("verdict_helper") or "").strip() != "indexer_candidate_verdict":
+            continue
+        registry_row = _dict(job.get("registry_row"))
+        if not registry_row:
+            continue
+        for runtime_result in result.get("runtime_results") or []:
+            for verdict in _dict(runtime_result).get("verdicts") or []:
+                verdict = _dict(verdict)
+                if len(pool) >= limit:
+                    return pool, owned
+                raw_result = _dict(_dict(verdict.get("raw")).get("result"))
+                if not raw_result:
+                    continue
+                if verdict.get("candidate_outcome") == "auto_grab":
+                    continue
+                if _sibling_verdict_is_pack_shaped(verdict):
+                    continue
+                if verdict.get("outer_work_identity_match") is not True:
+                    continue
+                confidence = str(verdict.get("match_confidence") or "").strip().lower().replace("-", "_")
+                if confidence == "mismatch" or confidence.startswith("related_series") or confidence in {"subseries", "related_title"}:
+                    continue
+                identities = _sibling_verdict_identities(verdict)
+                if identities & owned:
+                    continue
+                key = next(iter(sorted(identities)), None) or json.dumps(raw_result, sort_keys=True)[:200]
+                if key in seen:
+                    continue
+                seen.add(key)
+                pool.append({
+                    "key": key,
+                    "identities": identities,
+                    "provider_id": provider_id,
+                    "job": job,
+                    "registry_row": registry_row,
+                    "verdict": verdict,
+                    "raw_result": raw_result,
+                })
+    return pool, owned
+
+
+def _sibling_external_id_owned_elsewhere(db_path, external_id, queue_id):
+    external_id = str(external_id or "").strip()
+    if not external_id:
+        return False
+    placeholders = ",".join("?" for _ in _SIBLING_UNIT_ACTIVE_TASK_STATES)
+    with inkdrop_state.connect_read(db_path) as con:
+        row = con.execute(
+            f"""
+            select queue_id from download_tasks
+            where external_id=? and queue_id<>? and state in ({placeholders})
+            limit 1
+            """,
+            (external_id, str(queue_id or ""), *_SIBLING_UNIT_ACTIVE_TASK_STATES),
+        ).fetchone()
+    return bool(row)
+
+
+def _sibling_unit_number(wanted):
+    wanted = _dict(wanted)
+    unit_type = str(wanted.get("unit_type") or "").strip().lower()
+    if unit_type in {"volume", "vol", "book_volume", "manga_volume"}:
+        return wanted.get("volume_number") or wanted.get("issue_number")
+    if unit_type in {"chapter", "manga_chapter"}:
+        return wanted.get("chapter_number") or wanted.get("issue_number")
+    return wanted.get("issue_number")
+
+
+def _sibling_candidate_for_row(pool_entry, sibling_wanted, *, staging_root=None):
+    """The production verdict chain, run for the sibling row on its own evidence."""
+    registry_row = pool_entry["registry_row"]
+    reparsed = inkdrop_source_providers.prowlarr_candidate_from_result(
+        pool_entry["raw_result"], registry_row, sibling_wanted
+    )
+    confidence = str(reparsed.get("match_confidence") or "").strip().lower().replace("-", "_")
+    if confidence not in SIBLING_UNIT_ACCEPTED_CONFIDENCE:
+        return None, None
+    verdict = inkdrop_source_providers.classify_candidate_outcome(
+        inkdrop_candidate_matching.apply_compatibility(
+            inkdrop_source_providers.indexer_candidate_verdict(reparsed, registry_row),
+            sibling_wanted,
+        ),
+        registry_row,
+        staging_root=staging_root,
+    )
+    compatibility = _dict(verdict.get("target_compatibility"))
+    if not (
+        verdict.get("candidate_outcome") == "auto_grab"
+        and verdict.get("candidate_safe") is True
+        and verdict.get("auto_grab_verdict") == "auto_grab_safe"
+        and compatibility.get("status") == "compatible"
+    ):
+        return None, None
+    attempt = inkdrop_source_providers.indexer_candidate_attempt_seed(verdict, registry_row, staging_root=staging_root)
+    if str(attempt.get("status") or "").strip().lower() != "sent":
+        return None, None
+    if _normalize_handoff_client(attempt.get("download_client")) not in HANDOFF_DOWNLOAD_CLIENTS:
+        return None, None
+    return verdict, attempt
+
+
+def sibling_unit_fanout_for_queue(
+    db_path,
+    queue_id,
+    planned,
+    jobs,
+    job_results,
+    *,
+    dry_run=True,
+    source_memory_db_path=None,
+    source_memory_cooldown_seconds=None,
+    record_lock_retry_attempts=None,
+    record_lock_retry_initial_delay=None,
+    handoff_download_clients=False,
+    download_client_adder=None,
+    staging_root=None,
+    now=None,
+):
+    now = time.time() if now is None else float(now)
+    queue_id = str(queue_id or "").strip()
+    planned = _dict(planned)
+    trigger = _dict(planned.get("wanted_item"))
+    series_id = str(trigger.get("series_id") or "").strip()
+    jobs_by_provider_id = _jobs_by_provider_id(jobs)
+    out = {
+        "enabled": False,
+        "queue_id": queue_id,
+        "series_id": series_id,
+        "siblings_considered": 0,
+        "verdicts_considered": 0,
+        "seeded": [],
+        "skipped": [],
+        "records": [],
+    }
+    if not any(sibling_unit_fanout_enabled(job) for job in jobs_by_provider_id.values()):
+        return out
+    out["enabled"] = True
+    if not series_id or not queue_id:
+        return out
+    pool, _owned = _sibling_pool_from_job_results(job_results, jobs_by_provider_id)
+    out["verdicts_considered"] = len(pool)
+    if not pool:
+        return out
+    siblings = sibling_queue_items_for_series(db_path, series_id, exclude_queue_id=queue_id)
+    out["siblings_considered"] = len(siblings)
+    if not siblings:
+        return out
+    singleton_context = _singleton_issue_context(db_path, series_id, now=now)
+    consumed = set()
+    for sibling_row in siblings:
+        if len(out["seeded"]) >= SIBLING_UNIT_FANOUT_MAX_HANDOFFS:
+            out["skipped"].append({"queue_id": sibling_row.get("id"), "reason": "sibling_fanout_handoff_cap_reached"})
+            continue
+        sibling_id = str(sibling_row.get("id") or "").strip()
+        sibling_state = str(sibling_row.get("state") or "").strip().lower()
+        if sibling_state in SIBLING_UNIT_IN_FLIGHT_QUEUE_STATES:
+            out["skipped"].append({"queue_id": sibling_id, "reason": f"covered_queue_already_{sibling_state}"})
+            continue
+        sibling_wanted = wanted_item_from_queue(sibling_row, db_path=db_path, singleton_context=singleton_context)
+        ranked = []
+        for ordinal, entry in enumerate(pool):
+            if entry["key"] in consumed:
+                continue
+            verdict, attempt = _sibling_candidate_for_row(entry, sibling_wanted, staging_root=staging_root)
+            if not attempt:
+                continue
+            rank = runtime._auto_send_rank(attempt, entry["registry_row"], sibling_wanted, ordinal)
+            ranked.append((rank, ordinal, entry, verdict, attempt))
+        if not ranked:
+            out["skipped"].append({"queue_id": sibling_id, "reason": "no_result_names_this_unit"})
+            continue
+        ranked.sort(key=lambda row: (row[0], row[1]))
+        _rank, _ordinal, entry, verdict, attempt = ranked[0]
+        # One release serves one row: download-task ids carry no queue
+        # component, so a second row recording the same release would take
+        # the task over from the first. The verdict is spent here whether or
+        # not the row below accepts it.
+        consumed.add(entry["key"])
+        if dry_run:
+            out["seeded"].append(sibling_id)
+            out["records"].append({"queue_id": sibling_id, "dry_run": True, "title": attempt.get("title")})
+            continue
+        owner_id = f"sibling-unit-fanout:{queue_id}"
+        claim = inkdrop_state.claim_queue_item(
+            db_path,
+            sibling_id,
+            owner_id,
+            operation=SIBLING_UNIT_HANDOFF_KIND,
+            lease_seconds=SIBLING_UNIT_FANOUT_CLAIM_LEASE_SECONDS,
+            now=now,
+            raw={"primary_queue_id": queue_id},
+        )
+        if not claim.get("acquired"):
+            consumed.discard(entry["key"])
+            out["skipped"].append({"queue_id": sibling_id, "reason": claim.get("reason") or "queue_claim_not_acquired"})
+            continue
+        try:
+            live = inkdrop_state.queue_item(db_path, sibling_id, read_only=True) or {}
+            state = str(live.get("state") or "").strip().lower()
+            if not live or not live.get("active"):
+                out["skipped"].append({"queue_id": sibling_id, "reason": "covered_queue_inactive_or_missing"})
+                continue
+            if state in SIBLING_UNIT_IN_FLIGHT_QUEUE_STATES:
+                out["skipped"].append({"queue_id": sibling_id, "reason": f"covered_queue_already_{state}"})
+                continue
+            with inkdrop_state.connect_read(db_path) as con:
+                active_task = inkdrop_state.latest_active_handoff_download_task_for_queue(con, sibling_id, now=now)
+            if active_task:
+                out["skipped"].append({"queue_id": sibling_id, "reason": "covered_queue_has_active_download_task"})
+                continue
+            if _sibling_external_id_owned_elsewhere(db_path, attempt.get("external_id"), sibling_id):
+                out["skipped"].append({"queue_id": sibling_id, "reason": "release_already_owned_by_another_queue"})
+                continue
+            raw = _dict(attempt.get("raw"))
+            raw["kind"] = SIBLING_UNIT_HANDOFF_KIND
+            raw["sibling_unit_handoff"] = {
+                "contract_version": 1,
+                "primary_queue_id": queue_id,
+                "primary_issue_number": _sibling_unit_number(trigger),
+                "primary_match_confidence": entry["verdict"].get("match_confidence"),
+                "primary_review_reason": entry["verdict"].get("review_reason"),
+                "sibling_match_confidence": verdict.get("match_confidence"),
+                "sibling_unit_number": _sibling_unit_number(sibling_wanted),
+                "query_variant": verdict.get("query_variant"),
+                "seeded_at": now,
+                "seeded_at_iso": inkdrop_state.utc_stamp(now),
+            }
+            attempt = dict(attempt)
+            attempt["raw"] = raw
+            indexer = str(verdict.get("indexer") or entry["provider_id"] or "indexer").strip()
+            attempt["reason"] = (
+                f"{indexer} release names #{_sibling_unit_number(sibling_wanted)}; "
+                f"seeded from the search for #{_sibling_unit_number(trigger)}"
+            )
+            synthetic_result = {
+                "provider_id": entry["provider_id"],
+                "adapter_family": entry["job"].get("adapter_family"),
+                "result_status": "sent",
+                "reason": "sibling_unit_fanout",
+                "runtime_results": [
+                    {
+                        "status": "sent",
+                        "candidate_count": 1,
+                        "safe_candidate_count": 1,
+                        "review_candidate_count": 0,
+                        "blocked_candidate_count": 0,
+                        "candidates": [verdict],
+                        "verdicts": [verdict],
+                        "attempts": [attempt],
+                    }
+                ],
+                "attempts": [attempt],
+            }
+            synthetic_job = {
+                "provider_id": entry["provider_id"],
+                "adapter_family": entry["job"].get("adapter_family"),
+                "registry_row": entry["registry_row"],
+                "wanted_item": sibling_wanted,
+                "worker_plan": entry["job"].get("worker_plan"),
+            }
+            recorded = recorder.record_source_job_result(
+                db_path,
+                sibling_id,
+                synthetic_result,
+                job=synthetic_job,
+                source_memory_db_path=source_memory_db_path,
+                source_memory_cooldown_seconds=source_memory_cooldown_seconds,
+                dry_run=False,
+                max_attempts=1,
+                record_lock_retry_attempts=record_lock_retry_attempts,
+                record_lock_retry_initial_delay=record_lock_retry_initial_delay,
+                now=now,
+            )
+            record = {
+                "queue_id": sibling_id,
+                "ok": bool(recorded.get("ok")),
+                "title": attempt.get("title"),
+                "provider_id": entry["provider_id"],
+                "attempts_recorded": recorded.get("attempts_recorded"),
+                "download_tasks_created": recorded.get("download_tasks_created"),
+                "result_status": recorded.get("result_status"),
+            }
+            if not recorded.get("ok"):
+                record["reason"] = recorded.get("reason")
+                out["skipped"].append({"queue_id": sibling_id, "reason": recorded.get("reason") or "sibling_record_failed"})
+                out["records"].append(record)
+                continue
+            if not recorded.get("download_tasks_created"):
+                # Source memory or another recorder gate refused it; the
+                # attempt row is the evidence, the row is not seeded.
+                out["skipped"].append({"queue_id": sibling_id, "reason": recorded.get("result_status") or "sibling_attempt_not_sent"})
+                out["records"].append(record)
+                continue
+            if handoff_download_clients:
+                handoff = handoff_download_client_tasks(
+                    db_path,
+                    sibling_id,
+                    add_download_client=download_client_adder,
+                    dry_run=False,
+                    limit=1,
+                    max_successful=1,
+                    stop_on_failure=True,
+                    now=now,
+                )
+                record["handoff"] = {
+                    key: handoff.get(key)
+                    for key in ("ok", "tasks_handed_off", "tasks_failed", "reason")
+                    if key in handoff
+                }
+            out["seeded"].append(sibling_id)
+            out["records"].append(record)
+        finally:
+            try:
+                inkdrop_state.release_queue_claim(db_path, sibling_id, owner_id)
+            except Exception:
+                pass
+    return out
+
+
+
 def _provider_filter_allows_persisted_pack(provider_id, provider_ids):
     provider_id = inkdrop_sources.provider_key(provider_id)
     requested = {
@@ -2836,6 +3313,25 @@ def run_source_worker_for_queue(
             record_lock_retry_initial_delay=record_lock_retry_initial_delay,
             now=now,
         )
+    sibling_fanout = {}
+    if not replay and recorded.get("ok"):
+        with _phase(phases, "sibling_fanout"):
+            sibling_fanout = sibling_unit_fanout_for_queue(
+                db_path,
+                queue_id,
+                planned,
+                selected_jobs,
+                results,
+                dry_run=dry_run,
+                source_memory_db_path=source_memory_db_path,
+                source_memory_cooldown_seconds=source_memory_cooldown_seconds,
+                record_lock_retry_attempts=record_lock_retry_attempts,
+                record_lock_retry_initial_delay=record_lock_retry_initial_delay,
+                handoff_download_clients=handoff_download_clients,
+                download_client_adder=download_client_adder,
+                staging_root=staging_root,
+                now=now,
+            )
     direct_stage = {}
     if stage_direct:
         with _phase(phases, "direct_stage"):
@@ -2875,6 +3371,7 @@ def run_source_worker_for_queue(
         "job_results": results,
         "job_result_summary": source_jobs.source_job_result_summary(results),
         "recording": recorded,
+        "sibling_unit_fanout": sibling_fanout,
         "direct_stage": direct_stage,
         "download_client_handoff": download_client_handoff,
         # Handed back rather than written here: the caller owns the run

@@ -179,6 +179,7 @@ POLICY_SETTING_OVERRIDE_KEYS = (
     "pack_auto_allowed",
     "pack_detail_allowed_hosts",
     "pack_detail_fetch",
+    "sibling_unit_fanout",
     "pack_detail_max_bytes",
     "pack_detail_max_fetches",
     "pack_detail_sidecar_max_bytes",

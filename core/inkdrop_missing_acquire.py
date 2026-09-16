@@ -5686,6 +5686,125 @@ def acceptable_result(title, issue_number, result, is_manga=False, unit_model=No
     ).get("acceptable", False)
 
 
+# Sibling-unit fan-out for this file's per-issue loop.
+#
+# A search for one wanted issue routinely returns the rest of the series: the
+# "Watchmen 001" query brings back 002..012 too. Each result was scored only
+# against the row that issued the query, so a sibling's exact release scored
+# 45 ("not an exact single issue/volume match"), became a diagnostic sample,
+# and was thrown away -- while the sibling row sat in the same run's rows list
+# waiting to spend its own provider calls on the same search. The pool below
+# keeps every result a series has seen this run; after each row's batch, the
+# production acceptor (choose_acceptable, behind the same quality and
+# known-bad filters) is run for every other row of the same series, and a
+# hit is sent for that row exactly as a direct hit would be. One release
+# serves one row. Nothing here settles a row: only a verified import does.
+SIBLING_UNIT_FANOUT_ENV = "INKDROP_MISSING_ACQUIRE_SIBLING_UNIT_FANOUT"
+SIBLING_UNIT_ATTEMPT_KIND = "missing_acquire_sibling_unit"
+SIBLING_UNIT_MAX_SENDS_PER_TRIGGER = 10
+
+
+def sibling_unit_fanout_enabled():
+    value = str(os.environ.get(SIBLING_UNIT_FANOUT_ENV, "1") or "").strip().lower()
+    return value not in {"0", "false", "off", "no", "disabled"}
+
+
+def series_key_for_row(row):
+    """The work a row belongs to. Provider identity first, title only as a fallback.
+
+    Two works can share a title (a 2016 and a 2012 "Batman Beyond"); keying on
+    the provider's series id keeps their rows apart, and a row that has no
+    provider identity falls back to its normalized title.
+    """
+    row = row if isinstance(row, dict) else {}
+    provider = str(row.get("metadata_provider") or "").strip().lower()
+    metadata_id = str(row.get("metadata_id") or "").strip()
+    if provider and metadata_id:
+        return f"{provider}:{metadata_id}"
+    return f"title:{normalize(row.get('title'))}"
+
+
+def result_pool_key(result):
+    return result_download_url_hash(result) or normalize(release_title(result))
+
+
+def pool_series_results(pool, series_key, results):
+    """Remember a query's raw results for the series, deduplicated by locator."""
+    bucket = pool.setdefault(series_key, {"results": [], "seen": set(), "consumed": set()})
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+        key = result_pool_key(result)
+        if not key or key in bucket["seen"]:
+            continue
+        bucket["seen"].add(key)
+        bucket["results"].append(dict(result))
+    return len(bucket["results"])
+
+
+def mark_pool_result_consumed(pool, series_key, result):
+    bucket = pool.get(series_key)
+    if not bucket:
+        return
+    key = result_pool_key(result)
+    if key:
+        bucket["consumed"].add(key)
+
+
+def sibling_hits_for_pool(pool_results, rows, trigger_row, *, accept, consumed=None):
+    """Which other rows of the trigger's series does the pool serve?
+
+    ``accept(row, results)`` is the production acceptor for that row and
+    returns the chosen result or None. Each result serves one row: a release
+    chosen for one sibling is not offered to the next, and results the
+    trigger itself sent arrive already in ``consumed``.
+    """
+    consumed = consumed if consumed is not None else set()
+    trigger_key = series_key_for_row(trigger_row)
+    trigger_issue = normalized_number((trigger_row or {}).get("issue_number"))
+    hits = []
+    for row in rows or []:
+        if not isinstance(row, dict) or series_key_for_row(row) != trigger_key:
+            continue
+        if normalized_number(row.get("issue_number")) == trigger_issue:
+            continue
+        available = [result for result in pool_results if result_pool_key(result) not in consumed]
+        if not available:
+            break
+        chosen = accept(row, available)
+        if not chosen:
+            continue
+        consumed.add(result_pool_key(chosen))
+        hits.append((row, chosen))
+    return hits
+
+
+def dispatch_sibling_hits(hits, *, send_hit, is_in_flight, is_known_bad, sibling_sent, max_sends=SIBLING_UNIT_MAX_SENDS_PER_TRIGGER):
+    """Send each sibling hit that is not already in flight or known bad.
+
+    ``send_hit(row, chosen)`` performs the send and its bookkeeping and returns
+    False when the send did not happen. ``sibling_sent`` is the run-wide set of
+    (series key, issue) pairs already served this way, so the main loop can
+    skip a row the pool has already answered.
+    """
+    sent = []
+    for row, chosen in hits or []:
+        key = (series_key_for_row(row), normalized_number(row.get("issue_number")))
+        if key in sibling_sent:
+            continue
+        if max_sends is not None and len(sent) >= max_sends:
+            break
+        if is_in_flight(row):
+            continue
+        if is_known_bad(row, chosen):
+            continue
+        if send_hit(row, chosen) is False:
+            continue
+        sibling_sent.add(key)
+        sent.append((row, chosen))
+    return sent
+
+
 def choose_acceptable(title, issue_number, results, is_manga=False, unit_model=None, quality_rules=None, wanted_unit_type=None):
     accepted = [r for r in results if acceptable_result(
         title, issue_number, r, is_manga, unit_model,
@@ -6905,6 +7024,108 @@ def main():
             })
 
     unit_model_cache = {}
+    series_result_pool = {}
+    sibling_sent = set()
+    sibling_fanout = sibling_unit_fanout_enabled()
+    summary["sibling_unit_fanout"] = {"enabled": sibling_fanout, "sent": 0, "skipped": 0}
+
+    def accept_for_sibling(sibling_row, results):
+        sibling_title = sibling_row["title"]
+        sibling_manga = row_is_manga(sibling_row)
+        sibling_model = row_unit_model(sibling_row, unit_model_cache) if sibling_manga else None
+        # dry_run=True on both filters: matching a sibling records nothing;
+        # only the send below leaves evidence.
+        kept, _blocked = filter_quality_allowed_results(
+            acquire, sibling_row, sibling_title, sibling_row["issue_number"], results,
+            is_manga=sibling_manga, unit_model=sibling_model, quality_rules=quality_rules, dry_run=True,
+        )
+        kept, _bad = filter_known_bad_results(
+            cache, sibling_row, sibling_title, sibling_row["issue_number"], kept, dry_run=True,
+        )
+        return choose_acceptable(
+            sibling_title, sibling_row["issue_number"], kept, is_manga=sibling_manga, unit_model=sibling_model,
+            quality_rules=quality_rules, wanted_unit_type=sibling_row.get("unit_type"),
+        )
+
+    def sibling_in_flight(sibling_row):
+        state = str(sibling_row.get("queue_state") or "").strip().lower()
+        if state in {"downloading", "importing", "verified"}:
+            return True
+        if has_active_reconciled_download(sibling_row["title"], sibling_row["issue_number"]):
+            return True
+        return issue_has_pending(sibling_row["title"], sibling_row["issue_number"], raw_pending)
+
+    def sibling_known_bad(sibling_row, chosen):
+        return is_known_bad_result(cache, sibling_row["title"], sibling_row["issue_number"], chosen)
+
+    def send_sibling_hit(sibling_row, chosen, *, trigger_row):
+        sibling_title = sibling_row["title"]
+        sibling_context = row_output_context(sibling_row)
+        query = f"{sibling_title} {sibling_row['issue_number']} (sibling of #{trigger_row.get('issue_number')})"
+        if normalize(chosen.get("title")) in pending:
+            return False
+        try:
+            ensure_send_allowed(cache, sibling_title, sibling_row["issue_number"], chosen)
+            outcome = send(acquire, chosen, query, args.dry_run, target=sibling_row)
+        except Exception as exc:
+            failure_reason = send_failure_reason(exc, "download_client_send_failed")
+            remember_bad_result(cache, sibling_title, sibling_row["issue_number"], chosen, failure_reason)
+            record_inkdrop_queue_attempt(
+                sibling_row, "error", failure_reason, query=query, candidate=chosen, dry_run=args.dry_run,
+                extra={"error": redact_error(exc), "kind": SIBLING_UNIT_ATTEMPT_KIND,
+                       "sibling_of": trigger_row.get("issue_number")},
+            )
+            audit("sibling_send_failed", {"series": sibling_title, "issue": sibling_row["issue_number"],
+                                          "sibling_of": trigger_row.get("issue_number"), "error": redact_error(exc)})
+            return False
+        action = {
+            "series": sibling_title,
+            "issue": sibling_row["issue_number"],
+            "query": query,
+            "title": chosen.get("title"),
+            "indexer": chosen.get("indexer"),
+            "protocol": chosen.get("protocol"),
+            "seeders": chosen.get("seeders"),
+            "source_unit": chosen.get("source_unit"),
+            "outcome": outcome,
+            "sibling_of": trigger_row.get("issue_number"),
+            "kind": SIBLING_UNIT_ATTEMPT_KIND,
+            **sibling_context,
+        }
+        summary["actions"].append(action)
+        sent_by_series[sibling_title] = sent_by_series.get(sibling_title, 0) + 1
+        summary["sibling_unit_fanout"]["sent"] += 1
+        audit("sibling_selected", action)
+        record_inkdrop_queue_attempt(
+            sibling_row,
+            "sent" if not args.dry_run else "dry_run",
+            f"sent to downloader; release found by the search for #{trigger_row.get('issue_number')}",
+            query=query, candidate=chosen, outcome=outcome, dry_run=args.dry_run,
+            extra={"kind": SIBLING_UNIT_ATTEMPT_KIND, "sibling_of": trigger_row.get("issue_number")},
+        )
+        return True
+
+    def fan_out_to_siblings(trigger_row, series_key):
+        if not sibling_fanout:
+            return []
+        bucket = series_result_pool.get(series_key)
+        if not bucket or not bucket["results"]:
+            return []
+        hits = sibling_hits_for_pool(
+            bucket["results"], rows, trigger_row, accept=accept_for_sibling, consumed=bucket["consumed"],
+        )
+        if not hits:
+            return []
+        sent = dispatch_sibling_hits(
+            hits,
+            send_hit=lambda sibling_row, chosen: send_sibling_hit(sibling_row, chosen, trigger_row=trigger_row),
+            is_in_flight=sibling_in_flight,
+            is_known_bad=sibling_known_bad,
+            sibling_sent=sibling_sent,
+        )
+        summary["sibling_unit_fanout"]["skipped"] += len(hits) - len(sent)
+        return sent
+
     for row in rows:
         if selected_series_mode:
             if len(summary["actions"]) >= args.max_total:
@@ -6915,6 +7136,9 @@ def main():
             note_budget_skip(row)
             break
         title = row["title"]
+        series_key = series_key_for_row(row)
+        if (series_key, normalized_number(row.get("issue_number"))) in sibling_sent:
+            continue
         is_manga = row_is_manga(row)
         unit_model = row_unit_model(row, unit_model_cache) if is_manga else None
         row_context = row_output_context(row)
@@ -7056,6 +7280,8 @@ def main():
                             budget_stopped = True
                             note_budget_skip(row, tried_queries)
                         return "error_stop"
+                    if sibling_fanout:
+                        pool_series_results(series_result_pool, series_key, results)
                     results, quality_blocked_samples = filter_quality_allowed_results(
                         acquire,
                         row,
@@ -7175,6 +7401,7 @@ def main():
                     }
                     summary["actions"].append(action)
                     sent_by_series[title] = sent_by_series.get(title, 0) + 1
+                    mark_pool_result_consumed(series_result_pool, series_key, batch_chosen)
                     audit("selected", action)
                     record_inkdrop_queue_attempt(
                         row,
@@ -7204,6 +7431,7 @@ def main():
                 expansion_queries = expansion_queries_beyond(planned_queries, full_pool)
                 if expansion_queries:
                     run_issue_query_batch(expansion_queries)
+        fan_out_to_siblings(row, series_key)
         if budget_stopped and not pack_candidates:
             summary["skipped"].append({
                 "reason": "search_budget_exhausted",

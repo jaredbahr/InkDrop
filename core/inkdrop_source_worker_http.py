@@ -357,9 +357,60 @@ def effective_host_cap_or_none(global_hosts, request_hosts):
     return sorted(effective)
 
 
+# Hosts the operator's own Prowlarr instance declares for its configured
+# indexers (``indexerUrls``/``legacyUrls``), registered by the adapter when it
+# reads the indexer list. They widen the GLOBAL cap for one purpose only: a
+# pack-detail metadata fetch, which follows a result's own infoUrl to the
+# indexer's site to read the release's file list. Measured on production
+# (2026-08-18): 1,843 pack-detail requests refused as disallowed_host, 1,357
+# of them Nyaa -- a site Prowlarr itself was searching on every pass. Nothing
+# else is widened: a search, a download, or a direct fetch still meets the
+# configured cap, and an infoUrl on a host no configured indexer declares is
+# still refused.
+PACK_DETAIL_PURPOSE_PREFIX = "fetch_indexer_pack_detail"
+_INDEXER_DECLARED_HOSTS = {}
+
+
+def register_indexer_declared_hosts(hosts, *, indexer_id=None):
+    """Remember hosts a configured indexer declares, for pack-detail fetches."""
+    added = []
+    for value in hosts or []:
+        host = _lower(value)
+        if "://" in host:
+            host = _lower(parse.urlsplit(host).hostname or "")
+        host = host.strip("[]")
+        if not host or host.startswith("*") or host.startswith("."):
+            continue
+        if host not in _INDEXER_DECLARED_HOSTS:
+            added.append(host)
+        _INDEXER_DECLARED_HOSTS[host] = str(indexer_id or _INDEXER_DECLARED_HOSTS.get(host) or "")
+    return added
+
+
+def indexer_declared_hosts():
+    return sorted(_INDEXER_DECLARED_HOSTS)
+
+
+def clear_indexer_declared_hosts():
+    _INDEXER_DECLARED_HOSTS.clear()
+
+
+def _global_hosts_for_request(global_hosts, request):
+    purpose = str((request or {}).get("purpose") or "").strip().lower()
+    if not purpose.startswith(PACK_DETAIL_PURPOSE_PREFIX) or not _INDEXER_DECLARED_HOSTS:
+        return global_hosts
+    if not global_hosts:
+        # No global cap at all means no restriction; widening an unrestricted
+        # cap would turn it into a restriction.
+        return global_hosts
+    return [*list(global_hosts or []), *sorted(_INDEXER_DECLARED_HOSTS)]
+
+
 def _effective_host_cap(global_hosts, request_hosts, *, request=None):
     """Apply a request route cap without allowing global configuration to widen it."""
-    effective_exact, effective_suffix, narrowed = _intersect_host_cap(global_hosts, request_hosts)
+    effective_exact, effective_suffix, narrowed = _intersect_host_cap(
+        _global_hosts_for_request(global_hosts, request), request_hosts
+    )
     effective = effective_exact | effective_suffix
     if not effective and narrowed:
         raise SourceHttpError(
