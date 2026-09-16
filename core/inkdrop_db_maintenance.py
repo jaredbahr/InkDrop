@@ -128,14 +128,6 @@ def auto_vacuum_name(mode) -> str:
     return AUTO_VACUUM_NAMES.get(int(mode or 0), str(mode))
 
 
-def database_is_empty(con) -> bool:
-    """True for a database with no pages yet -- the only point auto_vacuum is free."""
-    try:
-        return int(con.execute("pragma page_count").fetchone()[0] or 0) == 0
-    except (sqlite3.Error, TypeError, ValueError, IndexError):
-        return False
-
-
 def configure_new_database_auto_vacuum(con) -> bool:
     """Put INCREMENTAL in the header while the file is still empty.
 

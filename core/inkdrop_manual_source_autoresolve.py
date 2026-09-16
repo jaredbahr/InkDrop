@@ -1469,10 +1469,6 @@ def refresh_probe_rows(probe, records, default_reason="no_safe_source"):
     return refreshed, status
 
 
-def refresh_waiting_probe_rows(probe, waiting):
-    return refresh_probe_rows(probe, waiting, default_reason="no_safe_source")
-
-
 def stable_detected_file(row, min_age_seconds):
     path = Path(str((row or {}).get("path") or ""))
     try:

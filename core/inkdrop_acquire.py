@@ -1860,12 +1860,6 @@ def _decode_torrent_payload(payload):
     return root, payload[info_span[0]:info_span[1]]
 
 
-def _torrent_text(value):
-    if not isinstance(value, bytes):
-        return ""
-    return value.decode("utf-8", errors="replace").strip()
-
-
 def _torrent_path_component(value):
     if not isinstance(value, bytes):
         raise ValueError("torrent path component invalid")

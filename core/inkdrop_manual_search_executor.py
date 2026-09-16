@@ -739,9 +739,3 @@ def runner_for_db(db_path: str | Path):
         return run_provider(db_path, provider_id, context, queries, profile, registry_loader=_shared_registry)
 
     return _runner
-
-
-def safe_public_result(value: dict[str, Any]) -> dict[str, Any]:
-    """Bounded helper for CLI diagnostics; never prints adapter raw evidence."""
-
-    return json.loads(json.dumps(value, default=str))

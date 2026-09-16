@@ -3669,10 +3669,6 @@ def direct_file_probe_request(url, index, method="HEAD", allowed_hosts=None):
     )
 
 
-def direct_file_probe_head_request(url, index):
-    return direct_file_probe_request(url, index, method="HEAD")
-
-
 def reader_page_pack_search_requests(row, plan, wanted_item=None, limit=20):
     query = source_query(wanted_item)
     urls = _configured_search_urls(row, query, limit=limit)
@@ -4629,13 +4625,6 @@ def _mangadex_feed_payload_has_match(payload, row, wanted_item, *, limit=20):
     return bool(_mangadex_matching_chapter_rows(payload, row, wanted_item, limit=max(1, int(limit or 1))))
 
 
-def _mangadex_page_payload(manga_row, feed_payload):
-    return {
-        "manga": manga_row,
-        "feed": feed_payload,
-    }
-
-
 def _fetch_mangadex_feed_pages(manga_id, manga_row, row, plan, wanted_item, http_get, result, *, limit=20, deadline=None):
     page_limit = _mangadex_feed_page_limit(row, fallback=100)
     max_pages = _mangadex_feed_max_pages(row)
@@ -4748,28 +4737,6 @@ def _suwayomi_chapter_number(chapter_row):
     chapter_row = chapter_row if isinstance(chapter_row, dict) else {}
     value = providers.first_text(chapter_row.get("chapterNumber"), chapter_row.get("chapter"), chapter_row.get("number"))
     return _mangadex_number_filter(value)
-
-
-def _suwayomi_meta_value(chapter_row, keys):
-    chapter_row = chapter_row if isinstance(chapter_row, dict) else {}
-    keys = {str(key or "").strip().lower() for key in keys or [] if str(key or "").strip()}
-    meta = chapter_row.get("meta")
-    if isinstance(meta, dict):
-        for key in keys:
-            value = meta.get(key)
-            if value not in (None, "", [], {}):
-                return value
-        for key, value in meta.items():
-            if str(key or "").strip().lower() in keys and value not in (None, "", [], {}):
-                return value
-        return ""
-    for row in meta or []:
-        if not isinstance(row, dict):
-            continue
-        key = str(row.get("key") or row.get("name") or "").strip().lower()
-        if key in keys and row.get("value") not in (None, "", [], {}):
-            return row.get("value")
-    return ""
 
 
 def _suwayomi_volume_number(chapter_row):
@@ -6950,11 +6917,3 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
         return result
     result["reason"] = fetch_plan.get("reason") or "no_request_available"
     return result
-
-
-def safe_request_json(request):
-    request = request if isinstance(request, dict) else {}
-    safe = dict(request)
-    if safe.get("secret_params"):
-        safe["secret_params"] = {key: "<redacted>" for key in dict(safe.get("secret_params") or {})}
-    return json.dumps(safe, sort_keys=True, ensure_ascii=True)

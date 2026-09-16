@@ -8397,28 +8397,6 @@ def _suwayomi_chapter_number(chapter_row):
     return _suwayomi_number_text(first_text(chapter_row.get("chapterNumber"), chapter_row.get("chapter"), chapter_row.get("number")))
 
 
-def _suwayomi_meta_value(chapter_row, keys):
-    chapter_row = chapter_row if isinstance(chapter_row, dict) else {}
-    keys = {str(key or "").strip().lower() for key in keys or [] if str(key or "").strip()}
-    meta = chapter_row.get("meta")
-    if isinstance(meta, dict):
-        for key in keys:
-            value = meta.get(key)
-            if value not in (None, "", [], {}):
-                return value
-        for key, value in meta.items():
-            if str(key or "").strip().lower() in keys and value not in (None, "", [], {}):
-                return value
-        return ""
-    for row in meta or []:
-        if not isinstance(row, dict):
-            continue
-        key = str(row.get("key") or row.get("name") or "").strip().lower()
-        if key in keys and row.get("value") not in (None, "", [], {}):
-            return row.get("value")
-    return ""
-
-
 SUWAYOMI_VOLUME_METADATA_KEYS = {"vol", "volume", "volumenumber"}
 
 
@@ -9230,12 +9208,6 @@ def suwayomi_candidates_from_payload(payload, registry_row=None, wanted_item=Non
     if volume_pack_candidates:
         return volume_pack_candidates
     return suwayomi_page_pack_candidates_from_payload(payload, registry_row, wanted_item, limit=limit)
-
-
-def _is_suwayomi_page_pack_candidate(candidate):
-    candidate = candidate if isinstance(candidate, dict) else {}
-    raw = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else {}
-    return bool(raw.get("suwayomi_page_pack") or candidate.get("suwayomi_page_pack") or candidate.get("page_image_urls"))
 
 
 def suwayomi_candidate_verdict(candidate, registry_row=None):

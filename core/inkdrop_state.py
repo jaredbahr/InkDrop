@@ -60896,10 +60896,6 @@ def apply_manual_review_contract(row, contract_input=None):
     return row
 
 
-def manual_review_row_is_actionable(row):
-    return bool(apply_manual_review_contract(row).get("manual_review_actionable"))
-
-
 def manual_review_row_matches_filter(row, manual_review_filter):
     value = str(manual_review_filter or "actionable").strip().lower().replace("-", "_")
     if value not in MANUAL_REVIEW_SOURCE_FILTERS:
@@ -61214,21 +61210,6 @@ def _manual_review_canonical_snapshot_build(db_path, limit=5000):
             for value, (label, _states) in MANUAL_REVIEW_FILTERS.items()
         ],
     }
-
-
-def manual_review_filter_options(summary, db_path=None):
-    if db_path:
-        return manual_review_canonical_snapshot(db_path)["filters"]
-    actionable = int((summary or {}).get("manual_review_actionable_count") or 0)
-    parked = int((summary or {}).get("manual_review_parked_count") or 0)
-    return [
-        {
-            "value": value,
-            "label": label,
-            "count": actionable if value in {"actionable", "all"} else parked if value == "parked" else 0,
-        }
-        for value, (label, _states) in MANUAL_REVIEW_FILTERS.items()
-    ]
 
 
 def manual_review_rows(db_path, limit=80, manual_review_filter=None):
@@ -73323,24 +73304,6 @@ def history_filter_clause(history_filter):
             )
         """, []
     return value, "", []
-
-
-def history_base_from_join():
-    return """
-        from history_events h
-        left join series s on s.id = h.series_id
-        left join issues i on i.id = h.issue_id
-        left join source_attempts sa on h.entity_type = 'source_attempt' and sa.id = h.entity_id
-        left join import_results ir on h.entity_type = 'import_result' and ir.id = h.entity_id
-        left join download_tasks dt on h.entity_type = 'download_task' and dt.id = h.entity_id
-        left join queue_items q on q.id = case
-            when h.entity_type = 'queue_item' then h.entity_id
-            when h.entity_type = 'source_attempt' then sa.queue_id
-            when h.entity_type = 'import_result' then ir.queue_id
-            when h.entity_type = 'download_task' then dt.queue_id
-            else null
-        end
-    """
 
 
 def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0):

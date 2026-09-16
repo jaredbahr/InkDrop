@@ -7302,10 +7302,6 @@ def ready_import_records(max_files):
         conn.close()
 
 
-def ready_import_paths(max_files):
-    return [record["source_file"] for record in ready_import_records(max_files)]
-
-
 def sync_reconciliation_from_inkdrop_import_results(limit=1000):
     if not (DB_PATH.exists() and INKDROP_STATE_DB.exists()):
         return {"ok": False, "reason": "db_missing", "updated": 0}

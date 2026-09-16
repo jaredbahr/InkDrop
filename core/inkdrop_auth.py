@@ -879,11 +879,6 @@ def resolve_config(db_path, environ=None):
     return json.loads(json.dumps(result))
 
 
-def _setting_from_db(db_path, key, fallback=None):
-    with _settings_connect(db_path) as con:
-        return _setting(con, key, fallback)
-
-
 def public_status(db_path, environ=None):
     config = resolve_config(db_path, environ)
     external = config["external"]

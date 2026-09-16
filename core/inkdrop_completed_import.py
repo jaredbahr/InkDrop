@@ -3853,12 +3853,6 @@ def archive_corruption_check(path):
     return {"outcome": "corrupt", "reason": reason, "detail": detail}
 
 
-def normalize_archive_member_name(member, root):
-    rel = member.relative_to(root)
-    parts = [re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", part).strip(" .") or "page" for part in rel.parts]
-    return "/".join(parts)
-
-
 def list_cbr_image_entries(source):
     proc = run_subprocess_bounded(
         ["7z", "l", "-slt", str(source)],
@@ -4629,10 +4623,6 @@ def load_kavita_settings():
     }
 
 
-def load_kavita_api_key():
-    return load_kavita_settings()["api_key"]
-
-
 def kavita_visibility_adapter_enabled():
     return bool(provider_enabled("kavita", KAVITA_DB.exists()) and KAVITA_DB.exists())
 
@@ -4701,38 +4691,6 @@ def load_komga_settings():
         "timeout_seconds": int_setting(settings, "timeout_seconds", 8, minimum=1, maximum=60),
         "source": config.get("source") or ("inkdrop_state" if config else "runtime"),
     }
-
-
-def host_folder_to_komga(path, settings=None):
-    settings = settings if isinstance(settings, dict) else load_komga_settings()
-    return inkdrop_library_frontends.host_path_to_frontend_path(
-        path,
-        comic_root=COMIC_ROOT,
-        manga_root=MANGA_ROOT,
-        frontend_comic_root=settings["komga_comic_root"],
-        frontend_manga_root=settings["komga_manga_root"],
-    )
-
-
-def host_path_to_komga(path, settings=None):
-    settings = settings if isinstance(settings, dict) else load_komga_settings()
-    return inkdrop_library_frontends.host_path_to_frontend_path(
-        path,
-        comic_root=COMIC_ROOT,
-        manga_root=MANGA_ROOT,
-        frontend_comic_root=settings["komga_comic_root"],
-        frontend_manga_root=settings["komga_manga_root"],
-    )
-
-
-def komga_library_ids_for_host_folder(host_folder, settings=None):
-    settings = settings if isinstance(settings, dict) else load_komga_settings()
-    return inkdrop_library_frontends.library_ids_for_host_folder(
-        host_folder,
-        settings,
-        comic_root=COMIC_ROOT,
-        manga_root=MANGA_ROOT,
-    )
 
 
 def komga_list_libraries(settings=None):

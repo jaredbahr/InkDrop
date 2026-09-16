@@ -39535,26 +39535,6 @@ def manual_review_count_for_series(series_title):
     return count
 
 
-def comic_watch_public_context():
-    reconciliation = []
-    for row in reconciliation_rows():
-        haystack = " ".join(
-            str(row.get(key) or "")
-            for key in ("matched_series", "title", "query", "matched_local_path")
-        )
-        reconciliation.append((normalize_key(haystack), row))
-    return {
-        "manga_unit_map": manga_unit_map(),
-        "manga_completion_rows": manga_completion_rows(),
-        "manga_unit_completion_rows": manga_unit_completion_rows(),
-        "manga_coverage_rows": manga_coverage_rows(),
-        "collection_completion_rows": collection_completion_rows(),
-        "reconciliation": reconciliation,
-        "manual_review_items": load_manual_review(limit=200),
-        "kavita_visible_cache": {},
-    }
-
-
 def completed_manga_unit_numbers_cached(context, unit_models, volume_id=None, series_title=None, native_series_id=None):
     if not context:
         return completed_manga_unit_numbers(unit_models, volume_id, series_title, native_series_id)

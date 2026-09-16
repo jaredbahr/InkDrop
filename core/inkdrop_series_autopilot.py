@@ -1683,23 +1683,6 @@ def budget_retry_seconds(args):
     return max(MIN_BUDGET_RETRY_SECONDS, min(retry_seconds, 10 * 60))
 
 
-def inkdrop_retired_queue_ids():
-    if inkdrop_state is None or not INKDROP_STATE_DB.exists():
-        return set()
-    try:
-        with inkdrop_state.connect(INKDROP_STATE_DB) as con:
-            return {
-                str(row["id"])
-                for row in con.execute(
-                    "select id from queue_items where state in ('superseded_duplicate')"
-                )
-                if row["id"] not in (None, "")
-            }
-    except Exception as exc:
-        log("inkdrop_retired_queue_ids_failed", error=f"{type(exc).__name__}: {exc}")
-        return set()
-
-
 def inkdrop_terminal_queue_rows():
     if inkdrop_state is None or not INKDROP_STATE_DB.exists():
         return {}
@@ -4810,10 +4793,6 @@ def stale_slskd_detected_probe_row(row, now):
     if checked_at <= 0:
         return False
     return checked_at < now - STALE_SLSKD_IMPORT_SIGNAL_SECONDS
-
-
-def read_waiting_review_ids():
-    return set(read_waiting_records())
 
 
 def manual_source_resolved_destination_paths(row):
@@ -14034,27 +14013,6 @@ def slskd_reprobe_group_admission_fairness_key(rows, now=None, service_at=None):
     )
 
 
-def oldest_due_slskd_reprobe(queue, args, now=None):
-    if now is None:
-        now = time.time()
-    allowed_series = set(getattr(args, "series", []) or [])
-    rows = []
-    for item in (queue.get("items") or {}).values():
-        if not isinstance(item, dict):
-            continue
-        if allowed_series and item.get("series") not in allowed_series:
-            continue
-        if has_soon_cached_slskd_autopick(item, now=now):
-            continue
-        if slskd_source_result_reprobe_due(item, now=now):
-            rows.append(item)
-    return min(
-        rows,
-        key=lambda item: slskd_reprobe_admission_fairness_key(item, now=now),
-        default=None,
-    )
-
-
 def first_pass_due_row_count(queue, args, now=None):
     if now is None:
         now = time.time()
@@ -16716,10 +16674,6 @@ def process_running_for_script(script_path, *, ignore_markers=()):
             continue
         return True
     return False
-
-
-def live_worker_in_progress():
-    return bool(series_worker_in_progress() or source_probe_in_progress())
 
 
 def series_worker_in_progress():

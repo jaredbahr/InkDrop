@@ -1146,15 +1146,6 @@ def _update_watch_claim(db_path, key, flag, *, done, extra):
         return dict(current)
 
 
-def watch_state_prefix(db_path, prefix):
-    with _connection(db_path) as con:
-        rows = con.execute(
-            "select key, value_json from notification_watch_state where key like ? order by key",
-            (f"{prefix}%",),
-        ).fetchall()
-        return {row["key"]: _json(row["value_json"], {}) for row in rows}
-
-
 def prune_watch_state(db_path, prefix, *, older_than_seconds):
     cutoff = time.time() - max(0, int(older_than_seconds or 0))
     with _connection(db_path) as con:

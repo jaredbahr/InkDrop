@@ -446,10 +446,6 @@ def _python_dependency_checks():
     return checks
 
 
-def _adapter_configured(adapter, values):
-    return _adapter_status(adapter, values)["configured"]
-
-
 def _adapter_status(adapter, values):
     required_keys = OPTIONAL_ADAPTER_REQUIRED_ENV.get(adapter, OPTIONAL_ADAPTER_ENV.get(adapter, ()))
     existing_path_keys = OPTIONAL_ADAPTER_EXISTING_PATH_ENV.get(adapter, ())

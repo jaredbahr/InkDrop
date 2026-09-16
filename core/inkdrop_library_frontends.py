@@ -1373,14 +1373,3 @@ def sync_library_frontends(
         "errors": [task for task in all_tasks if task.get("error")],
         "folders": folders,
     }
-
-
-def folders_from_imported_items(imported):
-    folders = []
-    for item in imported or []:
-        if not isinstance(item, dict):
-            continue
-        dest = str(item.get("dest") or "").strip()
-        if dest:
-            folders.append(str(Path(dest).parent))
-    return unique_folders(folders)
