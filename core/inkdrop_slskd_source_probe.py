@@ -455,12 +455,26 @@ AUTO_GRAB_CANDIDATE_LIMIT = 25
 # The most rows one run may start. Was a literal 10 at two sites; the row
 # reserve against the hard deadline already stops a run that cannot finish.
 AUTO_GRAB_MAX_PER_RUN = 25
+# What a run starts when nothing is stored for it. Matches the parent's
+# SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX, so the lanes that pass no
+# --auto-grab-max (the hot-retry and Manual Source autoresolve lanes, since
+# #1206 and its sibling) resolve the same number the broad lane is given.
+AUTO_GRAB_DEFAULT_PER_RUN = 20
 # A peer that holds the whole run gets asked for the whole run. Measured
 # 2026-09-09: drchzbrgr offered Coda 001-012, Tiny Titans 001-041, Gotham
 # Central 001-040 and Absolute Green Lantern 001-017 in one folder each, and
 # the run took one issue. slskd queues requests per peer itself; the
 # InkDrop-side caps below only bound how much one run asks for.
-AUTO_GRAB_MAX_ACTIVE_PER_USER = max(1, min(env_int("INKDROP_SLSKD_MAX_ACTIVE_PER_USER", 20), 40))
+# The stored per-peer setting is bounded by this, not by a literal 20: an
+# operator who raised it to 40 in Settings used to be silently read back at 20.
+AUTO_GRAB_MAX_ACTIVE_PER_USER_CEILING = 40
+AUTO_GRAB_MAX_ACTIVE_PER_USER = max(
+    1, min(env_int("INKDROP_SLSKD_MAX_ACTIVE_PER_USER", 20), AUTO_GRAB_MAX_ACTIVE_PER_USER_CEILING)
+)
+# A series named on the command line is loaded whole, not through the global
+# head-of-queue window -- naming it is what you do when the rotation is not
+# reaching it. The --review-id fallback already used this number.
+SERIES_SCOPED_LOAD_LIMIT = 2000
 SERIES_RUN_MAX_ISSUES = max(1, min(env_int("INKDROP_SLSKD_SERIES_RUN_MAX_ISSUES", 25), 25))
 SERIES_RUN_MAX_BYTES = max(
     50 * 1024 * 1024,
@@ -767,7 +781,7 @@ def load_slskd_provider_settings():
             "max_queries": int_setting(runtime, "max_queries", 2, 0, 5),
             "probe_budget_seconds": int_setting(runtime, "probe_budget_seconds", DEFAULT_PROBE_BUDGET_SECONDS, 30, 15 * 60),
             "cooldown_hours": float_setting(runtime, "cooldown_hours", 24, 0, 24 * 30),
-            "auto_grab_max": int_setting(runtime, "auto_grab_max", 6, 0, 10),
+            "auto_grab_max": int_setting(runtime, "auto_grab_max", AUTO_GRAB_DEFAULT_PER_RUN, 0, AUTO_GRAB_MAX_PER_RUN),
             "preferred_exact_min_bytes": int_setting(
                 runtime,
                 "preferred_exact_min_bytes",
@@ -775,7 +789,7 @@ def load_slskd_provider_settings():
                 256 * 1024,
                 64 * 1024 * 1024,
             ),
-            "max_active_per_user": int_setting(runtime, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, 20),
+            "max_active_per_user": int_setting(runtime, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, AUTO_GRAB_MAX_ACTIVE_PER_USER_CEILING),
             "series_run_max_issues": int_setting(runtime, "series_run_max_issues", SERIES_RUN_MAX_ISSUES, 1, 25),
             "series_run_max_bytes": int_setting(runtime, "series_run_max_bytes", SERIES_RUN_MAX_BYTES, 50 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
             "series_run_max_observed_files": int_setting(runtime, "series_run_max_observed_files", SERIES_RUN_MAX_OBSERVED_FILES, 16, 500),
@@ -800,7 +814,7 @@ def load_slskd_provider_settings():
         "max_queries": int_setting(settings, "max_queries", 2, 0, 5),
         "probe_budget_seconds": int_setting(settings, "probe_budget_seconds", DEFAULT_PROBE_BUDGET_SECONDS, 30, 15 * 60),
         "cooldown_hours": float_setting(settings, "cooldown_hours", 24, 0, 24 * 30),
-        "auto_grab_max": int_setting(settings, "auto_grab_max", 6, 0, 10),
+        "auto_grab_max": int_setting(settings, "auto_grab_max", AUTO_GRAB_DEFAULT_PER_RUN, 0, AUTO_GRAB_MAX_PER_RUN),
         "preferred_exact_min_bytes": int_setting(
             settings,
             "preferred_exact_min_bytes",
@@ -808,7 +822,7 @@ def load_slskd_provider_settings():
             256 * 1024,
             64 * 1024 * 1024,
         ),
-        "max_active_per_user": int_setting(settings, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, 20),
+        "max_active_per_user": int_setting(settings, "max_active_per_user", AUTO_GRAB_MAX_ACTIVE_PER_USER, 1, AUTO_GRAB_MAX_ACTIVE_PER_USER_CEILING),
         "series_run_max_issues": int_setting(settings, "series_run_max_issues", SERIES_RUN_MAX_ISSUES, 1, 25),
         "series_run_max_bytes": int_setting(settings, "series_run_max_bytes", SERIES_RUN_MAX_BYTES, 50 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
         "series_run_max_observed_files": int_setting(settings, "series_run_max_observed_files", SERIES_RUN_MAX_OBSERVED_FILES, 16, 500),
@@ -8030,6 +8044,11 @@ def item_match_details(filename, item, candidate=None):
 TRUSTED_SINGLETON_POSITIVE_EVIDENCE = {
     "singleton_exact_title",
     "singleton_exact_bare_volume_number",
+    # A single-issue work's file that names its one unit as a volume. Earned
+    # through the same _singleton_exact_title_match() identity contract as
+    # singleton_exact_title -- title, year, publisher, no range, no pack, no
+    # competing unit -- so it is as trustworthy here as that one.
+    "singleton_exact_volume_number",
     "collected_singleton_exact_title",
     "collected_singleton_alias_exact_title",
     "collected_singleton_alias_volume",
@@ -8181,11 +8200,34 @@ def shared_candidate_match_details(filename, item, candidate=None):
     )
     positive = list(compatibility.get("positive_evidence") or [])
     trusted = bool(TRUSTED_SINGLETON_POSITIVE_EVIDENCE & set(positive))
+    identity_reasons = [
+        *list(compatibility.get("rejection_codes") or []),
+        *list(compatibility.get("review_codes") or []),
+    ]
+    if (
+        not trusted
+        and not identity_reasons
+        # A COLLECTED singleton keeps the hard refusal. Its row wants one
+        # collected volume, and the ordinary arm would happily match
+        # "Series Name 001.cbz" against its issue_number 1 -- a single issue of
+        # the underlying run, not the collection. Proving the collected identity
+        # is exactly what that refusal is for.
+        and not (item or {}).get("collected_singleton_proof")
+    ):
+        # For an issue-singleton row the shared engine here neither confirmed
+        # the singleton nor rejected the file: it simply had nothing to say.
+        # Hard-refusing made a row that CLAIMS a proof strictly worse off than
+        # one that never claimed one -- the claim cost it the ordinary match
+        # underneath. That bites hardest on a stale series row:
+        # singleton_metadata_fresh goes false 30 days after the last refresh,
+        # candidate_compatibility() then withholds the proof, and an
+        # unambiguous "Azula in the Spirit Temple 001 (2023).cbz" was refused as
+        # "candidate file identity does not prove the collected singleton" -- a
+        # file the plain issue-number arm matches. Fall back to exactly what an
+        # unproven row gets. A file the engine positively rejected or flagged
+        # for review still takes the refusal below.
+        return details
     if not trusted or compatibility.get("rejection_codes"):
-        identity_reasons = [
-            *list(compatibility.get("rejection_codes") or []),
-            *list(compatibility.get("review_codes") or []),
-        ]
         return {
             "matched": False,
             "score": min(-40, int(details.get("score") or 0)),
@@ -9040,6 +9082,7 @@ EXACT_UNIT_POSITIVE_EVIDENCE = {
     "exact_chapter_number",
     "exact_volume_number",
     "singleton_exact_bare_volume_number",
+    "singleton_exact_volume_number",
 }
 
 
@@ -16273,14 +16316,34 @@ def run(args):
         probe_elapsed_seconds=0,
     )
     if args.series:
+        # Two lists, and only one of them is what the folder passes intersect
+        # an observed directory against. `all_items` is the GLOBAL head of the
+        # queue -- unscoped, ordered by queue_probe_priority, whose key never
+        # mentions the targeted series, and which touch_autopilot_queue_probe_row
+        # pushes that series down by stamping ts = now after every probe. A
+        # series under retry therefore sinks out of the window it is being
+        # probed against, and slskd_series_directory_observations() then drops
+        # the whole folder before it is observed at all (no row of its series in
+        # active_items => no candidate_items => `continue`), so
+        # observed_directory_count is 0 and no pass runs. With a partial window
+        # it is quieter and just as wrong: series_directory_completeness()
+        # computes the pack ratio over whatever slice happened to be in it.
+        #
+        # Load the targeted series whole -- the same limit the --review-id
+        # fallback already uses -- and fold it into all_items. The global window
+        # stays so a neutral multi-series folder still matches other series'
+        # rows; combine_source_review_items dedupes by review id and by
+        # series/issue identity, so a series already inside the window is not
+        # counted twice. select_probe_items still bounds what is searched.
         all_items = combine_source_review_items(
             load_source_review_items(limit=max(args.max_total * 4, 300)),
             load_queue_source_review_items(limit=max(args.max_total * 4, 300)),
         )
         items = combine_source_review_items(
-            load_source_review_items(limit=max(args.max_total * 4, 80), series=args.series),
-            load_queue_source_review_items(limit=max(args.max_total * 4, 80), series=args.series),
+            load_source_review_items(limit=SERIES_SCOPED_LOAD_LIMIT, series=args.series),
+            load_queue_source_review_items(limit=SERIES_SCOPED_LOAD_LIMIT, series=args.series),
         )
+        all_items = combine_source_review_items(all_items, items)
     else:
         items = combine_source_review_items(
             load_source_review_items(limit=max(args.max_total * 4, 300)),
@@ -16304,8 +16367,8 @@ def run(args):
             if cached_series:
                 all_items = combine_source_review_items(
                     all_items,
-                    load_source_review_items(limit=2000, series=cached_series),
-                    load_queue_source_review_items(limit=2000, series=cached_series),
+                    load_source_review_items(limit=SERIES_SCOPED_LOAD_LIMIT, series=cached_series),
+                    load_queue_source_review_items(limit=SERIES_SCOPED_LOAD_LIMIT, series=cached_series),
                 )
                 scoped = [
                     item for item in all_items
@@ -16609,6 +16672,12 @@ def run(args):
     series_directory_handoff["observation_truncated"] = bool(run_directory_observation_budget.get("truncated"))
     selected_review_ids.update(series_directory_handoff.get("selected_review_ids") or [])
     if series_directory_handoff.get("observed_directory_count"):
+        # The reasons and the caps that produced them, not just the counts.
+        # STATUS_FILE already held them and is overwritten every pass, so until
+        # now no window of runs could say which cap actually binds -- whether
+        # "series-run byte cap reached" fires before "series-run issue cap
+        # reached" in practice, or how often the evaluation deadline closes
+        # first. Raising a cap is a decision this event has to earn.
         log(
             "slskd_series_directory_handoff",
             observed_directory_count=series_directory_handoff.get("observed_directory_count"),
@@ -16617,6 +16686,9 @@ def run(args):
             selected_issue_count=series_directory_handoff.get("selected_issue_count"),
             selected_bytes=series_directory_handoff.get("selected_bytes"),
             deadline_exhausted=series_directory_handoff.get("deadline_exhausted"),
+            skipped_reasons=series_directory_handoff.get("skipped_reason_counts") or {},
+            issue_cap=series_directory_handoff.get("issue_cap"),
+            byte_cap=series_directory_handoff.get("byte_cap"),
         )
 
     # A directory that alone already covers the bulk of a series' open run
@@ -16629,15 +16701,42 @@ def run(args):
         deadline=series_run_evaluation_deadline(),
     )
     selected_review_ids.update(series_pack_complete_handoff.get("selected_review_ids") or [])
-    if series_pack_complete_handoff.get("eligible_directory_count"):
+    # Gated on observed, not eligible. A folder the 3-issue/75% floor REFUSED is
+    # the case worth counting -- it is the whole argument for or against moving
+    # that floor -- and it used to log nothing whatsoever, because the only
+    # event fired when the floor had already been cleared.
+    if series_pack_complete_handoff.get("observed_directory_count"):
         log(
             "slskd_series_pack_complete_handoff",
+            observed_directory_count=series_pack_complete_handoff.get("observed_directory_count"),
             eligible_directory_count=series_pack_complete_handoff.get("eligible_directory_count"),
             selected_issue_count=series_pack_complete_handoff.get("selected_issue_count"),
             selected_bytes=series_pack_complete_handoff.get("selected_bytes"),
             deadline_exhausted=series_pack_complete_handoff.get("deadline_exhausted"),
+            skipped_reasons=series_pack_complete_handoff.get("skipped_reason_counts") or {},
+            min_coverage=series_pack_complete_handoff.get("min_coverage"),
+            min_ratio_pct=series_pack_complete_handoff.get("min_ratio_pct"),
+            byte_cap=series_pack_complete_handoff.get("byte_cap"),
         )
     write_json(CACHE_FILE, cache)
+    # The folder passes above ran unconditionally -- they are not behind any
+    # `if not review_id_filter` -- and just wrote this run's handoff candidates
+    # for every row of the folder into the cache. But `active_review_ids` was
+    # fixed before them, from the run's SCOPE: under --review-id that is the one
+    # targeted row, so `active_cache` held one entry and
+    # auto_grab_scope_from_active_cache() could only ever admit one row, whatever
+    # --auto-grab-max said. That, not the flag, was the hot lane's real one-grab
+    # ceiling after #1206. The unused candidates then died with the run
+    # (SERIES_RUN_EPHEMERAL_CANDIDATES is cleared on every exit path) and the
+    # next pass refused them with "fresh in-memory SLSKD handoff routing is
+    # unavailable", so the folder was re-derived one row per retry.
+    #
+    # Admit what this run itself selected -- searched units plus handoff
+    # selections. eligible_auto_grab_review_ids stays derived from `items`, so a
+    # merely cached row this run did not select is still out of scope.
+    active_review_ids = set(active_review_ids) | {
+        str(rid) for rid in selected_review_ids if str(rid or "")
+    }
     active_cache = {
         key: value
         for key, value in cache.items()
@@ -16717,6 +16816,9 @@ def run(args):
         "queue_backed_selected_count": queue_backed_selected_count,
         "refreshed_cached_verdict_count": refreshed_cached_verdict_count,
         "series_directory_handoff": series_directory_handoff,
+        # The pack pass's own summary -- its floor, its byte cap and what it
+        # refused. It was computed on every run and thrown away here.
+        "series_pack_complete_handoff": series_pack_complete_handoff,
         "queue_context_backfilled_count": queue_context_backfilled_count,
         "queue_review_rows": queue_review_rows,
         "checked_count": len(checked),

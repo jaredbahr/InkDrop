@@ -980,7 +980,9 @@ def target_context(wanted_item=None, *, settings):
     }
 
 
-def _singleton_exact_title_match(candidate, wanted_item, target, evidence, *, allow_bare_number=""):
+def _singleton_exact_title_match(
+    candidate, wanted_item, target, evidence, *, allow_bare_number="", allow_own_volume_number=""
+):
     if not target.get("singleton_issue_proof"):
         return False
     wanted = wanted_item if isinstance(wanted_item, dict) else {}
@@ -993,12 +995,30 @@ def _singleton_exact_title_match(candidate, wanted_item, target, evidence, *, al
         and evidence.get("bare_number") == allow_bare_number
         and evidence.get("issue_number") == allow_bare_number
     )
+    # A work whose whole run is one unit names that unit both ways in the wild:
+    # `Title 001` and `Title v01` are the same object, and only the second was
+    # refused. This is NOT the collected-trade case -- the caller only passes
+    # allow_own_volume_number for a row with a trusted single-issue proof, so a
+    # series whose volume 1 collects issues 1-6 never reaches it. The volume the
+    # file names still has to be the work's own single unit; v02 of a
+    # one-volume work is not that work, and every other disqualifier below
+    # (range, pack, ambiguity, a competing issue number) still applies.
+    own_volume_match = bool(
+        allow_own_volume_number
+        and not evidence.get("issue_number")
+        and (
+            evidence.get("volume_number") == allow_own_volume_number
+            or evidence.get("book_number") == allow_own_volume_number
+        )
+        and evidence.get("volume_number") in ("", None, allow_own_volume_number)
+        and evidence.get("book_number") in ("", None, allow_own_volume_number)
+    )
     if any(
         (
             evidence.get("issue_number") and not bare_number_match,
             evidence.get("chapter_number"),
-            evidence.get("volume_number"),
-            evidence.get("book_number"),
+            evidence.get("volume_number") and not own_volume_match,
+            evidence.get("book_number") and not own_volume_match,
             evidence.get("coverage_start"),
             evidence.get("coverage_end"),
             evidence.get("pack_marker"),
@@ -1035,6 +1055,10 @@ def _singleton_exact_title_match(candidate, wanted_item, target, evidence, *, al
                 )
             )
             and (key != "edition_marker" or not missing_count_collected_proof)
+            and (
+                key not in ("volume_number", "book_number")
+                or not (own_volume_match and source.get(key) == allow_own_volume_number)
+            )
         )
         for source in parsed_sources
     ):
@@ -1082,6 +1106,18 @@ def _singleton_exact_title_match(candidate, wanted_item, target, evidence, *, al
         allowed_suffix.update({
             "january", "february", "march", "april", "may", "june",
             "july", "august", "september", "october", "november", "december",
+        })
+    if own_volume_match:
+        # The volume token itself, in the forms a filename writes it: the
+        # evidence parser has already confirmed it names this work's own single
+        # unit, so it is not an unexplained leftover token.
+        allowed_suffix.update({
+            "v", "vol", "volume", "book",
+            allow_own_volume_number,
+            allow_own_volume_number.zfill(2),
+            allow_own_volume_number.zfill(3),
+            f"v{allow_own_volume_number}",
+            f"v{allow_own_volume_number.zfill(2)}",
         })
     if target_year:
         allowed_suffix.add(target_year)
@@ -2070,6 +2106,28 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
             else ""
         ),
     )
+    # A single-issue work's file that names its one unit as a volume rather than
+    # an issue. Gated on the same trusted proof singleton_exact_match needs --
+    # _singleton_exact_title_match returns False without it -- so a multi-issue
+    # series' collected volume 1 never reaches this.
+    singleton_own_volume_match = bool(
+        target.get("unit_type") in ISSUE_UNITS
+        and target.get("singleton_issue_proof")
+        and target.get("issue_number")
+        # Only the new case: the file names a volume/book and no issue. Without
+        # this, allow_own_volume_number is inert on a file that carries no unit
+        # token at all and the branch below would shadow singleton_exact_title,
+        # renaming the evidence every existing unitless-work caller reads.
+        and not evidence.get("issue_number")
+        and (evidence.get("volume_number") or evidence.get("book_number"))
+        and _singleton_exact_title_match(
+            candidate,
+            wanted_item,
+            target,
+            evidence,
+            allow_own_volume_number=target.get("issue_number"),
+        )
+    )
 
     match_confidence = str(candidate.get("match_confidence") or "").strip().lower().replace("-", "_")
     # "Absent" and "present and False" mean opposite things here. Only the
@@ -2305,6 +2363,12 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
             positive.append("exact_issue_number")
             if singleton_exact_match:
                 positive.append("singleton_exact_title")
+        elif singleton_own_volume_match:
+            # The work has exactly one unit, and this file names it "volume 1"
+            # instead of "issue 1". Refusing it here treated a one-shot or
+            # graphic novel like a series whose volume 1 collects issues 1-6 --
+            # the same book was taken as `Title 001` and refused as `Title v01`.
+            positive.append("singleton_exact_volume_number")
         elif evidence.get("volume_number") or evidence.get("book_number"):
             blocked.append("wrong_unit_type")
         elif wanted and manifest_exact_member:

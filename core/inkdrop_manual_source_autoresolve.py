@@ -2445,8 +2445,12 @@ def run_next_slskd_autopick(args, record, review_id=None):
             "24",
             "--force",
             "--auto-grab-live",
-            "--auto-grab-max",
-            "1",
+            # No grab limit of its own: the child resolves the operator's
+            # configured value. This lane targets one row, but its probe's
+            # directory handoff routinely selects the rest of the peer's folder
+            # for the series, and a hardcoded 1 threw all of it away. Mirrors
+            # #1206 for the hot-retry lane. The lane keeps its targeting --
+            # --max-total 1, --max-per-series 1, --review-id, --force.
         ]
         if review_id:
             probe_cmd.extend(["--review-id", review_id])

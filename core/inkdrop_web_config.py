@@ -545,7 +545,15 @@ SERIES_AUTOPILOT_SLSKD_MAX_TOTAL = 20
 SERIES_AUTOPILOT_SLSKD_MAX_PER_SERIES = 12
 SERIES_AUTOPILOT_SLSKD_WAIT_SECONDS = 8
 SERIES_AUTOPILOT_SLSKD_MAX_QUERIES = 5
-SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX = 8
+# Seeded onto a fresh install's slskd row and used as the parent's fallback.
+# Was 8, which is what production actually ran under while #1199's raised code
+# defaults sat unreachable behind merge_provider_settings() keeping the stored
+# value. An existing row is NOT rewritten -- the operator raises it in Settings.
+SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX = 20
+# Transfers InkDrop keeps open or queued against one Soulseek peer at once. A
+# well-stocked comics peer routinely offers a whole run from one folder, and at
+# 8 a single run could take at most 8 of it.
+SERIES_AUTOPILOT_SLSKD_MAX_ACTIVE_PER_USER = 20
 SERIES_AUTOPILOT_SLSKD_PROBE_BUDGET_SECONDS = 300
 SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS = 0.0
 SERIES_AUTOPILOT_RETRY_SECONDS = 1800
@@ -1000,6 +1008,7 @@ __all__ = [
     "SERIES_AUTOPILOT_SCRIPT",
     "SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX",
     "SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS",
+    "SERIES_AUTOPILOT_SLSKD_MAX_ACTIVE_PER_USER",
     "SERIES_AUTOPILOT_SLSKD_MAX_PER_SERIES",
     "SERIES_AUTOPILOT_SLSKD_MAX_QUERIES",
     "SERIES_AUTOPILOT_SLSKD_MAX_TOTAL",

@@ -425,6 +425,14 @@ DEFAULT_SLSKD_MAX_QUERIES = 5
 DEFAULT_SLSKD_COOLDOWN_HOURS = 0.75
 # Default grabs per run: enough to take a whole folder in one or two runs.
 DEFAULT_SLSKD_AUTO_GRAB_MAX = 20
+# The most grabs the parent will ever ask the child for. This is the child's own
+# AUTO_GRAB_MAX_PER_RUN, pinned cross-module by
+# tests/inkdrop-slskd-the-grab-ceiling-is-one-number-smoke.py: the parent asking
+# for more than the child will run is a silently ignored setting, and the parent
+# asking for less is the bug #1199 left behind -- the argument normalization
+# clamped a settings-supplied 20 or 25 back down to a literal 10, after
+# apply_slskd_provider_defaults() had already filled the operator's value in.
+SLSKD_AUTO_GRAB_MAX_CEILING = 25
 DEFAULT_SLSKD_PROBE_BUDGET_SECONDS = 300
 DEFAULT_SLSKD_BROAD_MAX_TOTAL = 8
 # Every Soulseek search waits at least the floor for peers to answer, so the
@@ -2564,7 +2572,13 @@ def load_slskd_autopilot_settings():
         "wait_seconds": int_provider_setting(settings, "wait_seconds", DEFAULT_SLSKD_WAIT_SECONDS, 2, 30),
         "max_queries": int_provider_setting(settings, "max_queries", DEFAULT_SLSKD_MAX_QUERIES, 1, 5),
         "cooldown_hours": float_provider_setting(settings, "cooldown_hours", DEFAULT_SLSKD_COOLDOWN_HOURS, 0.0, 24.0 * 30.0),
-        "auto_grab_max": int_provider_setting(settings, "auto_grab_max", DEFAULT_SLSKD_AUTO_GRAB_MAX, 0, 25),
+        "auto_grab_max": int_provider_setting(
+            settings,
+            "auto_grab_max",
+            DEFAULT_SLSKD_AUTO_GRAB_MAX,
+            0,
+            SLSKD_AUTO_GRAB_MAX_CEILING,
+        ),
         "probe_budget_seconds": int_provider_setting(
             settings,
             "probe_budget_seconds",
@@ -17383,6 +17397,40 @@ def run_provider_then_companion_maintenance(args, provider_runner=None, maintena
     return provider_result
 
 
+def normalize_autopilot_args(args):
+    """Bound the run limits `main()` parsed, after the provider defaults filled them.
+
+    This tail used to sit inline at the bottom of `main()`, past every gate and
+    every `apply_*_provider_defaults()` call, which made it unreachable from a
+    test: the #1198 smoke hands `auto_grab_max` straight to
+    `slskd_probe_command()` and the #1199 smoke pins constants, so neither could
+    see that the SLSKD grab limit was still being clamped to a literal 10 here --
+    after the operator's stored 20 or 25 had already been read in. Named, it is
+    one seam a smoke can drive with the real values.
+
+    `slskd_hot_retry_max` is how many hot rows one pass retries, not a grab
+    ceiling, and deliberately keeps its own 10.
+    """
+
+    args.mangadex_max_total = max(1, min(int(args.mangadex_max_total or 1), 50))
+    args.mangadex_max_per_series = max(1, min(int(args.mangadex_max_per_series or 1), 20))
+    args.mangadex_command_timeout_seconds = mangadex_configured_command_timeout_seconds(args)
+    args.mangadex_verify_timeout_seconds = mangadex_configured_verify_timeout_seconds(args)
+    args.slskd_auto_grab_max = max(
+        0,
+        min(int(args.slskd_auto_grab_max or 0), SLSKD_AUTO_GRAB_MAX_CEILING),
+    )
+    args.slskd_hot_retry_max = max(0, min(int(args.slskd_hot_retry_max or 0), 10))
+    args.slskd_max_total = max(1, min(int(args.slskd_max_total or 1), 50))
+    args.slskd_max_per_series = max(1, min(int(args.slskd_max_per_series or 1), 20))
+    args.slskd_wait_seconds = max(2, min(int(args.slskd_wait_seconds or 8), 30))
+    args.slskd_max_queries = max(1, min(int(args.slskd_max_queries or 1), 5))
+    args.slskd_probe_budget_seconds = max(30, min(int(args.slskd_probe_budget_seconds or 300), 15 * 60))
+    args.retry_seconds = max(300, min(int(args.retry_seconds or 7200), 24 * 3600))
+    args.exhaustion_cycles = max(1, min(int(args.exhaustion_cycles or 6), 30))
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(description="InkDrop watched-series autopilot queue")
     parser.add_argument("--series", action="append", default=[], help="limit run to exact series title")
@@ -17660,19 +17708,7 @@ def main():
         30,
         min(int(args.comicscodes_command_timeout_seconds or DEFAULT_COMICSCODES_COMMAND_TIMEOUT_SECONDS), 300),
     )
-    args.mangadex_max_total = max(1, min(int(args.mangadex_max_total or 1), 50))
-    args.mangadex_max_per_series = max(1, min(int(args.mangadex_max_per_series or 1), 20))
-    args.mangadex_command_timeout_seconds = mangadex_configured_command_timeout_seconds(args)
-    args.mangadex_verify_timeout_seconds = mangadex_configured_verify_timeout_seconds(args)
-    args.slskd_auto_grab_max = max(0, min(int(args.slskd_auto_grab_max or 0), 10))
-    args.slskd_hot_retry_max = max(0, min(int(args.slskd_hot_retry_max or 0), 10))
-    args.slskd_max_total = max(1, min(int(args.slskd_max_total or 1), 50))
-    args.slskd_max_per_series = max(1, min(int(args.slskd_max_per_series or 1), 20))
-    args.slskd_wait_seconds = max(2, min(int(args.slskd_wait_seconds or 8), 30))
-    args.slskd_max_queries = max(1, min(int(args.slskd_max_queries or 1), 5))
-    args.slskd_probe_budget_seconds = max(30, min(int(args.slskd_probe_budget_seconds or 300), 15 * 60))
-    args.retry_seconds = max(300, min(int(args.retry_seconds or 7200), 24 * 3600))
-    args.exhaustion_cycles = max(1, min(int(args.exhaustion_cycles or 6), 30))
+    normalize_autopilot_args(args)
     run_provider_then_companion_maintenance(args)
 
 

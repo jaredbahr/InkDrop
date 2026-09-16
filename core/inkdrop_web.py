@@ -43874,7 +43874,12 @@ def run_slskd_source_probe(payload):
         probe_budget_seconds,
         min(15 * 60, max_per_series * max_queries * (wait_seconds + 4)),
     )
-    auto_grab_max = bounded_int(payload.get("autoGrabMax"), SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX, 0, 10)
+    auto_grab_max = bounded_int(
+        payload.get("autoGrabMax"),
+        SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX,
+        0,
+        ap.SLSKD_AUTO_GRAB_MAX_CEILING,
+    )
     run_token = f"web-manual:{uuid.uuid4()}"
     cmd = [
         python_command(),
@@ -54325,7 +54330,7 @@ def runtime_provider_settings():
             "auto_grab_max": SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX,
             "probe_budget_seconds": SERIES_AUTOPILOT_SLSKD_PROBE_BUDGET_SECONDS,
             "cooldown_hours": SERIES_AUTOPILOT_SLSKD_COOLDOWN_HOURS,
-            "max_active_per_user": 8,
+            "max_active_per_user": SERIES_AUTOPILOT_SLSKD_MAX_ACTIVE_PER_USER,
             "delete_search_history": False,
             "search_history_keep": 100,
             "search_history_max_delete": 5000,
@@ -55616,7 +55621,7 @@ PROVIDER_FIELD_HELP = {
     },
     "slskd": {
         "auto_grab_max": "Maximum safe SLSKD candidates InkDrop can start in one probe pass.",
-        "max_active_per_user": "How many transfers InkDrop will have active or queued from one Soulseek user at once. A well-stocked comics/manga peer often has dozens of matching files, but this doesn't limit how many InkDrop finds or considers -- it only paces how many it pulls from that one peer concurrently, so a single user can't hog the whole auto-grab pass. Default 8, up to 20.",
+        "max_active_per_user": "How many transfers InkDrop will have active or queued from one Soulseek user at once. A well-stocked comics/manga peer often has dozens of matching files, but this doesn't limit how many InkDrop finds or considers -- it only paces how many it pulls from that one peer concurrently, so a single user can't hog the whole auto-grab pass. Default 20, up to 40.",
         "delete_search_history": "When enabled, InkDrop periodically deletes old completed SLSKD search-history rows through the SLSKD API. Active searches are left alone.",
         "search_history_keep": "Newest completed SLSKD search rows to keep when history cleanup is enabled.",
         "search_history_max_delete": "Maximum completed SLSKD search rows InkDrop may delete in one cleanup pass.",
