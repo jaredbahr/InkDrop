@@ -144,7 +144,15 @@ def wrapper_fixtures():
     }
     saga_verdict = slskd.auto_grab_candidate_verdict(automatic_saga, {"series": "Saga", "issue": "1", "pack_allowed": False})
     require(not saga_verdict["is_pack_candidate"], "automatic Saga issue must retain legacy single-item classification")
-    require(saga_verdict["size_ceiling_bytes"] == 2 * 1024 * 1024 * 1024 and not saga_verdict["autopick_eligible"], "3 GB automatic Saga issue must retain the 2 GiB ceiling and remain non-autopick")
+    # The ceiling is now the issue band's 256 MiB rather than one global 2 GiB
+    # (see inkdrop_candidate_matching.UNIT_SIZE_BANDS) -- stricter for an issue
+    # target, not weaker. What this test protects is unchanged: a 3 GB file for
+    # a single issue must never auto-pick.
+    require(
+        saga_verdict["size_ceiling_bytes"] == 256 * 1024 * 1024
+        and not saga_verdict["autopick_eligible"],
+        "3 GB automatic Saga issue must stay under the issue-band ceiling and remain non-autopick",
+    )
 
     large_response = [{
         "username": "bounded-peer",

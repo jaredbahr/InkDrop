@@ -444,7 +444,12 @@ AUTO_INSPECT_ACRONYM_USER_MESSAGE = (
     "The filename names this series only by its initials, so we are checking inside before importing."
 )
 AUTO_GRAB_MAX_BYTES = 2 * 1024 * 1024 * 1024
-AUTO_GRAB_PACK_MAX_BYTES = 5 * 1024 * 1024 * 1024
+# Raised 5 -> 12 GiB 2026-08-15.  A 20-volume collected run of ~330 MB/volume
+# material is ~6-7 GB and was hitting review every time, which is friction on
+# the ordinary case rather than protection.  12 GiB still catches the
+# publisher-weekly and non-comic bundles measured live at 18-75 GB.  Kept in
+# step with inkdrop_candidate_matching.UNIT_SIZE_BANDS["pack"].
+AUTO_GRAB_PACK_MAX_BYTES = 12 * 1024 * 1024 * 1024
 AUTO_GRAB_MAX_ATTEMPTS_PER_REVIEW = 12
 AUTO_GRAB_MAX_RECOVERY_ATTEMPTS_PER_REVIEW = max(
     AUTO_GRAB_MAX_ATTEMPTS_PER_REVIEW,
@@ -9259,9 +9264,85 @@ def availability_gate(candidate):
     return False, "no free slot or known available transfer"
 
 
-def auto_grab_size_ceiling(filename):
-    is_pack, _ = filename_has_pack_or_range(filename)
-    return AUTO_GRAB_PACK_MAX_BYTES if is_pack else AUTO_GRAB_MAX_BYTES
+def target_unit_is_chapter(item):
+    """True when the want is for a manga chapter, whose sizes are tiny by norm."""
+    if inkdrop_candidate_matching is None:
+        return False
+    target = item if isinstance(item, dict) else {}
+    try:
+        target = inkdrop_candidate_matching.target_context(target, settings=None)
+    except Exception:
+        pass
+    unit_type = str(target.get("unit_type") or "").strip().lower()
+    return unit_type in inkdrop_candidate_matching.CHAPTER_UNITS
+
+
+def target_unit_type_is_known(item):
+    """True when the want names a unit type the size bands can be keyed on.
+
+    False means the band fell back to UNKNOWN_UNIT_SIZE_BAND, which is the
+    widest pair there is.  That is the right band -- widest is the safe
+    direction for a floor and a ceiling -- but it is NOT a licence to auto-grab
+    up to 12 GiB on a want that never said what unit it wanted.  Callers use
+    this to send an unknown-shape candidate to an operator instead.
+    """
+    if inkdrop_candidate_matching is None:
+        return False
+    target = item if isinstance(item, dict) else {}
+    try:
+        target = inkdrop_candidate_matching.target_context(target, settings=None)
+    except Exception:
+        return False
+    unit_type = str(target.get("unit_type") or "").strip().lower()
+    if not unit_type:
+        return False
+    return (
+        unit_type in inkdrop_candidate_matching.CHAPTER_UNITS
+        or unit_type in inkdrop_candidate_matching.ISSUE_UNITS
+        or unit_type in inkdrop_candidate_matching.VOLUME_UNITS
+    )
+
+
+def auto_grab_size_band(item=None, is_pack=False, pack_ceiling_bytes=None):
+    """The (floor, ceiling) this candidate's size is judged against.
+
+    Delegates to the shared per-unit-type bands so slskd, the indexer path and
+    the direct path all judge a size the same way.  The band comes from the
+    **target's** unit type -- see inkdrop_candidate_matching.unit_size_band()
+    for why it must never come from the candidate's own parsed unit type.
+
+    The old single pair (a 3 MiB / 5 MiB floor and a 2 GiB / 5 GiB ceiling) is
+    what made every manga chapter unauto-grabbable: Punpun ships chapters at
+    1.91-2.48 MB, under both floors, so `size_floor <= size <= size_ceiling`
+    could never hold for a chapter no matter how good the match was.
+    """
+    if inkdrop_candidate_matching is None:
+        # Import is optional here; keep the historical band rather than an
+        # accidental all-or-nothing gate when the module is unavailable.
+        return (
+            AUTO_GRAB_MIN_BYTES,
+            AUTO_GRAB_PACK_MAX_BYTES if is_pack else AUTO_GRAB_MAX_BYTES,
+        )
+    target = item if isinstance(item, dict) else {}
+    try:
+        # target_context() derives the unit type a bare wanted item leaves
+        # implicit (manga chapter providers, volume-only targets); fall back to
+        # the raw item, which simply lands on the widest band.
+        #
+        # `settings` IS KEYWORD-ONLY AND REQUIRED, AND OMITTING IT IS SILENT.
+        # It was positional-optional when this branch was cut. The except below
+        # cannot tell a TypeError from a call that never matched the signature
+        # apart from an item with nothing to derive, so a missing argument fell
+        # through to the widest band -- 12 GiB rather than the issue band's
+        # 256 MiB -- and a 3 GB file for a single wanted issue auto-grabbed.
+        # That is the exact inversion of what this function exists to do, and it
+        # reported success the whole time.
+        target = inkdrop_candidate_matching.target_context(target, settings=None)
+    except Exception:
+        pass
+    return inkdrop_candidate_matching.unit_size_band(
+        target, is_pack=is_pack, pack_ceiling_bytes=pack_ceiling_bytes
+    )
 
 
 def direct_title_issue_evidence(reasons):
@@ -9814,8 +9895,31 @@ def auto_grab_candidate_verdict(candidate, item, *, settings=None):
         size = int(candidate.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    size_ceiling = auto_grab_size_ceiling(filename)
-    size_floor = SLSKD_PREFERRED_EXACT_MIN_BYTES if direct_match and not is_pack else AUTO_GRAB_MIN_BYTES
+    size_floor, size_ceiling = auto_grab_size_band(item, is_pack=is_pack)
+    # The band is the hard edge.  On top of it, an exact single-unit match that
+    # is much smaller than that unit type normally runs still earns a look --
+    # that is the inspection handoff, and it is a real guard against a stub
+    # file with a perfect name.  It does NOT apply to chapter targets: manga
+    # chapters legitimately run 1.9-2.5 MB, well under the preferred size, and
+    # applying it there is exactly what made every chapter unauto-grabbable.
+    if direct_match and not is_pack and not target_unit_is_chapter(item):
+        size_floor = max(size_floor, SLSKD_PREFERRED_EXACT_MIN_BYTES)
+    # AN UNKNOWN SHAPE ASKS, IT DOES NOT HELP ITSELF TO THE WIDEST BAND.
+    #
+    # When the want names no unit type the band falls back to the widest pair
+    # there is. That is the correct band -- widest is the safe direction for a
+    # floor and a ceiling both -- but it must not double as permission to grab
+    # up to the pack ceiling unattended on a want that never said what it
+    # wanted. The size evidence is simply absent here, and absent evidence is
+    # an operator's question rather than an automatic yes.
+    #
+    # Deliberately a review reason and not a blocker: the candidate may well be
+    # right, and refusing it outright would be size deciding an edition, which
+    # is the thing this whole band model exists to stop.
+    if size and not target_unit_type_is_known(item):
+        review_reasons.append(
+            "the wanted row names no unit type, so this size has no band to be judged against"
+        )
     if size < size_floor:
         review_reasons.append("file is smaller than the preferred exact-match size")
     elif size > size_ceiling:
@@ -10335,14 +10439,17 @@ def retry_candidate_after_failure_eligible(row):
         size = int(gate.get("size_bytes") or row.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
+    default_floor, default_ceiling = auto_grab_size_band(
+        None, is_pack=bool(gate.get("is_pack_candidate"))
+    )
     try:
-        floor = int(gate.get("size_floor_bytes") or AUTO_GRAB_MIN_BYTES)
+        floor = int(gate.get("size_floor_bytes") or default_floor)
     except (TypeError, ValueError):
-        floor = AUTO_GRAB_MIN_BYTES
+        floor = default_floor
     try:
-        ceiling = int(gate.get("size_ceiling_bytes") or auto_grab_size_ceiling(filename))
+        ceiling = int(gate.get("size_ceiling_bytes") or default_ceiling)
     except (TypeError, ValueError):
-        ceiling = auto_grab_size_ceiling(filename)
+        ceiling = default_ceiling
     if size < floor or size > ceiling:
         return False
     return retry_candidate_has_direct_match(row)
@@ -10371,14 +10478,17 @@ def near_threshold_direct_match_eligible(row):
         size = int(gate.get("size_bytes") or row.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
+    default_floor, default_ceiling = auto_grab_size_band(
+        None, is_pack=bool(gate.get("is_pack_candidate"))
+    )
     try:
-        floor = int(gate.get("size_floor_bytes") or AUTO_GRAB_MIN_BYTES)
+        floor = int(gate.get("size_floor_bytes") or default_floor)
     except (TypeError, ValueError):
-        floor = AUTO_GRAB_MIN_BYTES
+        floor = default_floor
     try:
-        ceiling = int(gate.get("size_ceiling_bytes") or auto_grab_size_ceiling(filename))
+        ceiling = int(gate.get("size_ceiling_bytes") or default_ceiling)
     except (TypeError, ValueError):
-        ceiling = auto_grab_size_ceiling(filename)
+        ceiling = default_ceiling
     if size < floor or size > ceiling:
         return False
     return retry_candidate_has_direct_match(row)

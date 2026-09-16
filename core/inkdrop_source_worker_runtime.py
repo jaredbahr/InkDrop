@@ -307,7 +307,7 @@ def verdict_for_candidate(plan, row, candidate, *, wanted_item=None, headers=Non
     elif helper == "reader_page_pack_verdict":
         verdict = providers.reader_page_pack_verdict(candidate, row)
     elif helper == "indexer_candidate_verdict":
-        verdict = providers.indexer_candidate_verdict(candidate, row)
+        verdict = providers.indexer_candidate_verdict(candidate, row, wanted_item=wanted_item)
     elif helper == "external_tool_candidate_verdict":
         verdict = providers.external_tool_candidate_verdict(candidate, row)
     elif helper == "manual_source_card_verdict":

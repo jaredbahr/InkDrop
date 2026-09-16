@@ -43,6 +43,141 @@ COLLECTED_MARKERS = {
     "omnibus",
     "trade_paperback",
 }
+_KIB = 1024
+_MIB = 1024 * _KIB
+_GIB = 1024 * _MIB
+# A legitimate single unit runs from a ~1.9 MB manga chapter to a ~347 MB
+# collected trade -- measured live, and 181x apart.  One floor and one ceiling
+# cannot serve both: the floor that admits the chapter is meaningless for the
+# trade, and the floor that suits the trade rejected every manga chapter we
+# have ever seen (Oyasumi Punpun ships them at 1.91-2.48 MB, under both of the
+# old 3 MiB / 5 MiB floors, so a chapter could never auto-grab at all).
+#
+# Observed ranges behind each band, so a future re-calibration has the basis:
+#   chapter   1.91 - 2.48 MB     issue      5 - 40 MB
+#   volume   43.63 - 111.5 MB    collected  308 - 395 MB
+#   pack       ~6 - 7 GB legitimate; 18-75 GB publisher/non-comic bundles
+# Bands are deliberately generous at both ends and deliberately OVERLAP, so a
+# unit type we guessed wrong widens the band instead of rejecting outright.
+UNIT_SIZE_BANDS = {
+    "chapter": (256 * _KIB, 64 * _MIB),
+    "issue": (1 * _MIB, 256 * _MIB),
+    "volume": (8 * _MIB, 512 * _MIB),
+    "collected": (32 * _MIB, 2 * _GIB),
+    "pack": (64 * _MIB, 12 * _GIB),
+}
+# Unknown unit type gets the WIDEST band, never a middle default: not knowing
+# what we asked for must never be stricter than knowing.
+UNKNOWN_UNIT_SIZE_BAND = (
+    min(floor for floor, _ in UNIT_SIZE_BANDS.values()),
+    max(ceiling for _, ceiling in UNIT_SIZE_BANDS.values()),
+)
+
+
+def _with_pack_ceiling(band, is_pack, pack_ceiling_bytes=None):
+    """A pack raises the CEILING only -- never the floor.
+
+    Being a pack says a candidate may hold many units, so its size can exceed
+    any single unit's ceiling.  It says nothing about a minimum: a two-issue
+    pack is small, and filename_has_pack_or_range() also flags shapes like
+    "Love and Rockets v1 #19" that are a single issue wearing a volume marker.
+    Raising the floor for those rejected legitimate single issues.
+
+    ``pack_ceiling_bytes`` is the OPERATOR'S pack size limit, and it is the
+    number that decides where one is configured.  The 12 GiB in
+    UNIT_SIZE_BANDS is a shipped default, not a measurement anyone has to live
+    with: it was picked so a ~6-7 GB twenty-volume collected run stops going to
+    review on every pass while the 18-75 GB publisher bundles still do, and
+    that is an inference from one sample of what people currently seed.  An
+    operator who has said what their ceiling is outranks it.
+
+    A tightening only, on both sides.  A configured limit can lower the pack
+    ceiling but never raise it above the band, because widening admission is a
+    decision the band model owns and a per-media size knob is not the place to
+    make it.
+    """
+    if not is_pack:
+        return band
+    ceiling = max(band[1], UNIT_SIZE_BANDS["pack"][1])
+    try:
+        configured = int(pack_ceiling_bytes or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    if configured > 0:
+        ceiling = min(ceiling, configured)
+    return (band[0], ceiling)
+
+
+def unit_size_band(target=None, is_pack=False, pack_ceiling_bytes=None):
+    """Return the (floor, ceiling) byte band a candidate's size is judged against.
+
+    *** Read before "simplifying" this. ***
+
+    The band is chosen from the **target's** unit type -- what the want asked
+    for -- and never from the candidate's own parsed unit type.  Choosing it
+    from the candidate is circular: the candidate's size would help decide what
+    unit it is, and that unit would then decide which size band its size is
+    judged against.  The want already knows what it asked for; use that.
+
+    ``is_pack`` is the one candidate-side input, and it is structural rather
+    than inferred: a pack is a multi-unit carrier, so its size is not any single
+    unit's size and no per-unit band can describe it.  That is a different thing
+    from guessing a candidate's unit type, which is what the paragraph above
+    forbids.
+
+    Nothing here rejects.  Callers use the band to decide whether a candidate is
+    safe to grab *unattended*; out-of-band always means "surface it for review",
+    never "drop it".  A 2 MB and a 300 MB result for the same want are two
+    different editions, not a good one and a bad one, and size is the cheapest
+    evidence we have about which edition a candidate is -- spending it as a veto
+    throws that evidence away.
+    """
+    target = target if isinstance(target, dict) else {}
+    edition = str(target.get("edition_marker") or "").strip().lower()
+    if edition in COLLECTED_MARKERS:
+        return _with_pack_ceiling(UNIT_SIZE_BANDS["collected"], is_pack, pack_ceiling_bytes)
+    # Accept either a built target_context() or a raw wanted item; a wanted
+    # item that names no unit falls through to the widest band, which is the
+    # safe direction.
+    unit_type = str(
+        _first(target.get("unit_type"), target.get("unitType"), target.get("unit")) or ""
+    ).strip().lower()
+    if unit_type in CHAPTER_UNITS:
+        return _with_pack_ceiling(UNIT_SIZE_BANDS["chapter"], is_pack, pack_ceiling_bytes)
+    if unit_type in ISSUE_UNITS:
+        return _with_pack_ceiling(UNIT_SIZE_BANDS["issue"], is_pack, pack_ceiling_bytes)
+    if unit_type in VOLUME_UNITS:
+        band = UNIT_SIZE_BANDS["volume"]
+    else:
+        band = UNKNOWN_UNIT_SIZE_BAND
+    return _with_pack_ceiling(band, is_pack, pack_ceiling_bytes)
+
+
+def unit_size_band_reason(size_bytes, target=None, is_pack=False, pack_ceiling_bytes=None):
+    """Name the band a size missed, or "" when it is inside the band.
+
+    Returns a review reason, never a block reason -- see unit_size_band().
+
+    This is the one place the two reason names are spelled.  The indexer path
+    had its own copy of this body, which is how a size judgement ends up
+    meaning two slightly different things depending on which path asked.
+    """
+    try:
+        size = int(size_bytes or 0)
+    except (TypeError, ValueError):
+        return ""
+    if size <= 0:
+        # Unknown or absent size is not an out-of-band size.  A provider that
+        # never reported one must not be judged as though it reported zero.
+        return ""
+    floor, ceiling = unit_size_band(target, is_pack=is_pack, pack_ceiling_bytes=pack_ceiling_bytes)
+    if size < floor:
+        return "size_below_unit_band"
+    if size > ceiling:
+        return "size_above_unit_band"
+    return ""
+
+
 COLLECTED_SINGLETON_MARKERS = COLLECTED_MARKERS | {
     "deluxe_edition",
     "essential_edition",

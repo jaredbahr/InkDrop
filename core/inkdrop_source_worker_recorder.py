@@ -775,14 +775,43 @@ def _pack_value_decision(attempt, pack_match, job=None):
         )
 
     bytes_per_item = int(size_bytes / effective_count) if size_bytes and effective_count else 0
+
+    # PACK VALUE DESCRIBES A PACK. IT DOES NOT DECIDE WHETHER WE MAY HAVE IT.
+    #
+    # Tracker #209, decided 2026-09-16: any needed unit inside a pack justifies
+    # taking the pack, once the pack has proved the unit is there. The proof is
+    # the gate, and it runs upstream in the matcher -- a pack with no manifest,
+    # no declared range and no exact-number match never reaches this function.
+    #
+    # The two thresholds below used to refuse what the proof had already
+    # admitted, which is a different question: not "does this hold something we
+    # want" but "is it worth its bytes", which is appetite. A 15 GiB torrent
+    # holding exactly one genuinely wanted volume was refused for covering 1
+    # where min_covered_items said 3. Routing that to review instead of hard
+    # blocking it was an improvement and still the wrong answer.
+    #
+    # Left as an admission rule, bytes-per-covered-item also quietly prefers
+    # four ~9 MB issue PDFs over a 394.96 MB collected edition of the same
+    # story -- size choosing an edition behind the operator's back, when
+    # edition preference has already chosen and size is the cheapest evidence
+    # for telling two editions apart.
+    #
+    # So both figures stay computed and reported, because they are how an
+    # operator sees that a pack is expensive, and neither gates admission.
+    # `advisory` records what the retired thresholds would have said, so the
+    # signal survives for anyone counting it over a window.
+    # EVERY CONCERN, NOT THE FIRST ONE. These were an if/elif while they gated
+    # admission, because the first refusal ended the question. As a report they
+    # are counted over a window instead, and an elif would hide one of them:
+    # the 60 GB two-issue archive trips both, and reporting only the coverage
+    # one makes the bytes-per-item population read smaller than it is.
     allowed = True
     reason = "pack_value_accepted"
+    advisories = []
     if effective_count < min_covered:
-        allowed = False
-        reason = "pack_value_below_min_coverage"
-    elif max_bytes_per_item and bytes_per_item and bytes_per_item > max_bytes_per_item:
-        allowed = False
-        reason = "pack_value_bytes_per_item_too_high"
+        advisories.append("pack_value_below_min_coverage")
+    if max_bytes_per_item and bytes_per_item and bytes_per_item > max_bytes_per_item:
+        advisories.append("pack_value_bytes_per_item_too_high")
 
     if protocol == "usenet":
         protocol_bonus = 20
@@ -802,6 +831,7 @@ def _pack_value_decision(attempt, pack_match, job=None):
     return {
         "allowed": allowed,
         "reason": reason,
+        "advisories": advisories,
         "pack_class": pack_class,
         "protocol": protocol,
         "size_bytes": size_bytes,
@@ -841,8 +871,11 @@ def _pack_value_summary(decision):
 def _attempt_with_pack_value(attempt, pack_match, decision):
     enriched = dict(attempt or {})
     summary = _pack_value_summary(decision)
-    enriched["pack_value_status"] = "accepted" if decision.get("allowed") else "blocked"
+    enriched["pack_value_status"] = "accepted" if decision.get("allowed") else "review"
     enriched["pack_value_reason"] = decision.get("reason")
+    # What the retired thresholds would have said, carried so the signal is
+    # still countable over a window. Labels, never a gate.
+    enriched["pack_value_advisories"] = list(decision.get("advisories") or [])
     enriched["pack_value_score"] = decision.get("score")
     enriched["pack_coverage_count"] = decision.get("effective_coverage_count")
     raw = dict(enriched.get("raw") or {}) if isinstance(enriched.get("raw"), dict) else {}
@@ -863,29 +896,19 @@ def _attempt_with_pack_value(attempt, pack_match, decision):
         "multi_series": bool((pack_match or {}).get("multi_series")),
     }
     enriched["raw"] = raw
-    if decision.get("allowed"):
-        return enriched
-    reason = decision.get("reason") or "pack_value_below_threshold"
-    enriched["status"] = "blocked"
-    enriched["reason"] = reason
-    enriched["failure_reason"] = reason
-    enriched["retry_eligible"] = True
-    enriched["candidate_safe"] = False
-    enriched["auto_grab_verdict"] = "blocked"
-    enriched["quality_status"] = "rejected"
-    enriched["review_reason"] = reason
-    for key in ("download_client", "external_id", "download_id", "save_path", "category"):
-        enriched.pop(key, None)
-    raw_candidate = raw.get("candidate") if isinstance(raw.get("candidate"), dict) else {}
-    if raw_candidate:
-        raw_candidate["candidate_safe"] = False
-        raw_candidate["auto_grab_verdict"] = "blocked"
-        raw_candidate["review_reason"] = reason
-        raw_candidate.setdefault("block_reasons", [])
-        if reason not in raw_candidate["block_reasons"]:
-            raw_candidate["block_reasons"].append(reason)
-        raw_candidate["quality_status"] = "rejected"
-        raw["candidate"] = raw_candidate
+    # NOTHING HERE CHANGES THE ATTEMPT'S STATUS ANY MORE.
+    #
+    # This used to demote a pack to review whenever _pack_value_decision()
+    # refused it on minimum coverage or bytes-per-covered-item. Under the #209
+    # ruling those are not admission questions: the pack has already proved it
+    # holds a wanted unit, and a size rule second-guessing that is appetite
+    # wearing the costume of safety. _pack_value_decision() no longer refuses,
+    # so this branch had no reachable caller; removing it means a later change
+    # cannot quietly re-enter it either.
+    #
+    # The figures it used to gate on are all still above, in
+    # raw["pack_value"] and pack_value_advisory, where an operator and a
+    # window census can read them.
     return enriched
 
 

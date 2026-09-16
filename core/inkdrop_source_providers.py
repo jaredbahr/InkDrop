@@ -1502,6 +1502,7 @@ def direct_artifact_verdict(candidate, registry_row=None, headers=None, min_size
     probe_required = source_kind in {"direct_file_probe_source", "rss_detail_probe_feed"}
     probe_status = int_value(candidate.get("probe_status_code"), None)
     block_reasons = []
+    review_reasons = []
 
     if registry_row and registry_state not in {"ready", "assist", "manual_review"}:
         block_reasons.append(f"registry_{registry_state or 'unavailable'}")
@@ -1528,11 +1529,17 @@ def direct_artifact_verdict(candidate, registry_row=None, headers=None, min_size
     if size_bytes is None:
         block_reasons.append("size_unknown")
     elif size_bytes <= 0:
+        # A zero-byte artifact is a broken file, not a small edition -- this one
+        # stays a block.  The two band checks below do not: an artifact that is
+        # merely outside the expected size for its unit is a candidate for a
+        # human to look at, not one to drop.  A 2 MB and a 300 MB result for the
+        # same want are different editions, and hard-rejecting on size spends
+        # the cheapest evidence we have for telling them apart.
         block_reasons.append("zero_size")
     elif size_bytes < min_size:
-        block_reasons.append("size_too_small")
+        review_reasons.append("size_too_small")
     elif size_bytes > max_size:
-        block_reasons.append("size_too_large")
+        review_reasons.append("size_too_large")
     if not _rights_allowed(candidate, policy):
         block_reasons.append("rights_gate_failed")
     if language_status == "rejected":
@@ -1560,13 +1567,23 @@ def direct_artifact_verdict(candidate, registry_row=None, headers=None, min_size
     candidate["quality"] = quality_profile
     candidate["direct_artifact_key"] = candidate.get("direct_artifact_key") or direct_artifact_key(candidate)
     candidate["direct_suppression_key"] = candidate.get("direct_suppression_key") or candidate["direct_artifact_key"]
+    review_reasons = [reason for reason in dict.fromkeys(review_reasons) if reason not in block_reasons]
     candidate["block_reasons"] = block_reasons
+    candidate["review_reasons"] = review_reasons
     candidate["artifact_safe"] = not block_reasons
     if block_reasons:
         manual_only = "manual_review_required" in block_reasons or registry_state == "manual_review"
         candidate["auto_grab_verdict"] = "review" if manual_only else "blocked"
         candidate["review_reason"] = block_reasons[0]
         candidate["quality_status"] = "rejected"
+    elif review_reasons:
+        # Surfaced, not dropped.  Reaching here means nothing is wrong with the
+        # artifact except its size relative to the unit we asked for, and that
+        # is a question for a human rather than grounds to discard a candidate
+        # that may simply be a different edition.
+        candidate["auto_grab_verdict"] = "review"
+        candidate["review_reason"] = review_reasons[0]
+        candidate["quality_status"] = "review"
     else:
         candidate["auto_grab_verdict"] = "auto_grab_safe"
         candidate["review_reason"] = ""
@@ -3281,7 +3298,57 @@ def _categoryless_fallback_category_gate_allowed(candidate, policy):
     return indexer_id in {value.lower() for value in values}
 
 
-def indexer_candidate_verdict(candidate, registry_row=None):
+def _candidate_size_bytes(candidate):
+    """First positive size a candidate reports, under any of its field names."""
+    raw = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else {}
+    result = raw.get("result") if isinstance(raw.get("result"), dict) else {}
+    for source in (candidate, result):
+        for key in ("size_bytes", "size", "sizeBytes", "length"):
+            try:
+                value = int(source.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return 0
+
+
+def _unit_size_band_review_reason(candidate, wanted_item=None, policy=None):
+    """Review reason when a candidate's size sits outside its unit's band.
+
+    Never a block reason.  A size outside the band means "a human should look",
+    not "this is wrong" -- a 2 MB and a 300 MB result for one want are two
+    editions, and size is the cheapest signal for telling them apart.
+
+    ``policy["pack_size_limit_bytes"]`` may tighten the pack ceiling below the
+    band; it is the existing per-media pack size setting, honoured here so the
+    source-worker path uses that same control rather than a parallel one.  It
+    is only ever a tightening -- it cannot widen the band.
+    """
+    size = _candidate_size_bytes(candidate)
+    if size <= 0:
+        return ""
+    is_pack = bool(candidate.get("pack"))
+    # The operator's limit is handed to the shared band rather than applied on
+    # top of it here. It used to be this path's own min(), which meant the one
+    # control an operator actually has reached one of the three paths that
+    # judge a size -- a parallel mechanism, which is the shape this band model
+    # exists to remove.
+    try:
+        configured_pack_ceiling = int((policy or {}).get("pack_size_limit_bytes") or 0)
+    except (TypeError, ValueError):
+        configured_pack_ceiling = 0
+    # The shared helper names the reason, rather than this path spelling the
+    # two strings a second time. They were identical bodies, which is how the
+    # same size comes to mean two slightly different things depending on which
+    # path asked -- the parallel mechanism this function's own docstring
+    # objects to, one level down.
+    return inkdrop_candidate_matching.unit_size_band_reason(
+        size, wanted_item, is_pack=is_pack, pack_ceiling_bytes=configured_pack_ceiling
+    )
+
+
+def indexer_candidate_verdict(candidate, registry_row=None, wanted_item=None):
     candidate = dict(candidate or {})
     registry_row = registry_row if isinstance(registry_row, dict) else {}
     policy = provider_policy(registry_row, candidate)
@@ -3422,6 +3489,9 @@ def indexer_candidate_verdict(candidate, registry_row=None):
         review_reasons.append("issue_number_not_confirmed")
     if candidate.get("pack") and not packs_allowed and not pack_membership_proven:
         review_reasons.append("pack_requires_review")
+    size_band_reason = _unit_size_band_review_reason(candidate, wanted_item, policy)
+    if size_band_reason:
+        review_reasons.append(size_band_reason)
     if (
         not manifest_pack_safe
         and _candidate_targets_collection(candidate)
