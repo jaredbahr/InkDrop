@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools import inkdrop_public_release_check as release_check
 from tools import inkdrop_public_repo_export as exporter
 
 # One canary that imports root modules, one that reads a sibling file by path,
@@ -169,10 +170,70 @@ def assert_install_guide_matches_published_compose(target):
                 )
 
 
+def release_check_scripts():
+    """Every script path the public release checker will run, as written."""
+    names = set()
+    for _name, _timeout, command in release_check.LOCAL_CHECKS:
+        for part in command:
+            if isinstance(part, str) and part.endswith((".py", ".sh")):
+                names.add(part)
+    return names
+
+
+def resolves_in(target, name):
+    """The checker's own lookup (resolve_script), asked of the staged export.
+
+    A name that is a file relative to the tree root resolves as written --
+    `core/inkdrop_opds.py` is one. Otherwise the bare name is searched for
+    under each SCRIPT_SEARCH_DIRS folder.
+    """
+    if (target / name).is_file():
+        return True
+    return any((target / folder / name).is_file() for folder in release_check.SCRIPT_SEARCH_DIRS if folder)
+
+
+def assert_release_check_scripts_are_exported(target):
+    """A check the public release gate runs must have its script in the export.
+
+    The checker resolves each script at run time, at the root or under tests/
+    or scripts/, and an unresolved name fails at the subprocess. So a check
+    wired into LOCAL_CHECKS whose script was never added to the export list
+    turns every public release red, with only "failed: <name>" in the log --
+    the script's own output is captured and never reaches the job. That is how
+    about_release_limits_smoke blocked 0.1.17: added to LOCAL_CHECKS so it
+    would run on the pull-request path, and never exported.
+
+    A check the export deliberately excuses, named in EXPORT_SKIPPED_CHECKS,
+    is not required: the checker skips it inside an export by design.
+    """
+    wanted = release_check_scripts()
+    if not wanted:
+        fail("found no scripts in LOCAL_CHECKS -- the extraction rotted, so this proves nothing")
+    excused = set(release_check.EXPORT_SKIPPED_CHECKS)
+    missing = sorted(
+        name for name in wanted
+        if Path(name).name not in excused and not resolves_in(target, name)
+    )
+    if missing:
+        fail(
+            f"{len(missing)} script(s) the public release gate runs are not in the export, "
+            f"so every public release fails on them: {missing}"
+        )
+
+    # Control: the same lookup finds a script known to be exported, so an
+    # empty `missing` is a reading rather than a lookup that finds nothing.
+    known = "inkdrop-release-notes-version-smoke.py"
+    if known not in wanted:
+        fail(f"control script {known} is no longer a release check; pick another")
+    if not resolves_in(target, known):
+        fail(f"the lookup cannot find {known} in the export, so it would miss every script")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / "public"
         staged_export(target)
+        assert_release_check_scripts_are_exported(target)
         assert_manifest_matches_tree(target)
         assert_install_guide_matches_published_compose(target)
         assert_canaries_run(target)

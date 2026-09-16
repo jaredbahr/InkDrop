@@ -194,6 +194,7 @@ PUBLIC_REPO_EXTRA_PATHS = (
     "inkdrop-public-export-runnable-smoke.py",
     "inkdrop-public-release-safety-audit.py",
     "inkdrop-release-notes-version-smoke.py",
+    "inkdrop-about-release-limits-smoke.py",
     "inkdrop-github-release-contract-smoke.py",
     "inkdrop-closed-alpha-packet-smoke.py",
     "inkdrop-update-awareness-smoke.py",
