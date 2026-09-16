@@ -210,17 +210,70 @@ localized_volume_cases = (
     ({"series": "Absolute Swamp Thing", "issue": "1", "issue_title": "Volume One", "media_type": "comic"}, "Volume One"),
     ({"series": "The Legend of Korra: Turf Wars Library Edition", "issue": "1", "issue_title": "HC", "media_type": "comic"}, "HC"),
 )
+# The exact-query slots a genuine designator is promoted INTO. One name, used
+# by both loops below, so "promoted" cannot come to mean two different spans.
+PROMOTION_WINDOW = 4
+
 for item, exact_suffix in localized_volume_cases:
     queries = slskd.source_queries(item)
     require(queries[0] and str(item["issue"]) not in queries[0], (item, queries[:6]))
-    require(f"{queries[0]} {exact_suffix}" in queries[:4], (item, queries[:6]))
+    require(f"{queries[0]} {exact_suffix}" in queries[:PROMOTION_WINDOW], (item, queries[:6]))
     require(any("Volume " in query for query in queries[1:5]), (item, queries[:6]))
 
 # Similar prose must not be promoted merely because it contains a marker word.
-for ordinary_title in ("Band of Brothers", "The Book of Doom", "Tome of Magic"):
-    ordinary = {"series": "Example Series", "issue": "7", "issue_title": ordinary_title, "media_type": "comic"}
-    ordinary_queries = slskd.source_queries(ordinary)
-    require(not any(ordinary_title in query for query in ordinary_queries[:6]), (ordinary_title, ordinary_queries[:8]))
+#
+# PINNED AS A RANK COMPARISON, NOT AS A POSITION, AND THAT IS THE POINT.
+# This read `ordinary_queries[:6]`, where 6 was calibrated against a plan that
+# carried two rungs -- `collection` (0 productive / 10 zero) and `volumes`
+# (0 / 12) -- that measurement says never produce anything. Removing them is
+# what #600 is for, and it moves everything below them up a slot, so the
+# constant went stale the moment the dead rungs went away. A promotion rule
+# expressed as an absolute index is a rule that re-breaks every time a rung is
+# added or deleted above the line, which is drift wearing the costume of a
+# defect.
+#
+# The contract is comparative -- "not promoted MERELY because it contains a
+# marker word" is a claim about two titles, not about one index -- so each
+# prose title is measured against a genuine designator carrying the SAME marker
+# word on the SAME series and issue. The only difference between the two items
+# is whether the marker is a real unit designator.
+#
+# Measured both ways while making this change: the genuine designator ranks 1
+# with the dead rungs present and 1 with them gone, while the prose moves 7 to
+# 5. The thing this arm protects does not move; only the calibration did.
+marker_word_cases = (
+    ("Band 7", "Band of Brothers"),
+    ("Tome 7", "Tome of Magic"),
+    ("Volume 7", "The Book of Doom"),
+)
+
+
+def _rank_of(title, needle):
+    """Where `needle` first appears in the plan for a want titled `title`."""
+    queries = slskd.source_queries(
+        {"series": "Example Series", "issue": "7", "issue_title": title, "media_type": "comic"}
+    )
+    return next((i for i, query in enumerate(queries) if needle in query), None), queries[:8]
+
+
+for genuine_title, ordinary_title in marker_word_cases:
+    genuine_rank, genuine_plan = _rank_of(genuine_title, genuine_title)
+    ordinary_rank, ordinary_plan = _rank_of(ordinary_title, ordinary_title)
+    # Positive arm first: the designator really is promoted, so the negative
+    # arm below is refusing something the plan was capable of doing.
+    require(
+        genuine_rank is not None and genuine_rank < PROMOTION_WINDOW,
+        ("genuine designator was not promoted", genuine_title, genuine_rank, genuine_plan),
+    )
+    require(
+        ordinary_rank is None or ordinary_rank >= PROMOTION_WINDOW,
+        ("ordinary prose was promoted into the exact-query slots", ordinary_title, ordinary_rank, ordinary_plan),
+    )
+    require(
+        ordinary_rank is None or genuine_rank < ordinary_rank,
+        ("prose did not rank below its own marker word used as a designator",
+         genuine_title, genuine_rank, ordinary_title, ordinary_rank, ordinary_plan),
+    )
 
 require(slskd.book_volume_numbers("Fullmetal Alchemist Band 17.cbz") == [17], "localized Band marker was not parsed")
 require(slskd.book_volume_numbers("Asterix Tome Four.cbz") == [4], "localized Tome marker was not parsed")

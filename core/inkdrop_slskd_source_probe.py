@@ -4721,11 +4721,142 @@ def search_text(value):
         touching = int(previous.isalnum()) + int(following.isalnum())
         if touching != 1:
             kept.append(char)
+            continue
+        # Dropped grammar becomes a SPACE, not nothing. Deleting it fused the
+        # words either side whenever two marks sat between them: the `--` in
+        # `Airbender -- North and South` is two touching==1 drops in a row, so
+        # the emitted query was `Avatar The Last AirbenderNorth and South
+        # Omnibus` -- observed live in slskd's own history 2026-08-22 22:14Z,
+        # 0 files 0 responses, and again in the ledger as the unmatchable token
+        # `airbender-imbalance` (4 zero-response queries, 0 productive).
+        #
+        # A space is right for every case this branch already handled: the
+        # comma in `Suki, Alone`, the period ending `The Gods Lie.`, the
+        # brackets around `(Omnibus)` all collapse away under the .split()
+        # below. The in-word case (`Takopi's`, `ODY-C`) is touching==2 and
+        # never reaches here, so nothing that was being preserved changes.
+        kept.append(" ")
     return " ".join(
         token
         for token in "".join(kept).split()
         if len(token) == 1 or any(char.isalnum() for char in token)
     )
+
+
+# Generic query tokens that have NEVER appeared in a query that produced a
+# candidate. Every entry is (zero-response uses, productive uses) measured on
+# the live ledger 2026-08-23 over 357 distinct system-built queries -- 163 of
+# which returned zero responses and 109 of which produced at least one
+# candidate.
+#
+# THE COUNTS ARE THE ENTRY CRITERION, NOT DECORATION. A token belongs here only
+# if its productive count is zero. Anything added without a measured pair is
+# somebody's intuition wearing the same clothes as evidence, and the whole
+# reason this list is inspectable is so that is visible.
+#
+# Deliberately NOT here, and this is a judgement rather than a measurement:
+# `volume` (13/1), `comic` (11/1), `vol` (7/1), `complete` (13/3) and `01`
+# (9/2). They are heavily skewed toward failure but not zero, so stripping them
+# would also remove the handful of queries that worked. Losing a working query
+# to tidy a list is a worse trade than leaving a weak token in, and when
+# someone later finds the case a strip would have broken, this paragraph is
+# the reason it was left.
+MEASURED_UNPRODUCTIVE_QUERY_TOKENS = {
+    "tpb": (20, 0),
+    "hc": (14, 0),
+    "volumes": (12, 0),
+    "collection": (10, 0),
+    "v01": (8, 0),
+    "v1": (6, 0),
+    "v001": (6, 0),
+    "c01": (5, 0),
+    "ch001": (3, 0),
+}
+
+# Soulseek ANDs whole tokens against a peer's full path, so a query of one or
+# two bare tokens matches as a substring anywhere and saturates the 250-response
+# ceiling: `Blackbird`, `Powers`, `Tokyo Ghoul`, `The Rift` and `Squire 1` all
+# returned exactly 250. Measured: every capped query is <= 4 tokens, and the
+# median capped query is 2. `The Rift` capped; `The Rift comic` returned 1 --
+# the media-type word is what moved it out of the tail.
+UNDERDETERMINED_QUERY_TOKEN_FLOOR = 3
+
+
+def strip_unproductive_query_tokens(text, *, protect=()):
+    """Drop tokens measured to have never produced a candidate.
+
+    `protect` is the correction that matters here, and it came from a test
+    rather than from the analysis. `hc` is in the measured set at 0 productive
+    / 14 zero, which is true -- and `inkdrop-automatic-search-recall-smoke`
+    encodes a case where `HC` is the unit's OWN `issue_title`, the thing that
+    identifies it, for The Legend of Korra: Turf Wars Library Edition. The
+    token-frequency measurement never asked WHERE a token came from, so it
+    could not tell a format suffix decorating a series title from a unit
+    designator carried in metadata. That is the same error as ranking
+    `avatar` by how often it appeared in failing queries. Tokens supplied by
+    the item's own unit title are therefore protected from stripping, and
+    the same token is still removed when it is decoration.
+
+    Only whole-token matches, and only tokens in the measured set above. This
+    deliberately does NOT touch series-identity tokens: the first cut of this
+    analysis ranked `avatar`, `airbender` and `last` as the most
+    failure-associated tokens in the corpus (95 of 163 zero-response queries),
+    which is true and useless -- Avatar dominates because Avatar was searched
+    badly and repeatedly, so the frequency measured our own behaviour rather
+    than the tokens. Stripping them would have removed the only words that
+    identify the work.
+    """
+    protected = {str(t).lower() for t in (protect or ()) if str(t).strip()}
+    tokens = [t for t in str(text or "").split() if t]
+    kept = [t for t in tokens
+            if t.lower() in protected or t.lower() not in MEASURED_UNPRODUCTIVE_QUERY_TOKENS]
+    return " ".join(kept) if kept else ""
+
+
+def well_formed_queries(texts, *, media_qualifier="", protect=()):
+    """Strip the measured-unproductive tokens. That is the whole rule now.
+
+    #600's half only. The over-specified tail is real: nine tokens that appear
+    in NO series title and have never once produced a candidate -- `tpb` (0
+    productive / 20 zero), `hc` (0/14), `volumes` (0/12) and the rest.
+
+    #530'S HALF WAS REMOVED FROM THIS FUNCTION AFTER MEASUREMENT, and the
+    reason is worth more than the code was. #530 asks for media-type
+    qualifiers so comics stop being searched with manga notation. The first
+    cut of this function added them to any query under a token floor. Then
+    `source_queries()` was run against qa's OWN module in a shadow path, and
+    the generator ALREADY PLANS A QUALIFIED VARIANT FOR EVERY ITEM, at
+    position 2, in an order with its own measured rationale:
+
+        Descender -> ['Descender', 'Descender 15', 'Descender comics', ...]
+        The Rift  -> ['The Rift',  'The Rift 1',   'The Rift comics',  ...]
+
+    So the rule was not adding a missing query. It was adding a DUPLICATE and
+    pushing the planned rungs down a slot -- and because `comic` is a
+    deliberately-kept near-poison token, appending `comics` on top of it
+    produced `Descender comic comics`. Two smokes caught it:
+    `inkdrop-slskd-query-rotation-smoke` pins the first five queries with a
+    paragraph of measurement behind the ordering, and
+    `inkdrop-automatic-search-recall-smoke` pins broad-first for six real
+    items.
+
+    `media_qualifier` is kept in the signature and deliberately unused: the
+    caller passes it, and a future rule that needs it should not have to
+    re-derive where it comes from. If you are tempted to use it to append a
+    qualifier, read the paragraph above first.
+
+    NOTHING IS DROPPED FOR BEING SHORT. Suppressing queries below a token
+    floor removed three that had produced candidates -- `Dorohedoro` (126
+    responses, 25 candidates), `WE3` (21/12), `Fireborn` (188/1). Token count
+    cannot tell those from `Blackbird`, also one token, also a useless 250.
+    """
+    del media_qualifier  # see the docstring; kept for callers, deliberately unused
+    out = []
+    for text in texts:
+        stripped = strip_unproductive_query_tokens(text, protect=protect)
+        if stripped:
+            out.append(stripped)
+    return out
 
 
 def media_path_marker_queries(title, qualifier="comics"):
@@ -5086,7 +5217,17 @@ def source_queries(item):
     # it. Doing it before unique_values() also collapses the punctuated and
     # clean spellings of the same question into one slot instead of spending
     # two of the thirty-six on it.
-    return unique_values([search_text(query) for query in queries], limit=36)
+    # One chokepoint, deliberately. Every generated variant passes through
+    # here, so the shape rule lives at this line rather than in the twenty-odd
+    # builders above -- the same argument the search_text() cleaning already
+    # makes two lines up.
+    cleaned = [search_text(query) for query in queries]
+    # The unit's own declared title is evidence, not decoration -- see
+    # strip_unproductive_query_tokens(). Korra's `HC` IS the unit designator.
+    unit_title_tokens = str(item.get("issue_title") or "").split()
+    shaped = well_formed_queries(cleaned, media_qualifier=media_query_qualifier,
+                                 protect=unit_title_tokens)
+    return unique_values(shaped, limit=36)
 
 
 def manual_search_query_variants(item, explicit_queries=None):
