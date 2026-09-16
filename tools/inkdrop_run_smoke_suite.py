@@ -362,6 +362,32 @@ def _fcntl_available():
     import importlib.util
     return importlib.util.find_spec("fcntl") is not None
 
+
+def _proc_process_table_readable():
+    """True where /proc is a readable process table, not merely a path.
+
+    inkdrop_web.process_table_rows() enumerates the numeric entries under /proc
+    and reads each one's stat and cmdline. Where that answers nothing the status
+    compute falls back to forking `pgrep` per script -- which is correct, and is
+    exactly what the fork-free arm of the fork-storm smoke forbids. Windows has
+    no /proc, so that arm cannot hold there, and the smoke's own control says so
+    rather than pass: "/proc is unreadable on this host, so the control cannot
+    run and the arm above proves nothing".
+
+    Asked by reading this process's own entry the way the scanner does, rather
+    than inferred from os.name: a path check alone would answer yes on a host
+    where /proc exists but carries no process entries, which is the shape that
+    would make the arm pass while proving nothing.
+    """
+    try:
+        with open(f"/proc/{os.getpid()}/stat", "rb") as handle:
+            own = handle.read()
+        with open(f"/proc/{os.getpid()}/cmdline", "rb"):
+            pass
+        return bool(own.strip()) and any(name.isdigit() for name in os.listdir("/proc"))
+    except OSError:
+        return False
+
 REQUIREMENTS = {
     "origin_qa": (
         _origin_qa_available,
@@ -382,6 +408,11 @@ REQUIREMENTS = {
         "needs an environment where a read-only mode actually denies a write -- root on "
         "Linux bypasses the check, so the EACCES under test cannot be caused here "
         "(Windows CAN cause it: os.chmod moves the read-only attribute there)",
+    ),
+    "proc_table": (
+        _proc_process_table_readable,
+        "needs /proc to be a readable process table -- without one the status compute "
+        "correctly falls back to forking pgrep, so the fork-free arm cannot hold here",
     ),
     "change_time": (
         _change_time_moves,
@@ -433,6 +464,7 @@ REQUIREMENT_OWNERS = {
     "symlinks": "harness",
     "wslpath": "harness",
     "fcntl": "acquisition",
+    "proc_table": "web",
 }
 
 
@@ -466,6 +498,7 @@ def requirement_owner(key, owners=None):
 # here cannot hide a result, it can only decline to produce one.
 REQUIRES = {
     "inkdrop-archive-validation-cache-smoke.py": "change_time",
+    "inkdrop-status-compute-without-process-forks-smoke.py": "proc_table",
     "inkdrop-archive-verdict-honesty-smoke.py": "symlinks",
     "inkdrop-series-autopilot-cron-lock-smoke.py": "wslpath",
     "inkdrop-slskd-staging-sweep-missing-stage-priority-smoke.py": "fcntl",
