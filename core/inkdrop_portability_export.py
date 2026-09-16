@@ -142,11 +142,17 @@ def series_entries(con):
 
 
 def download_client_entries(db_path, *, secret_root=None):
-    """Configured download clients with secrets and usernames reduced to flags."""
+    """Configured download clients with secrets and usernames reduced to flags.
+
+    Returns ``(entries, error)``. The error string is what makes a failed read
+    distinguishable from an instance that genuinely has no download clients:
+    both produce an empty list, and an export taken during a failed read was
+    byte-identical to one taken on a clean install with none configured.
+    """
     try:
         listing = inkdrop_download_client_config.list_instances(db_path, secret_root=secret_root)
-    except Exception:
-        return []
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
     entries = []
     for item in listing.get("instances") or []:
         secrets_configured = sorted(
@@ -170,7 +176,7 @@ def download_client_entries(db_path, *, secret_root=None):
                 "secrets_configured": secrets_configured,
             }
         )
-    return entries
+    return entries, ""
 
 
 def export_portability_document(db_path, *, now=None, version=None, secret_root=None):
@@ -180,7 +186,9 @@ def export_portability_document(db_path, *, now=None, version=None, secret_root=
     with inkdrop_state.connect_read(db_path) as con:
         providers = provider_entries(con)
         series, series_excluded = series_entries(con)
-    download_clients = download_client_entries(db_path, secret_root=secret_root)
+    download_clients, download_clients_error = download_client_entries(
+        db_path, secret_root=secret_root
+    )
     metadata = inkdrop_version.build_metadata() if version is None else {"version": str(version)}
     monitored_count = sum(1 for item in series if item["monitored"])
     media_type_counts = {}
@@ -203,11 +211,19 @@ def export_portability_document(db_path, *, now=None, version=None, secret_root=
             "series_excluded_parked_or_replaced": series_excluded,
             "providers_total": len(providers),
             "download_clients_total": len(download_clients),
+            # Present ONLY when the read failed, so a reader can tell a
+            # zero from a silence. Absent on a genuine zero-client export.
+            **({"download_clients_unavailable": download_clients_error}
+               if download_clients_error else {}),
         },
         "contains": {
             "app_settings": True,
             "provider_config": True,
-            "download_client_config": True,
+            # OBSERVED, not asserted. This was a hardcoded True, so the
+            # document claimed to contain a configuration it had failed to
+            # read -- a status field written from a default rather than
+            # from what actually happened.
+            "download_client_config": not download_clients_error,
             "service_urls": True,
             "provider_credentials": False,
             "download_client_credentials": False,
