@@ -300,8 +300,8 @@ def assert_packaging_files():
         "inkdrop_*_cleanup.py",
         "inkdrop_*_diagnostic.py",
         "docs/*.py",
-        "inkdrop-agent-context-pack.py",
-        "inkdrop-agent-coordinator-quickcheck.py",
+        "kapinspect.py",
+        "kavitainspect.py",
         "inkdrop-completion-identity-audit-diff.py",
         "inkdrop_chainsaw_stale_proof_repair.py",
         "inkdrop_duplicate_manga_cleanup.py",
@@ -838,7 +838,7 @@ def assert_public_release_docs_contract():
     require("INKDROP_EXTERNAL_NETWORK" in network_override, "network override should require an explicit external network name")
     require("external: true" in network_override, "network override should join an existing external network")
     require("name: ${INKDROP_EXTERNAL_NETWORK:?" in network_override, "network override should fail closed without a network name")
-    for private_hint in ("arr-docker", "192.168.", "private-user", "/mnt/private-media"):
+    for private_hint in ("private-host", "192.168.", "private-user", "/srv/private-media"):
         require(private_hint not in network_override, f"network override should not contain private hint {private_hint}")
     require("split_host_release_ready" in evidence_helper, "release evidence helper should emit split-host readiness")
     require('"deploy/compose.network.example.yml"' in evidence_helper, "release evidence helper should include the optional network override")

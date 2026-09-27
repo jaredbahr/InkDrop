@@ -7,6 +7,49 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def without_comments(source):
+    """A component's code with its `//` comment lines removed.
+
+    These files explain in prose what their controls are for, and several name
+    the very labels asserted below. A bare substring search over the raw text
+    is then satisfied by the explanation: renaming the "Search Selected"
+    button to "Run" left the label assertion green, because Wanted.tsx's own
+    file comment still mentioned it. Measured, not assumed -- that mutant went
+    undetected until this was added.
+    """
+    return "\n".join(line for line in source.split("\n") if not line.strip().startswith("//"))
+
+
+def renders_button_label(source, label):
+    """True when a <button> in this component renders `label` as its text.
+
+    Scoped to the children of a button, not to the file. These labels also
+    appear in each button's own title text and in the reason shown when the
+    shell bridge behind it is absent, so a whole-file search stays green after
+    the visible label is renamed -- measured: renaming the button to "Find"
+    went undetected until this was scoped.
+    """
+    children = re.findall(r"<button\b[^>]*>(.*?)</button>", without_comments(source), re.S)
+    return any(label in block for block in children)
+
+
+def disabled_conditions(source):
+    """Every `disabled={...}` expression in a component, as text.
+
+    The two Wanted toolbar assertions used to pin the WHOLE expression --
+    `disabled={selectedCount < 1` -- which holds the bar only as long as the
+    condition never gains a term. It gained one: the buttons now also disable
+    when the shell bridge behind them is absent, so they say why instead of
+    being enabled and doing nothing. That is a strictly stronger control, and
+    an exact-substring match read it as a regression.
+
+    So the bar is stated as what it always meant: the button is disabled
+    through the native attribute, and the selection count is part of what
+    decides it. Extra terms are allowed; losing the count is not.
+    """
+    return re.findall(r"disabled=\{([^}]*)\}", source)
+
+
 def catalog_matches_release_contract():
     """The About page's newest entry and the release contract name one release.
 
@@ -181,10 +224,19 @@ checks = {
     # comes from the native `disabled` attribute driven by selectedCount, not
     # a CSS selector keyed on a vanilla data-attribute that no longer exists
     # on these buttons.
-    "wanted batch search stays visible": '"Search Selected"' in wanted_tsx
-    and '"Manual Search"' in wanted_tsx
-    and "disabled={selectedCount < 1" in wanted_tsx
-    and "disabled={selectedCount !== 1}" in wanted_tsx,
+    # Asserted on what each BUTTON renders. Requiring the quotes matched only
+    # "Search Selected" (a quoted string in a ternary); "Manual Search" is
+    # bare JSX text, and that clause was being satisfied by this component's
+    # own comment naming both labels. Dropping the quotes fixed that and left
+    # a second hole, since both labels also appear in title text.
+    "wanted batch search stays visible": renders_button_label(wanted_tsx, "Search Selected")
+    and renders_button_label(wanted_tsx, "Manual Search")
+    # Still the native `disabled` attribute, still driven by the selection
+    # count -- not by hiding the button, and not by a CSS selector keyed on a
+    # vanilla data-attribute these buttons no longer carry.
+    and any("selectedCount < 1" in condition for condition in disabled_conditions(wanted_tsx))
+    and any("selectedCount !== 1" in condition for condition in disabled_conditions(wanted_tsx))
+    and "hidden={" not in wanted_tsx,
     "wanted rows expose queue and open with a labeled evidence drawer": 'if (view === "wanted") {' in web
     and 'label: "Queue"' in web
     and 'label: "Open"' in web

@@ -2680,7 +2680,7 @@ def prowlarr_candidate_from_result(result, registry_row=None, wanted_item=None):
         # selected indexers declare. Carried per-result so the gate below admits
         # what the request asked for; without it a Nyaa release tagged 7000 is
         # fetched and then rejected category_not_allowed, which is the same zero
-        # under a worse name. See tracker #198.
+        # under a worse name.
         "resolved_allowed_categories": category_ids(result.get("_inkdrop_resolved_categories") or []),
         "categoryless_fallback_primary_request_id": str(
             result.get("_inkdrop_categoryless_fallback_primary_request_id") or ""

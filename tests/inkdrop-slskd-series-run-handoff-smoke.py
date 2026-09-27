@@ -1,18 +1,44 @@
 #!/usr/bin/env python3
 """Deterministic coverage for bounded SLSKD numbered-directory handoff."""
 
+import atexit
 import json
+import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from core import inkdrop_completed_import as completed
-from core import inkdrop_missing_acquire as acquire
-from core import inkdrop_manual_source_autoresolve as autoresolve
-from core import inkdrop_slskd_source_probe as probe
-from core import inkdrop_state
+# inkdrop_slskd_source_probe fixes STATE_DIR (and the files under it, such as
+# its log) once, at import, from INKDROP_STATE_DIR and friends, falling back
+# to the real default state dir otherwise. slskd_search() itself is mocked
+# out here, but probe.probe_item() runs for real and touches STATE_DIR on its
+# own account (logging, at minimum) -- into the real default state dir
+# (D:\state on Windows) unless isolated here, before the import.
+_ISOLATED_ROOT = tempfile.mkdtemp(prefix="tmp-slskd-series-run-handoff-smoke-")
+atexit.register(shutil.rmtree, _ISOLATED_ROOT, True)
+for _var, _rel in (
+    ("INKDROP_CONFIG_DIR", "config"),
+    ("INKDROP_STATE_DIR", "state"),
+    ("INKDROP_LOCK_DIR", "state/locks"),
+    ("INKDROP_LOG_DIR", "state/logs"),
+    ("INKDROP_CACHE_DIR", "state/cache"),
+    ("INKDROP_BACKUP_DIR", "state/backups"),
+    ("INKDROP_STAGING_DIR", "staging"),
+    ("INKDROP_MANUAL_INBOX_DIR", "manual-inbox"),
+    ("INKDROP_QUARANTINE_DIR", "state/quarantine"),
+):
+    _path = os.path.join(_ISOLATED_ROOT, _rel)
+    os.makedirs(_path, exist_ok=True)
+    os.environ[_var] = _path
+
+from core import inkdrop_completed_import as completed  # noqa: E402
+from core import inkdrop_missing_acquire as acquire  # noqa: E402
+from core import inkdrop_manual_source_autoresolve as autoresolve  # noqa: E402
+from core import inkdrop_slskd_source_probe as probe  # noqa: E402
+from core import inkdrop_state  # noqa: E402
 
 
 def require(condition, message):

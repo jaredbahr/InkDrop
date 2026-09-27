@@ -4403,7 +4403,7 @@ def _prowlarr_indexer_coverage(row, requests, combined_results, http_get, fetch_
     # that list feeds requests_made_count / completed_call_count, which are the
     # operator-facing "how much searching happened" numbers. An availability
     # probe is not a search, and quietly inflating those counters is the same
-    # class of defect as the attempt counter in #191.
+    # class of defect as the attempt counter.
     fetch_result["indexer_status_probe"] = {
         "request_id": probe.get("request_id"),
         "purpose": probe.get("purpose"),
@@ -5945,7 +5945,7 @@ def fetch_payloads(row, plan, wanted_item=None, *, http_get=None, tool_runner=No
             # Carried onto the payload so the candidate gate can admit releases
             # under the categories we actually asked for. Without this the gate
             # still holds the unresolved 7030 and rejects them category_not_allowed
-            # -- the same zero under a different name. See tracker #198.
+            # -- the same zero under a different name.
             payload["category_resolution"] = result["category_resolution"]
         if fetch_plan.get("categoryless_fallback_requests"):
             payload["categoryless_fallback_indexer_ids"] = list(fetch_plan.get("categoryless_fallback_indexer_ids") or [])

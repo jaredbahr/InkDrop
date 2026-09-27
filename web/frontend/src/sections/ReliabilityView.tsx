@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { request, InkDropApiError } from "../api";
+import { useLatestOnly } from "../latestOnly";
 import { useRowActions } from "../rowActions";
 import {
   RELIABILITY_STAGE_ORDER,
@@ -594,21 +595,27 @@ export function ReliabilityView({ payload }: { payload: ReliabilityViewPayload }
     };
   }, []);
 
+  // Only the newest list request may write to this section's state.
+  const listRequest = useLatestOnly();
+
   async function loadPage(nextOffset: number, filter?: string) {
     const activeFilter = filter ?? bucketFilterRef.current;
+    const isCurrent = listRequest.begin();
     setLoading(true);
     setError(null);
     try {
       const data = await request<{ ok: boolean; view: ReliabilityViewPayload }>(buildEndpoint(nextOffset, activeFilter));
+      if (!isCurrent()) return;
       const view = data.view;
       setItems(view.rows || []);
       setOffset(view.offset ?? nextOffset);
       setTotalCount(view.total_count || 0);
       if (view.summary) setSummary(view.summary);
     } catch (cause) {
+      if (!isCurrent()) return;
       setError(cause instanceof InkDropApiError ? cause.message : "Could not load the Reliability view.");
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 

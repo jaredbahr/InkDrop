@@ -41,6 +41,8 @@ def env_bool(name, default=False):
 HOST = inkdrop_runtime_config.web_host()
 PORT = inkdrop_runtime_config.web_port(strict=False)
 WEB_RUNTIME_STARTED_AT = time.time()
+WEB_OVERLOAD_REFUSAL_COUNT = 0
+WEB_OVERLOAD_REFUSAL_LOCK = threading.Lock()
 MANUAL_SEARCH_THREADS = {}
 MANUAL_SEARCH_THREADS_LOCK = threading.Lock()
 MANUAL_REVIEW_RETRY_THREADS = {}
@@ -473,9 +475,22 @@ def web_runtime_status_fields():
     }
 
 
+def record_web_overload_refusal():
+    global WEB_OVERLOAD_REFUSAL_COUNT
+    with WEB_OVERLOAD_REFUSAL_LOCK:
+        WEB_OVERLOAD_REFUSAL_COUNT += 1
+        return WEB_OVERLOAD_REFUSAL_COUNT
+
+
+def web_overload_refusal_status():
+    with WEB_OVERLOAD_REFUSAL_LOCK:
+        return {"count": WEB_OVERLOAD_REFUSAL_COUNT}
+
+
 def attach_web_runtime_status(payload):
     out = dict(payload or {})
     out.update(web_runtime_status_fields())
+    out["overload_refusal_count"] = web_overload_refusal_status()["count"]
     return out
 
 
@@ -546,7 +561,7 @@ SERIES_AUTOPILOT_SLSKD_MAX_PER_SERIES = 12
 SERIES_AUTOPILOT_SLSKD_WAIT_SECONDS = 8
 SERIES_AUTOPILOT_SLSKD_MAX_QUERIES = 5
 # Seeded onto a fresh install's slskd row and used as the parent's fallback.
-# Was 8, which is what production actually ran under while #1199's raised code
+# Was 8, which is what production actually ran under while the raised code
 # defaults sat unreachable behind merge_provider_settings() keeping the stored
 # value. An existing row is NOT rewritten -- the operator raises it in Settings.
 SERIES_AUTOPILOT_SLSKD_AUTO_GRAB_MAX = 20
@@ -626,11 +641,48 @@ except OSError:
 # always has) simply reports "missing" the same way a stripped-down export
 # with no CSS/JS assets does above.
 INKDROP_UI_REACT_DIR = Path(__file__).resolve().parents[1] / "web" / "static" / "dist"
-INKDROP_UI_REACT_ASSETS = frozenset({"inkdrop-react.js"})
+INKDROP_UI_REACT_ENTRY = "inkdrop-react.js"
+# Only files this build actually emitted, and only names matching the shape it
+# emits them under. The chunk names carry a content hash, so they cannot be
+# written down here the way the entry can -- but the set is still resolved ONCE,
+# at import, and membership is still an exact-name check, so serving stays an
+# allowlist lookup rather than a per-request directory read. A name with a path
+# separator, a traversal segment, or anything but a bare `inkdrop-react*.js`
+# basename cannot get into this set and therefore cannot be served.
+INKDROP_UI_REACT_ASSET_PREFIX = "inkdrop-react"
+INKDROP_UI_REACT_ASSET_SUFFIX = ".js"
+
+
+def _discover_react_assets(directory):
+    names = set()
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return frozenset()
+    for entry in entries:
+        name = entry.name
+        if not entry.is_file():
+            continue
+        if name != Path(name).name or "/" in name or "\\" in name:
+            continue
+        if not name.startswith(INKDROP_UI_REACT_ASSET_PREFIX) or not name.endswith(INKDROP_UI_REACT_ASSET_SUFFIX):
+            continue
+        names.add(name)
+    return frozenset(names)
+
+
+INKDROP_UI_REACT_ASSETS = _discover_react_assets(INKDROP_UI_REACT_DIR)
 try:
-    INKDROP_UI_REACT_VERSION = hashlib.sha256(
-        b"".join((INKDROP_UI_REACT_DIR / name).read_bytes() for name in sorted(INKDROP_UI_REACT_ASSETS))
-    ).hexdigest()[:12]
+    # Hashed over every served file, so replacing a chunk changes the entry's
+    # ?v= too -- a browser cannot end up holding a new entry beside an old
+    # chunk under the same version string.
+    INKDROP_UI_REACT_VERSION = (
+        hashlib.sha256(
+            b"".join((INKDROP_UI_REACT_DIR / name).read_bytes() for name in sorted(INKDROP_UI_REACT_ASSETS))
+        ).hexdigest()[:12]
+        if INKDROP_UI_REACT_ASSETS
+        else "missing"
+    )
 except OSError:
     INKDROP_UI_REACT_VERSION = "missing"
 # Standalone lightweight mobile status view (/m) -- deliberately not part of
@@ -714,6 +766,14 @@ MANGADEX_COVER_URL = "https://uploads.mangadex.org/covers"
 # MangaDex's maximum page size for /cover. One page ordered by volume is enough
 # to find book one even for a hundred-volume run.
 MANGADEX_COVER_PAGE_LIMIT = 100
+# MangaDex's maximum page size for /manga/{id}/feed, and how far one feed call
+# will page. A feed budget counts DISTINCT chapters, and a heavily scanlated
+# chapter can carry a dozen competing group rows, so the page loop has to be
+# free to run well past the requested chapter count. These two are what stop it
+# from walking a several-thousand-row feed to its end to do that.
+MANGADEX_FEED_PAGE_LIMIT = 100
+MANGADEX_FEED_MAX_ROWS = 1000
+MANGADEX_FEED_MAX_PAGES = MANGADEX_FEED_MAX_ROWS // MANGADEX_FEED_PAGE_LIMIT
 METRON_API = "https://metron.cloud/api"
 METRON_SITE_URL = "https://metron.cloud/series"
 SAB_COMIC_CATEGORIES = {"comics", "manga", "mylar", "kapowarr"}
@@ -872,6 +932,7 @@ __all__ = [
     "INKDROP_UI_JS_VERSION",
     "INKDROP_UI_REACT_ASSETS",
     "INKDROP_UI_REACT_DIR",
+    "INKDROP_UI_REACT_ENTRY",
     "INKDROP_UI_REACT_VERSION",
     "KAVITA_API",
     "KAVITA_COMIC_ROOT",
@@ -891,6 +952,9 @@ __all__ = [
     "MANGADEX_COVER_PAGE_LIMIT",
     "MANGADEX_COVER_URL",
     "MANGADEX_DEFAULT_CONTENT_RATINGS",
+    "MANGADEX_FEED_MAX_PAGES",
+    "MANGADEX_FEED_MAX_ROWS",
+    "MANGADEX_FEED_PAGE_LIMIT",
     "MANGADEX_MATURE_RATING_PENALTY",
     "MANGADEX_SITE_URL",
     "MANGADEX_USER_AGENT",
@@ -1091,6 +1155,8 @@ __all__ = [
     "WEB_STACK_DUMP_SIGNAL_INSTALLED",
     "WEB_THREAD_ROSTER_FILE",
     "attach_web_runtime_status",
+    "record_web_overload_refusal",
+    "web_overload_refusal_status",
     "env_bool",
     "env_value",
     "install_web_stack_dump_signal",

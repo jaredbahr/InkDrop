@@ -8194,7 +8194,17 @@
     .settings-form-row {
       grid-column: 1 / -1;
       display: grid;
-      grid-template-columns: minmax(150px, 220px) minmax(260px, 520px) auto;
+      /* The actions track is minmax(min-content, auto) rather than auto:
+         .settings-form-actions carries min-width: 0, which makes its automatic
+         minimum size 0, so an `auto` track is free to resolve below the
+         Cancel/Save buttons inside it and let them paint outside their own
+         track. At exactly 900px -- the first width above the two-column band
+         below -- a vertical scrollbar takes the content box to 885px, the
+         actions track resolves to 108.5px against 125.4px of buttons, and Save
+         lands 17px past the right edge of the page. min-content floors the
+         track at the buttons; the flexible control track gives up the
+         difference. */
+      grid-template-columns: minmax(150px, 220px) minmax(260px, 520px) minmax(min-content, auto);
       gap: 10px 14px;
       align-items: start;
       min-width: 0;
@@ -8388,8 +8398,8 @@
        the background lives here because this is the selector that wins.
 
        Until 2026-08-20 the row was the only chrome on the Settings page
-       (tracker row 546: the masthead and `#inkdropSettings > summary` were
-       both display:none), and the #242424 fill inherited from the shared
+       (the masthead and `#inkdropSettings > summary` were both display:none),
+       and the #242424 fill inherited from the shared
        .workflow-actions card made it read as a raised slab with its left
        half empty -- the "detached floating toolbar" in the report. Settings
        now has a real masthead header above it (15-redesign-shell.css), so
@@ -22994,7 +23004,7 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
   overflow-wrap: anywhere;
 }
 
-/* #572 expected-versus-found, inside the Reason cell. Reference the operator
+/* Expected-versus-found, inside the Reason cell. Reference the operator
    reads while deciding, so it sits quiet under the badge rather than
    competing with it. The found value is a file name and must stay readable
    and unmangled, so it wraps rather than truncating. */
@@ -23562,6 +23572,83 @@ body[data-inkdrop-view="source_memory"] #opDetailDock:not(:has(.source-memory-de
   }
 }
 
+
+/* A section that failed to render. Deliberately looks like a contained
+   panel rather than a full-page error: the point it has to make is that
+   the rest of the app still works, so it must not read as the app being
+   down. See web/frontend/src/SectionErrorBoundary.tsx. */
+.section-error-boundary {
+  margin: 16px 0;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--danger, #d9534f);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.section-error-boundary h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.section-error-boundary p {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.section-error-boundary-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.section-error-boundary-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+/* Available to assistive technology, absent from the visual layout. Used by
+   the islands' polite status region (web/frontend/src/selection.tsx): the
+   selected-row count is already on screen as a visible chip, so repeating it
+   visually would be noise, but it had no spoken equivalent at all. */
+.inkdrop-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Per-item outcomes for bulk row actions. Hidden until something has run,
+   so it never occupies space in a session that has not used a bulk action.
+   See recordInkdropActionResults() in core/inkdrop_web.py. */
+.inkdrop-action-results-button {
+  align-self: flex-start;
+  margin: 8px 0 0;
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.inkdrop-action-results-button:hover {
+  color: var(--text);
+}
+
+.inkdrop-action-results-button.has-failures {
+  border-color: var(--danger, #d9534f);
+  color: var(--text);
+}
     .pull-list-page-head {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;

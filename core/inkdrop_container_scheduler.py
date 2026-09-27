@@ -23,6 +23,7 @@ import urllib.request
 from pathlib import Path
 
 from core import inkdrop_process_lifecycle
+from core import inkdrop_restore_quiescence
 from core import inkdrop_runtime_config
 
 
@@ -74,7 +75,7 @@ def job_enabled(job: "ScheduledJob") -> bool:
     2026-08-02 decision to shelve ebooks was recorded in a ledger and enforced
     nowhere -- there was no mechanism to enforce it with, so both ebook jobs
     kept running successfully in production for three weeks after the feature
-    was shelved. Tracker #599: a shelved decision must name the mechanism that
+    was shelved. A shelved decision must name the mechanism that
     enforces it, or be marked advisory.
 
     A job's own `enabled_by_default` is the recorded decision. The environment
@@ -211,7 +212,7 @@ def shelved_job_names() -> list[str]:
 
     Reported in the status file so the running process states this
     positively. Absence alone would be indistinguishable from a job that was
-    deleted, renamed, or never existed -- and the whole of #599 is that a
+    deleted, renamed, or never existed -- and the whole lesson is that a
     recorded decision and a running process disagreed with nobody able to see
     it.
     """
@@ -588,7 +589,7 @@ def all_jobs() -> list[ScheduledJob]:
             timeout_seconds=1800,
             env={
                 "INKDROP_MANGA_METADATA_GUARD_MAX_ARCHIVES": os.environ.get("INKDROP_MANGA_METADATA_GUARD_MAX_ARCHIVES", "250"),
-                # #340 fixed this job's own command but not this env-var
+                # An earlier fix covered this job's own command but not this env-var
                 # injection: it still handed the child a pre-move path,
                 # overriding that child's own correct self-relative default.
                 "INKDROP_COMPLETED_IMPORT_SCRIPT": os.environ.get("INKDROP_COMPLETED_IMPORT_SCRIPT", _script("inkdrop_completed_import.py")),
@@ -869,6 +870,36 @@ def _job_runner(job: ScheduledJob, completed: queue.Queue) -> None:
     )
 
 
+def claim_jobs_lock(held):
+    """Return (jobs_lock, deferred): the jobs lock to keep, and why no new job
+    may start this tick (None if one may).
+
+    The jobs lock is only ever taken while this process holds the restore lock,
+    so a restore that holds the restore lock and finds the jobs lock free knows
+    no job can begin until it lets go. A held restore lock, an unusable lock
+    directory, or a jobs lock someone else holds all defer new jobs. A handle
+    already held is always returned as it is, whatever the outcome: it stays
+    held while any job runs, and only the caller closes it, once none does.
+    """
+    directory = Path(inkdrop_runtime_config.lock_dir())
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        restore = inkdrop_restore_quiescence.try_exclusive_lock(
+            directory / inkdrop_restore_quiescence.RESTORE_LOCK_NAME, existing_read_only=True
+        )
+        if restore is None:
+            return held, "a restore holds the restore lock"
+        try:
+            if held is not None:
+                return held, None
+            taken = inkdrop_restore_quiescence.try_exclusive_lock(directory / inkdrop_restore_quiescence.JOBS_LOCK_NAME)
+            return taken, None if taken is not None else "the jobs lock is held elsewhere"
+        finally:
+            restore.close()
+    except OSError as exc:
+        return held, f"lock directory unusable error_type={type(exc).__name__}"
+
+
 def _restored_job_state(job: ScheduledJob, previous: dict, started_at: float) -> dict:
     previous_jobs = previous.get("jobs") if isinstance(previous.get("jobs"), list) else []
     previous_row = next((row for row in previous_jobs if isinstance(row, dict) and row.get("name") == job.name), {})
@@ -893,7 +924,8 @@ def _restored_job_state(job: ScheduledJob, previous: dict, started_at: float) ->
     }
 
 
-def scheduler_status_payload(*, started_at, heartbeat_at, job_states, active, max_concurrency, stopping=False, shelved=None):
+def scheduler_status_payload(*, started_at, heartbeat_at, job_states, active, max_concurrency, stopping=False, shelved=None,
+                             start_deferred=None):
     rows = []
     now = float(heartbeat_at)
     for name in sorted(job_states):
@@ -912,7 +944,12 @@ def scheduler_status_payload(*, started_at, heartbeat_at, job_states, active, ma
         "started_at": float(started_at),
         "heartbeat_at": float(heartbeat_at),
         "max_concurrency": int(max_concurrency),
+        # A restore may rely on this scheduler starting no job while it holds
+        # the restore lock (see claim_jobs_lock).
+        "restore_lock_protocol": 1,
         "active_jobs": [dict(active[name]) for name in sorted(active)],
+        # Why due jobs are waiting (a restore, an unusable lock directory), or None.
+        "job_start_deferred": start_deferred,
         "jobs": rows,
         # Named, not merely missing. A reader comparing a shelving decision
         # against the running process needs the process to say what it is
@@ -949,6 +986,8 @@ def main() -> int:
     heartbeat_seconds = bounded_int_env("INKDROP_SCHEDULER_HEARTBEAT_SECONDS", 10, 2, 60)
     job_states = {job.name: _restored_job_state(job, previous, started_at) for job in jobs}
     active = {}
+    jobs_lock = None
+    start_deferred = None
     completed = queue.Queue()
     last_heartbeat = 0.0
     log(
@@ -994,7 +1033,22 @@ def main() -> int:
             ),
             key=lambda job: (not job.critical, float(job_states[job.name].get("next_run_at") or now), job.name),
         )
-        for job in due[:available]:
+        to_start = due[:available]
+        if to_start:
+            # The held handle is never replaced by a failed claim: dropping it
+            # would free the jobs lock while a job still runs.
+            jobs_lock, deferred = claim_jobs_lock(jobs_lock)
+            if deferred is not None:
+                # One line per deferral window, not one per tick.
+                if deferred != start_deferred:
+                    log(f"job start deferred: {deferred}")
+                to_start = []
+            start_deferred = deferred
+        elif not due:
+            # Nothing is due. Jobs due but held back only by full concurrency
+            # keep the reason, so the log and status do not flicker.
+            start_deferred = None
+        for job in to_start:
             log(f"job start name={job.name}")
             active[job.name] = {
                 "name": job.name,
@@ -1004,6 +1058,9 @@ def main() -> int:
             }
             thread = threading.Thread(target=_job_runner, args=(job, completed), name=f"inkdrop-{job.name}", daemon=True)
             thread.start()
+        if jobs_lock is not None and not active:
+            jobs_lock.close()
+            jobs_lock = None
 
         now = time.time()
         if now - last_heartbeat >= heartbeat_seconds:
@@ -1016,11 +1073,16 @@ def main() -> int:
                     job_states=job_states,
                     active=active,
                     max_concurrency=max_concurrency,
+                    start_deferred=start_deferred,
                 ),
             )
             last_heartbeat = now
         time.sleep(1.0)
 
+    # Jobs still running keep the lock until the process exits; closing it here
+    # would tell a restore the install is idle while they write.
+    if jobs_lock is not None and not active:
+        jobs_lock.close()
     inkdrop_process_lifecycle.reap_untracked_children()
     write_status(
         status_path,

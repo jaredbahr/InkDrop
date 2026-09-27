@@ -1682,7 +1682,78 @@ def _ready_comic_pack_child_provider_ids(plan):
     return _trusted_comic_pack_child_provider_ids(child_provider_ids)
 
 
-def _promote_concrete_comic_prowlarr_lanes(plan):
+COMIC_PACK_PROWLARR_AGGREGATE_COOLDOWN_DAYS = 7
+
+
+def _comic_pack_policy_value(plan, key, default):
+    """Read a comic-pack policy override the same way inkdrop_source_worker_adapters
+    reads per-row search policy (_policy_value): an explicit field on the row
+    first, then a nested `policy` dict, else the default. `plan` stands in for
+    the row here -- this gate has no per-row policy plumbed to it yet, so today
+    every call falls through to `default`."""
+    plan = plan if isinstance(plan, dict) else {}
+    policy = plan.get("policy") if isinstance(plan.get("policy"), dict) else {}
+    value = plan.get(key)
+    if value in (None, "", [], {}):
+        value = policy.get(key, default)
+    return value
+
+
+def _provider_history_timestamp(mapping, provider_id):
+    try:
+        return float((mapping or {}).get(provider_id) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _aggregate_comic_prowlarr_due(plan, child_provider_ids, *, now=None):
+    """Whether the aggregate Prowlarr lane's precise (series + issue number)
+    search is still due to run this pass.
+
+    Gated on *real*, *completed* aggregate attempts only -- source_attempts
+    rows for provider_wait backoff skips, leftover `searching` placeholders,
+    queue/activity bookkeeping, and a search that started but never finished
+    (kind `source_started_timeout`) are not real completed attempts.
+    inkdrop_state.source_attempt_is_real_attempt() (real_attempt_predicate_sql())
+    is the single authority for that question elsewhere in this codebase (the
+    retry ceiling, the Reliability page); this reuses it via
+    source_worker_real_provider_attempt_counts instead of the raw (history +
+    terminal) count the earlier version of this gate used. That combined count
+    let a backoff skip or a `searching` placeholder outrank an aggregate lane
+    that had never gotten a real attempt, so the precise per-issue query almost
+    never came due.
+
+    The aggregate is due while it has zero real completed attempts, and
+    becomes due again only after a cooldown once it has one -- a precise
+    search that already completed recently must not re-run every pass just
+    because a child lane's own history changed. child_provider_ids is unused:
+    the decision no longer ranks the aggregate against the children's history,
+    only against its own."""
+
+    real_counts = plan.get("source_worker_real_provider_attempt_counts")
+    real_counts = real_counts if isinstance(real_counts, dict) else {}
+    real_count = _provider_history_count(real_counts, PROWLARR_AGGREGATE_PROVIDER_ID)
+    if real_count <= 0:
+        return True
+
+    cooldown_days = _comic_pack_policy_value(
+        plan,
+        "comic_pack_prowlarr_aggregate_cooldown_days",
+        COMIC_PACK_PROWLARR_AGGREGATE_COOLDOWN_DAYS,
+    )
+    try:
+        cooldown_seconds = max(0.0, float(cooldown_days)) * 86400.0
+    except Exception:
+        cooldown_seconds = COMIC_PACK_PROWLARR_AGGREGATE_COOLDOWN_DAYS * 86400.0
+
+    last_real_attempt_at = plan.get("source_worker_last_real_provider_attempt_at")
+    last_real_attempt_at = last_real_attempt_at if isinstance(last_real_attempt_at, dict) else {}
+    last_attempt_at = _provider_history_timestamp(last_real_attempt_at, PROWLARR_AGGREGATE_PROVIDER_ID)
+    resolved_now = time.time() if now is None else float(now)
+    return (resolved_now - last_attempt_at) >= cooldown_seconds
+
+
+def _promote_concrete_comic_prowlarr_lanes(plan, *, now=None):
     """Replace aggregate Prowlarr with ready concrete comic indexers for western comic rows."""
 
     plan = dict(plan or {})
@@ -1696,6 +1767,8 @@ def _promote_concrete_comic_prowlarr_lanes(plan):
 
     child_provider_ids = _ready_comic_pack_child_provider_ids(plan)
     if not child_provider_ids:
+        return plan
+    if _aggregate_comic_prowlarr_due(plan, child_provider_ids, now=now):
         return plan
 
     promoted_provider_ids = []
@@ -1887,14 +1960,14 @@ def _slice_prowlarr_child_lanes(plan, provider_counts, *, comic_pack_child_lane_
     return plan
 
 
-def _slice_selected_provider_lanes(plans, *, comic_pack_child_lane_limit=None):
+def _slice_selected_provider_lanes(plans, *, comic_pack_child_lane_limit=None, now=None):
     plans = list(plans or [])
     if not plans:
         return []
     provider_counts = _provider_counts(plans)
     out = []
     for plan in plans:
-        plan = _promote_concrete_comic_prowlarr_lanes(plan)
+        plan = _promote_concrete_comic_prowlarr_lanes(plan, now=now)
         plan = _slice_rss_fast_lane_before_prowlarr(plan)
         plan = _slice_local_page_pack_fast_lane(plan)
         plan = _slice_prowlarr_child_lanes(
@@ -3141,6 +3214,7 @@ def _runnable_plans(plans, *, eligible_limit=None, operator_payloads=None, defau
     selected = _slice_selected_provider_lanes(
         selected,
         comic_pack_child_lane_limit=comic_pack_child_lane_limit,
+        now=now,
     )
     return selected
 

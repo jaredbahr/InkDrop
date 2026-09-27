@@ -8,7 +8,7 @@ WHY THIS EXISTS
     `skip_known_bad_artifact_content` and `continue`s, never reaching
     `match_comic_target()` or `artifact_acceptance_decision()`. A code fix does
     not change the bytes, so a file recorded bad under an old rule can never be
-    re-judged under a new one. Tracker #956.
+    re-judged under a new one.
 
     Until this file there was NO delete path anywhere in `core/` or `tools/`.
 

@@ -38,7 +38,7 @@ THE GATE NAMED THOSE TWO CAUSES AND COULD ONLY EVER DETECT THE FIRST.
     went 50 while the corpus went to 89 -- and the stale figure then printed
     inside the regression message itself ("below the committed baseline of
     50/50"), which is the one sentence a developer reads to decide which of
-    the two causes they are looking at. Found 2026-08-30 re-verifying #141:
+    the two causes they are looking at. Found 2026-08-30 while re-verifying it:
     every behavioural clause of that row held, and the number in its own
     failure text was 78% low.
 

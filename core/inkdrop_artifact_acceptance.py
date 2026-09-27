@@ -913,7 +913,7 @@ def archive_output_refusal(path, *, assume_suffix=None):
         }
     if not semantics.get("checked"):
         # THE READER DECLINED TO LOOK, AND THAT IS NOT A PASS. This branch is
-        # the whole reason #723 came back: the semantics reader answers only
+        # the whole reason that defect came back: the semantics reader answers only
         # for names ending .cbz, both converters asked it about "<dest>.cbz.tmp",
         # it returned an empty result, and this function read the absence of a
         # complaint as soundness. The gate was wired, tested and inert -- a
@@ -1512,7 +1512,7 @@ def decide_acceptance(path, target=None, event=None, row=None, archive_check=Non
         target_type=target_type,
         # The series record's own publication year. Without it the trailing-year
         # discount is refused, which would re-refuse the correctly tagged files
-        # #1078 was written for -- so this is not optional plumbing.
+        # the discount was written for -- so this is not optional plumbing.
         expected_series_year=acceptance_target.get("year"),
     )
     if decision == "accepted" and not source_identity_gate.get("ok"):

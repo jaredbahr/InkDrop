@@ -120,8 +120,14 @@
   <!-- Built by web/frontend (Vite); defines window.InkDropReact. A checkout
        that hasn't run the frontend build 404s here harmlessly -- every call
        site guards with window.InkDropReact?. and falls back to the existing
-       vanilla rendering path. -->
-  <script src="/static/dist/inkdrop-react.js?v=__INKDROP_UI_REACT_VERSION__" defer></script>
+       vanilla rendering path.
+
+       type="module" because the build is code-split: the entry opens with a
+       static import of its runtime chunk and resolves the section chunks
+       through import.meta.url. A classic script throws "Cannot use import
+       statement outside a module" before its first line runs. No defer -- a
+       module script is deferred by default. -->
+  <script type="module" src="/static/dist/inkdrop-react.js?v=__INKDROP_UI_REACT_VERSION__"></script>
 </head>
 <body>
   <div id="inkdropAuthRoot" class="inkdrop-auth-root" aria-live="polite"></div>
@@ -210,6 +216,11 @@
             <div id="activityList" hidden></div>
           </div>
         </section>
+        <!-- Per-item outcomes for bulk row actions, for this session. The
+             toast beside it reports a summary and then goes away; this is the
+             only place the individual items and their failure reasons can be
+             read back. Hidden until something has actually run. -->
+        <button type="button" class="inkdrop-action-results-button" id="inkdropActionResultsButton" hidden>Action results</button>
         <div class="toast" id="toast"></div>
       </div>
     </div>

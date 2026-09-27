@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlsplit
 
 from core import inkdrop_secret_store
+from core import inkdrop_db
 
 
 CONTRACT_SCHEMA = "inkdrop.download_client_instances.v1"
@@ -860,7 +861,7 @@ def _legacy_rows(db_path, client_types):
     path = Path(db_path)
     if not path.exists():
         return {}
-    uri = f"file:{path}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=3.0)) as con:
         con.row_factory = sqlite3.Row
         table = con.execute("select 1 from sqlite_master where type='table' and name='provider_configs'").fetchone()
@@ -913,7 +914,7 @@ def _external_config_credentials(client_type):
     _legacy_payload() below reads only the legacy card's settings_json, so a
     credential that lives only in one of these files never carried across --
     the migration under-carried relative to what the client actually runs on
-    (PASS522, tracker #522). Returns (secrets, username), both best-effort
+    during migration. Returns (secrets, username), both best-effort
     empty on any read failure so a missing or malformed file just leaves the
     migration exactly as unconfigured as it was before this existed.
 
@@ -1169,7 +1170,7 @@ def legacy_instance_metadata(db_path, known_types=None):
     path = Path(db_path)
     if not path.exists():
         return {"schema": CONTRACT_SCHEMA, "legacy_instances": [], "writes_performed": False}
-    uri = f"file:{path}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=3.0)) as con:
         con.row_factory = sqlite3.Row
         table = con.execute("select 1 from sqlite_master where type='table' and name='provider_configs'").fetchone()

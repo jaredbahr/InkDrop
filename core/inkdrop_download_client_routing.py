@@ -10,6 +10,7 @@ from pathlib import Path
 
 from core import inkdrop_download_client_config
 from core import inkdrop_secret_store
+from core import inkdrop_db
 
 
 CLIENT_PROTOCOLS = {
@@ -66,7 +67,7 @@ def _private_rows(db_path):
     path = Path(db_path)
     if not path.exists():
         return [], []
-    uri = f"file:{path}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=3.0)) as con:
         con.row_factory = sqlite3.Row
         table = con.execute("select 1 from sqlite_master where type='table' and name='download_client_instances'").fetchone()

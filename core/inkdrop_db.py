@@ -30,6 +30,37 @@ def _label(db_path) -> str:
 AUTO_VACUUM_INCREMENTAL = 2
 
 
+def sqlite_readonly_uri(db_path, *, immutable: bool = False) -> str:
+    """Build a `file:` URI for a read-only open, escaping the pathname.
+
+    Every read-only open in this tree used to write its own URI by pasting a
+    pathname into URI text -- an f-string that glued the scheme, the raw
+    `as_posix()` pathname and a `?mode=ro` suffix together, or the same thing
+    built with `+`.
+
+    A pathname is not URI text. Every character a URI reserves is legal in a
+    POSIX filename, so any of them in the configured state-database path stops
+    being part of the name and becomes URI structure instead. `#` is the one
+    that bites hardest: it opens a FRAGMENT, so the pathname is truncated there
+    and the `?mode=ro` meant to follow it lands inside that fragment and is
+    never parsed. The open then reads a different file, is not read-only, and
+    -- because a read-write open of a missing database creates it -- leaves a
+    stray database behind. Reproduced on a file named `state#one.sqlite3`:
+    both readers raised `no such table`, and a zero-byte `state` appeared
+    beside it. `?` truncates the same way; a literal `%` is a latent decode.
+
+    `Path.as_uri()` percent-encodes the pathname with only `/` left safe, which
+    is exactly the escaping SQLite's URI parser expects to undo, and it emits
+    the `file:///...` form SQLite documents for both POSIX and Windows.
+
+    `immutable=1` is deliberately opt-in rather than a default: it is true of a
+    VACUUM INTO snapshot by construction and must never be claimed about the
+    live database. See open_snapshot for why that distinction is load-bearing.
+    """
+    uri = Path(db_path).resolve().as_uri()
+    return f"{uri}?mode=ro&immutable=1" if immutable else f"{uri}?mode=ro"
+
+
 def _configure_new_database_auto_vacuum(con) -> bool:
     """Set auto_vacuum=INCREMENTAL, but only while the database is still empty.
 
@@ -75,7 +106,7 @@ def open_snapshot(db_path, *, timeout_seconds=30.0, busy_timeout_ms=30000):
     """
     timeout = max(0.1, float(timeout_seconds or 30.0))
     busy_timeout = max(100, int(busy_timeout_ms or 30000))
-    uri = f"file:{Path(db_path).resolve().as_posix()}?mode=ro&immutable=1"
+    uri = sqlite_readonly_uri(db_path, immutable=True)
     con = sqlite3.connect(uri, uri=True, timeout=timeout, isolation_level="DEFERRED")
     con.row_factory = sqlite3.Row
     con.execute(f"pragma busy_timeout={busy_timeout}")
@@ -96,7 +127,7 @@ def open_connection(
     timeout = max(0.1, float(timeout_seconds or 30.0))
     busy_timeout = max(100, int(busy_timeout_ms or 30000))
     if readonly:
-        uri = f"file:{Path(db_path).resolve().as_posix()}?mode=ro"
+        uri = sqlite_readonly_uri(db_path)
         con = sqlite3.connect(uri, uri=True, timeout=timeout, isolation_level=None if autocommit else "DEFERRED")
     else:
         con = sqlite3.connect(db_path, timeout=timeout, isolation_level=None if autocommit else "DEFERRED")

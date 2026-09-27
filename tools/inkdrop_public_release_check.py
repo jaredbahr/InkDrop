@@ -550,7 +550,7 @@ _ISOLATED_STATE_ENV = None
 def isolated_state_env_defaults():
     """INKDROP_STATE_DIR and friends default to a real, persistent path when
     unset. CI sets these explicitly via the workflow, but a local run of this
-    script -- by a developer or an agent verifying a fix -- would otherwise
+    script -- while verifying a fix -- would otherwise
     run every check below against real application state. Lazily build one
     isolated temp root (shared across the whole run here, same as CI's own
     per-job $RUNNER_TEMP) and reuse it for every check_env() call in this

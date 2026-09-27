@@ -20,8 +20,10 @@ import secrets
 import stat
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 from xml.etree import ElementTree
+from core import inkdrop_archive_compression
 from core import inkdrop_safe_xml
 
 from PIL import Image, UnidentifiedImageError
@@ -313,10 +315,11 @@ def _write_archive(path, pages, comicinfo):
             allowZip64=True,
             strict_timestamps=False,
         ) as archive:
+            # Per-member, by measurement -- see inkdrop_archive_compression.
             for page in pages:
-                archive.write(page["path"], page["stored_name"])
+                inkdrop_archive_compression.write_file_member(archive, page["path"], page["stored_name"])
             if comicinfo is not None:
-                archive.writestr("ComicInfo.xml", comicinfo)
+                inkdrop_archive_compression.write_bytes_member(archive, "ComicInfo.xml", comicinfo)
     except (OSError, ValueError, zipfile.LargeZipFile) as exc:
         raise ImageFolderError("archive_write_failed", str(exc)) from exc
 
@@ -396,9 +399,13 @@ def validate_cbz(path, pages, comicinfo=None):
                 member = archive.getinfo("ComicInfo.xml")
                 if member.file_size != len(comicinfo):
                     raise ImageFolderError("output_comicinfo_size_mismatch")
-            bad_member = archive.testzip()
-            if bad_member is not None:
-                raise ImageFolderError("output_crc_failed", bad_member)
+            # testzip() decompressed every member to check CRCs, and then the
+            # loop below decompressed every page AGAIN to hash and decode it.
+            # Reading a member to EOF is what makes zipfile verify its CRC, so
+            # the reads below already do that job; a CRC mismatch surfaces as
+            # BadZipFile and is translated back to output_crc_failed at the
+            # bottom of this function. Non-page members keep their check too:
+            # ComicInfo.xml is read and compared below.
             for page in pages:
                 data = archive.read(page["stored_name"])
                 if _sha256_bytes(data) != page["source_sha256"]:
@@ -426,7 +433,16 @@ def validate_cbz(path, pages, comicinfo=None):
                 _validate_xml(output_comicinfo, source="output ComicInfo.xml")
     except ImageFolderError:
         raise
-    except (OSError, KeyError, zipfile.BadZipFile) as exc:
+    except (zipfile.BadZipFile, zlib.error) as exc:
+        # A CRC mismatch, or a deflate stream that will not decompress, is a
+        # verdict about a member -- what testzip() used to report by name.
+        # Anything else BadZipFile covers is the container failing to read.
+        # zlib.error is neither an OSError nor a BadZipFile and used to escape
+        # this handler entirely.
+        if "crc" in str(exc).lower() or isinstance(exc, zlib.error):
+            raise ImageFolderError("output_crc_failed", f"{type(exc).__name__}: {exc}") from exc
+        raise ImageFolderError("output_archive_invalid", str(exc)) from exc
+    except (OSError, KeyError) as exc:
         raise ImageFolderError("output_archive_invalid", str(exc)) from exc
     return {
         "ok": True,

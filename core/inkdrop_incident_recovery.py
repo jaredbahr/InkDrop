@@ -8,7 +8,7 @@ RECOVERY HERE MEANS RECOVERING THE LIBRARY FROM A BAD FILE, NOT RECOVERING THE F
     and retracts this issue's stale verified import proofs. It never clears or
     un-rejects anything; `tools/inkdrop_clear_known_bad_content.py` does that.
 
-    The name reads the other way, and that is tracker row #959: someone
+    The name reads the other way: someone
     looking for a way to clear five known-bad staged files found this as the
     only file whose name suggested it, and the flags it asks for would have
     recorded them bad and moved them out of staging. The dry run used to open
@@ -343,7 +343,7 @@ def recover_exact_artifact(
 
 def main():
     # The description used to read "Safely reconcile one exact known-bad
-    # imported artifact", which names no action at all (row #959).
+    # imported artifact", which names no action at all.
     _stdout_survives_any_name()
     parser = _EffectFirstParser(
         description=(

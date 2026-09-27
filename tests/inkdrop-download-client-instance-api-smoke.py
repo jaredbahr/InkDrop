@@ -81,7 +81,10 @@ def main():
             bad_origin, _, payload = http_json(browser, "POST", base + "/api/download-clients", {"name": "Bad Origin", "client_type": "qbittorrent"}, {"X-InkDrop-CSRF": csrf, "Origin": "https://evil.invalid"})
             require(bad_origin == 403 and payload["error"] == "origin_validation_failed", "cookie mutation bypassed origin validation")
             oversized, _, _ = http_json(browser, "POST", base + "/api/download-clients/test", {"padding": "x" * (inkdrop_download_client_api.MAX_BODY_BYTES + 1)}, good_headers)
-            require(oversized == 400, "oversized client body was accepted")
+            # 413, not 400: this line's bar is that an oversized body is
+            # refused, and Content Too Large is what that refusal is. 400 is
+            # kept for a request whose framing or JSON shape cannot be parsed.
+            require(oversized == 413, "oversized client body was accepted")
 
             class RedirectResponse:
                 status_code = 302

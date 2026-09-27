@@ -280,7 +280,7 @@ def archive_metadata(identifier="jobs-example-comics"):
 def fake_http_get(request):
     url = request["url"]
     if url.endswith("/api/v1/indexer"):
-        # Capability probe behind category resolution (#198). Declaring the full
+        # Capability probe behind category resolution. Declaring the full
         # Books subtree means 7030 stays 7030 for these fixtures, so the cases
         # below keep asserting on the categories they were written for.
         return {

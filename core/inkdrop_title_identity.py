@@ -68,6 +68,37 @@ PROVENANCE_BRANDING_PREFIX = "branding_prefix"
 # predicate emitted mismatch against every genuine copy.
 BRANDING_PREFIXES = ("nickelodeon",)
 
+# A franchise word releases put in front of a title that the catalogue writes
+# without it: the show is "Avatar: The Legend of Korra", ComicVine calls the
+# comic "Nickelodeon The Legend of Korra-Turf Wars", and the shares are named
+# "Avatar The Legend of Korra - Turf Wars Part 1". Same one-entry-one-case rule
+# as BRANDING_PREFIXES: the word is tolerated in front of exactly the title
+# tokens listed with it and nowhere else, so "Avatar" before a different title
+# is still a different series.
+FRANCHISE_LEAD_INS = (
+    ("avatar", ("legend", "korra")),
+)
+
+
+def tolerated_lead_in_tokens(wanted_series, title_tokens):
+    """Leading words a candidate may carry without naming a different series.
+
+    That is the branding prefix the wanted series itself starts with (the
+    candidate spells out the full catalogue title), and a franchise lead-in
+    registered for the wanted title's opening tokens.
+    """
+    tolerated = set()
+    wanted_tokens = normalized_tokens(wanted_series)
+    for prefix in BRANDING_PREFIXES:
+        prefix_tokens = normalized_tokens(prefix)
+        if prefix_tokens and wanted_tokens[: len(prefix_tokens)] == prefix_tokens:
+            tolerated.update(prefix_tokens)
+    title_tokens = tuple(str(token or "").lower() for token in title_tokens or ())
+    for lead_in, opening in FRANCHISE_LEAD_INS:
+        if title_tokens[: len(opening)] == tuple(opening):
+            tolerated.add(lead_in)
+    return tolerated
+
 # The publication formats whose OWN numbering convention is chapter/volume
 # (`v01`, `ch001`, `c001`) rather than the issue/part convention Western
 # comics use. Two query builders each independently decide whether a numbered
@@ -79,8 +110,8 @@ BRANDING_PREFIXES = ("nickelodeon",)
 # query builders cannot silently disagree on it again. Each keeps its own
 # SECONDARY fallback heuristic for when `media_type` is absent or disputed
 # (Prowlarr's title/publisher list, slskd's publisher-phrase list) --
-# reconciling those is a data-correctness question (#578) this does not
-# attempt, on purpose: #578 already found one of the two measurably less
+# reconciling those is a data-correctness question this does not
+# attempt, on purpose: that work already found one of the two measurably less
 # reliable than the other, and "do not bulk-correct" is its own ruling.
 MANGA_SHAPED_MEDIA_TYPES = frozenset({"manga", "manhwa", "manhua", "webtoon"})
 

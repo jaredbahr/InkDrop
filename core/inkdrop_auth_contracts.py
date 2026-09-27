@@ -68,6 +68,14 @@ _add("POST", {
     "/api/inkdrop-settings/portability/export",
     "/api/system/logs/download",
 }, "settings_backup", "admin", admin=True, high_impact=True)
+_add("GET", {
+    "/api/inkdrop-settings/backup/archives",
+    "/api/inkdrop-settings/backup/archives/download",
+}, "full_backup_read", "admin", admin=True, high_impact=True)
+_add("HEAD", {
+    "/api/inkdrop-settings/backup/archives/download",
+}, "full_backup_read", "admin", admin=True, high_impact=True)
+
 _add("POST", {
     "/api/system/support-bundle/download",
 }, "support_bundle_export", "admin", admin=True, high_impact=True)
@@ -261,4 +269,11 @@ def mutation_route_policy(path, method):
 
 
 def public_inventory():
-    return [dict(MUTATION_ROUTE_INVENTORY[key]) for key in sorted(MUTATION_ROUTE_INVENTORY)]
+    # This endpoint inventories cookie-mutating routes for the CSRF contract.
+    # Read contracts share the runtime table above but are intentionally not
+    # mutations and therefore do not belong in this projection.
+    return [
+        dict(MUTATION_ROUTE_INVENTORY[key])
+        for key in sorted(MUTATION_ROUTE_INVENTORY)
+        if key[0] in COOKIE_MUTATION_METHODS
+    ]

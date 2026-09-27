@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, quote, quote_plus, urlsplit
 from core import inkdrop_runtime_config
 from core import inkdrop_secret_store
 from core import inkdrop_version
+from core import inkdrop_db
 
 
 EXPORT_SCHEMA = "inkdrop.support_bundle.v1"
@@ -424,7 +425,7 @@ def _collect_kavita_db(environ, inventory, deadline=None):
         return
     try:
         _deadline_check(deadline)
-        uri = f"file:{Path(configured).resolve().as_posix()}?mode=ro"
+        uri = inkdrop_db.sqlite_readonly_uri(configured)
         with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as con:
             succeeded = False
             for query in (
@@ -483,7 +484,7 @@ def collect_secret_inventory(state_db=None, *, environ=None, secret_root=None, d
     if state_db and state_db.is_file():
         try:
             _deadline_check(deadline)
-            uri = f"file:{state_db.resolve().as_posix()}?mode=ro"
+            uri = inkdrop_db.sqlite_readonly_uri(state_db)
             with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as con:
                 con.row_factory = sqlite3.Row
                 con.execute("pragma query_only=1")
@@ -739,7 +740,7 @@ def collect_public_configuration(state_db, redactor, *, deadline=None):
     app_settings = []
     if not state_db or not Path(state_db).is_file():
         return {"providers": providers, "app_settings": app_settings}, {"download_clients": clients}
-    uri = f"file:{Path(state_db).resolve().as_posix()}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(state_db)
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as con:
         con.row_factory = sqlite3.Row
         con.execute("pragma query_only=1")

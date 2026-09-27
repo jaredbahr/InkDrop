@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections import Counter
 from pathlib import Path
+from core import inkdrop_db
 
 
 PERMANENT_CLASSES = {"already_applied", "superseded", "target_row_removed", "malformed_stale_record", "duplicate"}
@@ -77,10 +78,25 @@ def _record_retry_times(payload):
 def classify_deferred_syncs(db_path, *, stale_after=24 * 3600, limit=1000, now=None, replay_ttl=None):
     now = float(now or time.time())
     replay_ttl = float(REPLAY_TTL_SECONDS if replay_ttl is None else replay_ttl)
-    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=3)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=3)
     con.row_factory = sqlite3.Row
     con.execute("pragma query_only=1")
-    rows = con.execute("select * from deferred_queue_syncs order by created_at desc limit ?", (max(1, min(int(limit), 5000)),)).fetchall()
+    bounded_limit = max(1, min(int(limit), 5000))
+    status_counts = {
+        str(row["status"] or "unknown"): int(row["count"] or 0)
+        for row in con.execute(
+            "select status, count(*) as count from deferred_queue_syncs group by status"
+        )
+    }
+    # Apply the bound after selecting pending work. A large acknowledged history
+    # must never push unapplied snapshots out of the classifier and reconciler.
+    rows = con.execute(
+        "select * from deferred_queue_syncs where status='pending' order by created_at desc limit ?",
+        (bounded_limit,),
+    ).fetchall()
+    last_successful_sync = con.execute(
+        "select max(applied_at) from deferred_queue_syncs where status in ('acked','applied')"
+    ).fetchone()[0]
     queue_ids = {str(row[0]) for row in con.execute("select id from queue_items")}
     fingerprints = set()
     results = []
@@ -136,7 +152,10 @@ def classify_deferred_syncs(db_path, *, stale_after=24 * 3600, limit=1000, now=N
         "ok": True,
         "dry_run": True,
         "generated_at": now,
-        "count": len(pending),
+        "count": int(status_counts.get("pending") or 0),
+        "status_counts": dict(sorted(status_counts.items())),
+        "classified_count": len(pending),
+        "classification_truncated": int(status_counts.get("pending") or 0) > len(pending),
         "count_by_reason": dict(sorted(by_reason.items())),
         "oldest_age_seconds": max((row["age_seconds"] for row in pending), default=0),
         "eligible_now": sum(row["eligible_now"] for row in pending),
@@ -153,12 +172,14 @@ def classify_deferred_syncs(db_path, *, stale_after=24 * 3600, limit=1000, now=N
             if not row["permanently_stale"] and not row["eligible_now"] and not row["replay_expired"]
             and not row.get("next_attempt_at")
         ),
-        "last_successful_sync": max((row.get("applied_at") or 0 for row in results), default=0) or None,
+        "last_successful_sync": last_successful_sync or None,
         "next_attempt": min((row["next_attempt_at"] for row in pending if row.get("next_attempt_at")), default=None),
         "due_now": any(row["due_now"] for row in pending),
         "overdue": any(row["overdue"] for row in pending),
         "overdue_seconds": max((int(row.get("overdue_seconds") or 0) for row in pending), default=0),
-        "stale_signal": len(pending) >= 50 or any(row["age_seconds"] >= stale_after for row in pending),
+        "stale_signal": int(status_counts.get("pending") or 0) >= 50 or any(
+            row["age_seconds"] >= stale_after for row in pending
+        ),
         "rows": pending,
     }
 
@@ -166,7 +187,7 @@ def classify_deferred_syncs(db_path, *, stale_after=24 * 3600, limit=1000, now=N
 def _load_payloads(db_path, ids):
     if not ids:
         return {}
-    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=3)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=3)
     try:
         con.execute("pragma query_only=1")
         placeholders = ",".join("?" for _ in ids)

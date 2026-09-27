@@ -23,6 +23,7 @@ from pathlib import Path
 import yaml
 
 from core import inkdrop_bounded_read
+from core import inkdrop_db
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:5030/api/v0"
@@ -96,7 +97,7 @@ def load_provider_settings(provider_id: str) -> dict:
     if not db_path.exists():
         return {}
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as con:
+        with sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=5) as con:
             row = con.execute(
                 "select settings_json from provider_configs where id = ? limit 1",
                 (provider_id,),

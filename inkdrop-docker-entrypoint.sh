@@ -33,17 +33,60 @@ DEFAULT_PGID=1000
 # `docker run` still sees the Dockerfile's real, non-blank /config/state and
 # both this script and Python read that value directly instead.
 #
-# InkDrop's own working directories: safe to fix recursively, since they hold
-# InkDrop's database/config/logs, not an operator's media collection.
-CHOWN_RECURSIVE_DIRS="${INKDROP_CONFIG_DIR:-/config} ${INKDROP_STATE_DIR:-/state}"
-# Roots that can hold a large, operator-owned media library or a lot of
-# transient files. Only each root itself is touched (not walked recursively)
-# so InkDrop can create new subdirectories under it with correct ownership;
-# existing library content is left alone on purpose -- InkDrop only needs the
-# containing directory to be writable to add new files, and a recursive
-# chown here could walk hundreds of thousands of comic/manga files for no
-# functional benefit.
-CHOWN_SHALLOW_DIRS="${INKDROP_STAGING_DIR:-/downloads/staging} ${INKDROP_MANUAL_INBOX_DIR:-/config/manual-inbox} ${INKDROP_COMIC_ROOT:-/data/comics} ${INKDROP_MANGA_ROOT:-/data/manga}"
+# These were two whitespace-joined strings iterated with an unquoted
+# `for dir in $CHOWN_RECURSIVE_DIRS`. Quoting "$dir" inside the loop is too
+# late -- the split has already happened -- so "/config/Ink Drop" became two
+# paths and a glob character was expanded against the container filesystem.
+# Each path is now one quoted argument to a function, the only shape in POSIX
+# sh that cannot word-split. See tests/inkdrop-a-configured-path-is-one-
+# argument-smoke.py.
+#
+#   recursive -- InkDrop's own database, config and logs. Safe to walk.
+#   shallow -- roots that can hold a large operator-owned library. Only the
+#     root itself, so new subdirectories are born with the right ownership;
+#     walking existing content buys nothing and can cost hundreds of thousands
+#     of files.
+chown_recursive_dir() {
+    _dir="$1"
+    mkdir -p "$_dir" 2>/dev/null || true
+    if [ -d "$_dir" ]; then
+        chown -R "$PUID:$PGID" "$_dir" 2>/dev/null \
+            || warn_log "warning: could not fully chown $_dir -- check host mount permissions"
+    fi
+}
+
+chown_shallow_dir() {
+    # mkdir -p first (still root here): some of these are subdirectories
+    # InkDrop creates under a mount rather than the mount root itself (for
+    # example the default /downloads/staging under a plain `docker run` with
+    # no docker-compose.yml override), so the target may not exist yet on a
+    # fresh mount. Creating it now means it is born with the right ownership
+    # instead of being silently skipped.
+    _dir="$1"
+    mkdir -p "$_dir" 2>/dev/null || true
+    if [ -d "$_dir" ]; then
+        chown "$PUID:$PGID" "$_dir" 2>/dev/null \
+            || warn_log "warning: could not chown $_dir -- check host mount permissions"
+    fi
+}
+
+# What INKDROP_SKIP_CHOWN actually skips.
+#
+# It used to skip only the shallow loop, was read AFTER the recursive
+# config/state loop had run and BEFORE the INKDROP_CHOWN_LIBRARY loop that ran
+# regardless, and logged "leaving mount ownership untouched" -- false in two
+# directions, and the two install guides described it differently.
+#
+# It now means what its name says: no ownership change at all. `mounts` is the
+# old narrow behaviour, kept and named so an install that relied on config and
+# state still being fixed has somewhere to go rather than silently losing it.
+skip_chown_mode() {
+    case "$(printf '%s' "${INKDROP_SKIP_CHOWN:-0}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on|all) printf 'all' ;;
+        mounts|shallow) printf 'mounts' ;;
+        *) printf 'none' ;;
+    esac
+}
 
 # `docker compose run`/`exec` do not reliably keep a container's stdout and
 # stderr as separate streams from the caller's point of view -- scripted
@@ -114,37 +157,44 @@ usermod -o -u "$PUID" -g "$PGID" "$RUN_USER" >/dev/null 2>&1
 
 verbose_log "Running as PUID=$PUID PGID=$PGID (user $RUN_USER, group $RUN_GROUP)"
 
-for dir in $CHOWN_RECURSIVE_DIRS; do
-    mkdir -p "$dir" 2>/dev/null || true
-    if [ -d "$dir" ]; then
-        chown -R "$PUID:$PGID" "$dir" 2>/dev/null || warn_log "warning: could not fully chown $dir -- check host mount permissions"
-    fi
-done
+SKIP_CHOWN="$(skip_chown_mode)"
 
-if [ "${INKDROP_SKIP_CHOWN:-0}" != "1" ]; then
-    for dir in $CHOWN_SHALLOW_DIRS; do
-        # mkdir -p first (still root here): some of these are subdirectories
-        # InkDrop creates under a mount rather than the mount root itself (for
-        # example the default /downloads/staging under a plain `docker run`
-        # with no docker-compose.yml override), so the target may not exist
-        # yet on a fresh mount. Creating it now means it's born with the
-        # right ownership instead of being silently skipped.
-        mkdir -p "$dir" 2>/dev/null || true
-        if [ -d "$dir" ]; then
-            chown "$PUID:$PGID" "$dir" 2>/dev/null || warn_log "warning: could not chown $dir -- check host mount permissions"
-        fi
-    done
+# NOT DONE HERE, deliberately: skipping the recursive pass when ownership is
+# "already established". The root directory being correctly owned says nothing
+# about its children, so the cheap version of that check leaves a half-owned
+# tree and an install that cannot write; the honest version needs a stamp
+# recording a previous successful walk, and a stale stamp fails the same way
+# silently. Neither is worth adding without a large real config/state tree to
+# measure the walk against.
+
+if [ "$SKIP_CHOWN" = "all" ]; then
+    # The only branch that may claim to leave ownership untouched, because it
+    # is the only one that does. Nothing below this runs -- not the recursive
+    # config/state pass, not the shallow mount roots, and not
+    # INKDROP_CHOWN_LIBRARY, which would otherwise walk an entire library
+    # after the operator asked for no ownership changes.
+    verbose_log "INKDROP_SKIP_CHOWN=${INKDROP_SKIP_CHOWN:-0}: making no ownership changes at all. Every mount must already be owned by $PUID:$PGID or preflight will report it as unwritable."
 else
-    verbose_log "INKDROP_SKIP_CHOWN=1: leaving mount ownership untouched"
-fi
+    chown_recursive_dir "${INKDROP_CONFIG_DIR:-/config}"
+    chown_recursive_dir "${INKDROP_STATE_DIR:-/state}"
 
-if [ "${INKDROP_CHOWN_LIBRARY:-0}" = "1" ]; then
-    for dir in "${INKDROP_COMIC_ROOT:-/data/comics}" "${INKDROP_MANGA_ROOT:-/data/manga}"; do
-        if [ -d "$dir" ]; then
-            verbose_log "INKDROP_CHOWN_LIBRARY=1: recursively fixing ownership under $dir -- this can take a long time on a large library"
-            chown -R "$PUID:$PGID" "$dir" 2>/dev/null || warn_log "warning: could not fully chown $dir -- check host mount permissions"
-        fi
-    done
+    if [ "$SKIP_CHOWN" = "mounts" ]; then
+        verbose_log "INKDROP_SKIP_CHOWN=mounts: leaving the staging, manual-inbox and library mount roots untouched. InkDrop's own config and state directories were still fixed -- set INKDROP_SKIP_CHOWN=1 to skip those too."
+    else
+        chown_shallow_dir "${INKDROP_STAGING_DIR:-/downloads/staging}"
+        chown_shallow_dir "${INKDROP_MANUAL_INBOX_DIR:-/config/manual-inbox}"
+        chown_shallow_dir "${INKDROP_COMIC_ROOT:-/data/comics}"
+        chown_shallow_dir "${INKDROP_MANGA_ROOT:-/data/manga}"
+    fi
+
+    if [ "${INKDROP_CHOWN_LIBRARY:-0}" = "1" ]; then
+        for dir in "${INKDROP_COMIC_ROOT:-/data/comics}" "${INKDROP_MANGA_ROOT:-/data/manga}"; do
+            if [ -d "$dir" ]; then
+                verbose_log "INKDROP_CHOWN_LIBRARY=1: recursively fixing ownership under $dir -- this can take a long time on a large library"
+                chown -R "$PUID:$PGID" "$dir" 2>/dev/null || warn_log "warning: could not fully chown $dir -- check host mount permissions"
+            fi
+        done
+    fi
 fi
 
 exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups --no-new-privs -- "$@"

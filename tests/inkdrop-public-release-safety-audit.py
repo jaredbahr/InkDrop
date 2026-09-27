@@ -91,8 +91,8 @@ REQUIRED_DOCKERIGNORE_PATTERNS = (
     "inkdrop_*_cleanup.py",
     "inkdrop_*_diagnostic.py",
     "docs/*.py",
-    "inkdrop-agent-context-pack.py",
-    "inkdrop-agent-coordinator-quickcheck.py",
+    "kapinspect.py",
+    "kavitainspect.py",
     "inkdrop-completion-identity-audit-diff.py",
     "inkdrop_chainsaw_stale_proof_repair.py",
     "inkdrop_duplicate_manga_cleanup.py",
@@ -139,14 +139,9 @@ REQUIRED_GITIGNORE_PATTERNS = (
     "*.7z",
 )
 
-PRIVATE_HOME_MARKERS = (
-    "/home/" + "curlz" + "620",
-    "C:\\Users\\" + "Jar" + "ed",
-)
-
 PRIVATE_PATTERNS = (
-    ("private_home_path", re.compile("|".join(re.escape(value) for value in PRIVATE_HOME_MARKERS), re.IGNORECASE)),
-    ("private_drivepool_path", re.compile(re.escape("/mnt/" + "drive" + "pool"), re.IGNORECASE)),
+    ("private_home_path", re.compile(r"(?:/home/|C:\\Users\\)[A-Za-z0-9._-]+", re.IGNORECASE)),
+    ("private_mount_path", re.compile(r"/mnt/(?!media(?:/|$)|data(?:/|$))[A-Za-z0-9][A-Za-z0-9._-]*", re.IGNORECASE)),
     ("private_lan_ip", re.compile(r"\b192\.168\.\d+\.\d+\b")),
     ("comicvine_api_key_literal", re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)),
     ("query_api_key_literal", re.compile(r"(?:api[_-]?key|apikey)=([A-Za-z0-9][A-Za-z0-9._-]{8,})", re.IGNORECASE)),

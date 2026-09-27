@@ -49,6 +49,8 @@ if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
 
+import contextlib
+import errno
 import json
 import os
 import time
@@ -58,6 +60,11 @@ from core import inkdrop_runtime_config
 
 
 RESTORE_LOCK_NAME = "inkdrop-restore.lock"
+# Held by the scheduler for as long as it has active jobs, and only ever taken
+# while the scheduler itself holds RESTORE_LOCK_NAME. A restore that holds the
+# restore lock and finds this one free therefore knows no job can begin until it
+# lets go: the check and the start can no longer be pulled apart.
+JOBS_LOCK_NAME = "inkdrop-scheduler-jobs.lock"
 WORKER_STATUS_FILE_NAME = "worker-scheduler-status.json"
 # The scheduler heartbeats every INKDROP_SCHEDULER_HEARTBEAT_SECONDS (default
 # 10, bounded 2..60). Treat a heartbeat as live well past the slowest possible
@@ -211,7 +218,7 @@ def probe_restore_quiescence(*, lock_dir=None, status_path=None, now=None, envir
             # populated forever. Believing it past the heartbeat window made
             # the operator move this gate exists to permit ("docker stop
             # inkdrop-worker, then restore") refuse indefinitely, with no way
-            # out through the UI at all: the availability failure in row #974.
+            # out through the UI at all, an availability failure.
             #
             # The heartbeat only decides whether the FILE still describes
             # anything. What is actually running is decided below by probing
@@ -278,6 +285,18 @@ def probe_restore_quiescence(*, lock_dir=None, status_path=None, now=None, envir
         if lock_file.name == RESTORE_LOCK_NAME:
             continue
         is_held, reason = _probe_one_lock(lock_file)
+        if lock_file.name == JOBS_LOCK_NAME:
+            # Its own blocker: this is the scheduler saying it has jobs, not a
+            # job's private lock.
+            if is_held:
+                blockers.append(
+                    {
+                        "kind": "scheduler_jobs_active",
+                        "detail": "the scheduler is running jobs (" + JOBS_LOCK_NAME + " " + reason + ")",
+                        "next_action": "Wait for the running jobs to finish, or stop the worker container.",
+                    }
+                )
+            continue
         if is_held:
             held.append(lock_file.name + " (" + reason + ")")
     if held:
@@ -296,6 +315,100 @@ def probe_restore_quiescence(*, lock_dir=None, status_path=None, now=None, envir
         "checked": checked,
         "probed_at": moment,
     }
+
+
+def not_quiescent(kind, detail, next_action):
+    return RestoreNotQuiescent({"quiescent": False, "blockers": [
+        {"kind": kind, "detail": detail, "next_action": next_action}]})
+
+
+def _lock_nonblocking(handle):
+    """Try to take an exclusive lock on an open handle; never block.
+
+    True if taken, False if another open file description holds it. Only real
+    contention is False: POSIX BlockingIOError, or on Windows EACCES / EDEADLK /
+    winerror 33 / 36. Any other OSError (EBADF from a lock that needs a write
+    handle, ENOLCK, EIO) propagates, so a fault is never read as "held".
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EDEADLK) or getattr(exc, "winerror", None) in (33, 36):
+                return False
+            raise
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def try_exclusive_lock(lock_path, *, existing_read_only=False):
+    """Take an exclusive lock without blocking.
+
+    Returns the open handle, which holds the lock until it is closed, or None
+    if another open file description holds it. With existing_read_only, a lock
+    file that already exists is first opened read-only on POSIX (flock does not
+    need write access), so a file owned by another user is still lockable; if
+    that open or its lock fails for any reason but contention (NFS emulates
+    flock with fcntl locks, which need a write handle), it is retried once
+    read-write. A missing file is created as usual; Windows always opens
+    read-write. An OSError that survives the retry propagates.
+    """
+    if existing_read_only and os.name != "nt" and Path(lock_path).exists():
+        try:
+            handle = open(lock_path, "rb")
+        except OSError:
+            handle = None
+        if handle is not None:
+            try:
+                if _lock_nonblocking(handle):
+                    return handle
+            except OSError:
+                pass
+            else:
+                handle.close()
+                return None
+            handle.close()
+    handle = open(lock_path, "a+b")
+    try:
+        if _lock_nonblocking(handle):
+            return handle
+    except BaseException:
+        handle.close()
+        raise
+    handle.close()
+    return None
+
+
+@contextlib.contextmanager
+def hold_restore_lock(*, lock_dir=None, environ=None):
+    """Hold RESTORE_LOCK_NAME for a whole apply; refuse if another restore has it."""
+    directory = Path(lock_dir or inkdrop_runtime_config.lock_dir(environ))
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = try_exclusive_lock(directory / RESTORE_LOCK_NAME)
+    except OSError as exc:
+        raise not_quiescent("restore_lock_unavailable", f"cannot create {directory / RESTORE_LOCK_NAME}: {exc}",
+                            "Make the lock directory writable, then retry the restore.") from None
+    if handle is None:
+        raise not_quiescent("restore_in_progress", "another restore holds " + RESTORE_LOCK_NAME,
+                            "Wait for that restore to finish.")
+    try:
+        yield
+    finally:
+        handle.close()
 
 
 def blocker_summary(probe):

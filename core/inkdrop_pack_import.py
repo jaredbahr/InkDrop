@@ -25,6 +25,7 @@ from core import inkdrop_bounded_read
 from core import inkdrop_runtime_config
 from core import inkdrop_library_frontends
 from core import inkdrop_artifact_acceptance
+from core import inkdrop_db
 
 try:
     from core import inkdrop_state
@@ -1260,7 +1261,7 @@ def inkdrop_queue_identity_for_pack_missing(target, row, key, active_only=True):
         state_filter = "(q.state in ('verified','satisfied') or lower(coalesce(w.status,'')) = 'satisfied')"
         state_params = []
     try:
-        conn = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True, timeout=30)
+        conn = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
             found = conn.execute(
@@ -2427,7 +2428,7 @@ def inkdrop_download_task_path_hints(item, limit=80):
         return []
     placeholders = ",".join("?" for _ in queue_ids)
     try:
-        conn = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True, timeout=8)
+        conn = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True, timeout=8)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -3280,28 +3281,6 @@ def suffixless_existing_dest(dest):
     return base if base.exists() else None
 
 
-def existing_canonical_file(dest):
-    dest = Path(dest)
-    if dest.exists():
-        return dest
-    suffixless = suffixless_existing_dest(dest)
-    if suffixless:
-        return suffixless
-    match = COPY_SUFFIX_RE.match(dest.name)
-    stem = match.group("stem") if match else dest.stem
-    suffix = match.group("suffix") if match else dest.suffix
-    pattern = re.compile(rf"^{re.escape(stem)} \(([2-9][0-9]*)\){re.escape(suffix)}$")
-    try:
-        siblings = sorted(
-            candidate
-            for candidate in dest.parent.iterdir()
-            if candidate.is_file() and pattern.match(candidate.name)
-        )
-    except OSError:
-        siblings = []
-    return siblings[0] if siblings else None
-
-
 def same_file_in_target(importer, target_dir, path, digest, dry_run):
     if dry_run:
         return None
@@ -3548,8 +3527,6 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
                 existing_canonical = canonical_finder(target_dir, canonical, path)
             except Exception:
                 existing_canonical = None
-        if not existing_canonical:
-            existing_canonical = existing_canonical_file(dest)
         if existing_canonical:
             try:
                 same_source = existing_canonical.resolve() == Path(path).resolve()
@@ -3634,32 +3611,10 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
             elif path.suffix.lower() == ".cbr":
                 dest = importer.unique_dest_name(dest.parent, dest.with_suffix(".cbz").name)
                 event["dest"] = str(dest)
-                existing_after_normalize = existing_canonical_file(dest)
-                if existing_after_normalize:
-                    event["event"] = "pack_skip_canonical_already_present"
-                    event["dest"] = str(existing_after_normalize)
-                    event["state"] = "suppressed_completed"
-                    event["skip_reason"] = "canonical_file_already_visible_or_present"
-                    skipped_existing.append(event)
-                    log(event)
-                    if unit_key[0] and unit_key[2]:
-                        handled_units.add(unit_key)
-                    continue
                 event["normalized_archive"] = importer.repack_cbr_to_cbz(path, dest)
             elif path.suffix.lower() == ".pdf":
                 dest = importer.unique_dest_name(dest.parent, dest.with_suffix(".cbz").name)
                 event["dest"] = str(dest)
-                existing_after_normalize = existing_canonical_file(dest)
-                if existing_after_normalize:
-                    event["event"] = "pack_skip_canonical_already_present"
-                    event["dest"] = str(existing_after_normalize)
-                    event["state"] = "suppressed_completed"
-                    event["skip_reason"] = "canonical_file_already_visible_or_present"
-                    skipped_existing.append(event)
-                    log(event)
-                    if unit_key[0] and unit_key[2]:
-                        handled_units.add(unit_key)
-                    continue
                 issue_row = row.get("missing_issue") or {
                     "issue_number": row.get("issue_number"),
                     "calculated_issue_number": row.get("issue_number"),
@@ -3669,10 +3624,9 @@ def import_matched_files(importer, matched, dry_run, max_files, review_id, extra
                 event["normalized_archive"] = importer.convert_pdf_to_cbz(path, dest, target, issue_row)
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                if hasattr(importer, "place_import_file"):
-                    event.update(importer.place_import_file(path, dest, hardlink=hardlink_imports))
-                else:
-                    shutil.copy2(path, dest)
+                if not hasattr(importer, "place_import_file"):
+                    raise RuntimeError(f"import_matched_files: importer {type(importer).__name__} lacks no-clobber place_import_file; cannot place {path} at {dest}")
+                event.update(importer.place_import_file(path, dest, hardlink=hardlink_imports))
             if event.get("truth_model") == "kavita_manga":
                 event["comicinfo"] = ensure_comicinfo(dest, target, row)
             conn.execute(
@@ -3962,7 +3916,7 @@ def record_native_pack_no_match(result, item, pack_path, candidate_title, missin
         return {"ok": False, "reason": "missing_issue_map_empty"}
     rows = []
     try:
-        conn = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True, timeout=30)
+        conn = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
             candidates = conn.execute(

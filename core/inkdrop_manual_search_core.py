@@ -22,6 +22,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from core import inkdrop_manga_unit_policy
 from core import inkdrop_manual_search as manual_contract
+from core import inkdrop_db
 
 
 CONTRACT_VERSION = 1
@@ -379,7 +380,7 @@ def _now(value: Any = None) -> float:
 def _connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
     path = Path(db_path)
     if read_only:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True, timeout=5.0)
         con.execute("pragma query_only=1")
     else:
         con = sqlite3.connect(path, timeout=10.0)

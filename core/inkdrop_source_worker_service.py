@@ -23,6 +23,7 @@ from pathlib import Path
 
 from core import inkdrop_runtime_config
 from core import inkdrop_source_worker_cli as cli
+from core import inkdrop_db
 
 
 CONTRACT_VERSION = 1
@@ -148,7 +149,7 @@ def _query_state_ready_import_rows(db_path):
     if not db_path or not Path(db_path).exists():
         return []
     status_placeholders = ",".join("?" for _ in INKDROP_STATE_IMPORT_READY_STATUSES)
-    db_uri = f"file:{db_path}?mode=ro"
+    db_uri = inkdrop_db.sqlite_readonly_uri(db_path)
     con = sqlite3.connect(db_uri, uri=True, timeout=1.0)
     con.row_factory = sqlite3.Row
     try:
@@ -205,7 +206,7 @@ def _latest_reconciliation_states(reconciliation_db_path, queue_ids, download_ta
     if download_task_ids:
         clauses.append(f"inkdrop_download_task_id in ({','.join('?' for _ in download_task_ids)})")
         params.extend(download_task_ids)
-    db_uri = f"file:{path}?mode=ro"
+    db_uri = inkdrop_db.sqlite_readonly_uri(path)
     con = sqlite3.connect(db_uri, uri=True, timeout=1.0)
     con.row_factory = sqlite3.Row
     try:

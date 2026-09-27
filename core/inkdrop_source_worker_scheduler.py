@@ -414,7 +414,9 @@ def _queue_rows(
     # grouped pass restricted to the schedulable set. As two correlated
     # subqueries the same answers cost 2.2s against the live database; grouped,
     # 1.4s, because each row's attempt history is walked once instead of twice.
-    real_attempt_predicate = inkdrop_state.real_attempt_predicate_sql("sa")
+    real_attempts_cte = inkdrop_state.real_attempts_by_queue_cte_sql(
+        "sa", "join schedulable_queue sq on sq.id = sa.queue_id"
+    )
     ordered_cte = f"""
         with series_initial_search_priority as (
         select series_id, max(created_at) as series_initial_search_priority_at,
@@ -431,15 +433,7 @@ def _queue_rows(
         left join series s on s.id=q.series_id
         left join wanted_items w on w.id=q.wanted_id
         where {" and ".join(clauses)}
-        ), real_attempts as (
-        select sa.queue_id,
-               count(*) as real_attempt_count,
-               max(coalesce(sa.completed_at, sa.started_at, 0)) as last_real_attempt_at
-        from source_attempts sa
-        join schedulable_queue sq on sq.id = sa.queue_id
-        where {real_attempt_predicate}
-        group by sa.queue_id
-        ), series_real_service as (
+        ), {real_attempts_cte}, series_real_service as (
         -- When a series was last genuinely searched, over the rows that can
         -- be scheduled now. Real attempts only: MAD's import-retry loop
         -- writes download_client/importer rows every hour, and a clock read
@@ -469,7 +463,7 @@ def _queue_rows(
                slsa.series_latest_source_attempt_at,
                -- Earliest evidence the series exists at all. The series_added
                -- history row is pruned at 30 days by diagnostic retention
-               -- (#151) and is rewritten on re-add, so it cannot carry this on
+               -- and is rewritten on re-add, so it cannot carry this on
                -- its own; series.created_at is durable and never moves back.
                case
                  when sisp.series_first_added_at is null then s.created_at
@@ -1553,6 +1547,33 @@ def _is_non_attempt_source_attempt(row):
     return any(text in reason for text in NON_ATTEMPT_SOURCE_ATTEMPT_REASON_TEXT)
 
 
+def _is_completed_real_source_attempt(row):
+    """True when a real source_attempts row also finished with an answer.
+
+    real_attempt_count/last_real_attempt_at (below) feed only the aggregate
+    Prowlarr due gate (_aggregate_comic_prowlarr_due() in
+    inkdrop_source_worker_batch.py), so narrowing them here stays local to
+    that gate and does not touch source_attempt_is_real_attempt() itself or
+    its other callers (the retry ceiling, the Reliability page). A row of
+    kind `source_started_timeout` ("InkDrop started a Prowlarr search ... and
+    never finished it") passes source_attempt_is_real_attempt() -- `timeout`
+    is not a non-attempt status -- but the search never returned an answer,
+    so it must not start the aggregate's 7-day cooldown or stand in for a
+    real completed attempt.
+
+    completed_at cannot stand in for that check: measured live on the
+    2026-09-22T22:27:06Z snapshot, completed_at is NULL on 1,634 of 1,648
+    `searched_no_candidates` rows and all 12,046 `review` rows -- both
+    genuinely real, completed prowlarr outcomes. Requiring completed_at
+    would have zeroed real_attempt_count almost everywhere, not just for the
+    timeout shape, and made the aggregate cooldown never apply at all.
+    """
+    row = row if isinstance(row, dict) else {}
+    raw = _json_loads(row.get("raw_json"))
+    kind = _lower(row.get("kind") or raw.get("kind"))
+    return kind != "source_started_timeout"
+
+
 def recent_source_attempt_cooldowns(
     db_path,
     queue_id,
@@ -1711,10 +1732,13 @@ def _history_counts_from_attempt_rows(rows, provider_ids):
                 "provider_id": provider_id,
                 "attempt_count": 0,
                 "terminal_attempt_count": 0,
+                "real_attempt_count": 0,
                 "last_attempt_at": 0.0,
                 "last_attempt_status": "",
                 "last_terminal_attempt_at": 0.0,
                 "last_terminal_attempt_status": "",
+                "last_real_attempt_at": 0.0,
+                "last_real_attempt_status": "",
             },
         )
         entry["attempt_count"] = int(entry.get("attempt_count") or 0) + 1
@@ -1727,6 +1751,21 @@ def _history_counts_from_attempt_rows(rows, provider_ids):
             if activity_at >= float(entry.get("last_terminal_attempt_at") or 0):
                 entry["last_terminal_attempt_at"] = activity_at
                 entry["last_terminal_attempt_status"] = row.get("status") or ""
+        # source_attempt_is_real_attempt() is inkdrop_state's single authority for
+        # "a real try" (real_attempt_predicate_sql() composes the same predicate
+        # for the retry ceiling and the Reliability page). _is_terminal_source_attempt_history
+        # above answers a different question and counts a provider_wait backoff skip
+        # as terminal, so callers that need "did this provider actually get tried"
+        # -- not "did the ledger settle" -- read real_attempt_count instead.
+        # _is_completed_real_source_attempt() additionally requires the try to
+        # have finished, so a source_started_timeout row (real per the status
+        # predicate, but never completed) does not count here -- see its
+        # docstring for why that stays local to this field.
+        if inkdrop_state.source_attempt_is_real_attempt(row) and _is_completed_real_source_attempt(row):
+            entry["real_attempt_count"] = int(entry.get("real_attempt_count") or 0) + 1
+            if activity_at >= float(entry.get("last_real_attempt_at") or 0):
+                entry["last_real_attempt_at"] = activity_at
+                entry["last_real_attempt_status"] = row.get("status") or ""
     return history
 
 
@@ -2773,6 +2812,14 @@ def source_worker_queue_plan(
                 provider_id: int(history.get("terminal_attempt_count") or 0)
                 for provider_id, history in attempt_history.items()
             }
+            provider_real_history_counts = {
+                provider_id: int(history.get("real_attempt_count") or 0)
+                for provider_id, history in attempt_history.items()
+            }
+            provider_last_real_attempt_at = {
+                provider_id: float(history.get("last_real_attempt_at") or 0.0)
+                for provider_id, history in attempt_history.items()
+            }
             plans.append(
                 {
                     "source_worker_scheduler_contract_version": CONTRACT_VERSION,
@@ -2812,6 +2859,8 @@ def source_worker_queue_plan(
                     "provider_attempt_counts": _provider_attempt_counts(provider_plan),
                     "source_worker_provider_attempt_counts": provider_history_counts,
                     "source_worker_terminal_provider_attempt_counts": provider_terminal_history_counts,
+                    "source_worker_real_provider_attempt_counts": provider_real_history_counts,
+                    "source_worker_last_real_provider_attempt_at": provider_last_real_attempt_at,
                     "latest_source_attempt": latest_attempts.get(queue_id) or {},
                     "jobs_available": len(jobs),
                     "all_jobs_available": len(all_jobs),

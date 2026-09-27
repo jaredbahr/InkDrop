@@ -28,6 +28,7 @@ from core import inkdrop_runtime_config
 from core import inkdrop_qbittorrent_auth
 from core import inkdrop_download_client_routing
 from core import inkdrop_download_client_config
+from core import inkdrop_db
 
 
 def script_path(name: str, remote_path=None, *, env_var=None, fallback=None) -> Path:
@@ -106,7 +107,7 @@ def _configured_client_categories():
     found = set()
     try:
         if INKDROP_STATE_DB.exists():
-            con = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True)
+            con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True)
             try:
                 exists = con.execute(
                     "select 1 from sqlite_master where type='table' and name='provider_configs'"
@@ -4819,6 +4820,11 @@ def classify_inkdrop_client_file(path, row, targets, imported_state, bad_archive
         trusted_target = dict(trusted_target)
         if row.get("issue_title"):
             trusted_target["issue_title"] = row.get("issue_title")
+        # `targets` omits unmonitored and pathless series; the years the loader
+        # stamped from every series must survive.
+        trusted_target["newer_volume_years"] = sorted(
+            set(trusted_target.get("newer_volume_years") or ()) | set(imp.newer_volume_years(trusted_target, targets))
+        )
         if classification_issue:
             trusted_target["issue_number"] = classification_issue
             trusted_target["normalized_number"] = classification_issue
@@ -5849,9 +5855,18 @@ def completed_sets_for_target(target, imported_state):
 def matching_imported_destination(target, number, imported_state):
     if not target or not number:
         return None
+    # Only a file in the target's own folder can be this target's book. Title
+    # and number alone credited Coda (2018) #4 with `Coda (2023)/Coda #004`
+    # (audit 2026-09-26 H1); with no known folder there is nothing to credit.
+    folder = imp.kavita_manga_series_dir(target) if imp.is_manga_target(target) else target.get("folder")
+    folder = str(folder or "").replace("\\", "/").rstrip("/").lower()
+    if not folder:
+        return None
     for dest in imported_state.get("dest_paths", set()):
         dest_path = Path(dest)
         if dest_path.suffix.lower() not in {".cbz", ".cbr", ".pdf"}:
+            continue
+        if not str(dest).replace("\\", "/").lower().startswith(folder + "/"):
             continue
         dest_number = imp.normalize_manga_number(imp.extract_issue_number(dest_path))
         if dest_number != number:
@@ -5992,6 +6007,8 @@ def classify_local_file(
             "matched_series": target.get("title"),
             "matched_kapowarr_volume_id": target.get("id"),
         }
+    if "newer_volume_years" not in target:
+        target = dict(target, newer_volume_years=imp.newer_volume_years(target, targets))
     early_filename_gate = imp.classify_import_filename_safety(path, target=target, kind="comics", trusted_issue=trusted_issue)
     if not early_filename_gate.get("ok") and early_filename_gate.get("reason") != "duplicate_copy_suffix":
         return {

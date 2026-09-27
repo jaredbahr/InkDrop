@@ -778,7 +778,7 @@ def _pack_value_decision(attempt, pack_match, job=None):
 
     # PACK VALUE DESCRIBES A PACK. IT DOES NOT DECIDE WHETHER WE MAY HAVE IT.
     #
-    # Tracker #209, decided 2026-09-16: any needed unit inside a pack justifies
+    # Any needed unit inside a pack justifies
     # taking the pack, once the pack has proved the unit is there. The proof is
     # the gate, and it runs upstream in the matcher -- a pack with no manifest,
     # no declared range and no exact-number match never reaches this function.
@@ -899,7 +899,7 @@ def _attempt_with_pack_value(attempt, pack_match, decision):
     # NOTHING HERE CHANGES THE ATTEMPT'S STATUS ANY MORE.
     #
     # This used to demote a pack to review whenever _pack_value_decision()
-    # refused it on minimum coverage or bytes-per-covered-item. Under the #209
+    # refused it on minimum coverage or bytes-per-covered-item. Under the current
     # ruling those are not admission questions: the pack has already proved it
     # holds a wanted unit, and a size rule second-guessing that is appetite
     # wearing the costume of safety. _pack_value_decision() no longer refuses,

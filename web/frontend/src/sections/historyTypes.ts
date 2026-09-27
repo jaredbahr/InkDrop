@@ -4,6 +4,14 @@
 // field is optional -- compact_state_view_rows() omits any key whose value
 // is falsy/empty rather than sending null.
 export type HistoryRow = {
+  // Served by core/inkdrop_history_presentation.py so this island and the
+  // vanilla shell render the same words for the same row. Optional because a
+  // payload cached before they existed will not carry them; History.tsx
+  // falls back to its own ladder in that case.
+  event_label?: string;
+  event_icon?: string;
+  result_label?: string;
+  result_tone?: string;
   id: string;
   series?: string;
   series_id?: string;

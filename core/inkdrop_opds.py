@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import stat as stat_module
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -32,6 +33,54 @@ MEDIA_TYPES = {
 }
 XML_INVALID = re.compile("[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]")
 SCAN_BATCH_SIZE = 200
+
+# What one OPDS request may examine, whatever it finds.
+#
+# Pagination bounded the ENTRIES RETURNED and nothing else: both catalogue
+# loops kept fetching batches until enough physically valid files were found,
+# and "valid" is a stat() of the file on disk. fetchmany bounds what is in
+# memory at once, not how many batches are fetched, and the SQLite busy
+# timeout bounds lock waiting, not filesystem latency. On a library whose rows
+# say present but whose files are gone, one request for one entry walked the
+# whole eligible population. Measured in
+# tests/inkdrop-a-page-limit-is-not-a-work-limit-smoke.py.
+#
+# A request that runs out of budget says where it stopped rather than
+# returning fewer results as if that were the whole truth.
+OPDS_MAX_EXAMINED = int(os.environ.get("INKDROP_OPDS_MAX_EXAMINED") or 5000)
+OPDS_MAX_SECONDS = float(os.environ.get("INKDROP_OPDS_MAX_SECONDS") or 5.0)
+
+
+class ScanBudget:
+    """What one request may spend, shared across every loop inside it.
+
+    One budget per request, not per loop: the root feed's cost is the product
+    of the two, since each series it considers gets a second scan for its
+    first valid file. Separate budgets would multiply instead of add.
+    """
+
+    def __init__(self, max_examined=None, max_seconds=None):
+        self.max_examined = max(1, int(OPDS_MAX_EXAMINED if max_examined is None else max_examined))
+        self.deadline = time.monotonic() + max(
+            0.05, float(OPDS_MAX_SECONDS if max_seconds is None else max_seconds)
+        )
+        self.examined = 0
+        self.exhausted = False
+
+    def spend(self, count=1):
+        """Authorize one more unit of work. False once nothing further may run.
+
+        The call that exhausts the budget still returns True. Returning False
+        there would mean a budget of one authorizes nothing, every loop breaks
+        before its first row, and the cursor never advances -- a feed that asks
+        for the same page forever.
+        """
+        if self.exhausted:
+            return False
+        self.examined += int(count)
+        if self.examined >= self.max_examined or time.monotonic() > self.deadline:
+            self.exhausted = True
+        return True
 
 
 def xml_text(value):
@@ -121,7 +170,19 @@ def canonical_nonempty_media(path, roots):
     return canonical, current
 
 
-def first_valid_series_media(con, series_id, roots):
+def first_valid_series_media(con, series_id, roots, budget=None):
+    """The series' first file that is on disk, and whether the search finished.
+
+    Returns (row or None, resolved). `resolved` is the load-bearing half: None
+    with resolved=True means this series genuinely has no file on disk, None
+    with resolved=False means the budget ran out before that could be
+    established. Treating "unknown" as "none" moves the caller's cursor past a
+    series whose media was never looked at, which is how a catalogue skips the
+    only series that had anything.
+
+    Every row here is a stat(), and this runs once per series the root feed
+    considers, so it is the inner half of a product.
+    """
     cursor = con.execute(
         """
         select path,mtime,last_seen_at
@@ -134,12 +195,38 @@ def first_valid_series_media(con, series_id, roots):
         while True:
             batch = cursor.fetchmany(SCAN_BATCH_SIZE)
             if not batch:
-                return None
+                return None, True
             for row in batch:
+                if budget is not None and not budget.spend():
+                    return None, False
                 if canonical_nonempty_media(row["path"], roots) is not None:
-                    return row
+                    return row, True
     finally:
         cursor.close()
+
+
+def _continuation(rows, page_rows, limit, budget, last_examined):
+    """The `next` cursor: where a reader must resume so nothing is skipped.
+
+    Order matters. If more rows were collected than fit on the page, the cursor
+    is the last row ON the page -- resuming from the last EXAMINED id there
+    would skip the ones already collected but not shown.
+
+    Otherwise, if the scan stopped because it ran out of budget, the cursor is
+    the last id examined, even when the page is short or completely empty. That
+    is the case pagination alone could not express: a reader that sees a page
+    with no entries and no `next` link concludes the catalogue has ended, when
+    in truth the request gave up part-way through a library whose valid media
+    is further down.
+
+    A page that ends because the data ended has no cursor, which is what tells
+    a reader it has genuinely reached the end.
+    """
+    if len(rows) > limit and page_rows:
+        return page_rows[-1]["id"]
+    if budget is not None and budget.exhausted and last_examined:
+        return last_examined
+    return None
 
 
 def root_catalog(db_path, *, after=None, limit=None):
@@ -148,8 +235,14 @@ def root_catalog(db_path, *, after=None, limit=None):
     with inkdrop_state.connect_read(db_path, timeout_seconds=2.0, busy_timeout_ms=2000) as con:
         roots = inkdrop_state.media_management_roots_from_connection(con)
         rows = []
-        scan_series = after
-        while len(rows) < limit + 1:
+        # The id a reader must resume AFTER. It moves only when a series has
+        # been fully resolved -- shown, or established to have no file on disk.
+        # A series whose scan was cut short mid-way is deliberately left in
+        # front of this cursor so the next request looks at it again.
+        resume_after = after
+        resolved_any = False
+        budget = ScanBudget()
+        while len(rows) < limit + 1 and not budget.exhausted:
             batch = con.execute(
                 """
                 select s.id,s.title,s.media_type,s.publisher,s.year,s.updated_at
@@ -162,13 +255,26 @@ def root_catalog(db_path, *, after=None, limit=None):
                 order by s.id
                 limit ?
                 """,
-                (scan_series, SCAN_BATCH_SIZE),
+                (resume_after, SCAN_BATCH_SIZE),
             ).fetchall()
             if not batch:
                 break
             for row in batch:
-                scan_series = row["id"]
-                media = first_valid_series_media(con, row["id"], roots)
+                if not budget.spend():
+                    break
+                media, resolved = first_valid_series_media(con, row["id"], roots, budget)
+                if not resolved and resolved_any:
+                    # The budget ran out inside this series, so whether it has
+                    # a file on disk is UNKNOWN. Leave the cursor in front of
+                    # it and stop: advancing here is how the one series that
+                    # had media gets skipped and the catalogue reports itself
+                    # finished. Only when nothing at all has been resolved yet
+                    # do we fall through and take the answer as given, because
+                    # a request that resolves nothing returns the cursor it was
+                    # handed and the reader asks for the same page forever.
+                    break
+                resume_after = row["id"]
+                resolved_any = True
                 if media is None:
                     continue
                 rows.append({
@@ -183,7 +289,7 @@ def root_catalog(db_path, *, after=None, limit=None):
     path = "/opds/v1.2/catalog.xml"
     feed = _feed("InkDrop Library", "urn:inkdrop:catalog", newest, _query_href(path, limit, after))
     page_rows = rows[:limit]
-    _next(feed, path, limit, page_rows[-1]["id"] if len(rows) > limit and page_rows else None)
+    _next(feed, path, limit, _continuation(rows, page_rows, limit, budget, resume_after))
     for row in page_rows:
         entry = ET.SubElement(feed, f"{{{ATOM}}}entry")
         _text(entry, "id", f"urn:inkdrop:series:{row['id']}")
@@ -217,7 +323,8 @@ def series_catalog(db_path, series_id, *, after=None, limit=None):
         roots = inkdrop_state.media_management_roots_from_connection(con)
         rows = []
         scan_media = after
-        while len(rows) < limit + 1:
+        budget = ScanBudget()
+        while len(rows) < limit + 1 and not budget.exhausted:
             batch = con.execute(
                 """
                 select mf.id,mf.path,mf.size_bytes,mf.mtime,mf.last_seen_at,
@@ -233,6 +340,11 @@ def series_catalog(db_path, series_id, *, after=None, limit=None):
             if not batch:
                 break
             for row in batch:
+                # The budget first, THEN the cursor. Setting the cursor before
+                # the check names a row that was never examined, so the next
+                # request starts past it and never looks at it.
+                if not budget.spend():
+                    break
                 scan_media = row["id"]
                 if canonical_nonempty_media(row["path"], roots) is None:
                     continue
@@ -245,7 +357,7 @@ def series_catalog(db_path, series_id, *, after=None, limit=None):
     path = f"/opds/v1.2/series/{encoded_id}.xml"
     feed = _feed(series["title"], f"urn:inkdrop:series:{series_id}", series["updated_at"], _query_href(path, limit, after), self_kind="acquisition", up_href="/opds/v1.2/catalog.xml")
     page_rows = rows[:limit]
-    _next(feed, path, limit, page_rows[-1]["id"] if len(rows) > limit and page_rows else None)
+    _next(feed, path, limit, _continuation(rows, page_rows, limit, budget, scan_media))
     for row in page_rows:
         filename = Path(str(row["path"] or "")).name
         number = str(row["normalized_number"] or row["issue_number"] or "").strip()

@@ -230,10 +230,14 @@ def main():
         original_row_builder = inkdrop_state.history_row_from_record
         transformed = 0
 
-        def counted_row_builder(row):
+        # **kwargs so this keeps wrapping the real builder after it gained a
+        # hydration mode (history_row_from_record(row, stats_only=...)). The
+        # bound below is unchanged: it counts rows built, whichever mode they
+        # were built in.
+        def counted_row_builder(row, **kwargs):
             nonlocal transformed
             transformed += 1
-            return original_row_builder(row)
+            return original_row_builder(row, **kwargs)
 
         inkdrop_state.history_row_from_record = counted_row_builder
         started = time.perf_counter()
@@ -394,10 +398,10 @@ def main():
             exact_count_calls.append(history_filter)
             raise AssertionError(f"compact Activity called exact history counter: {history_filter}")
 
-        def count_compact_transforms(row):
+        def count_compact_transforms(row, **kwargs):
             nonlocal compact_transformed
             compact_transformed += 1
-            return original_row_builder(row)
+            return original_row_builder(row, **kwargs)
 
         inkdrop_state.HISTORY_ACTIVITY_VIEW_CACHE.clear()
         inkdrop_state.history_filter_count = reject_exact_download_count

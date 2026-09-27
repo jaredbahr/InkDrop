@@ -125,8 +125,7 @@ def main() -> int:
     require(worker_text, 'RECONCILE_SCRIPT="${INKDROP_RECONCILE_IMPORTS_SCRIPT:-$SCRIPT_DIR/core/inkdrop_reconcile_imports.py}"', "import-ready worker neutral reconcile command")
     require(worker_text, 'SAB_CLEANUP_SCRIPT="${INKDROP_SAB_FAILED_CLEANUP_SCRIPT:-$SCRIPT_DIR/core/inkdrop_sab_failed_cleanup.py}"', "import-ready worker neutral SAB cleanup command")
     require(worker_text, 'LOG="${INKDROP_IMPORT_READY_LOG:-$LOG_DIR/inkdrop-import-ready-worker.log}"', "import-ready worker configurable log path")
-    private_home = "/home/" + "curlz620"
-    if f"{private_home}/bin/" in worker_text or f"{private_home}/arr-docker/" in worker_text:
+    if "/home/" in worker_text or "/srv/private-stack/" in worker_text:
         fail("import-ready worker should not require operator-specific host paths")
 
     # inkdrop_web_config.py holds the module-level script_path(...) constants

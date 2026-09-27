@@ -14,7 +14,7 @@
     {
       "id": "pack-001-issue-range-proves-the-member",
       "category": "ambiguous_multi_unit_packs",
-      "description": "An issues 001-006 pack whose title names the range PROVES it holds wanted issue 3 (tracker #209, ruling 2026-08-15; PR #655). Re-pinned from blocked at 1.5.0: the 1.4.0 gold said 'without member proof', which was the pre-ruling policy.",
+      "description": "An issues 001-006 pack whose title names the range PROVES it holds wanted issue 3 (ruling 2026-08-15; PR #655). Re-pinned from blocked at 1.5.0: the 1.4.0 gold said 'without member proof', which was the pre-ruling policy.",
       "wanted": {
         "series": "Saga",
         "series_title": "Saga",
@@ -735,7 +735,7 @@
     {
       "id": "edition-004-omnibus-naming-the-exact-issue-is-admitted",
       "category": "editions_reprints",
-      "description": "An omnibus that names the exact wanted issue has proved it holds it, and content comes first: admitted on the shipped default (tracker #209, owner ruling 2026-09-16). Re-pinned from review at 1.6.0: the 1.5.0 gold said 'the shipped default is review', which was the pre-ruling policy.",
+      "description": "An omnibus that names the exact wanted issue has proved it holds it, and content comes first: admitted on the shipped default (owner ruling 2026-09-16). Re-pinned from review at 1.6.0: the 1.5.0 gold said 'the shipped default is review', which was the pre-ruling policy.",
       "wanted": {
         "series": "Hawkeye",
         "series_title": "Hawkeye",
@@ -754,7 +754,7 @@
     {
       "id": "edition-006-range-proven-omnibus-is-admitted",
       "category": "editions_reprints",
-      "description": "An omnibus whose own title declares a range holding the wanted issue has proved containment; the pack-containment policy admits it (tracker #209, 2026-09-16).",
+      "description": "An omnibus whose own title declares a range holding the wanted issue has proved containment; the pack-containment policy admits it (2026-09-16).",
       "wanted": {
         "series": "Hawkeye",
         "series_title": "Hawkeye",

@@ -256,7 +256,6 @@ SERVICE_INVENTORY = [
             "inkdrop-queue-throughput-audit.py",
             "inkdrop-backup-retention-audit.py",
             "inkdrop-completion-identity-audit.py",
-            "inkdrop-agent-lane-audit.py",
             "inkdrop-config-drift-audit.py",
             "inkdrop-public-readiness-audit.py",
             "inkdrop-ui-polish-drift-audit.py",
@@ -266,7 +265,7 @@ SERVICE_INVENTORY = [
         ],
         "owns": [
             "operator audits, safe repair utilities, provider recovery checks",
-            "queue/source/backup/completion/agent-lane/config-drift/public-readiness/UI-drift diagnostics",
+            "queue/source/backup/completion/work-lane/config-drift/public-readiness/UI-drift diagnostics",
             "read-only or preview-first cleanup workflows",
         ],
         "external_adapters": [
@@ -280,9 +279,8 @@ SERVICE_INVENTORY = [
             "inkdrop-queue-throughput-audit-smoke.py",
             "inkdrop-backup-retention-smoke.py",
             "inkdrop-system-health-smoke.py",
-            "inkdrop-agent-alignment-smoke.py",
         ],
-        "next_step": "Keep cross-agent alignment and config-drift checks visible while moving recurring diagnostics into a System/Operations service manifest after core worker roles stabilize.",
+        "next_step": "Keep cross-workstream alignment and config-drift checks visible while moving recurring diagnostics into a System/Operations service manifest after core worker roles stabilize.",
     },
 ]
 

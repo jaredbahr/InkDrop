@@ -33,7 +33,7 @@ export type ManualReviewRow = {
   reason_tone?: string;
   reason_detail?: string;
   reason_label_source?: string;
-  // #572. Built by decision_evidence() in core/inkdrop_import_evidence.py and
+  // Built by decision_evidence() in core/inkdrop_import_evidence.py and
   // now carried through the compact/table row shape. `incomplete` is
   // load-bearing: it means InkDrop could not say what was expected, which must
   // read differently from "nothing was expected".

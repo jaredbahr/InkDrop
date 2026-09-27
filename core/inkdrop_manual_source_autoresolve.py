@@ -27,6 +27,7 @@ from core import inkdrop_internal_jobs
 from core import inkdrop_artifact_acceptance
 from core import inkdrop_completed_import
 from core import inkdrop_library_paths
+from core import inkdrop_db
 
 try:
     from core import inkdrop_state
@@ -536,6 +537,23 @@ def native_attempt_from_autoresolve_row(row, reason):
     return attempt, ts
 
 
+# Lifecycle-only statuses for a download_task that is not retiring: each pass
+# over db_import_retry_records() re-observes the same stuck task and re-emits
+# the same status for it until something else clears the task. Stamping the
+# attempt id with the pass timestamp turned that into a new source_attempts
+# row every ~10 minutes for the life of the stuck task -- one unit logged 603
+# preview_not_importable rows for a single candidate over 12.8 days, all
+# counting toward the retry ceiling as if they were 603 separate tries.
+# Keying the id on the candidate and transfer instead collapses repeats of the
+# same unchanged observation into one row that gets refreshed in place, while a
+# status change, a different candidate or a different slskd transfer still
+# mints its own id. The retry-ceiling count applies the same grouping to rows
+# already written (inkdrop_state.real_attempt_count_expr_sql).
+LIFECYCLE_LOOP_STABLE_ATTEMPT_STATUSES = (
+    inkdrop_state.LIFECYCLE_REPLAY_ATTEMPT_STATUSES if inkdrop_state is not None else frozenset()
+)
+
+
 def record_native_autoresolve_attempts(result, reason="manual_source_autoresolve"):
     if inkdrop_state is None:
         return {"ok": False, "reason": "inkdrop_state_module_missing", "attempted": 0}
@@ -553,7 +571,16 @@ def record_native_autoresolve_attempts(result, reason="manual_source_autoresolve
             continue
         attempted += 1
         attempt, ts = native_attempt_from_autoresolve_row(row, reason)
-        attempt_id = f"manual-source:{queue_id}:{attempt.get('status')}:{row.get('review_id') or ''}:{int(ts)}"
+        status = str(attempt.get("status") or "")
+        review_id = row.get("review_id") or ""
+        if status in LIFECYCLE_LOOP_STABLE_ATTEMPT_STATUSES:
+            candidate_identity = str(
+                inkdrop_state.normalize_source_attempt_payload(dict(attempt)).get("candidate_identity") or ""
+            )
+            transfer_id = str(attempt.get("transfer_id") or "")
+            attempt_id = f"manual-source:{queue_id}:{status}:{review_id}:{candidate_identity}:{transfer_id}"
+        else:
+            attempt_id = f"manual-source:{queue_id}:{status}:{review_id}:{int(ts)}"
         try:
             outcome = inkdrop_state.record_queue_source_attempt(
                 INKDROP_STATE_DB,
@@ -1276,7 +1303,7 @@ def durable_autopilot_queue_item_verified(record):
     conn = None
     try:
         conn = sqlite3.connect(
-            f"file:{INKDROP_STATE_DB.resolve().as_posix()}?mode=ro",
+            inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB),
             uri=True,
             timeout=5,
         )
@@ -2449,7 +2476,7 @@ def run_next_slskd_autopick(args, record, review_id=None):
             # configured value. This lane targets one row, but its probe's
             # directory handoff routinely selects the rest of the peer's folder
             # for the series, and a hardcoded 1 threw all of it away. Mirrors
-            # #1206 for the hot-retry lane. The lane keeps its targeting --
+            # the same fix for the hot-retry lane. The lane keeps its targeting --
             # --max-total 1, --max-per-series 1, --review-id, --force.
         ]
         if review_id:
@@ -3303,7 +3330,7 @@ def repeat_bad_candidate_review_row(
         # candidate_match returns dict(row)) and has carried all three the whole
         # time. Verbatim, never through a label function -- a peer path is data
         # the operator copies, and title-casing one hands them a path that does
-        # not resolve (tracker #820).
+        # not resolve.
         #
         # `source` above stays the provider id. decision_evidence()'s
         # source_is_path and mobile's staged-path branch both key off it, so
@@ -3799,6 +3826,31 @@ def stale_waiting_failure_reason(record, transfer=None, stall_policy=None):
     if status == "transfer_unknown" and age >= SLSKD_WAITING_UNKNOWN_STALE_SECONDS:
         return f"SLSKD transfer state stayed unknown after {compact_duration(age)}"
     return ""
+
+
+def succeeded_transfer_filename_mismatch_reason(record, transfer, stall_policy=None):
+    """Bound a filename mismatch once SLSKD reports the transfer succeeded.
+
+    A completed transfer whose staged file never matches this candidate's
+    filename used to fall through the transfer_succeeded branch above with no
+    staleness check at all, so it never retired no matter how old the waiting
+    record got; the Planetes #1/#2 case looped for 43+ days.
+    """
+    if str((record or {}).get("candidate_source") or "") != "slskd_probe":
+        return ""
+    age = max(age_seconds_from_record(record), transfer_age_seconds(transfer))
+    stale_seconds = queued_transfer_stale_seconds(transfer, stall_policy)
+    if age < stale_seconds:
+        return ""
+    # "staged file did not match" is the exact marker classify_candidate_failure()
+    # looks for (reason_key staged_file_mismatch), which is deliberately not in
+    # TRANSIENT_BAD_CANDIDATE_REASONS: the gate here already proved a real file
+    # arrived and never matched this candidate, not that evidence went missing,
+    # so the wrong-unit verdict should stick rather than cool down and retry.
+    return (
+        "SLSKD transfer succeeded but the staged file did not match the "
+        f"marked candidate after {compact_duration(age)}"
+    )
 
 
 def slskd_api_key():
@@ -5425,7 +5477,8 @@ def issue_number_keys(value):
 
 def issue_number_keys_in_text(value):
     out = set()
-    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", str(value or "")):
+    text = inkdrop_completed_import.strip_issue_total_markers(value)
+    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", text):
         out |= issue_number_keys(raw)
     return out
 
@@ -6437,6 +6490,41 @@ def run(args):
                                 rejections=filename_rejections[:5],
                                 ignored_detected_count=len(filename_rejections),
                             ))
+                        continue
+                    stale_reason = succeeded_transfer_filename_mismatch_reason(record, transfer, stall_policy)
+                    if stale_reason:
+                        record_slskd_learning(record, None, False, stale_reason, review_id)
+                        skip = waiting_status_row(
+                            review_id,
+                            record,
+                            stale_reason,
+                            source=source,
+                            # Reuse transfer_stale_unknown rather than mint a
+                            # status: it is already registered in every
+                            # consumer this row reaches (download_task_state's
+                            # failed set, the scheduler's
+                            # TERMINAL_OR_PROBLEM_HANDOFF_STATUSES so this
+                            # never counts as an active handoff, the autopilot
+                            # sync searching branch, and the reliability/web
+                            # label maps) -- a new value would need every one
+                            # of those touched to avoid the exact phantom
+                            # active-handoff row this branch exists to retire.
+                            status="transfer_stale_unknown",
+                            transfer=transfer,
+                            rejections=filename_rejections[:5],
+                        )
+                        recovery = recover_failed_waiting_candidate(
+                            args,
+                            result,
+                            review_id,
+                            record,
+                            None,
+                            stale_reason,
+                            transfer=transfer,
+                        )
+                        if recovery:
+                            skip["recovery"] = recovery
+                        result["skipped"].append(skip)
                         continue
                 else:
                     # No transfer info at all for the marked candidate -- the

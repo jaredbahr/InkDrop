@@ -290,7 +290,7 @@ def assert_no_private_text_markers(root):
 # repos disagree about which branch ships: qa here, main there. A condition
 # written for one reads as false on the other, and a job that skips reports a
 # green check, so the release still looks verified while nothing tested it.
-# That is how it nearly shipped -- #682 gated full_smoke_suite to
+# That is how it nearly shipped: full_smoke_suite was gated to
 # refs/heads/qa to keep it off pull requests, correct for this repo, and the
 # next export would have carried it to a repo where the release commit lands
 # on main.

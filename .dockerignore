@@ -201,8 +201,6 @@ inkdrop_*_diagnostic.py
 !/core/sab_rescue_server.py
 
 docs/*.py
-inkdrop-agent-context-pack.py
-inkdrop-agent-coordinator-quickcheck.py
 inkdrop-completion-identity-audit-diff.py
 inkdrop_chainsaw_stale_proof_repair.py
 inkdrop_duplicate_manga_cleanup.py

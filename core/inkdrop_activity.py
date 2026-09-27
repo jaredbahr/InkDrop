@@ -16,6 +16,7 @@ from contextlib import closing
 from pathlib import Path
 
 from core import inkdrop_staged_projection
+from core import inkdrop_db
 
 
 SUPPORTED_SORTS = {
@@ -73,7 +74,7 @@ STAGED_ATTEMPT_STATUSES = {"staged", "staged_file_ready", "preview_importable", 
 
 
 def _connect(db_path):
-    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=2.0)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=2.0)
     con.row_factory = sqlite3.Row
     con.execute("pragma query_only=1")
     con.execute("pragma busy_timeout=2000")

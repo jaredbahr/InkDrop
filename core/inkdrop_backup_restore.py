@@ -26,6 +26,7 @@ import argparse
 import base64
 import calendar
 import contextlib
+import functools
 import hashlib
 import hmac
 import json
@@ -48,10 +49,12 @@ from cryptography.hazmat.primitives import hashes
 
 from core import inkdrop_runtime_config
 from core import inkdrop_auth
+from core import inkdrop_preflight
 from core import inkdrop_restore_quiescence
 from core import inkdrop_settings_registry
 from core import inkdrop_state
 from core import inkdrop_version
+from core import inkdrop_db
 
 
 BACKUP_RESTORE_SCHEMA_VERSION = 1
@@ -261,14 +264,17 @@ def redacted_config_export(environ=None):
     env = environ if environ is not None else os.environ
     values = {}
     secret_refs = {}
+    known_keys = frozenset(inkdrop_preflight.CONFIG_ENV_KEYS)
     for key in sorted(key for key in env if key.startswith("INKDROP_")):
         raw = str(env.get(key) or "")
-        if is_secret_key(key):
-            values[key] = "<set>" if raw else "<unset>"
-            if raw:
-                secret_refs[key] = {"configured": True, "value": "<redacted>"}
-        else:
-            values[key] = raw
+        if key in known_keys and not is_secret_key(key):
+            values[key] = sanitize_url_credentials(raw)
+            continue
+        # Unknown keys fail closed. A future connector may carry a credential
+        # without advertising that fact in its name, as webhook URLs do today.
+        values[key] = "<set>" if raw else "<unset>"
+        if raw:
+            secret_refs[key] = {"configured": True, "value": REDACTED_MARKER}
     return {
         "schema_version": BACKUP_RESTORE_SCHEMA_VERSION,
         "exported_at": utc_stamp(),
@@ -788,11 +794,15 @@ def _portable_settings_plan(document, rows):
     }
 
 
-def _snapshot_existing_file(source, backup_dir, *, now=None):
+def _snapshot_existing_file(source, backup_dir, *, now=None, sqlite_backup=False):
     """Copy `source` aside into `backup_dir` before it gets overwritten, using
     the same atomic tempfile-then-replace pattern as _write_settings_snapshot.
     Returns the snapshot path, or None if there was nothing to snapshot yet
-    (e.g. a first-ever restore onto an empty state dir)."""
+    (e.g. a first-ever restore onto an empty state dir).
+
+    With sqlite_backup the copy goes through Connection.backup(), as in
+    backup_sqlite_db: a byte copy of a WAL-mode database's main file drops
+    every committed transaction still sitting in its -wal."""
     source = Path(source)
     if not source.exists():
         return None
@@ -801,11 +811,16 @@ def _snapshot_existing_file(source, backup_dir, *, now=None):
     target = backup_dir / f"{source.stem}-before-restore-{compact_stamp(now)}{source.suffix}"
     fd, temporary = tempfile.mkstemp(prefix=f".{source.stem}-", suffix=".tmp", dir=backup_dir)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            with source.open("rb") as src:
-                shutil.copyfileobj(src, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
+        if sqlite_backup:
+            os.close(fd)
+            with contextlib.closing(sqlite3.connect(str(source))) as src, contextlib.closing(sqlite3.connect(temporary)) as dst:
+                src.backup(dst)
+        else:
+            with os.fdopen(fd, "wb") as handle:
+                with source.open("rb") as src:
+                    shutil.copyfileobj(src, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
         os.replace(temporary, target)
         _verify_sensitive_archive_mode(target)
         if os.name != "nt":
@@ -818,6 +833,98 @@ def _snapshot_existing_file(source, backup_dir, *, now=None):
         Path(temporary).unlink(missing_ok=True)
         raise
     return target
+
+
+def _restore_db_timeout():
+    try:
+        return max(0.1, min(600.0, float(os.environ.get("INKDROP_RESTORE_DB_LOCK_TIMEOUT_SECONDS") or 30)))
+    except ValueError:
+        return 30.0
+
+
+def _require_databases_idle(targets):
+    """Refuse, before any byte changes, if another connection is writing to a
+    database this restore will replace.
+
+    The probe is BEGIN IMMEDIATE then ROLLBACK, on a connection that does not
+    checkpoint when it closes: closing the last connection to a WAL database
+    otherwise folds the -wal into the main file, which would make a refusal
+    mutate what it refused to touch. Returns the targets SQLite cannot read at
+    all (often why a restore is being run); those are replaced as raw files.
+
+    "Cannot read" means exactly SQLITE_CORRUPT or SQLITE_NOTADB. Any other
+    failure (read-only, cannot open, I/O, full, protocol, no setconfig) says
+    nothing about the file, so the restore is refused and nothing changes.
+    """
+    unreadable = set()
+    for target in targets:
+        if not target.exists():
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(str(target), timeout=0, isolation_level=None)) as con:
+                con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+                con.execute("BEGIN IMMEDIATE")
+                con.execute("ROLLBACK")
+        except sqlite3.Error as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            if (code or 0) & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+                unreadable.add(target)
+                continue
+            raise inkdrop_restore_quiescence.not_quiescent(
+                "database_in_use" if (code or 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) else "database_unusable",
+                f"{path_text(target)} could not be checked, is it being written? (sqlite error code {code}: {exc})",
+                "Wait for other writers to finish or fix the database and its permissions, then retry the restore.",
+            ) from None
+    return unreadable
+
+
+def _journal_mode(path):
+    with contextlib.closing(sqlite3.connect(str(path))) as con:
+        return str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+
+
+def _copy_database_into(source, target, *, timeout, verify=True, on_commit=None):
+    """Copy the database file `source` into the live database `target` with the
+    SQLite backup API: one write transaction under SQLite's own locking, so
+    connections already open on `target` (the web pool) see the new content and
+    keep working, and no old -wal frame is replayed over it. Gives up when the
+    destination stays locked past `timeout`. A database that already existed
+    keeps whatever journal mode it had (the completion ledger is a DELETE-mode
+    file) and is checked; one created here (first restore, or an unreadable file
+    removed first) has WAL switched on. `on_commit` is called once the backup
+    has committed into `target`, and never for a copy that gave up first, so a
+    caller can tell a database it changed from one it did not. A source corrupt
+    past its header makes backup() abort before it changes anything.
+    """
+    target = Path(target)
+    fresh = not target.exists()
+    deadline = time.monotonic() + timeout
+
+    def give_up(status, remaining, total):
+        if status in (5, 6) and time.monotonic() > deadline:  # BUSY, LOCKED
+            raise sqlite3.OperationalError("database is locked")
+
+    try:
+        # An unreadable ledger is removed first, so it is recreated here in WAL.
+        before = "wal" if fresh else _journal_mode(target)
+        with contextlib.closing(sqlite3.connect(str(source))) as src, \
+                contextlib.closing(sqlite3.connect(str(target), timeout=timeout)) as dst:
+            src.backup(dst, sleep=0.05, progress=give_up)
+            if on_commit:
+                on_commit()
+            if fresh:
+                dst.execute("PRAGMA journal_mode=WAL")
+        after = _journal_mode(target)
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc) and "busy" not in str(exc):
+            raise
+        raise inkdrop_restore_quiescence.not_quiescent(
+            "database_in_use", f"{path_text(target)} stayed locked for {timeout:g}s while it was being restored",
+            "Wait for the other connection to finish, then retry the restore.",
+        ) from None
+    if verify and after != before:
+        raise RuntimeError(f"restored database {path_text(target)} is in {after} mode; a restore must leave "
+                           f"each database in the mode it had ({before})")
 
 
 def _write_settings_snapshot(rows, backup_dir, *, now=None):
@@ -1076,7 +1183,7 @@ def backup_sqlite_db(source_db: Path, target_db: Path):
     for attempt in range(1, attempts + 1):
         target_db.unlink(missing_ok=True)
         try:
-            with contextlib.closing(sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)) as src, contextlib.closing(sqlite3.connect(target_db)) as dst:
+            with contextlib.closing(sqlite3.connect(inkdrop_db.sqlite_readonly_uri(source_db), uri=True)) as src, contextlib.closing(sqlite3.connect(target_db)) as dst:
                 src.backup(dst)
                 dst.commit()
             last_error = None
@@ -1916,7 +2023,7 @@ def _validate_sqlite_database(database_path, *, label):
     """Reject non-databases and internally inconsistent SQLite snapshots."""
     try:
         with contextlib.closing(
-            sqlite3.connect(f"file:{Path(database_path)}?mode=ro", uri=True)
+            sqlite3.connect(inkdrop_db.sqlite_readonly_uri(database_path), uri=True)
         ) as con:
             quick_check = [row[0] for row in con.execute("pragma quick_check").fetchall()]
             foreign_key_violations = con.execute("pragma foreign_key_check").fetchall()
@@ -2144,7 +2251,7 @@ def _clear_state_auth_generation(state_db_path):
 # named here still gets LISTED -- this map only adds the "why it matters" line.
 # The distinction that matters is rebuildable vs learned: a cache costs time to
 # refill, but a learned file cannot be reconstructed from any rescan, which is
-# the same argument that put the completion ledger into the archive in #752.
+# the same argument that put the completion ledger into the archive.
 UNCARRIED_REBUILD_NOTES = {
     "slskd-auto-grab-learning.json": (
         "LEARNED -- nothing rebuilds this. A restored install re-downloads releases it had already ruled out."
@@ -2252,7 +2359,7 @@ def credentials_needing_reentry(state_db_path):
     """
     summary = {"providers": [], "notification_connectors": [], "count": 0, "unavailable": None}
     try:
-        con = sqlite3.connect("file:" + Path(state_db_path).as_posix() + "?mode=ro", uri=True)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(state_db_path), uri=True)
     except sqlite3.Error as exc:
         summary["unavailable"] = type(exc).__name__
         return summary
@@ -2294,6 +2401,32 @@ def credentials_needing_reentry(state_db_path):
     return summary
 
 
+def _is_live_state_dir(target_state_dir):
+    live_state_dir = Path(inkdrop_runtime_config.state_dir())
+    try:
+        return Path(target_state_dir).resolve() == live_state_dir.resolve()
+    except OSError:
+        return str(target_state_dir) == str(live_state_dir)
+
+
+def _holding_restore_lock(restore):
+    """An apply onto the live install holds RESTORE_LOCK_NAME throughout: a
+    second restore is refused, and the worker scheduler starts no new job while
+    it is held (it tries this lock before every start). Jobs already running
+    are not stopped: the scheduler keeps its jobs lock while any runs, so a
+    restore's quiescence check refuses with scheduler_jobs_active, and a
+    restore that finds the jobs lock free knows nothing can start."""
+    @functools.wraps(restore)
+    def wrapper(archive_path, **kwargs):
+        lock = contextlib.nullcontext()
+        if kwargs.get("apply") and _is_live_state_dir(kwargs.get("target_state_dir") or inkdrop_runtime_config.state_dir()):
+            lock = inkdrop_restore_quiescence.hold_restore_lock(lock_dir=kwargs.get("quiescence_lock_dir"))
+        with lock:
+            return restore(archive_path, **kwargs)
+    return wrapper
+
+
+@_holding_restore_lock
 def restore_backup_archive(
     archive_path,
     *,
@@ -2482,10 +2615,7 @@ def restore_backup_archive(
         # So the precondition is scoped to what it actually protects: a restore
         # that replaces the databases this install is running on.
         live_state_dir = Path(inkdrop_runtime_config.state_dir())
-        try:
-            targets_live_install = target_state_dir.resolve() == live_state_dir.resolve()
-        except OSError:
-            targets_live_install = str(target_state_dir) == str(live_state_dir)
+        targets_live_install = _is_live_state_dir(target_state_dir)
         quiescence["enforced"] = bool(targets_live_install)
         quiescence["target_is_live_install"] = bool(targets_live_install)
         if not targets_live_install:
@@ -2585,63 +2715,99 @@ def restore_backup_archive(
         pre_restore_snapshots = []
         try:
             state_target = target_state_dir / inkdrop_runtime_config.STATE_DB_NAME
-            snapshot = _snapshot_existing_file(state_target, backup_dir)
-            if snapshot:
-                pre_restore_snapshots.append(path_text(snapshot))
-            os.replace(staged_files.pop(STATE_DB_ARCHIVE_NAME), state_target)
-            # The live state DB runs in WAL mode (see backup_sqlite_db above),
-            # so a -wal/-shm pair from whatever was at this path before almost
-            # always still exists here. Left in place, the next open replays
-            # those stale frames onto the just-restored file -- silently
-            # reinstating the pre-restore data (including, in the worst case,
-            # whatever was corrupt enough to need a restore in the first
-            # place) while this function still reports the restore as ok.
-            # The auth_target branch below has always done this; this branch
-            # never did.
-            for suffix in ("-wal", "-shm"):
-                Path(str(state_target) + suffix).unlink(missing_ok=True)
-            result["restored_state_db"] = path_text(state_target)
             auth_target = target_state_dir / inkdrop_auth.AUTH_STORE_DB_NAME
+            completion_target = target_state_dir / inkdrop_runtime_config.IMPORTED_FILES_DB_NAME
+            # Staging can take minutes on a large archive, so the gate is re-run.
+            if targets_live_install:
+                inkdrop_restore_quiescence.require_restore_quiescence(
+                    lock_dir=quiescence_lock_dir, status_path=quiescence_status_path,
+                )
+            copies = [(state_target, staged_files[STATE_DB_ARCHIVE_NAME])]
             if preserve_current_auth:
                 # Explicitly requested: keep whatever credentials exist right
                 # now and let the next open adopt them. The restored state
                 # database must not claim a store generation it never met.
-                _clear_state_auth_generation(target_state_dir / inkdrop_runtime_config.STATE_DB_NAME)
                 result["auth_store"] = "preserved_current_auth"
             elif AUTH_DB_ARCHIVE_NAME in archive_names:
-                snapshot = _snapshot_existing_file(auth_target, backup_dir)
-                if snapshot:
-                    pre_restore_snapshots.append(path_text(snapshot))
-                os.replace(staged_files.pop(AUTH_DB_ARCHIVE_NAME), auth_target)
-                for suffix in ("-wal", "-shm"):
-                    Path(str(auth_target) + suffix).unlink(missing_ok=True)
-                result["restored_auth_db"] = path_text(auth_target)
+                copies.append((auth_target, staged_files[AUTH_DB_ARCHIVE_NAME]))
                 result["auth_store"] = "restored_from_archive"
             elif auth_target.exists():
                 # The archive predates the auth split. Leaving today's store
                 # would mix old application state with current logins, so the
                 # first open must rebuild it from the restored state database.
-                snapshot = _snapshot_existing_file(auth_target, backup_dir)
-                if snapshot:
-                    pre_restore_snapshots.append(path_text(snapshot))
-                auth_target.unlink()
-                for suffix in ("-wal", "-shm"):
-                    Path(str(auth_target) + suffix).unlink(missing_ok=True)
+                # The file stays in place under any open connection: an empty
+                # store goes in, and the state database's claim on the old one
+                # is dropped below.
+                empty_store = target_state_dir / f".auth-empty-{os.getpid()}.tmp"
+                staged_files["empty_auth"] = empty_store
+                with contextlib.closing(sqlite3.connect(str(empty_store))) as empty:
+                    empty.execute("PRAGMA journal_mode=WAL")
+                    empty.execute("CREATE TABLE t(x)")
+                    empty.execute("DROP TABLE t")
+                copies.append((auth_target, empty_store))
                 result["auth_store"] = "removed_for_archive_epoch"
             else:
                 result["auth_store"] = "absent"
-            inkdrop_auth.reset_auth_store_cache()
             if COMPLETION_DB_ARCHIVE_NAME in staged_files:
-                completion_target = target_state_dir / inkdrop_runtime_config.IMPORTED_FILES_DB_NAME
-                snapshot = _snapshot_existing_file(completion_target, backup_dir)
-                if snapshot:
-                    pre_restore_snapshots.append(path_text(snapshot))
-                os.replace(staged_files.pop(COMPLETION_DB_ARCHIVE_NAME), completion_target)
-                # Same stale-WAL hazard as the state database above: whatever
-                # -wal/-shm pair belonged to the file that used to be at this
-                # path would otherwise be replayed onto the restored one.
-                for suffix in ("-wal", "-shm"):
-                    Path(str(completion_target) + suffix).unlink(missing_ok=True)
+                copies.append((completion_target, staged_files[COMPLETION_DB_ARCHIVE_NAME]))
+            unreadable = _require_databases_idle([target for target, _ in copies])
+            snapshots, stamp = {}, time.time()
+            for target, _ in copies:
+                raw = target in unreadable
+                kept = [_snapshot_existing_file(Path(str(target) + suffix), backup_dir, sqlite_backup=not raw, now=stamp)
+                        for suffix in (("", "-wal", "-shm") if raw else ("",))]
+                snapshots[target] = [path for path in kept if path]
+                pre_restore_snapshots.extend(path_text(path) for path in snapshots[target])
+            attempted, committed = [], []
+            try:
+                for target, staged in copies:
+                    if target in unreadable:
+                        # The only case in which a live file is unlinked: SQLite
+                        # calls it corrupt or not a database (see
+                        # _require_databases_idle), so no connection can be using it.
+                        for suffix in ("", "-wal", "-shm"):
+                            Path(str(target) + suffix).unlink(missing_ok=True)
+                    attempted.append(target)
+                    # Rollback-eligible only once the backup has committed (the
+                    # journal-mode check after it can still fail). A copy that
+                    # gave up first changed nothing, and putting the snapshot
+                    # back would erase what other writers committed since.
+                    _copy_database_into(staged, target, timeout=_restore_db_timeout(),
+                                        on_commit=functools.partial(committed.append, target))
+            except BaseException as failure:
+                # Logical rollback only: SQLite cannot lock several files at
+                # once, so a writer arriving between the check above and a copy
+                # can still make a later copy fail. Every database whose copy
+                # committed is put back from its snapshot; the outcome is the old
+                # content, not the old bytes. What happened is attached to the error.
+                outcome = {}
+                for target in attempted:
+                    key = path_text(target)
+                    if target in unreadable:
+                        kept = ", ".join(path_text(path) for path in snapshots[target])
+                        outcome[key] = f"live file removed; raw snapshot at {kept}, not restored automatically"
+                        continue
+                    if target not in committed:
+                        outcome[key] = "unchanged: copy did not commit"
+                        continue
+                    if not snapshots[target]:
+                        outcome[key] = "not rolled back: no snapshot to copy from"
+                        continue
+                    try:
+                        _copy_database_into(snapshots[target][0], target, timeout=_restore_db_timeout(), verify=False)
+                        outcome[key] = "ok"
+                    except (sqlite3.Error, RuntimeError, OSError) as rollback_error:
+                        outcome[key] = f"error: {rollback_error}"
+                failure.rollback, failure.pre_restore_snapshots = outcome, list(pre_restore_snapshots)
+                failure.add_note(f"rollback: {outcome}; pre-restore snapshots: {pre_restore_snapshots}")
+                raise
+            inkdrop_auth.reset_auth_store_cache()
+            if preserve_current_auth or result["auth_store"] == "removed_for_archive_epoch":
+                _clear_state_auth_generation(state_target)
+            result["restored_state_db"] = path_text(state_target)
+            if result["auth_store"] == "restored_from_archive":
+                result["restored_auth_db"] = path_text(auth_target)
+            if COMPLETION_DB_ARCHIVE_NAME in staged_files:
                 result["restored_completion_db"] = path_text(completion_target)
             for archive_name, target_name in (
                 (CONFIG_EXPORT_ARCHIVE_NAME, "inkdrop-config-export.json"),
@@ -3014,7 +3180,7 @@ def preview_backup_merge(archive_path, *, state_db_path=None, backup_dir=None, s
             _check_validation_deadline(deadline, stage="state database staging")
             database_validation = {"state_db": _validate_sqlite_database(staged_state, label="backup state database")}
             _check_validation_deadline(deadline, stage="state database validation")
-            staged_uri = f"file:{staged_state.resolve().as_posix()}?mode=ro"
+            staged_uri = inkdrop_db.sqlite_readonly_uri(staged_state)
             # Both sides are read-only: the live connection is opened via
             # inkdrop_state.connect_read (pragma query_only=1), and the uploaded
             # archive's state DB is attached by its own read-only URI -- nothing in

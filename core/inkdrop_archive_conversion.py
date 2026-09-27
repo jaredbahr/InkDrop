@@ -53,12 +53,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import zipfile
+import zlib
 from pathlib import Path
 
 from core import inkdrop_runtime_config
+from core import inkdrop_archive_compression
 from core import inkdrop_comicinfo_identity
 from core import inkdrop_artifact_acceptance
 
@@ -180,20 +183,111 @@ def rar_tooling():
     }
 
 
-def _run_bounded(args, timeout):
+# How much an archive tool may say before it is stopped. A `7z l -slt` listing
+# is a few hundred bytes per member and the member count is capped, so a well
+# behaved listing of the largest acceptable archive fits many times over.
+TOOL_OUTPUT_MAX_BYTES = 16 * 1024 * 1024
+# What is kept once the ceiling is hit: the END of the stream, because that is
+# where a tool puts the error that made it noisy.
+TOOL_OUTPUT_TAIL_BYTES = 8 * 1024
+
+
+def _drain_bounded(stream, sink, limit, stop):
+    """Read one pipe until EOF, the ceiling, or someone else gives up.
+
+    Runs on its own thread because two pipes cannot be read in sequence
+    without risking a deadlock: a tool that fills stderr while this code is
+    still reading stdout blocks forever on a full pipe buffer.
+    """
+    try:
+        while not stop.is_set():
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            sink["bytes"] += len(chunk)
+            sink["chunks"].append(chunk)
+            if sink["bytes"] > limit:
+                sink["truncated"] = True
+                stop.set()
+                break
+            # Keep only a bounded tail in memory while streaming; the whole
+            # point is that the retained size does not track the emitted size.
+            if len(sink["chunks"]) > 64:
+                joined = b"".join(sink["chunks"])
+                sink["chunks"] = [joined[-TOOL_OUTPUT_TAIL_BYTES:]] if sink["truncated"] else [joined]
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _run_bounded(args, timeout, *, max_output_bytes=TOOL_OUTPUT_MAX_BYTES):
+    """Run an archive tool under BOTH a time limit and an output limit.
+
+    communicate() bounds how long a tool may run, not how much it may say, and
+    a tool can emit a gigabyte in a second. Member-count validation happens
+    only after the listing has been emitted and parsed. Both streams are
+    bounded: a tool silent on stdout can still fill stderr.
+    """
     popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
+    sinks = {
+        "stdout": {"bytes": 0, "chunks": [], "truncated": False},
+        "stderr": {"bytes": 0, "chunks": [], "truncated": False},
+    }
+    stop = threading.Event()
     with subprocess.Popen(args, **popen_kwargs) as proc:
+        readers = [
+            threading.Thread(
+                target=_drain_bounded,
+                args=(pipe, sinks[name], max_output_bytes, stop),
+                daemon=True,
+            )
+            for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr))
+            if pipe is not None
+        ]
+        for reader in readers:
+            reader.start()
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            stop.set()
             proc.kill()
-            proc.communicate()
+            proc.wait()
+            for reader in readers:
+                reader.join(timeout=5)
             raise
-    return proc.returncode, (stdout or b"").decode("utf-8", errors="replace"), (stderr or b"").decode("utf-8", errors="replace")
+        if stop.is_set():
+            # Over budget rather than out of time. Stop the tool rather than
+            # waiting for it to finish saying whatever it was saying.
+            proc.kill()
+            proc.wait()
+        for reader in readers:
+            reader.join(timeout=5)
+
+    def collected(name):
+        sink = sinks[name]
+        data = b"".join(sink["chunks"])
+        if sink["truncated"]:
+            data = data[-TOOL_OUTPUT_TAIL_BYTES:]
+        return data.decode("utf-8", errors="replace"), sink["truncated"]
+
+    stdout_text, stdout_truncated = collected("stdout")
+    stderr_text, stderr_truncated = collected("stderr")
+    if stdout_truncated or stderr_truncated:
+        # Said in the text the callers already surface, so a refusal built from
+        # this output cannot read as a verdict about the archive's contents.
+        stderr_text = (
+            f"[inkdrop: output exceeded {max_output_bytes} bytes and the tool was stopped; "
+            f"last {TOOL_OUTPUT_TAIL_BYTES} bytes kept]\n" + stderr_text
+        )
+    return proc.returncode, stdout_text, stderr_text
 
 
 def _member_kind(name):
@@ -270,8 +364,25 @@ def _list_rar_members_unrar(source, unrar):
 # a target that the path itself says nothing about. The extractor honours all of
 # that; a name-only check does not, so a member named "Pages/link" whose target
 # is "../../outside" passes a path check and still escapes.
-RAR_MAX_MEMBERS = 10000
-RAR_MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
+# Budgets, per container format until now. RAR had a member count and a total
+# declared size; ZIP had neither, so the protection a comic archive got
+# depended on which container it arrived in. The numbers are RAR's, unchanged.
+ARCHIVE_MAX_MEMBERS = 10000
+ARCHIVE_MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
+# No single comic page is two gigabytes. A member that claims to be is either
+# a mistake or a bomb, and either way the whole-archive total alone would let
+# one member spend the entire budget before anything noticed.
+ARCHIVE_MAX_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+# Read size, and the interval at which the deadline and the running total are
+# consulted. Small enough that a refusal is prompt, large enough not to matter.
+EXTRACT_CHUNK_BYTES = 1024 * 1024
+# Declared sizes are a claim by the file under suspicion, so staging capacity
+# is checked against them with headroom rather than trusted exactly.
+ARCHIVE_STAGING_HEADROOM = 1.05
+
+# The RAR spellings, kept so the RAR checks and their tests read as they did.
+RAR_MAX_MEMBERS = ARCHIVE_MAX_MEMBERS
+RAR_MAX_TOTAL_BYTES = ARCHIVE_MAX_TOTAL_BYTES
 
 
 def _parse_sevenzip_slt_records(stdout):
@@ -470,13 +581,138 @@ def assert_extraction_contained(workdir):
                     raise ConversionRefused("extracted_member_type_unsafe", f"special:{name}")
 
 
+def _zip_member_link_kind(info):
+    """Whether a ZIP member declares itself as something other than a file.
+
+    A Unix-made entry carries its POSIX mode in the top sixteen bits of
+    external_attr. Python's extractor writes a regular file whatever that says,
+    so this is not a traversal hole -- it is refused for the reason the RAR
+    path refuses it: an archive of comic pages containing a device node is not
+    an archive of comic pages, and the next reader may not be Python.
+    """
+    if info.create_system != 3:
+        # Not a Unix-made entry, so external_attr holds DOS attributes and
+        # there is no mode to read. Saying "not a link" is the truth here.
+        return ""
+    mode = (info.external_attr >> 16) & 0xFFFF
+    # The type bits, not the whole mode. zipfile.writestr() stores 0o600 with
+    # no S_IFMT bits at all, so treating "no type declared" as "not a regular
+    # file" refuses every archive this code writes itself -- which is how the
+    # control arm of the accompanying smoke caught this.
+    if not stat.S_IFMT(mode):
+        return ""
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode) or stat.S_ISREG(mode):
+        return ""
+    return "special"
+
+
+def assert_safe_zip_members(infos):
+    """Refuse a ZIP before extraction, on the budget RAR already had.
+
+    Held close to assert_safe_rar_members: same refusal codes, same order, same
+    normalization-collision rule.
+
+    Returns (accepted relative names, total declared uncompressed bytes). The
+    total is a CLAIM from the central directory of the file under suspicion, so
+    it bounds what is attempted, never what is believed; the bytes that arrive
+    are counted again during extraction.
+    """
+    if len(infos) > ARCHIVE_MAX_MEMBERS:
+        raise ConversionRefused("source_member_count_exceeded", len(infos))
+    accepted = []
+    seen = {}
+    total = 0
+    for info in infos:
+        raw = str(info.filename)
+        if info.is_dir():
+            # A directory entry writes no bytes, but its name still has to be
+            # contained or the extractor creates it outside the work dir.
+            if _safe_relative_name(raw) is None and raw.strip():
+                raise ConversionRefused("source_member_path_unsafe", raw)
+            continue
+        link_kind = _zip_member_link_kind(info)
+        if link_kind:
+            raise ConversionRefused("source_member_type_unsafe", f"{link_kind}:{raw}")
+        relative = _safe_relative_name(raw)
+        if relative is None:
+            raise ConversionRefused("source_member_path_unsafe", raw)
+        key = _normalized_collision_key(relative)
+        if key in seen and seen[key] != relative:
+            raise ConversionRefused("source_member_normalization_collision", f"{seen[key]}|{relative}")
+        if key in seen:
+            raise ConversionRefused("source_member_duplicate", relative)
+        seen[key] = relative
+        size = max(0, int(info.file_size or 0))
+        if size > ARCHIVE_MAX_MEMBER_BYTES:
+            raise ConversionRefused("source_member_size_exceeded", {"member": relative, "declared": size})
+        total += size
+        if total > ARCHIVE_MAX_TOTAL_BYTES:
+            raise ConversionRefused("source_member_size_exceeded", total)
+        accepted.append(relative)
+    return accepted, total
+
+
+def _assert_staging_capacity(workdir, declared_total):
+    """Refuse before writing when the staging filesystem cannot hold it.
+
+    Not a security bound -- the declared total is the archive's own claim. It
+    is the difference between a named refusal and a full disk.
+    """
+    try:
+        free = shutil.disk_usage(workdir).free
+    except OSError:
+        return
+    if declared_total and free < declared_total * ARCHIVE_STAGING_HEADROOM:
+        raise ConversionRefused(
+            "source_staging_capacity_exceeded",
+            {"declared_bytes": declared_total, "free_bytes": free},
+        )
+
+
+def _extract_zip_member(archive, info, destination, relative, state):
+    """Copy one member, counting the bytes that actually arrive.
+
+    Reading to EOF is what validates the CRC, so this single pass does the work
+    testzip() used to do in a pass of its own. The old code decompressed every
+    page twice per conversion and neither pass had a budget.
+    """
+    written = 0
+    with archive.open(info) as member, open(destination, "wb") as handle:
+        while True:
+            if time.monotonic() > state["deadline"]:
+                raise ConversionRefused(
+                    "source_extraction_deadline_exceeded",
+                    {"member": relative, "seconds": EXTRACT_TIMEOUT_SECONDS},
+                )
+            chunk = member.read(EXTRACT_CHUNK_BYTES)
+            if not chunk:
+                break
+            written += len(chunk)
+            state["total"] += len(chunk)
+            # The ACTUAL bytes, not the declared ones. A central directory that
+            # understates a member is exactly how a preflight on declared sizes
+            # is defeated, so the budget is enforced again on what arrives.
+            if written > ARCHIVE_MAX_MEMBER_BYTES:
+                raise ConversionRefused(
+                    "source_member_size_exceeded",
+                    {"member": relative, "extracted": written},
+                )
+            if state["total"] > ARCHIVE_MAX_TOTAL_BYTES:
+                raise ConversionRefused("source_member_size_exceeded", state["total"])
+            handle.write(chunk)
+    return written
+
+
 def _extract_zip(source, workdir):
     try:
         with zipfile.ZipFile(source) as archive:
-            bad = archive.testzip()
-            if bad is not None:
-                raise ConversionRefused("source_member_crc_failed", bad)
-            for info in archive.infolist():
+            infos = archive.infolist()
+            _, declared_total = assert_safe_zip_members(infos)
+            _assert_staging_capacity(workdir, declared_total)
+            state = {"total": 0, "deadline": time.monotonic() + EXTRACT_TIMEOUT_SECONDS}
+            for info in infos:
                 if info.is_dir():
                     continue
                 relative = _safe_relative_name(info.filename)
@@ -484,9 +720,25 @@ def _extract_zip(source, workdir):
                     raise ConversionRefused("source_member_path_unsafe", info.filename)
                 destination = workdir / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(info) as member, open(destination, "wb") as handle:
-                    shutil.copyfileobj(member, handle)
-    except (OSError, zipfile.BadZipFile) as exc:
+                _extract_zip_member(archive, info, destination, relative, state)
+    except ConversionRefused:
+        # A refusal must not leave half an archive on disk for the next step to
+        # mistake for a complete one.
+        _empty_directory(workdir)
+        raise
+    except (zipfile.BadZipFile, zlib.error) as exc:
+        _empty_directory(workdir)
+        # Reading a member to EOF is where damage surfaces. A CRC mismatch and
+        # a deflate stream that will not decompress are both verdicts about a
+        # member rather than about the container. zlib.error is neither an
+        # OSError nor a BadZipFile, so before this it escaped the handler
+        # entirely and reached the caller as an unclassified exception -- which
+        # testzip() would have done too.
+        if "crc" in str(exc).lower() or isinstance(exc, zlib.error):
+            raise ConversionRefused("source_member_crc_failed", f"{type(exc).__name__}: {exc}")
+        raise ConversionRefused("source_archive_unreadable", f"{type(exc).__name__}: {exc}")
+    except OSError as exc:
+        _empty_directory(workdir)
         raise ConversionRefused("source_archive_unreadable", f"{type(exc).__name__}: {exc}")
     return {"extractor": "zipfile"}
 
@@ -664,10 +916,15 @@ def _write_page_archive(pages, dest_tmp, base_dir, comicinfo_file, leading_pages
     dest_tmp.parent.mkdir(parents=True, exist_ok=True)
     if dest_tmp.exists():
         dest_tmp.unlink()
+    # The archive default stays DEFLATE; inkdrop_archive_compression decides
+    # per member, so an already-compressed page is not deflated again for a
+    # gain it does not have (measured: 793 ms -> 9.7 ms over sixteen noisy
+    # JPEG pages) while a page that genuinely compresses, and ComicInfo.xml,
+    # still are.
     with zipfile.ZipFile(dest_tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for index, page in enumerate(ordered, 1):
             stored = f"{index:0{width}d}{page.suffix.lower()}"
-            archive.write(page, stored)
+            inkdrop_archive_compression.write_file_member(archive, page, stored)
             manifest.append(
                 {
                     "stored_name": stored,
@@ -677,10 +934,29 @@ def _write_page_archive(pages, dest_tmp, base_dir, comicinfo_file, leading_pages
                 }
             )
         if comicinfo_file is not None:
-            archive.writestr("ComicInfo.xml", comicinfo_file.read_bytes())
+            inkdrop_archive_compression.write_bytes_member(archive, "ComicInfo.xml", comicinfo_file.read_bytes())
         for name, data in list(extra_members or []):
-            archive.writestr(name, data)
+            inkdrop_archive_compression.write_bytes_member(archive, name, data)
     return manifest
+
+
+def _stream_member_sha256(archive, info):
+    """Hash one member while verifying its CRC, without holding it whole.
+
+    Returns (hex digest, bytes read). Reading to EOF is what makes zipfile
+    check the CRC, so a caller that needs both gets both from one pass and a
+    fixed-size buffer instead of a whole page in memory.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with archive.open(info) as member:
+        while True:
+            chunk = member.read(EXTRACT_CHUNK_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size
 
 
 def validate_cbz(path, build_meta):
@@ -689,10 +965,8 @@ def validate_cbz(path, build_meta):
     expected = {entry["stored_name"]: entry for entry in build_meta["pages"]}
     try:
         with zipfile.ZipFile(path) as archive:
-            bad = archive.testzip()
-            if bad is not None:
-                return {"ok": False, "reason": "output_member_crc_failed", "detail": bad}
-            names = [info.filename for info in archive.infolist() if not info.is_dir()]
+            infos = [info for info in archive.infolist() if not info.is_dir()]
+            names = [info.filename for info in infos]
             images = [name for name in names if _member_kind(name) == "image"]
             if len(images) != len(expected):
                 return {
@@ -700,18 +974,40 @@ def validate_cbz(path, build_meta):
                     "reason": "output_page_count_mismatch",
                     "detail": {"expected": len(expected), "found": len(images)},
                 }
-            for name in images:
-                entry = expected.get(name)
-                if entry is None:
+            # One pass over every member, not two over all of them plus a third
+            # over the pages. This used to run testzip() -- which decompresses
+            # the whole archive to check CRCs -- and then decompress every page
+            # AGAIN with archive.read(name) to hash it, holding each page whole
+            # in memory while it did. Reading a member to EOF is what makes
+            # zipfile verify its CRC, so streaming the hash does both jobs at
+            # once and never materializes a page.
+            #
+            # Every member is read, not only the images: testzip() covered
+            # ComicInfo.xml and the cover marker too, and dropping their CRC
+            # check would be a real loss disguised as an optimization.
+            for info in infos:
+                name = info.filename
+                is_page = _member_kind(name) == "image"
+                if is_page and name not in expected:
                     return {"ok": False, "reason": "output_unexpected_page", "detail": name}
-                data = archive.read(name)
-                if not data:
+                digest, size = _stream_member_sha256(archive, info)
+                if not is_page:
+                    continue
+                if not size:
                     return {"ok": False, "reason": "output_page_empty", "detail": name}
-                if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                if digest != expected[name]["sha256"]:
                     return {"ok": False, "reason": "output_page_content_mismatch", "detail": name}
             if build_meta["comicinfo_preserved"] and "ComicInfo.xml" not in names:
                 return {"ok": False, "reason": "output_comicinfo_missing"}
-    except (OSError, zipfile.BadZipFile) as exc:
+    except (zipfile.BadZipFile, zlib.error) as exc:
+        # Reading to EOF is where damage surfaces now. A CRC mismatch and a
+        # deflate stream that will not decompress are both verdicts about the
+        # output. zlib.error is neither an OSError nor a BadZipFile, so it used
+        # to escape this handler entirely.
+        if "crc" in str(exc).lower() or isinstance(exc, zlib.error):
+            return {"ok": False, "reason": "output_member_crc_failed", "detail": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "reason": "output_archive_unreadable", "detail": f"{type(exc).__name__}: {exc}"}
+    except OSError as exc:
         return {"ok": False, "reason": "output_archive_unreadable", "detail": f"{type(exc).__name__}: {exc}"}
     return {
         "ok": True,

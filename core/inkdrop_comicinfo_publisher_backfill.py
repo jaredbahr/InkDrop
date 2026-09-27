@@ -20,6 +20,7 @@ from core import inkdrop_safe_xml
 
 import inkdrop_completed_import as importer
 from inkdrop_manga_metadata_guard import read_bounded_comicinfo, env_path, STATE_DIR
+from core import inkdrop_db
 
 INKDROP_STATE_DB = importer.INKDROP_STATE_DB
 BACKUP_ROOT = env_path("INKDROP_BACKUP_DIR", STATE_DIR / "backups")
@@ -36,7 +37,7 @@ def now_slug():
 
 def library_series_rows(series_filter=None):
     filters = {str(item).strip().lower() for item in (series_filter or []) if str(item).strip()}
-    conn = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True)
+    conn = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(

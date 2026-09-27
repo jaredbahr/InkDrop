@@ -722,7 +722,7 @@
   overflow-wrap: anywhere;
 }
 
-/* #572 expected-versus-found, inside the Reason cell. Reference the operator
+/* Expected-versus-found, inside the Reason cell. Reference the operator
    reads while deciding, so it sits quiet under the badge rather than
    competing with it. The found value is a file name and must stay readable
    and unmangled, so it wraps rather than truncating. */
@@ -1290,3 +1290,80 @@
   }
 }
 
+
+/* A section that failed to render. Deliberately looks like a contained
+   panel rather than a full-page error: the point it has to make is that
+   the rest of the app still works, so it must not read as the app being
+   down. See web/frontend/src/SectionErrorBoundary.tsx. */
+.section-error-boundary {
+  margin: 16px 0;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--danger, #d9534f);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.section-error-boundary h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.section-error-boundary p {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.section-error-boundary-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.section-error-boundary-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+/* Available to assistive technology, absent from the visual layout. Used by
+   the islands' polite status region (web/frontend/src/selection.tsx): the
+   selected-row count is already on screen as a visible chip, so repeating it
+   visually would be noise, but it had no spoken equivalent at all. */
+.inkdrop-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Per-item outcomes for bulk row actions. Hidden until something has run,
+   so it never occupies space in a session that has not used a bulk action.
+   See recordInkdropActionResults() in core/inkdrop_web.py. */
+.inkdrop-action-results-button {
+  align-self: flex-start;
+  margin: 8px 0 0;
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.inkdrop-action-results-button:hover {
+  color: var(--text);
+}
+
+.inkdrop-action-results-button.has-failures {
+  border-color: var(--danger, #d9534f);
+  color: var(--text);
+}

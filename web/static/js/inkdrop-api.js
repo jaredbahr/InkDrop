@@ -186,11 +186,26 @@
         status: response.status,
       };
     }
+    const expectsJson = contentType.includes("json");
+    // 204 and 205 are defined to carry no body, so there is nothing to decode
+    // and nothing malformed about that.
+    const noContent = response.status === 204 || response.status === 205;
     let payload = {};
-    try {
-      payload = contentType.includes("json") ? await response.json() : {detail: await response.text()};
-    } catch (_error) {
-      payload = {};
+    // Remembered rather than swallowed. This used to be replaced with `{}`,
+    // which is indistinguishable from a successful empty object, so a 200
+    // nobody could decode was returned to the caller as a success.
+    let decodeFailure = null;
+    if (!noContent) {
+      try {
+        payload = expectsJson ? await response.json() : {detail: await response.text()};
+      } catch (cause) {
+        // The abort guard around fetch() itself already rethrows. Consuming
+        // the body is the other place a cancellation lands, and it was being
+        // turned into a successful empty object.
+        if (cause?.name === "AbortError") throw cause;
+        decodeFailure = cause;
+        payload = {};
+      }
     }
     if (!response.ok || payload?.ok === false) {
       const code = String(payload?.code || payload?.error || `http_${response.status}`);
@@ -214,6 +229,29 @@
       error.retryAfter = error.retry_after;
       if (response.status === 401) window.dispatchEvent(new CustomEvent("inkdrop:session-expired", {detail: {path: location.hash || location.pathname}}));
       throw error;
+    }
+    // Past here the server said this succeeded, so the response has to
+    // actually be the JSON object every caller destructures.
+    if (noContent) return {};
+    const protocolFailure = decodeFailure
+      ? `The response body could not be read: ${decodeFailure.message}`
+      : !expectsJson
+        ? `The server answered ${response.status} with ${contentType || "no content type"} where JSON was expected.`
+        : !isPlainObject(payload)
+          ? `The server answered ${response.status} with a JSON ${Array.isArray(payload) ? "array" : typeof payload}, not an object.`
+          : "";
+    if (protocolFailure) {
+      throw new InkDropApiError(
+        "InkDrop got an unreadable reply from the server. Retry, and check whether anything sits between "
+        + "your browser and InkDrop.",
+        {
+          status: response.status,
+          code: "malformed_response",
+          detail: protocolFailure,
+          request_id: requestId,
+          cause: decodeFailure,
+        },
+      );
     }
     return payload;
   }

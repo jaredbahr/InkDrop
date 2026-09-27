@@ -490,7 +490,7 @@ def download_direct_file(
     if not http_get:
         return _blocked("http_client_required", provider_id=provider_id, download_task_id=download_task_id)
     # download_root/incomplete_root are the trusted confinement boundaries; a
-    # caller that only knows about one shared root (the pre-#281 contract)
+    # caller that only knows about one shared root (the single-root contract)
     # still works because both fall back to staging_root.
     resolved_download_root = download_root or staging_root
     resolved_incomplete_root = incomplete_root or resolved_download_root
@@ -819,7 +819,7 @@ def download_direct_task(
     # incomplete_root is a trusted confinement boundary, so it must come from
     # an explicit caller (the coordinator resolves it from the provider
     # registry row -- see inkdrop_source_providers.direct_download_incomplete_
-    # root) or fall back to sharing download_root, same as the pre-#281
+    # root) or fall back to sharing download_root, same as the original
     # single-root contract. Deriving it from the task's own stored
     # partial_path would make the confinement check meaningless: a path is
     # always "inside" its own parent, so any stored path would trivially pass.

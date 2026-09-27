@@ -22,6 +22,7 @@ from core import inkdrop_source_registry as registry
 from core import inkdrop_source_worker_adapters as adapters
 from core import inkdrop_source_worker_plan as worker_plan
 from core import inkdrop_source_worker_runtime as runtime
+from core import inkdrop_db
 
 
 CONTRACT_VERSION = 1
@@ -369,7 +370,7 @@ def _mangadex_query_rotation(db_path, wanted_item, query_pool):
         return {}
     con = None
     try:
-        con = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=1.0)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True, timeout=1.0)
         con.row_factory = sqlite3.Row
         if not _sqlite_table_exists(con, "source_attempts"):
             return {}
@@ -517,7 +518,7 @@ def _suwayomi_recent_source_error_buckets(db_path, *, now, window_seconds):
     buckets = {}
     con = None
     try:
-        con = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=1.0)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True, timeout=1.0)
         con.row_factory = sqlite3.Row
         if not _sqlite_table_exists(con, "source_attempts"):
             return []
@@ -751,7 +752,7 @@ def _suwayomi_recent_volume_gap_buckets(db_path, *, now, window_seconds, wanted_
     buckets = {}
     con = None
     try:
-        con = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=1.0)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True, timeout=1.0)
         con.row_factory = sqlite3.Row
         if not _sqlite_table_exists(con, "source_attempts"):
             return []
@@ -2617,7 +2618,7 @@ def run_source_jobs(
 
     The whole automatic search is one process, one item at a time, one provider
     at a time, one request at a time: nothing in the source worker has ever
-    overlapped. Manual search has run its providers in a pool since #599 and is
+    overlapped. Manual search has run its providers in a pool for some time and is
     5-20x faster per item against the same hosts, so the precedent for the fan-
     out and its shutdown is in-repo rather than invented here.
 

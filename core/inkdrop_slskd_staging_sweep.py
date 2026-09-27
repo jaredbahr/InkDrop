@@ -35,6 +35,7 @@ import time
 
 from core import inkdrop_runtime_config
 from core import inkdrop_archive_conversion
+from core import inkdrop_db
 
 try:
     from core import inkdrop_state
@@ -383,7 +384,7 @@ def load_priority_paths():
     matched by basename, for the case below where only a filename (not a
     full local path) was ever recorded."""
     try:
-        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=10)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(STATE_DB), uri=True, timeout=10)
         con.execute("pragma busy_timeout = 10000")
     except sqlite3.OperationalError:
         return set(), set()
@@ -579,7 +580,7 @@ def process_one_file(path):
 # qBittorrent completion waits skip a file before import_files() matches it to
 # a target, so no acceptance rule sees it. Counted as judgements, any of these
 # let a run that re-judged nothing read as all_candidates_processed while the
-# checkpoint window held the rest back (row #961). lock_busy is never counted
+# checkpoint window held the rest back. lock_busy is never counted
 # as processed in the first place.
 NOT_A_JUDGEMENT_REASONS = frozenset({
     "no_decision_returned",
@@ -617,7 +618,7 @@ def main():
     # into "nothing held back this run can be re-judged before T" -- the one
     # fact a person verifying an acceptance-rule change needs to exclude those
     # files or wait them out, instead of reading a pass over files the run
-    # never showed to acceptance code (row #961).
+    # never showed to acceptance code.
     held_checked_at = []
     if page_directory_summary["enabled"]:
         page_directory_started = time.time()

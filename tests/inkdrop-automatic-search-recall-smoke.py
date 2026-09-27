@@ -1,18 +1,47 @@
 #!/usr/bin/env python3
 """Focused regressions for broad-first automatic provider discovery."""
 
+import atexit
+import os
+import shutil
+import tempfile
 from unittest import mock
 
-from core import inkdrop_slskd_source_probe as slskd
-from core import inkdrop_candidate_matching as matching
-from core import inkdrop_manual_search as manual_search
-from core import inkdrop_manual_search_executor as manual_search_executor
-from core import inkdrop_series_autopilot as autopilot
-from core import inkdrop_source_providers as providers
-from core import inkdrop_source_worker_adapters as adapters
-from core import inkdrop_source_worker_http as source_http
-from core import inkdrop_source_worker_jobs as jobs
-from core import inkdrop_sources
+# inkdrop_slskd_source_probe fixes STATE_DIR (and the real-search marker path
+# under it) once, at import, from INKDROP_STATE_DIR and friends, falling back
+# to the real default state dir otherwise. One arm below reaches a real
+# slskd.slskd_search() with only slskd_post()/pacing mocked, so if that arm
+# ever takes the live-POST branch, record_real_slskd_search_sent() would run
+# for real and write slskd-real-search-sent.json into the real default state
+# dir (D:\state on Windows) -- isolated here, before the import, so that can
+# never happen regardless of which branch a future edit exercises.
+_ISOLATED_ROOT = tempfile.mkdtemp(prefix="tmp-automatic-search-recall-smoke-")
+atexit.register(shutil.rmtree, _ISOLATED_ROOT, True)
+for _var, _rel in (
+    ("INKDROP_CONFIG_DIR", "config"),
+    ("INKDROP_STATE_DIR", "state"),
+    ("INKDROP_LOCK_DIR", "state/locks"),
+    ("INKDROP_LOG_DIR", "state/logs"),
+    ("INKDROP_CACHE_DIR", "state/cache"),
+    ("INKDROP_BACKUP_DIR", "state/backups"),
+    ("INKDROP_STAGING_DIR", "staging"),
+    ("INKDROP_MANUAL_INBOX_DIR", "manual-inbox"),
+    ("INKDROP_QUARANTINE_DIR", "state/quarantine"),
+):
+    _path = os.path.join(_ISOLATED_ROOT, _rel)
+    os.makedirs(_path, exist_ok=True)
+    os.environ[_var] = _path
+
+from core import inkdrop_slskd_source_probe as slskd  # noqa: E402
+from core import inkdrop_candidate_matching as matching  # noqa: E402
+from core import inkdrop_manual_search as manual_search  # noqa: E402
+from core import inkdrop_manual_search_executor as manual_search_executor  # noqa: E402
+from core import inkdrop_series_autopilot as autopilot  # noqa: E402
+from core import inkdrop_source_providers as providers  # noqa: E402
+from core import inkdrop_source_worker_adapters as adapters  # noqa: E402
+from core import inkdrop_source_worker_http as source_http  # noqa: E402
+from core import inkdrop_source_worker_jobs as jobs  # noqa: E402
+from core import inkdrop_sources  # noqa: E402
 
 
 def require(value, message):
@@ -226,7 +255,7 @@ for item, exact_suffix in localized_volume_cases:
 # This read `ordinary_queries[:6]`, where 6 was calibrated against a plan that
 # carried two rungs -- `collection` (0 productive / 10 zero) and `volumes`
 # (0 / 12) -- that measurement says never produce anything. Removing them is
-# what #600 is for, and it moves everything below them up a slot, so the
+# the intended fix, and it moves everything below them up a slot, so the
 # constant went stale the moment the dead rungs went away. A promotion rule
 # expressed as an absolute index is a rule that re-breaks every time a rung is
 # added or deleted above the line, which is drift wearing the costume of a
@@ -452,7 +481,7 @@ partial_calls = 0
 
 def partial_response(_request):
     global partial_calls
-    # The capability probe behind category resolution (#198) is not a search and
+    # The capability probe behind category resolution is not a search and
     # must not consume this fixture's call count, or the "first search succeeds,
     # second times out" shape below silently inverts.
     if str(_request.get("url") or "").endswith("/api/v1/indexer"):

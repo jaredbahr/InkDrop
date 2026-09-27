@@ -28,6 +28,7 @@ from core import inkdrop_records
 from core import inkdrop_state
 from core import inkdrop_source_catalog
 from core import inkdrop_sources
+from core import inkdrop_db
 
 
 DEFAULT_PROVIDER_ID = "suwayomi_managed_folder"
@@ -122,7 +123,7 @@ def _provider_policy_from_db(db_path, provider_id=DEFAULT_PROVIDER_ID):
     if not path.exists():
         return {}
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True)
     except Exception:
         return {}
     try:
@@ -471,7 +472,7 @@ def _provider_config_from_db(db_path, provider_id=DEFAULT_PROVIDER_ID):
     if not path.exists():
         return {"exists": False, "enabled": False, "settings": {}, "policy": {}}
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True)
     except Exception:
         return {"exists": False, "enabled": False, "settings": {}, "policy": {}}
     try:
@@ -521,7 +522,7 @@ def load_active_wanted_index(db_path, queue_ids=None):
     if queue_ids:
         queue_filter_sql = "and q.id in (%s)" % ",".join("?" for _ in queue_ids)
         params.extend(queue_ids)
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(path), uri=True)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from core import inkdrop_notification_store as store
 from core import inkdrop_notifications
+from core import inkdrop_db
 
 DOWNLOAD_TASK_SCAN_LIMIT = 500
 TASK_WATCH_PREFIX = "dt:"
@@ -74,7 +75,7 @@ UPDATE_NOTABLE_STATES = {"update_available", "newer_prerelease_available"}
 
 
 def _read_only_connect(db_path):
-    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=30.0)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=30.0)
     con.row_factory = sqlite3.Row
     return con
 

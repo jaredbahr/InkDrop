@@ -701,7 +701,7 @@ def wanted_item_from_queue(queue, db_path=None, *, con=None, singleton_context=N
         wanted["issue_title_shared_by_sibling_units"] = bool(
             row_issue_title and row_issue_title in {str(value or "") for value in shared_titles}
         )
-    # Tracker #296. This is the one producer on the acquisition path that holds
+    # This is the one producer on the acquisition path that holds
     # a db_path; everything downstream is pure (candidate, item) functions with
     # no database in scope. Read the stored settings here and carry them, so an
     # operator's choice reaches the matcher instead of dying at the first
@@ -710,14 +710,14 @@ def wanted_item_from_queue(queue, db_path=None, *, con=None, singleton_context=N
     # Read at projection time, from the live settings row, for a queue item
     # that is being worked NOW. It re-evaluates nothing: no stored decision is
     # revisited and nothing is written back -- this dict is an in-memory
-    # projection, never persisted. #296's never-retroactive rule holds.
+    # projection, never persisted. The never-retroactive rule holds.
     if db_path is not None:
         try:
             wanted[inkdrop_acquisition_policy.SETTINGS_SNAPSHOT_KEY] = inkdrop_state.acquisition_policy_settings(db_path)
         except Exception:
             # A settings read must never take down a search. Absent snapshot
             # means resolve() falls to the shipped defaults, which is exactly
-            # the pre-#296 behaviour -- degraded, not wrong.
+            # the earlier behaviour -- degraded, not wrong.
             pass
     return {key: value for key, value in wanted.items() if value not in (None, "", [], {})}
 
@@ -911,8 +911,24 @@ def pending_direct_stage_queue_ids(db_path, *, limit=50, exclude_queue_ids=None,
     return out
 
 
-def pending_download_client_handoff_queue_ids(db_path, *, limit=50, queue_ids=None, now=None):
-    """Return accepted client tasks that still need an authoritative client job."""
+def pending_download_client_handoff_queue_ids(
+    db_path, *, limit=50, queue_ids=None, now=None, return_oldest_started_at=False
+):
+    """Return accepted client tasks that still need an authoritative client job.
+
+    With ``return_oldest_started_at=True`` also returns the age anchor for the
+    stall clock: the smallest ``started_at`` (``updated_at`` if unset) among the active
+    handoff tasks actually found, i.e. how long the oldest pending handoff has
+    been sitting there. That is a fact about the row, not about how many rows
+    are pending, so it cannot reset just because the pending count is flat or
+    briefly ticks between 1 and 2 -- see ``handoff_gate_stall_state``.
+
+    The prefilter below orders candidates the same way: oldest ``started_at``
+    first, ``updated_at`` only as a fallback when ``started_at`` is unset. It
+    matches the age anchor's own preference so the row that will actually
+    become ``oldest_started_at`` is not dropped by the ``limit`` cutoff before
+    it is ever looked at.
+    """
 
     included = [str(value or "").strip() for value in (queue_ids or []) if str(value or "").strip()]
     limit = max(1, min(int(limit or 50), 100))
@@ -921,10 +937,10 @@ def pending_download_client_handoff_queue_ids(db_path, *, limit=50, queue_ids=No
     else:
         with inkdrop_state.connect_read(db_path) as con:
             if not inkdrop_state.table_exists(con, "download_tasks"):
-                return []
+                return ([], None) if return_oldest_started_at else []
             rows = con.execute(
                 """
-                select queue_id, min(coalesce(updated_at, started_at, 0)) as first_seen
+                select queue_id, min(coalesce(started_at, updated_at, 0)) as first_seen
                 from download_tasks
                 where queue_id is not null
                   and lower(coalesce(download_client,'')) in
@@ -941,6 +957,7 @@ def pending_download_client_handoff_queue_ids(db_path, *, limit=50, queue_ids=No
         candidates = [str(row["queue_id"] or "").strip() for row in rows]
     out = []
     seen = set()
+    oldest_started_at = None
     with inkdrop_state.connect_read(db_path) as con:
         for queue_id in candidates:
             if not queue_id or queue_id in seen:
@@ -966,11 +983,23 @@ def pending_download_client_handoff_queue_ids(db_path, *, limit=50, queue_ids=No
                 or inkdrop_state.series_row_user_removed({"raw_json": queue["series_raw_json"]})
             ):
                 continue
-            if download_client_handoff_tasks_for_queue(db_path, queue_id, limit=1, now=now):
+            active_tasks = download_client_handoff_tasks_for_queue(db_path, queue_id, limit=1, now=now)
+            if active_tasks:
                 out.append(queue_id)
+                if return_oldest_started_at:
+                    task = active_tasks[0]
+                    # started_at first: updated_at moves whenever anything touches
+                    # the row, and an age that a retry can reset is the same
+                    # defect as a count that can tick.
+                    try:
+                        started_at = float(task.get("started_at") or task.get("updated_at") or 0)
+                    except (TypeError, ValueError):
+                        started_at = 0.0
+                    if started_at > 0 and (oldest_started_at is None or started_at < oldest_started_at):
+                        oldest_started_at = started_at
             if len(out) >= limit:
                 break
-    return out
+    return (out, oldest_started_at) if return_oldest_started_at else out
 
 
 def _legacy_sab_url_fetch_failure(task):
@@ -1431,14 +1460,24 @@ def _task_download_locator(task):
     task = _dict(task)
     raw = _dict(task.get("raw_json"))
     candidate = _dict(raw.get("candidate"))
+    owner_identity = str(task.get("candidate_identity") or "").strip()
     values = []
+    bound_values = []
     seen_values = set()
+    bound_seen = set()
 
     def add(value):
         text = str(value or "")
         if _is_protected_locator(text) and text not in seen_values:
             seen_values.add(text)
             values.append(text)
+
+    def add_bound(value):
+        text = str(value or "")
+        if _is_protected_locator(text) and text not in bound_seen:
+            bound_seen.add(text)
+            bound_values.append(text)
+        add(value)
 
     def visit_nested(value, depth=0):
         if depth > 6:
@@ -1464,6 +1503,32 @@ def _task_download_locator(task):
                 if isinstance(item, (dict, list)):
                     visit_nested(item, depth + 1)
 
+    def visit_bound(value, depth=0):
+        if depth > 2:
+            return
+        if isinstance(value, dict):
+            candidate_identity = str(value.get("candidate_identity") or "").strip()
+            if owner_identity and candidate_identity == owner_identity:
+                for key in (
+                    "download_id",
+                    "download_url",
+                    "downloadUrl",
+                    "downloadUrlRemote",
+                    "external_id",
+                    "guid",
+                    "magnetUrl",
+                    "magnet_url",
+                ):
+                    add_bound(value.get(key))
+            for key in ("candidate", "download_task", "indexer", "raw", "raw_json"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    visit_bound(nested, depth + 1)
+        elif isinstance(value, list):
+            for item in value[:25]:
+                if isinstance(item, (dict, list)):
+                    visit_bound(item, depth + 1)
+
     for value in (
         raw.get("download_id"),
         raw.get("download_url"),
@@ -1478,9 +1543,17 @@ def _task_download_locator(task):
         candidate.get("magnet_url"),
     ):
         add(value)
+    visit_bound(raw)
     visit_nested(raw)
     add(task.get("external_id"))
     if not values:
+        return ""
+
+    bound_digest = str(raw.get("locator_digest") or "").strip().lower()
+    if bound_digest:
+        for value in bound_values:
+            if hashlib.sha256(value.encode("utf-8")).hexdigest() == bound_digest:
+                return value
         return ""
 
     def priority(value):
@@ -1885,7 +1958,31 @@ def _stable_handoff_lookup_without_locator(task, client):
 
 def _default_download_client_adder(task):
     task = _dict(task)
+    raw_task = _dict(task.get("raw_json"))
+    bound_digest = str(raw_task.get("locator_digest") or "").strip().lower()
+    owner_identity = str(task.get("candidate_identity") or "").strip()
+    binding_evidence_identity = _first_text(
+        raw_task.get("candidate_identity"),
+        _dict(raw_task.get("candidate")).get("candidate_identity"),
+        _dict(_dict(raw_task.get("raw")).get("candidate")).get("candidate_identity"),
+    )
+    binding_required = bool(owner_identity and binding_evidence_identity)
     locator = _task_download_locator(task)
+    if (
+        (binding_required and not bound_digest)
+        or (
+            bound_digest
+            and (
+                not locator
+                or bound_digest != hashlib.sha256(locator.encode("utf-8")).hexdigest()
+            )
+        )
+    ):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "candidate_locator_binding_mismatch",
+        }
     if not locator:
         client = _normalize_handoff_client(task.get("download_client") or task.get("protocol"))
         stable = _stable_handoff_lookup_without_locator(task, client)
@@ -1895,14 +1992,6 @@ def _default_download_client_adder(task):
             "ok": False,
             "status": "failed_download",
             "reason": "download_locator_missing",
-        }
-    raw_task = _dict(task.get("raw_json"))
-    bound_digest = str(raw_task.get("locator_digest") or "").strip().lower()
-    if bound_digest and bound_digest != hashlib.sha256(locator.encode("utf-8")).hexdigest():
-        return {
-            "ok": False,
-            "status": "blocked",
-            "reason": "candidate_locator_binding_mismatch",
         }
     client = _normalize_handoff_client(task.get("download_client") or task.get("protocol"))
     title = _first_text(task.get("title"), task.get("candidate_identity"), task.get("external_id"), "InkDrop source result")

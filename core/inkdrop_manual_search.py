@@ -331,6 +331,31 @@ def trusted_target_unit_identity(value: dict[str, Any] | None) -> dict[str, str]
                     "source": "series_manga_unit_override",
                     "volume_number": unit_number,
                 }
+        # A chapter-native SERIES provider is the authority on which units the
+        # series ships, and its own issue rows cannot outvote it. The branch
+        # below reads ``issue_provider or series_provider``, so a MangaDex
+        # series whose chapter rows carry ComicVine provenance -- what a
+        # companion link writes, 887 of the 1,005 wanted rows on MangaDex manga
+        # series in the 2026-09-22 snapshot -- came back as a VOLUME want whose
+        # volume number was the chapter number. That relabel is what refused
+        # "One Piece 1191" as wrong_unit_type, compared "Centuria v02" against
+        # chapter 102 as wrong_volume_number, turned the indexer query pool
+        # volume-shaped, and made suwayomi_volume_metadata_missing reachable
+        # for a chapter.
+        #
+        # Deliberately below the per-series override: an operator who has said
+        # "this MangaDex series is volume-managed" still wins. And deliberately
+        # below the chapter-native ISSUE provider branch above, which already
+        # states the mirror-image rule for MangaDex chapters hanging off a
+        # ComicVine series. Nothing here relaxes a gate -- the volume gate
+        # still refuses a volume pack for a chapter want; the want is simply
+        # labelled by the series that owns it.
+        if series_provider in MANGA_CHAPTER_METADATA_PROVIDERS:
+            return {
+                "unit_type": "chapter",
+                "source": "trusted_chapter_series_metadata_provider",
+                "volume_number": "",
+            }
         # ComicVine/Kapowarr issue rows for a manga publication are the
         # volume-managed release units.  Their issue titles are often subtitles
         # (for example, "Founding"), so requiring the word "Volume" loses the
@@ -1092,7 +1117,7 @@ def _canonical_pack_target_safe(candidate: dict[str, Any], context: dict[str, An
         "edition_marker": context.get("edition_marker"),
         "publication_title": context.get("publication_title"),
         # Explicit, and NOT the acquisition-settings-snapshot gap the slskd
-        # probe's loaders and entry points close (tracker #828). Two facts, in
+        # probe's loaders and entry points close. Two facts, in
         # order. First, `settings` is None on every production call: the one
         # caller is normalize_candidate() below, which passes nothing, and
         # `context` comes from structured_search_input(), a fixed-key
@@ -1105,7 +1130,7 @@ def _canonical_pack_target_safe(candidate: dict[str, Any], context: dict[str, An
         # same dict with this one key dropped and settings admit -> admit.
         # Threading settings= through would therefore not move
         # collected_edition at all, only pack_containment, unit_preference and
-        # unidentified_unit -- a different change from the one #828 asked for.
+        # unidentified_unit -- a separate change from this one.
         # The pin is the point: a pack is proof only when it contains the
         # wanted unit itself, which is why a manifest member parsing as a
         # collected edition is refused outright above, before any matcher call.

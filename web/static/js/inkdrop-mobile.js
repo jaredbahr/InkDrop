@@ -402,6 +402,12 @@
     els.series.hidden = name !== "series";
     els.add.hidden = name !== "add";
     els.stuck.hidden = name !== "stuck";
+    // m-screen-active marks which section is current, for styling and for
+    // tests (e.g. a closest("[hidden], .m-screen:not(.m-screen-active)")
+    // focus check) to key on independently of the hidden attribute.
+    [els.home, els.series, els.add, els.stuck].forEach((section) => {
+      section.classList.toggle("m-screen-active", section === els[name]);
+    });
     els.nav.querySelectorAll(".m-nav-btn").forEach((btn) => {
       btn.classList.toggle("m-nav-active", btn.dataset.screen === name);
     });
@@ -1181,7 +1187,7 @@
   // copy of the allowed-source list -- the server re-checks the source itself
   // in approve_manual_review(), and a second, drifting copy here is exactly
   // how a button ends up enabled for an action the backend will refuse.
-  // #572. The server already knows what was wanted and what actually arrived
+  // The server already knows what was wanted and what actually arrived
   // (decision_evidence(), core/inkdrop_import_evidence.py). This renders it so
   // the operator decides from the facts instead of inferring them from a
   // reason code.
@@ -1189,7 +1195,7 @@
   // THREE outcomes, kept distinct on purpose. Collapsing the middle one is how
   // a blank field starts reading as "nothing was expected" -- the same
   // false-certainty shape that has cost this library books:
-  //   no decision_evidence at all  -> render nothing (payload predates #572)
+  //   no decision_evidence at all  -> render nothing (legacy payload)
   //   decision_evidence.incomplete -> say in words that we do not know
   //   otherwise                    -> expected / found / why
   function reviewEvidenceHtml(evidence) {
@@ -1359,14 +1365,14 @@
               // path title-cased: the client can see a separator as well as the
               // server can, and mutating a path is data loss, not cosmetics.
               ? `<span class="m-item-source">${escapeHtml(
-                  // Path check FIRST, before any label function. #814 landed
+                  // Path check FIRST, before any label function. The
                   // row.source_label (source_display_label(), this repo's one
-                  // source-naming function) after this branch was cut; it is
+                  // source-naming function) was added after this branch was cut; it is
                   // the right name for a PROVIDER id and the wrong thing for a
                   // path, because source_display_label is itself what mutates
                   // the path. Consulting it ahead of the separator check would
                   // hand a mutated path straight back. Ordered this way mobile
-                  // keeps #814's naming without reopening #820's defect.
+                  // keeps its naming without reopening the earlier defect.
                   //
                   // The last resort used to be humanizeToken(), a title-caser
                   // that knows no source names at all -- so a row arriving

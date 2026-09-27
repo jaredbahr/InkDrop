@@ -49,6 +49,23 @@
   // complete release history without adding old entries to every page load.
   var DETAILED_RELEASES = Object.freeze([
     publicRelease({
+      version: "v0.1.18",
+      slug: "v0-1-18",
+      released_at: "2026-09-27",
+      title: "Files stay with the right book",
+      summary: "Files from another volume no longer satisfy the wrong book, stale issue totals are corrected, Soulseek retries stop looping, and automatic imports receive front covers when available.",
+      highlights: [
+        "A file from another volume no longer satisfies a book",
+        "An issue total is no longer read as the issue number",
+        "New imports receive a front cover when the series has one",
+        "A corrupt canonical archive no longer blocks a good download",
+        "A stuck Soulseek transfer no longer consumes retries on every pass",
+        "Chapter links stay in the chapter lane",
+        "Automatic Search no longer waits on a handoff that will not clear",
+        "Read-scoped keys cannot download backup archives",
+      ],
+    }),
+    publicRelease({
       version: "v0.1.17",
       slug: "v0-1-17",
       released_at: "2026-09-16",
@@ -193,23 +210,6 @@
         "Manual Review's Reject and Search Again actually retries now, and accepts exact unresolved manga matches with a real approve path.",
         "A verified collected trade now satisfies an individual issue want directly, and stale import claims auto-release after a timeout instead of blocking forever.",
         "Added an OPDS catalog discoverability panel to Settings, and Series pages now render through the same fast, virtualized approach used elsewhere in InkDrop."
-      ]
-    }),
-    publicRelease({
-      version: "v0.1.08",
-      slug: "v0-1-08",
-      released_at: "2026-08-07",
-      title: "Undo a wrong match, fix manga units per series, and steadier imports",
-      summary: "Mostly focused on search/import reliability, better troubleshooting when something goes wrong, and UI cleanup, including a way to correct a wrong match after import and fix a series' manga unit type individually.",
-      highlights: [
-        "Manga series that release as individual issues are no longer searched and imported as volumes -- InkDrop now checks the series itself instead of assuming based on the provider.",
-        "Added a way to correct a wrong match after import: retract it, quarantine the file, and start a new search for the right one.",
-        "Allow-and-retry on Blocklist no longer hangs waiting on an external API; blocked items now show the source filename, wanted issue, and rejection reason.",
-        "Manual Review now shows the actual SLSKD filename, wanted issue, and rejection reason, with working approve/retry/delete and pagination for larger queues.",
-        "The Test button for additional SLSKD instances now performs a real connection check instead of doing nothing.",
-        "ComicInfo.xml now includes publisher information from ComicVine, backfilled across 2,417 existing archives.",
-        "Suwayomi and MangaDex downloads are now correctly attributed in History instead of losing their source.",
-        "Fixed a long-running import verification bug that could leave successfully imported files stuck for weeks."
       ]
     }),
   ]);

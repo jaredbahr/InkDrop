@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { request, InkDropApiError } from "../api";
+import { useLatestOnly } from "../latestOnly";
 import { useRowActions } from "../rowActions";
+import { SelectAllCheckbox, SelectionStatus, useFocusRetention } from "../selection";
+import { seriesNav, shellCapability, wantedNav } from "../shellBridge";
 import type { WantedRow, WantedViewPayload, WantedRunResult } from "./wantedTypes";
 import { rowStateLabel } from "./stateLabel";
 
@@ -51,18 +54,10 @@ function canSelectRow(row: WantedRow): boolean {
 // real running instance: no .arr-table-controlbar-wanted node exists in the
 // DOM at all. So this isn't reconnecting a disabled button to a live wire;
 // there is no wire, and no button. The toolbar has to live here.
-const shell = window as unknown as {
-  InkDropWantedNav?: {
-    runSelectedSearches?: (rows: WantedRow[]) => Promise<void>;
-  };
-  InkDropSeriesNav?: {
-    // openManualSearchForRow (inkdrop_web.py) only reads series_id/issue_id/
-    // unit_id/edition_id/series/title/issue_number off the row it's given --
-    // it doesn't care which view's row shape called it. Reused as-is here,
-    // same reasoning SeriesDetail.tsx already applies to this same bridge.
-    openManualSearch?: (row: WantedRow) => boolean;
-  };
-};
+// Both bridges are declared once in src/shellBridge.ts, which also explains
+// why openManualSearchForRow takes a structural target rather than this
+// view's row type: it reads a fixed handful of fields and does not care
+// which view's row shape called it.
 
 export function Wanted({ payload }: { payload: WantedViewPayload }) {
   const [rows, setRows] = useState<WantedRow[]>(payload.rows || []);
@@ -74,7 +69,7 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
   const [error, setError] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [runningSelected, setRunningSelected] = useState(false);
-  const { pendingIds, doneIds, actionError, clearActionError, runRowAction } = useRowActions(() => loadPage(offset));
+  const { pendingIds, doneIds, actionError, actionOutcome, clearActionError, runRowAction } = useRowActions(() => loadPage(offset));
 
   // A fresh `payload` reference only arrives when the surrounding shell
   // re-fetched page one on our behalf (filter change, section re-entry) --
@@ -93,20 +88,26 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
     setSelectedIds(new Set());
   }, [payload]);
 
+  // Only the newest list request may write to this section's state.
+  const listRequest = useLatestOnly();
+
   async function loadPage(nextOffset: number) {
+    const isCurrent = listRequest.begin();
     setLoading(true);
     setError(null);
     try {
       const data = await request<{ ok: boolean; view: WantedViewPayload }>(buildEndpoint(nextOffset, wantedFilter));
+      if (!isCurrent()) return;
       const view = data.view;
       setRows(view.rows || []);
       setOffset(view.offset ?? nextOffset);
       setTotalCount(view.total_count || 0);
       setHasMore(Boolean(view.has_more));
     } catch (cause) {
+      if (!isCurrent()) return;
       setError(cause instanceof InkDropApiError ? cause.message : "Could not load Wanted page.");
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -124,8 +125,25 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
   }
 
   const selectableRows = rows.filter(canSelectRow);
+  const selectableIds = selectableRows.map((row) => row.id);
+  // A control the shell cannot service is disabled and says why, rather than
+  // being enabled and doing nothing. Both of these used to be guarded by
+  // `if (!bridge) return` inside the click handler, which makes the ABSENCE
+  // safe and the SILENCE inevitable -- the operator clicks an enabled button
+  // and gets no action and no explanation.
+  const bulkSearch = shellCapability(
+    wantedNav().runSelectedSearches,
+    "Bulk search is not available on this page yet. Reload, then try again.",
+  );
+  const manualSearch = shellCapability(
+    seriesNav().openManualSearch,
+    "Manual Search is not available on this page yet. Reload, then try again.",
+  );
+  // A row action usually removes its row and the coalesced reload replaces
+  // every node regardless, so the focused control vanishes and focus falls
+  // to <body> -- the next Tab then restarts from the top of the document.
+  const tableRef = useFocusRetention(selectableIds.join(","));
   const selectedCount = selectedIds.size;
-  const allSelectableSelected = selectableRows.length > 0 && selectableRows.every((row) => selectedIds.has(row.id));
 
   function toggleRowSelected(rowId: string, checked: boolean) {
     setSelectedIds((prev) => {
@@ -149,10 +167,10 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
   // extra loadPage() call is needed here once it resolves.
   async function runSelectedSearches() {
     const selected = rows.filter((row) => selectedIds.has(row.id));
-    if (!selected.length || !shell.InkDropWantedNav?.runSelectedSearches) return;
+    if (!selected.length || !bulkSearch.call) return;
     setRunningSelected(true);
     try {
-      await shell.InkDropWantedNav.runSelectedSearches(selected);
+      await bulkSearch.call(selected);
     } finally {
       setRunningSelected(false);
     }
@@ -160,15 +178,15 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
 
   function manualSearchSelected() {
     const selected = rows.filter((row) => selectedIds.has(row.id));
-    if (selected.length !== 1) return;
-    shell.InkDropSeriesNav?.openManualSearch?.(selected[0]);
+    if (selected.length !== 1 || !manualSearch.call) return;
+    manualSearch.call(selected[0]);
   }
 
   const pageStart = totalCount === 0 ? 0 : offset + 1;
   const pageEnd = offset + rows.length;
 
   return (
-    <div className="inkdrop-react-wanted">
+    <div className="inkdrop-react-wanted" ref={tableRef}>
       {(error || actionError) && (
         <div className="inkdrop-react-error-banner" role="alert">
           {error || actionError}
@@ -178,33 +196,44 @@ export function Wanted({ payload }: { payload: WantedViewPayload }) {
         <div className="arr-table-controlbar-left">
           <button
             type="button"
-            disabled={selectedCount < 1 || runningSelected}
+            disabled={!bulkSearch.available || selectedCount < 1 || runningSelected}
             onClick={() => void runSelectedSearches()}
-            title={selectedCount < 1 ? "Select one or more visible rows first." : "Queue searches for selected visible Wanted rows"}
+            title={
+              !bulkSearch.available
+                ? bulkSearch.reason
+                : selectedCount < 1
+                  ? "Select one or more visible rows first."
+                  : "Queue searches for selected visible Wanted rows"
+            }
           >
             {runningSelected ? "Queuing…" : "Search Selected"}
           </button>
           <button
             type="button"
-            disabled={selectedCount !== 1}
+            disabled={!manualSearch.available || selectedCount !== 1}
             onClick={manualSearchSelected}
-            title={selectedCount !== 1 ? "Select exactly one Wanted row for Manual Search." : "Search providers for the single selected Wanted row"}
+            title={
+              !manualSearch.available
+                ? manualSearch.reason
+                : selectedCount !== 1
+                  ? "Select exactly one Wanted row for Manual Search."
+                  : "Search providers for the single selected Wanted row"
+            }
           >
             Manual Search
           </button>
           <span className="arr-table-selection-count">{selectedCount} selected</span>
+          <SelectionStatus selectableIds={selectableIds} selectedIds={selectedIds} outcome={actionOutcome} />
         </div>
       </div>
       <table className="arr-table wanted-table">
         <thead>
           <tr>
             <th>
-              <input
-                type="checkbox"
-                aria-label="Select all visible rows"
-                checked={allSelectableSelected}
-                disabled={selectableRows.length === 0}
-                onChange={(event) => toggleSelectAll(event.target.checked)}
+              <SelectAllCheckbox
+                selectableIds={selectableIds}
+                selectedIds={selectedIds}
+                onChange={toggleSelectAll}
               />
             </th>
             <th>Series / Issue</th>

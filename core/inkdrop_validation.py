@@ -1,6 +1,6 @@
 """A refusal is not a fault.
 
-Tracker #535. The API guard in inkdrop_web.py answers ~112 `/api/` routes and
+The API guard in inkdrop_web.py answers ~112 `/api/` routes and
 prints a full traceback for every exception it catches, including the ordinary
 case of a request being rejected because its input was wrong. A self-hosted
 operator typing a bad value into a form gets a stack trace in their container

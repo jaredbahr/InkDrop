@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { request, InkDropApiError } from "../api";
+import { useLatestOnly } from "../latestOnly";
 import { useRowActions } from "../rowActions";
 import type { QueueRow, QueueRowDetail, QueueTransfer, QueueViewPayload, QueueRunResult, QueueBlockResult, StateViewFilter } from "./queueTypes";
 import { rowStateLabel } from "./stateLabel";
@@ -227,14 +228,29 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
     clearActionError();
   }, [payload]);
 
+  // Only the newest list request may write to this section's state.
+  const listRequest = useLatestOnly();
+  // And only the newest detail request, for the row that is actually open.
+  const detailRequest = useLatestOnly();
+  // A ref rather than the detailId state: an async continuation closes over
+  // the render it started in, so reading detailId there answers "which row was
+  // open when this request began", not "which row is open now".
+  const detailIdRef = useRef<string | null>(null);
+
   async function loadPage(nextOffset: number, nextFilter?: string, options?: { quiet?: boolean }) {
     const filter = nextFilter ?? queueFilter;
+    // The quiet ten-second poll goes through the same guard as a click. It is
+    // the likeliest way to reach this race without a fast clicker: the poll
+    // sets no loading state, so nothing is disabled while it is in flight, and
+    // clearing its interval does not cancel a request already on the wire.
+    const isCurrent = listRequest.begin();
     if (!options?.quiet) {
       setLoading(true);
       setError(null);
     }
     try {
       const data = await request<{ ok: boolean; view: QueueViewPayload }>(buildEndpoint(nextOffset, filter));
+      if (!isCurrent()) return;
       const view = data.view;
       setRows(view.rows || []);
       setOffset(view.offset ?? nextOffset);
@@ -243,9 +259,10 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
       if (view.filters?.length) setFilters(view.filters);
       if (view.queue_filter) setQueueFilter(view.queue_filter);
     } catch (cause) {
+      if (!isCurrent()) return;
       if (!options?.quiet) setError(cause instanceof InkDropApiError ? cause.message : "Could not load Queue page.");
     } finally {
-      if (!options?.quiet) setLoading(false);
+      if (isCurrent() && !options?.quiet) setLoading(false);
     }
   }
 
@@ -291,12 +308,17 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
       // toggle-closed while its own fetch hasn't finished yet; once it has
       // (success or error), a click here still closes it as expected.
       if (detailLoading) return;
+      // Closing supersedes whatever is in flight, so a reply for this row
+      // cannot arrive afterwards and repopulate a panel the user shut.
+      detailRequest.cancel();
+      detailIdRef.current = null;
       setDetailId(null);
       setDetail(null);
       setDetailError(null);
       setDetailRedacted(false);
       return;
     }
+    detailIdRef.current = row.id;
     setDetailId(row.id);
     setDetail(null);
     setDetailError(null);
@@ -305,20 +327,33 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
     try {
       await fetchDetail(row.id, false);
     } catch (cause) {
+      if (detailIdRef.current !== row.id) return;
       setDetailError(cause instanceof InkDropApiError ? cause.message : "Could not load details.");
     } finally {
-      setDetailLoading(false);
+      if (detailIdRef.current === row.id) setDetailLoading(false);
     }
   }
 
-  async function fetchDetail(rowId: string, reveal: boolean) {
+  // Returns false when this answer was superseded -- another row was opened,
+  // or the panel was closed -- so the caller does not report an error for a
+  // panel that is no longer on screen either.
+  async function fetchDetail(rowId: string, reveal: boolean): Promise<boolean> {
+    const isCurrent = detailRequest.begin();
     const data = await request<{ ok: boolean; view: { rows?: QueueRowDetail[]; operational_detail_redacted?: boolean } }>(
       `/api/inkdrop-state/queue?queue_id=${encodeURIComponent(rowId)}&summary=compact&limit=1${reveal ? "&reveal=1" : ""}`,
     );
+    // Both conditions, not one. The generation says this is the newest detail
+    // request; the id says it is about the row currently open. The render
+    // guard only ever checked that the PANEL belonged to the open row, never
+    // that the data inside it did, so one row's payload could render
+    // underneath another -- including a reveal response carrying exact paths
+    // and download-client identifiers.
+    if (!isCurrent() || detailIdRef.current !== rowId) return false;
     const full = data.view?.rows?.[0];
     if (!full) throw new InkDropApiError("No detail available for this row.", { status: 200, code: "queue_detail_missing" });
     setDetail(full);
     setDetailRedacted(Boolean(data.view?.operational_detail_redacted));
+    return true;
   }
 
   // Exact paths, the download client's item id and the provider peer's
@@ -331,6 +366,10 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
     try {
       await fetchDetail(rowId, true);
     } catch (cause) {
+      // Same guard as the open path. A reveal answers with exact paths and
+      // download-client identifiers, so it is the last response that should
+      // be allowed to land under a row it was not asked about.
+      if (detailIdRef.current !== rowId) return;
       setDetailError(
         cause instanceof InkDropApiError && cause.status === 403
           ? "Only an administrator can show the full paths and client identifiers."
@@ -339,7 +378,7 @@ export function Queue({ payload }: { payload: QueueViewPayload }) {
             : "Could not show the full details.",
       );
     } finally {
-      setRevealing(false);
+      if (detailIdRef.current === rowId) setRevealing(false);
     }
   }
 

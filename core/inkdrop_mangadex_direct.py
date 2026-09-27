@@ -22,6 +22,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import requests
 
+from core import inkdrop_archive_compression
 from core import inkdrop_db
 from core import inkdrop_runtime_config
 
@@ -384,6 +385,22 @@ def _assert_approved_peer(response, approved_ips):
         raise RuntimeError("MangaDex At-Home connection peer was refused")
 
 
+def at_home_session():
+    """A session configured the way every At-Home fetch needs it.
+
+    trust_env off so a proxy variable in the environment cannot redirect these
+    requests, and auth cleared so nothing from a netrc file is attached. Both
+    were set inline in at_home_get; they live here so a caller that owns a
+    session for a whole chapter cannot accidentally configure it differently
+    from one that does not.
+    """
+
+    session = requests.Session()
+    session.trust_env = False
+    session.auth = ()
+    return session
+
+
 def at_home_get(url, *, timeout=45, session=None):
     """Fetch an At-Home URL through a bounded, per-hop-validated transport.
 
@@ -394,9 +411,7 @@ def at_home_get(url, *, timeout=45, session=None):
     """
     owned = session is None
     if owned:
-        session = requests.Session()
-        session.trust_env = False
-        session.auth = ()
+        session = at_home_session()
     current = str(url or "")
     try:
         for _ in range(AT_HOME_MAX_REDIRECTS + 1):
@@ -507,21 +522,35 @@ def write_cbz(row, payload, dest, data_saver=False, max_pages=None):
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix=".inkdrop-mangadex-", suffix=".cbz", dir=str(dest.parent), delete=False) as handle:
         temp_path = Path(handle.name)
+    # One session for the whole chapter. Every page is still a separate fetch
+    # through the bounded transport -- the per-hop origin, address and peer
+    # checks run on each one, and the peer check reads the socket the response
+    # actually arrived on, so a pooled connection is verified exactly like a
+    # fresh one. What changes is that pages on the same volunteer host reuse
+    # that connection instead of paying TCP and TLS setup per page, which
+    # at_home_get could already do through its `session` argument and no
+    # caller used.
+    session = at_home_session()
     try:
         with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for index, page in enumerate(pages, start=1):
-                # Every page is a separate fetch against the same volunteer
-                # host, so each one goes back through the bounded transport
-                # rather than trusting that the base URL was checked once.
-                response = at_home_get(page_url(info, page, data_saver=data_saver), timeout=45)
+                response = at_home_get(page_url(info, page, data_saver=data_saver), timeout=45, session=session)
                 try:
                     content = response.content
                 finally:
+                    # Consumed and released before the next page asks for the
+                    # connection back; a response left open would keep it
+                    # checked out of the pool and the reuse would not happen.
                     _close_quietly(response)
                 if not content:
                     raise RuntimeError(f"MangaDex page {index} was empty")
-                archive.writestr(f"{index:04d}{page_extension(page)}", content)
-            archive.writestr("ComicInfo.xml", comicinfo_xml(row, payload))
+                # Per-member, by measurement -- see inkdrop_archive_compression.
+                inkdrop_archive_compression.write_bytes_member(
+                    archive, f"{index:04d}{page_extension(page)}", content
+                )
+            inkdrop_archive_compression.write_bytes_member(
+                archive, "ComicInfo.xml", comicinfo_xml(row, payload)
+            )
         temp_path.replace(dest)
     except Exception:
         try:
@@ -529,6 +558,13 @@ def write_cbz(row, payload, dest, data_saver=False, max_pages=None):
         except OSError:
             pass
         raise
+    finally:
+        close = getattr(session, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
     return {"path": str(dest), "page_count": len(pages), "size_bytes": dest.stat().st_size}
 
 
@@ -552,27 +588,36 @@ def kavita_visible(path):
         con.close()
 
 
-def trigger_scan(dest):
+def trigger_scan(dest, requested=None):
+    """Ask the reader to scan the folder this file landed in.
+
+    `requested` is a per-run record of folders already asked for. A chapter run
+    normally writes several chapters into the same series folder, and each one
+    used to request its own force_library_scan of that same folder -- the
+    reader does the same work again for a directory it is already scanning.
+    Passing the record collapses those into one request per folder per run and
+    reports the repeats as coalesced rather than pretending they were sent.
+    """
+
     if completed_import is None:
         return {"ok": False, "reason": "completed_import_module_missing"}
+    folder = str(Path(dest).parent)
+    if requested is not None and folder in requested:
+        return {**requested[folder], "coalesced": True, "scan_folder": folder}
     try:
-        result = completed_import.trigger_kavita_scan_folder(str(Path(dest).parent), force_library_scan=True)
-        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+        result = completed_import.trigger_kavita_scan_folder(folder, force_library_scan=True)
+        payload = {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
     except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if requested is not None:
+        requested[folder] = payload
+    return {**payload, "scan_folder": folder}
 
 
-def wait_visible(path, timeout_seconds=90):
-    deadline = time.time() + max(0, float(timeout_seconds or 0))
-    while True:
-        if kavita_visible(path):
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(5)
+VERIFY_POLL_SECONDS = 5
 
 
-def record_attempt(row, status, reason, *, dest=None, payload=None, extra=None):
+def record_attempt(row, status, reason, *, dest=None, payload=None, extra=None, attempt_id=None):
     if inkdrop_state is None:
         return {"ok": False, "reason": "inkdrop_state_module_missing"}
     payload = payload if isinstance(payload, dict) else {}
@@ -602,7 +647,12 @@ def record_attempt(row, status, reason, *, dest=None, payload=None, extra=None):
         INKDROP_STATE_DB,
         row.get("queue_id"),
         {key: value for key, value in attempt.items() if value not in (None, "")},
-        attempt_id=stable_attempt_id(row, status, dest),
+        # An explicit id lets a later call move an attempt already on record to
+        # its next state instead of writing a second attempt beside it. The
+        # deferred verification below uses it to turn one chapter's
+        # "verification_pending" row into "kavita_verified": one attempt, two
+        # states, which is what actually happened.
+        attempt_id=attempt_id or stable_attempt_id(row, status, dest),
     )
 
 
@@ -630,7 +680,15 @@ def record_import(row, status, verified, dest, raw):
     )
 
 
-def process_row(row, args):
+def process_row(row, args, pending=None, scan_requests=None):
+    """Acquire one chapter. Never waits for the reader.
+
+    `pending` collects what still needs confirming so run() can do it once for
+    the whole batch; `scan_requests` collapses repeated scan requests for one
+    folder. Called without them -- a single row, from a script -- the row is
+    still recorded as verification_pending and simply nobody confirms it here.
+    """
+
     payload = merged_payload(row)
     payload.setdefault("mangadex_id", row.get("mangadex_id"))
     payload.setdefault("mangadex_chapter_id", payload.get("chapterId") or row.get("chapter_id"))
@@ -651,22 +709,158 @@ def process_row(row, args):
         info = at_home(payload.get("mangadex_chapter_id")) if args.preflight else {}
         return {**base, "status": "dry_run", "reason": "MangaDex direct download preview", "at_home": info}
     if dest.exists() and dest.stat().st_size > 0:
-        scan = trigger_scan(dest)
-        verified = wait_visible(dest, args.verify_timeout_seconds)
-        status = "kavita_verified" if verified else "verification_pending"
-        reason = "MangaDex file already present; Kavita verified" if verified else "MangaDex file already present; waiting for Kavita scan"
-        record_attempt(row, status, reason, dest=dest, payload=payload, extra={"scan": scan, "already_present": True})
-        import_result = record_import(row, status, verified, dest, {"scan": scan, "already_present": True, "payload": payload})
-        return {**base, "status": status, "reason": reason, "verified": verified, "scan": scan, "import": import_result}
+        scan = trigger_scan(dest, scan_requests)
+        return _park_for_verification(
+            row,
+            payload,
+            dest,
+            base,
+            scan,
+            reason="MangaDex file already present; waiting for Kavita scan",
+            verified_reason="MangaDex file already present; Kavita verified",
+            extra={"already_present": True},
+            pending=pending,
+        )
     record_attempt(row, "download_started", "MangaDex direct download started", dest=dest, payload=payload)
     written = write_cbz(row, payload, dest, data_saver=args.data_saver, max_pages=args.max_pages)
-    scan = trigger_scan(dest)
-    verified = wait_visible(dest, args.verify_timeout_seconds)
-    status = "kavita_verified" if verified else "verification_pending"
-    reason = "MangaDex chapter downloaded and verified in Kavita" if verified else "MangaDex chapter downloaded; waiting for Kavita verification"
-    record_attempt(row, status, reason, dest=dest, payload=payload, extra={"scan": scan, **written})
-    import_result = record_import(row, status, verified, dest, {"scan": scan, "written": written, "payload": payload})
-    return {**base, "status": status, "reason": reason, "verified": verified, "scan": scan, "import": import_result, **written}
+    scan = trigger_scan(dest, scan_requests)
+    return _park_for_verification(
+        row,
+        payload,
+        dest,
+        base,
+        scan,
+        reason="MangaDex chapter downloaded; waiting for Kavita verification",
+        verified_reason="MangaDex chapter downloaded and verified in Kavita",
+        extra=dict(written),
+        pending=pending,
+        result_extra=dict(written),
+    )
+
+
+def _park_for_verification(row, payload, dest, base, scan, *, reason, verified_reason, extra, pending, result_extra=None):
+    """Record the file as written-but-unverified and hand it to the sweep.
+
+    This is where the downloader used to sit and poll the reader for up to
+    verify_timeout_seconds, per chapter, before starting the next one -- so a
+    slow reader charged its timeout once per chapter even though the
+    downloading and writing were already done. The record written here is the
+    durable one: a run that dies now leaves "verification_pending" against the
+    queue item, which is what it actually is, rather than losing the fact that
+    the file exists.
+    """
+
+    attempt_id = stable_attempt_id(row, "verification_pending", dest)
+    record_attempt(
+        row,
+        "verification_pending",
+        reason,
+        dest=dest,
+        payload=payload,
+        extra={"scan": scan, **(extra or {})},
+        attempt_id=attempt_id,
+    )
+    import_result = record_import(
+        row, "verification_pending", False, dest, {"scan": scan, **(extra or {}), "payload": payload}
+    )
+    result = {
+        **base,
+        "status": "verification_pending",
+        "reason": reason,
+        "verified": False,
+        "scan": scan,
+        "import": import_result,
+        **(result_extra or {}),
+    }
+    if pending is not None:
+        pending.append(
+            {
+                "row": row,
+                "payload": payload,
+                "dest": dest,
+                "scan": scan,
+                "extra": dict(extra or {}),
+                "attempt_id": attempt_id,
+                "verified_reason": verified_reason,
+                "result": result,
+            }
+        )
+    return result
+
+
+def _mark_verified(item):
+    row, dest = item["row"], item["dest"]
+    record_attempt(
+        row,
+        "kavita_verified",
+        item["verified_reason"],
+        dest=dest,
+        payload=item["payload"],
+        extra={"scan": item["scan"], **item["extra"]},
+        # The same attempt this run already recorded, moved on to its next
+        # state rather than duplicated.
+        attempt_id=item["attempt_id"],
+    )
+    import_result = record_import(
+        row,
+        "kavita_verified",
+        True,
+        dest,
+        {"scan": item["scan"], **item["extra"], "payload": item["payload"]},
+    )
+    item["result"].update(
+        {
+            "status": "kavita_verified",
+            "reason": item["verified_reason"],
+            "verified": True,
+            "import": import_result,
+        }
+    )
+
+
+def verify_pending(pending, timeout_seconds=90, poll_seconds=VERIFY_POLL_SECONDS):
+    """Confirm the reader can see everything this run wrote, under ONE budget.
+
+    verify_timeout_seconds used to be spent per chapter and in series with the
+    downloads: twelve chapters against an unresponsive reader cost twelve
+    timeouts, with the downloader idle through all of them. It is now one
+    budget for the whole run, spent after the downloading is finished, and
+    every chapter gets the whole of it -- so a reader that is merely slow
+    resolves chapters the old shape would have given up on.
+
+    Whatever is still unconfirmed when the budget runs out keeps the
+    "verification_pending" record written when it was downloaded. That is the
+    honest state, and it is the state the next run and the operator-facing
+    views already understand; nothing is marked complete on a timeout.
+    """
+
+    pending = [item for item in (pending or []) if item.get("dest")]
+    if not pending:
+        return {"checked": 0, "verified": 0, "pending": 0, "pending_paths": []}
+    deadline = time.time() + max(0, float(timeout_seconds or 0))
+    outstanding = list(pending)
+    verified = 0
+    while True:
+        still_waiting = []
+        for item in outstanding:
+            if kavita_visible(item["dest"]):
+                _mark_verified(item)
+                verified += 1
+            else:
+                still_waiting.append(item)
+        outstanding = still_waiting
+        if not outstanding:
+            break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_seconds, remaining))
+    return {
+        "checked": len(pending),
+        "verified": verified,
+        "pending": len(outstanding),
+        "pending_paths": [str(item["dest"]) for item in outstanding],
+    }
 
 
 def run(args):
@@ -676,6 +870,10 @@ def run(args):
     skipped = []
     errors = []
     per_series = {}
+    # Filled by process_row and settled once, after the downloading, by
+    # verify_pending below.
+    pending_verification = []
+    scan_requests = {}
     for row in rows:
         series_key = normalize_key(row.get("series"))
         count = per_series.get(series_key, 0)
@@ -683,7 +881,7 @@ def run(args):
             skipped.append({"queue_id": row.get("queue_id"), "series": row.get("series"), "reason": "max_per_series_reached"})
             continue
         try:
-            result = process_row(row, args)
+            result = process_row(row, args, pending=pending_verification, scan_requests=scan_requests)
             actions.append(result)
             per_series[series_key] = count + 1
         except Exception as exc:
@@ -705,11 +903,19 @@ def run(args):
                 }
             )
             errors.append({"queue_id": row.get("queue_id"), "error": reason})
+    # The action dicts in `actions` are the same objects verify_pending
+    # updates, so the payload printed below reports each chapter's settled
+    # state rather than the state it had when it was written.
+    verification = verify_pending(pending_verification, args.verify_timeout_seconds) if not args.dry_run else {
+        "checked": 0, "verified": 0, "pending": 0, "pending_paths": []
+    }
     result = {
         "ok": True,
         "source": SOURCE,
         "dry_run": bool(args.dry_run),
         "rows_considered": len(rows),
+        "verification": verification,
+        "scan_requests": sorted(scan_requests),
         "actions": actions,
         "review": review,
         "skipped": skipped,

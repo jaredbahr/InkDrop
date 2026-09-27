@@ -28,19 +28,11 @@ import {
 // navigation -- see seriesDetailTypes.ts's file comment for why those stay
 // vanilla rather than being ported here.
 
-declare global {
-  interface Window {
-    InkDropSeriesNav?: {
-      openDetail: (row: SeriesDetailRow) => void;
-      openLinked?: (section: string, row: IssueRow | SeriesDetailRow) => void;
-      openManualSearch?: (row: IssueRow) => boolean;
-      runWantedSearch?: (payload: { id?: string; series?: string; series_id?: string; issue_id?: string }) => Promise<void>;
-      runSeriesSearch?: (payload: { id?: string; title?: string }) => Promise<void>;
-      markImportWrong?: (row: IssueRow, seriesRow?: SeriesDetailRow | null) => Promise<void>;
-      setIssueMonitored?: (row: IssueRow, monitored: boolean) => Promise<void>;
-    };
-  }
-}
+// The InkDropSeriesNav declaration used to live here, and three other files
+// reached the same bridge through `window as unknown as { ... }` with
+// different shapes -- openDetail was required here and optional in
+// History.tsx, over three different row types. It is declared once now, in
+// src/shellBridge.ts, which that file explains at length.
 
 function Fact({ label, value, href }: { label: string; value: string; href?: string }) {
   if (!value) return null;

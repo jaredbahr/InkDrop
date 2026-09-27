@@ -151,6 +151,31 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python -B tools/inkdrop_run_changed_tests.py --base "$BASE_SHA"
 
+      # The step above is selected by the tests a pull request CHANGES, so a
+      # pull request that edits production code and touches no test selects
+      # nothing -- a change to request handling, the state database, archive
+      # extraction or import identity could reach qa having executed no
+      # behavioural check of the thing it changed. This is the other selector:
+      # changed PRODUCTION code picks a small fixed set of behavioural tests.
+      #
+      # A STEP, not a job: it reuses this job's checkout, Python and
+      # dependencies, so it costs its own runtime and nothing else. Measured at
+      # 12s for all four areas on a development host, which is why it fits
+      # inside the cost decision inkdrop-qa-nightly-smoke.yml records rather
+      # than reopening it. It is not a substitute for the nightly full suite
+      # and does not try to be: it says the change did not break the paths it
+      # touched, not that it broke nothing elsewhere.
+      - name: Run the critical-path tier for the production code this pull request changes
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 20
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python -B tools/inkdrop_critical_path_tier.py --base "$BASE_SHA"
+
       # This workflow is exported to jaredbahr/InkDrop, but the nightly
       # workflow and private runbooks inspected by this test deliberately are
       # not. Keep the contract gate on the private PR path where all four
@@ -337,7 +362,7 @@ jobs:
     # workflow into the public repo, and there the release commit lands on
     # main -- so a qa-only condition would have read as false on every public
     # release and skipped the suite that is supposed to be gating it. The
-    # public copy predates the qa-only gate (#682) and still has no condition
+    # public copy predates the qa-only gate and still has no condition
     # at all, which is why public releases are still running the suite today;
     # the next export is what would have carried the regression over.
     #

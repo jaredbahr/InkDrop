@@ -429,7 +429,7 @@ DEFAULT_SLSKD_AUTO_GRAB_MAX = 20
 # AUTO_GRAB_MAX_PER_RUN, pinned cross-module by
 # tests/inkdrop-slskd-the-grab-ceiling-is-one-number-smoke.py: the parent asking
 # for more than the child will run is a silently ignored setting, and the parent
-# asking for less is the bug #1199 left behind -- the argument normalization
+# asking for less is the bug that was left behind -- the argument normalization
 # clamped a settings-supplied 20 or 25 back down to a literal 10, after
 # apply_slskd_provider_defaults() had already filled the operator's value in.
 SLSKD_AUTO_GRAB_MAX_CEILING = 25
@@ -1530,13 +1530,24 @@ def save_handoff_gate_state(payload):
         log("handoff_gate_state_write_failed", error=f"{type(exc).__name__}: {exc}")
 
 
-def handoff_gate_stall_state(pending, active, now=None):
+def handoff_gate_stall_state(pending, active, oldest_started_at=None, now=None):
     """Track whether the pending handoffs holding priority are actually clearing.
 
-    Progress is the count going down. While it keeps dropping the clock resets
-    and the gate holds priority as before. If it never gets below the smallest
-    value seen for the whole window, nothing is handing off, and stopping every
-    search in the catalog is only costing search cycles.
+    The clock is the age of the oldest pending handoff (``oldest_started_at``,
+    an epoch-seconds timestamp on the row itself), not whether the pending
+    *count* has ever dropped. Counting drops as the only sign of progress let
+    ``held_seconds`` reset to 0 every time ``pending`` merely ticked -- 2 to 1,
+    or 1 to 0 and back to 1 on the next pass -- even while the exact same row
+    sat there for hours. Confirmed live 2026-09-23: from 14:00Z to 21:35Z
+    `download-handoff-gate.json` kept showing `held_seconds: 0.0` while
+    `pending_count` stayed 1 the whole time, so the 30-minute release never
+    fired and every 15-minute pass exited in ~1.6s. A row's own age can only
+    go up while it is still pending, so this cannot happen again.
+
+    ``oldest_started_at`` is None when the caller could not resolve a real
+    per-row age (e.g. the coordinator lookup did not return one); that case
+    falls back to the previous count-drop heuristic rather than treating an
+    unknown age as either instant progress or an instant stall.
     """
 
     now = float(now if now is not None else time.time())
@@ -1549,14 +1560,21 @@ def handoff_gate_stall_state(pending, active, now=None):
         previous_min = int(previous.get("min_pending_seen"))
     except (TypeError, ValueError):
         previous_min = None
-    try:
-        since = float(previous.get("since"))
-    except (TypeError, ValueError):
-        since = None
-    progressed = previous_min is None or pending < previous_min
-    if progressed or since is None:
-        since = now
+    if oldest_started_at is not None:
+        try:
+            since = min(float(oldest_started_at), now)
+        except (TypeError, ValueError):
+            since = now
         previous_min = pending
+    else:
+        try:
+            since = float(previous.get("since"))
+        except (TypeError, ValueError):
+            since = None
+        progressed = previous_min is None or pending < previous_min
+        if progressed or since is None:
+            since = now
+            previous_min = pending
     held_seconds = max(0.0, now - since)
     stalled = bool(
         AUTOPILOT_HANDOFF_GATE_STALL_SECONDS
@@ -1568,6 +1586,7 @@ def handoff_gate_stall_state(pending, active, now=None):
         "min_pending_seen": previous_min,
         "last_pending": pending,
         "last_seen_at": now,
+        "oldest_started_at": oldest_started_at,
     })
     return {"stalled": stalled, "held_seconds": round(held_seconds, 1), "min_pending_seen": previous_min}
 
@@ -1594,10 +1613,11 @@ def accepted_download_handoff_priority_gate(db_path=None, *, now=None):
     if not path.exists():
         return {"active": False, "reason": "state_database_missing"}
     try:
-        queue_ids = inkdrop_source_worker_coordinator.pending_download_client_handoff_queue_ids(
+        queue_ids, oldest_started_at = inkdrop_source_worker_coordinator.pending_download_client_handoff_queue_ids(
             path,
             limit=HANDOFF_GATE_PENDING_COUNT_LIMIT,
             now=now,
+            return_oldest_started_at=True,
         )
     except Exception as exc:
         return {
@@ -1607,7 +1627,7 @@ def accepted_download_handoff_priority_gate(db_path=None, *, now=None):
         }
     pending = len(queue_ids or [])
     active = pending > 0
-    stall = handoff_gate_stall_state(pending, active, now=now)
+    stall = handoff_gate_stall_state(pending, active, oldest_started_at=oldest_started_at, now=now)
     if stall.get("stalled"):
         active = False
     return {
@@ -1624,6 +1644,7 @@ def accepted_download_handoff_priority_gate(db_path=None, *, now=None):
         "stall_seconds": AUTOPILOT_HANDOFF_GATE_STALL_SECONDS,
         "stalled": bool(stall.get("stalled")),
         "held_seconds": stall.get("held_seconds"),
+        "oldest_started_at": oldest_started_at,
     }
 
 
@@ -1722,14 +1743,122 @@ def inkdrop_terminal_queue_rows():
 # decide whether a `verified` row is one this pass granted.
 WATCH_VERIFIED_EVENT = "no longer missing in watched series"
 
+# WATCHER VISIBILITY IS NOT SEARCH ELIGIBILITY.
+#
+# `present_in_watch` answers one question: does the series watcher still report
+# this unit as missing? The scheduler read it as a second, different question --
+# may this row be searched -- and the two part company in exactly one place. The
+# refusal branch in `merge_current_queue()` handles a unit that left the watch
+# list with NO imported file to show for it; it declines to verify, says the row
+# was "left searchable", and clears `present_in_watch` because that flag is
+# honest about the watcher. The scheduler then skipped the row forever, so the
+# refusal only moved the silent-and-terminal failure one step later.
+#
+# So the refusal opens an explicit, bounded search grant instead. Bounded on
+# BOTH sides on purpose:
+#   * not the very next pass -- a unit nothing can be found for must not burn a
+#     slot every cycle,
+#   * and not forever -- a series the user removed, or a unit that is genuinely
+#     gone, leaves the watch list the same way and must stop being retried.
+# Everything else that reads `present_in_watch` -- reconciliation, the import
+# sweep, the slskd re-probe, the progress counts -- is asking the watcher
+# question and is left alone.
+WATCH_REFUSAL_SEARCH_DELAY_SECONDS = 6 * 3600
+WATCH_REFUSAL_SEARCH_WINDOW_SECONDS = 14 * 86400
+
+WATCH_REFUSAL_SEARCH_FIELDS = (
+    "watch_refusal_search_after",
+    "watch_refusal_search_after_iso",
+    "watch_refusal_search_until",
+    "watch_refusal_search_until_iso",
+)
+
+
+def grant_watch_refusal_search(item, now):
+    """Let a watch-refused row back into a later pass, for a bounded window.
+
+    Written once per refusal episode. The refusal branch re-runs on every pass
+    while the unit stays out of the watch list, so refreshing the stamps here
+    would push the retry time forward forever and the row would never come due.
+    """
+    if not isinstance(item, dict):
+        return
+    if item.get("watch_refusal_search_until"):
+        return
+    after = now + WATCH_REFUSAL_SEARCH_DELAY_SECONDS
+    until = now + WATCH_REFUSAL_SEARCH_WINDOW_SECONDS
+    item["watch_refusal_search_after"] = after
+    item["watch_refusal_search_after_iso"] = now_iso(after)
+    item["watch_refusal_search_until"] = until
+    item["watch_refusal_search_until_iso"] = now_iso(until)
+
+
+def clear_watch_refusal_search(item):
+    """Drop the grant once the row has a real answer -- seen again, or verified."""
+    if not isinstance(item, dict):
+        return
+    for field in WATCH_REFUSAL_SEARCH_FIELDS:
+        item.pop(field, None)
+
+
+def watch_refusal_search_grant_lapsed(item, now=None):
+    """A grant was opened for this row and its window has run out.
+
+    Distinct from "no grant at all": the first refusal of a unit has nothing to
+    report yet, whereas a row whose window has closed is one the autopilot has
+    stopped searching, and that is the state worth counting.
+    """
+    if not isinstance(item, dict):
+        return False
+    try:
+        until = float(item.get("watch_refusal_search_until") or 0)
+    except (TypeError, ValueError):
+        return False
+    if until <= 0:
+        return False
+    if now is None:
+        now = time.time()
+    return until <= now
+
+
+def watch_refusal_search_grant_active(item, now=None):
+    if not isinstance(item, dict):
+        return False
+    try:
+        until = float(item.get("watch_refusal_search_until") or 0)
+        after = float(item.get("watch_refusal_search_after") or 0)
+    except (TypeError, ValueError):
+        return False
+    if until <= 0:
+        return False
+    if now is None:
+        now = time.time()
+    return after <= now < until
+
+
+def queue_item_searchable(item, now=None):
+    """May the scheduler still search this row?
+
+    True while the watcher reports it, and -- separately -- while a watch
+    refusal's bounded grant is open. Not a watcher-visibility predicate.
+    """
+    if not isinstance(item, dict):
+        return False
+    if item.get("present_in_watch", True):
+        return True
+    return watch_refusal_search_grant_active(item, now)
+
 
 def queue_ids_with_file_evidence(keys):
     """Of `keys`, those whose unit actually has a file we can point at.
 
-    Evidence is either an ACTIVE `media_files` row, or an `import_results` row
-    that imported and whose `dest_path` RESOLVES on disk. A stored path is a
+    Evidence is either an ACTIVE `media_files` row, or a qualifying and ordered
+    `import_results` row, that is BOUND TO THE SAME IDENTITY as the unit's
+    `queue_items` row -- same `series_id`, and same `issue_id` when the queue row
+    names one -- and whose stored path RESOLVES on disk. A stored path is a
     claim, not a fact -- library folders get renamed and rows go stale -- so the
-    path is checked rather than trusted.
+    path is checked rather than trusted; and a shared `queue_id` is not identity,
+    so the identity columns are compared rather than assumed to agree.
 
     Returns a set. On any failure it returns an EMPTY set, which makes the
     caller refuse rather than verify: the caller must not treat "I could not
@@ -1747,18 +1876,27 @@ def queue_ids_with_file_evidence(keys):
 def queue_ids_with_file_evidence_result(keys):
     """`queue_ids_with_file_evidence()` plus whether the lookup SUCCEEDED.
 
-    `{"ok": bool, "ids": set}`. `ok` is False when the state database is absent
-    or the read raised, and in that case `ids` is empty and means nothing --
-    "I could not look", not "nobody has a file". Callers that grant may ignore
-    `ok` and treat empty as refusal; callers that retract must not.
+    `{"ok": bool, "ids": set, "times": dict}`. `ok` is False when the state
+    database is absent or the read raised, and in that case `ids` is empty and
+    means nothing -- "I could not look", not "nobody has a file". Callers that
+    grant may ignore `ok` and treat empty as refusal; callers that retract must
+    not.
+
+    `times` maps each granted queue id to WHEN the evidence behind the grant was
+    recorded -- the newest `import_results.created_at` or
+    `media_files.first_seen_at` among the rows that both bound and resolved. It
+    is the evidence's own clock, not a row's touched `updated_at`, so a caller
+    ordering this grant against something it already knows is comparing two
+    events rather than two labels. A granted id with no usable timestamp is
+    absent from `times` rather than present with a guess.
     """
     wanted = {str(key) for key in keys if str(key or "")}
     if not wanted:
         # Nothing was asked, so nothing failed. An empty question has an empty
         # answer and that answer is trustworthy.
-        return {"ok": True, "ids": set()}
+        return {"ok": True, "ids": set(), "times": {}}
     if inkdrop_state is None or not INKDROP_STATE_DB.exists():
-        return {"ok": False, "ids": set()}
+        return {"ok": False, "ids": set(), "times": {}}
     try:
         evidenced = set()
         ordered = list(wanted)
@@ -1771,42 +1909,118 @@ def queue_ids_with_file_evidence_result(keys):
         # upon: this build allows 32,766 variables and older SQLite defaults to
         # 999.
         chunk_size = 400
-        with inkdrop_state.connect(INKDROP_STATE_DB) as con:
+        with inkdrop_state.connect_read(INKDROP_STATE_DB) as con:
             for start in range(0, len(ordered), chunk_size):
                 chunk = ordered[start:start + chunk_size]
                 placeholders = ",".join("?" for _ in chunk)
+                # JOINED TO `queue_items` BECAUSE THE `queue_id` IS NOT THE
+                # IDENTITY. Both tables carry the importer's own
+                # `series_id`/`issue_id`, and those can disagree with the queue
+                # row the evidence is being claimed for -- a mis-parsed
+                # filename, a repointed folder, a row carried across a
+                # re-identification. The 2026-09-21 source audit granted a
+                # correct-series queue row on a `media_files` row bound to
+                # another series whose path happened to resolve, and only the
+                # missing-path control was refused, so the sole live gate was
+                # the filesystem. Association plus existence is not identity,
+                # and this grant is TERMINAL: a verified row stops being
+                # searched, so a wrong grant loses the book in silence.
+                #
+                # A queue row this database does not hold has no durable
+                # identity to bind to and is refused, which costs a re-search.
+                identity = """
+                      and coalesce(q.series_id, '')<>''
+                      and coalesce(e.series_id, '')=coalesce(q.series_id, '')
+                      and (
+                        coalesce(q.issue_id, '')=''
+                        or coalesce(e.issue_id, '')=coalesce(q.issue_id, '')
+                      )
+                """
                 for row in con.execute(
                     f"""
-                    select queue_id, path from media_files
-                    where queue_id in ({placeholders})
-                      and active=1 and status='present'
+                    select e.queue_id as queue_id, e.path as path,
+                           e.first_seen_at as evidence_at
+                    from media_files e
+                    join queue_items q on q.id=e.queue_id
+                    where e.queue_id in ({placeholders})
+                      and e.active=1 and e.status='present'
+                      {identity}
                     """,
                     chunk,
                 ):
-                    evidenced.add((str(row["queue_id"]), str(row["path"] or "")))
+                    evidenced.add((
+                        str(row["queue_id"]),
+                        str(row["path"] or ""),
+                        row["evidence_at"],
+                    ))
+                # ORDERED, TOO: an import recorded before the queue row existed
+                # cannot be proof that THIS request was satisfied, and an event
+                # with no `created_at` cannot be placed either way.
                 for row in con.execute(
                     f"""
-                    select queue_id, dest_path from import_results
-                    where queue_id in ({placeholders})
-                      and (coalesce(verified, 0)=1 or coalesce(imported_count, 0)>0)
-                      and coalesce(dest_path, '')<>''
+                    select e.queue_id as queue_id, e.dest_path as dest_path,
+                           e.created_at as evidence_at
+                    from import_results e
+                    join queue_items q on q.id=e.queue_id
+                    where e.queue_id in ({placeholders})
+                      and (coalesce(e.verified, 0)=1 or coalesce(e.imported_count, 0)>0)
+                      and coalesce(e.dest_path, '')<>''
+                      and e.created_at is not null
+                      and e.created_at>=coalesce(q.created_at, 0)
+                      {identity}
                     """,
                     chunk,
                 ):
-                    evidenced.add((str(row["queue_id"]), str(row["dest_path"] or "")))
+                    evidenced.add((
+                        str(row["queue_id"]),
+                        str(row["dest_path"] or ""),
+                        row["evidence_at"],
+                    ))
         confirmed = set()
-        for queue_id, path in evidenced:
-            if queue_id in confirmed or not path:
+        # EVERY resolving row is stat-ed, not just the first one that grants,
+        # because `times` must be the NEWEST evidence that actually resolved. An
+        # early exit on the first hit would report whichever row the set happened
+        # to yield first, and a caller ordering against that would be handed an
+        # arbitrary clock dressed up as the answer.
+        times = {}
+        for queue_id, path, evidence_at in evidenced:
+            if not path:
                 continue
             try:
-                if Path(path).is_file():
-                    confirmed.add(queue_id)
+                if not Path(path).is_file():
+                    continue
             except OSError:
                 continue
-        return {"ok": True, "ids": confirmed}
+            confirmed.add(queue_id)
+            try:
+                stamp = float(evidence_at)
+            except (TypeError, ValueError):
+                # The grant stands -- the file is there and bound -- but this row
+                # cannot be PLACED IN TIME, so it contributes no clock. Leaving
+                # the id out of `times` makes an ordering caller refuse rather
+                # than invent an ordering.
+                continue
+            if stamp > times.get(queue_id, float("-inf")):
+                times[queue_id] = stamp
+        return {"ok": True, "ids": confirmed, "times": times}
     except Exception as exc:
         log("queue_ids_with_file_evidence_failed", error=f"{type(exc).__name__}: {exc}")
-        return {"ok": False, "ids": set()}
+        return {"ok": False, "ids": set(), "times": {}}
+
+
+def queue_item_verify_refused_at(item):
+    """When this queue row last REFUSED to verify, or None.
+
+    The refusal is the only event on the queue side that is specifically about
+    this claim. `updated_at` is a touched clock -- every pass that looks at a row
+    moves it -- so ordering against it would compare "when we last thought about
+    this" with "when a file arrived", which is not a comparison.
+    """
+    try:
+        refused_at = float(item.get("verify_refused_at"))
+    except (TypeError, ValueError):
+        return None
+    return refused_at if refused_at > 0 else None
 
 
 def retire_queue_items_from_inkdrop_state(queue):
@@ -1816,6 +2030,47 @@ def retire_queue_items_from_inkdrop_state(queue):
     terminal_rows = inkdrop_terminal_queue_rows()
     if not terminal_rows:
         return 0
+
+    # MONOTONIC, NOT LABEL-BASED. This function reconciles two stores, and until
+    # the 2026-09-21 source audit it did so by copying a label: if the state
+    # database said `verified`, the queue row became `verified`. Nothing compared
+    # WHEN either side learned anything. The audit's fixture was a database row
+    # verified on evidence recorded at time 10 against a queue row that refused
+    # to verify at time 20 because no bound file could be produced for it -- the
+    # older store won, purely because it was the one holding the terminal word,
+    # and the row stopped being searched.
+    #
+    # So a `verified` label may only retire a row that refused if the EVIDENCE
+    # BEHIND THE LABEL is at least as new as that refusal. The evidence's own
+    # clock is read through `queue_ids_with_file_evidence_result()`, which
+    # already requires the row to be bound to this unit's identity and, for
+    # import events, to be qualifying and ordered against the queue row -- so
+    # this composes with that binding instead of re-deriving it, and a stale
+    # label cannot borrow some other row's timestamp. `superseded_duplicate` is
+    # not gated: it is not a claim that a file arrived, so a verification refusal
+    # says nothing about it.
+    #
+    # When the evidence cannot be placed in time at all -- the lookup failed, or
+    # no bound row carries a usable timestamp -- the row is LEFT SEARCHABLE.
+    # Retirement is terminal: a wrong "you have it" loses the book in silence,
+    # a wrong "you don't" costs a search.
+    refused_at_by_identifier = {}
+    for key, item in items.items():
+        if not isinstance(item, dict) or item.get("state") == "verified":
+            continue
+        refused_at = queue_item_verify_refused_at(item)
+        if refused_at is None:
+            continue
+        for identifier in (str(key), str(item.get("key") or "")):
+            if identifier and terminal_rows.get(identifier, {}).get("state") == "verified":
+                refused_at_by_identifier[identifier] = refused_at
+    evidence_times = {}
+    evidence_ok = True
+    if refused_at_by_identifier:
+        evidence = queue_ids_with_file_evidence_result(list(refused_at_by_identifier))
+        evidence_ok = bool(evidence.get("ok"))
+        evidence_times = evidence.get("times") or {}
+
     now = time.time()
     changed = 0
     for key, item in items.items():
@@ -1823,9 +2078,11 @@ def retire_queue_items_from_inkdrop_state(queue):
             continue
         identifiers = {str(key), str(item.get("key") or "")}
         terminal = None
+        matched_identifier = ""
         for identifier in identifiers:
             terminal = terminal_rows.get(identifier)
             if terminal:
+                matched_identifier = identifier
                 break
         if not terminal:
             continue
@@ -1834,6 +2091,18 @@ def retire_queue_items_from_inkdrop_state(queue):
             continue
         if item.get("state") == target_state:
             continue
+        refused_at = refused_at_by_identifier.get(matched_identifier)
+        if refused_at is not None:
+            evidence_at = evidence_times.get(matched_identifier) if evidence_ok else None
+            if evidence_at is None or evidence_at < refused_at:
+                log(
+                    "inkdrop_state_terminal_retirement_refused_as_stale",
+                    queue_id=matched_identifier,
+                    refused_at=refused_at,
+                    evidence_at=evidence_at,
+                    evidence_ok=evidence_ok,
+                )
+                continue
         previous_state = item.get("state")
         item["state"] = target_state
         item["current_source"] = None
@@ -3059,8 +3328,11 @@ def issue_number_keys(value):
 
 
 def issue_number_keys_in_text(value):
+    from core import inkdrop_completed_import
+
     out = set()
-    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", str(value or "")):
+    text = inkdrop_completed_import.strip_issue_total_markers(value)
+    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", text):
         out |= issue_number_keys(raw)
     return out
 
@@ -3829,7 +4101,10 @@ def clear_source_started_marker(item, source=None):
 SYNCHRONOUS_MARKER_SOURCES = frozenset({"prowlarr", "rss", "comicscodes", "mangadex"})
 
 
-def retract_unsearched_source_started_markers(rows, source, mark_ts, now=None):
+SOURCE_MARKER_RETRACTION_CAP = 3
+
+
+def retract_unsearched_source_started_markers(rows, source, mark_ts, now=None, stats=None):
     """Take back "searching X" on rows this pass marked but never searched.
 
     record_source_started_attempts() marks the whole batch before the search
@@ -3843,9 +4118,65 @@ def retract_unsearched_source_started_markers(rows, source, mark_ts, now=None):
     genuinely in-flight search always has a different stamp than the one we
     are retracting, which is what keeps this from killing live work.
 
-    Nothing is recorded when a marker is retracted, because nothing happened:
-    no attempt row, no verdict, no retry reason. The row simply goes back to
-    looking unsearched, which is what it is.
+    Ordinarily nothing is recorded when a marker is retracted, because nothing
+    happened: no attempt row, no verdict, no retry reason. The row simply goes
+    back to looking unsearched, which is what it is.
+
+    One exception, from the 2026-09-23 livelock (no SLSKD search left the
+    building from 12:40Z to 21:35Z). A retracted row keeps "no recorded result
+    for this provider", which is what puts it in the missing_provider_result
+    priority bucket -- so the same handful of series that this provider never
+    actually reaches (a lost queue claim, a provider-pass failure, a
+    per-series limit that cut the row off before it ran, ...) refilled every
+    pass and nothing else was ever reached. A row retracted
+    SOURCE_MARKER_RETRACTION_CAP times in a row for the same provider, with no
+    real result recorded in between, is not going to get one by being retried
+    the same way. The next retraction instead records an honest, non-attempt
+    entry: the provider did not run for this row, full stop. That is true
+    whatever the reason was upstream, and it must never read as a real
+    search. Two separate mechanisms have to agree on that, for two separate
+    reasons:
+
+    - Status "observed" is not a real attempt -- inkdrop_state.
+      source_attempt_is_real_attempt() keys on status, and "observed" is in
+      NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES -- so it does not count toward the
+      retry ceiling or the aggregate Prowlarr cooldown, both of which key
+      off real-attempt status.
+    - automatic_sources_exhausted() and the other retry/cooldown guards do
+      NOT key off status. They call the same
+      missing_required_source_result_sources() this rotation path uses, so
+      the record has to be excluded there explicitly:
+      queue_item_recorded_source_result_attempt_count() takes
+      exclude_retraction_cap=True for exactly this, and the guard callers
+      pass it. Without that, an honest "did not run" record would satisfy the
+      missing-provider guard the same way a real result does, and a provider
+      that never searched the row would read as "exhausted" or as due for a
+      24h retry -- the same "limit as verdict" mistake this fix exists to
+      remove, just from an honest-looking record instead of a fake one.
+
+    By default (exclude_retraction_cap=False, what
+    queue_item_recorded_source_result_attempt_count() and
+    missing_required_source_result_sources() use unless told otherwise) the
+    record DOES satisfy the count, so the row still rotates out of the
+    missing-provider-result priority bucket -- that is the whole point of
+    writing it. The count lives on the row and is dropped as soon as a real
+    result is recorded for this provider.
+
+    A provider that ran cleanly and simply had nothing for a row is NOT
+    handled here, deliberately. That is already recorded, with genuine
+    per-row evidence read straight from the payload, by
+    record_source_no_row_result_attempts() before this function ever runs --
+    a row it recorded already has its started marker cleared for this source
+    and so never reaches this loop at all. An earlier version of this fix
+    tried a batch-level "the provider ran cleanly" flag here instead, and it
+    was wrong: nothing at the batch level can tell a row the provider
+    genuinely searched apart from one skipped after a provider-pass failure,
+    one that lost its queue claim, or one cut off by max_per_series_reached,
+    because none of those carry the per-row projection this function would
+    need to tell them apart -- and record_source_no_row_result_attempts()
+    already owns every case where that projection exists.
+
+    ``stats``, when given, receives a ``recorded_retraction_cap`` count.
     """
     source_key = source_order_attempt_key(source)
     if source_key not in SYNCHRONOUS_MARKER_SOURCES:
@@ -3871,6 +4202,22 @@ def retract_unsearched_source_started_markers(rows, source, mark_ts, now=None):
             continue
         if not clear_source_started_marker(item, source_key):
             continue
+        counts = item.get("source_marker_retractions")
+        counts = counts if isinstance(counts, dict) else {}
+        entry = counts.get(source_key) if isinstance(counts.get(source_key), dict) else {}
+        results_now = int(queue_item_recorded_source_result_attempt_count(item, source_key))
+        # A result recorded since the last retraction means the run of
+        # retractions ended; count from zero again.
+        previous = int(numeric_timestamp(entry.get("count"))) if entry.get("results") == results_now else 0
+        capped = previous >= SOURCE_MARKER_RETRACTION_CAP
+        settled = False
+        if capped:
+            settled = record_marker_settled_attempt(item, source_key, now)
+            if settled and isinstance(stats, dict):
+                stats["recorded_retraction_cap"] = int(stats.get("recorded_retraction_cap") or 0) + 1
+        if not settled:
+            counts[source_key] = {"count": previous + 1, "results": results_now, "last_at": now}
+            item["source_marker_retractions"] = counts
         # The marker also lives as a "searching" attempt row, and
         # source_started_at() falls back to it. Leaving that behind retracts
         # the claim in one place and leaves it standing in the other, so the
@@ -3891,9 +4238,69 @@ def retract_unsearched_source_started_markers(rows, source, mark_ts, now=None):
             ]
         if source_order_attempt_key(item.get("current_source")) == source_key:
             item["current_source"] = None
+        if settled:
+            touch_queue_item(item, now)
+            continue
         retracted += 1
         touch_queue_item(item, now)
     return retracted
+
+
+def record_marker_settled_attempt(item, source, now):
+    """Write the cap's honest, non-attempt record. See the retraction docstring.
+
+    Status "observed" is deliberate: inkdrop_state.source_attempt_is_real_attempt()
+    keys only on status, and "observed" is one of NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES
+    (pure bookkeeping, not an acquisition attempt), so this never starts the
+    retry ceiling or the aggregate Prowlarr cooldown on a provider that
+    never ran. Status alone does NOT keep it out of
+    automatic_sources_exhausted() and the other retry/cooldown guards --
+    those key off missing_required_source_result_sources(), the same
+    function rotation uses, not off status. That function's
+    exclude_retraction_cap=True (checked by the guard callers, not by this
+    record) is what keeps a "did not run" record from reading as a result
+    for exhaustion/retry-delay/cooldown purposes.
+    queue_item_recorded_source_result_attempt_count() counts this record by
+    default (exclude_retraction_cap=False), which is what lets the row still
+    rotate out of the missing-provider-result priority bucket once this is
+    recorded.
+    """
+
+    label = public_source_name(source) or source
+    reason = (
+        f"{label} did not run for this row on {SOURCE_MARKER_RETRACTION_CAP} consecutive passes; "
+        "recorded so other rows are searched"
+    )
+    title = " ".join(
+        str(value or "").strip()
+        for value in (item.get("series"), item.get("issue"))
+        if str(value or "").strip()
+    )
+    attempt = {
+        "ts": now,
+        "ts_iso": now_iso(now),
+        "source": source,
+        "provider": label,
+        "provider_id": source,
+        "status": "observed",
+        "lifecycle_phase": "observed",
+        "reason": reason,
+        "failure_reason": reason,
+        "kind": "source_ladder_provider_summary",
+        "title": title,
+        "query": item.get("query") or title,
+        "marker_settled_as": "retraction_cap",
+    }
+    if not append_unique_queue_attempt(item, attempt, dedupe_retry_state=False):
+        return False
+    record_automation_source_outcome(item, reason, source, now, {"query": attempt["query"]})
+    item["last_event"] = reason
+    counts = item.get("source_marker_retractions")
+    if isinstance(counts, dict):
+        counts.pop(source, None)
+        if not counts:
+            item.pop("source_marker_retractions", None)
+    return True
 
 
 def source_started_stale_seconds(source, default_seconds=STALE_SEARCH_SOURCE_MARKER_SECONDS):
@@ -6051,7 +6458,7 @@ def automatic_sources_exhausted(item, exhaustion_cycles=DEFAULT_EXHAUSTION_CYCLE
         attempts = 0
     if attempts < int(exhaustion_cycles or 0):
         return False
-    if missing_required_source_result_sources(item):
+    if missing_required_source_result_sources(item, exclude_retraction_cap=True):
         return False
     if not slskd_attempted_at(item):
         return False
@@ -6110,7 +6517,20 @@ def no_actionable_source_result(item):
     return detected_count <= 0
 
 
-def missing_required_source_result_sources(item):
+def missing_required_source_result_sources(item, *, exclude_retraction_cap=False):
+    """List sources this row still needs a real result from.
+
+    ``exclude_retraction_cap=True`` is for the missing-provider GUARD: pass
+    it from automatic_sources_exhausted(), no_actionable_source_retry_delay(),
+    repeated_source_retry_should_cooldown(), provider_transient_retry_delay(),
+    provider_retry_should_cooldown(), and their callers, so an honest
+    "did not run" retraction-cap record (see record_marker_settled_attempt())
+    cannot flip exhaustion, extend a retry delay, or start a cooldown for a
+    provider that never actually searched the row. Leave it False for
+    rotation/priority use (the missing_provider_result bucket, pending-source
+    markers, per-provider eligibility) where the cap record must still count
+    so the row stops outbidding every other row waiting on the same provider.
+    """
     if not isinstance(item, dict):
         return []
     missing = []
@@ -6123,7 +6543,10 @@ def missing_required_source_result_sources(item):
         slskd_reprobe = source == "slskd" and slskd_source_result_reprobe_due(item)
         if source == "slskd" and slskd_attempted_at(item) and not slskd_reprobe:
             continue
-        if queue_item_recorded_source_result_attempt_count(item, source) > 0 and not slskd_reprobe:
+        result_count = queue_item_recorded_source_result_attempt_count(
+            item, source, exclude_retraction_cap=exclude_retraction_cap
+        )
+        if result_count > 0 and not slskd_reprobe:
             continue
         missing.append(source)
     return missing
@@ -6808,7 +7231,7 @@ def no_actionable_source_retry_delay(item, exhaustion_cycles=DEFAULT_EXHAUSTION_
         base_retry_seconds = max(0, int(base_retry_seconds or DEFAULT_RETRY_SECONDS))
     except (TypeError, ValueError):
         base_retry_seconds = DEFAULT_RETRY_SECONDS
-    if missing_required_source_result_sources(item):
+    if missing_required_source_result_sources(item, exclude_retraction_cap=True):
         return base_retry_seconds
     if attempts < threshold:
         return base_retry_seconds
@@ -6830,7 +7253,7 @@ def repeated_source_retry_should_cooldown(item, now, *, missing_source_results=N
     if not retry_due_now(item, now=now):
         return False
     if missing_source_results is None:
-        missing_source_results = missing_required_source_result_sources(item)
+        missing_source_results = missing_required_source_result_sources(item, exclude_retraction_cap=True)
     if missing_source_results:
         return False
     if has_cached_safe_slskd_candidate(item):
@@ -7040,7 +7463,7 @@ def provider_transient_retry_delay(item, source, *, base_seconds=None, missing_s
     except (TypeError, ValueError):
         delay = provider_transient_retry_base_seconds(source)
     if missing_source_results is None:
-        missing_source_results = missing_required_source_result_sources(item)
+        missing_source_results = missing_required_source_result_sources(item, exclude_retraction_cap=True)
     if missing_source_results:
         return delay
     try:
@@ -7071,7 +7494,7 @@ def provider_retry_should_cooldown(item, now, *, source=None, missing_source_res
     if source not in SOURCE_PROVIDER_IDS:
         return False
     if missing_source_results is None:
-        missing_source_results = missing_required_source_result_sources(item)
+        missing_source_results = missing_required_source_result_sources(item, exclude_retraction_cap=True)
     if missing_source_results:
         return False
     if has_cached_safe_slskd_candidate(item):
@@ -7347,7 +7770,7 @@ def normalize_waiting_retry_state(item, now):
         item["retry_waiting_normalized_at_iso"] = now_iso(now)
         return True
     if slskd_transient_checked_result(item):
-        missing_source_results = missing_required_source_result_sources(item)
+        missing_source_results = missing_required_source_result_sources(item, exclude_retraction_cap=True)
         retry_delay = provider_transient_retry_delay(
             item,
             "slskd",
@@ -7396,7 +7819,16 @@ def normalize_waiting_retry_state(item, now):
     no_actionable = no_actionable_source_result(item)
     low_confidence = low_confidence_slskd_result(item)
     automatic_retry_event = automatic_source_retry_event(item)
-    missing_source_results = update_pending_source_result_markers(item)
+    # update_pending_source_result_markers() sets pending_source_result_sources
+    # from the ROTATION-flavored missing list (a retraction-cap record counts
+    # as "not missing", so the row's own display and the priority bucket see
+    # it as searched enough to move on). Everything below this line is the
+    # exhaustion/retry-delay/cooldown GUARD, which must not be satisfied by
+    # that same honest "did not run" record -- so it gets its own
+    # exclude_retraction_cap=True list instead of the marker function's return
+    # value. See missing_required_source_result_sources()'s docstring.
+    update_pending_source_result_markers(item)
+    missing_source_results = missing_required_source_result_sources(item, exclude_retraction_cap=True)
     provider_retry_source = provider_retry_source_from_event(item)
     provider_retry_cooldown = provider_retry_should_cooldown(
         item,
@@ -8655,6 +9087,7 @@ def merge_current_queue(queue, current, *, file_evidence=None):
     created = 0
     verified = 0
     verify_refused = 0
+    watch_refusal_search_expired = 0
     verify_retracted = 0
     for key, entry in current.items():
         item = items.get(key)
@@ -8722,6 +9155,7 @@ def merge_current_queue(queue, current, *, file_evidence=None):
         item["source_order"] = apply_queue_item_source_policy(item, now)
         item["recovery_steps"] = queue_item_recovery_steps(item)
         item["present_in_watch"] = True
+        clear_watch_refusal_search(item)
         item["updated_from_watch_at"] = now
         item["updated_from_watch_at_iso"] = now_iso(now)
         if item.get("state") in {"", None}:
@@ -8738,7 +9172,7 @@ def merge_current_queue(queue, current, *, file_evidence=None):
         and item.get("state") != "verified"
         and not wrong_language_quarantine_active(item)
     ]
-    # THE RESIDUE #1095 COULD NOT SEE. That change put the evidence check inside
+    # THE RESIDUE THE OLD CHECK COULD NOT SEE. That change put the evidence check inside
     # `state != "verified"`, so it stopped the write and left every row already
     # carrying it. On snapshot inkdrop-state-20260902T222706Z-383f7b167d00, 153
     # queue rows still read `no longer missing in watched series` and 91 were
@@ -8803,18 +9237,38 @@ def merge_current_queue(queue, current, *, file_evidence=None):
             # cannot; discarding it entirely would be its own regression.
             if key not in evidence_ids:
                 item["present_in_watch"] = False
-                item["last_event"] = (
-                    "watched series stopped reporting this as missing, but no imported file "
-                    "was found for it -- left searchable"
-                )
+                # SAY WHICH REFUSAL THIS IS. The grant is written once and
+                # expires; after that the row is refused AND no longer searched
+                # by anything, which is a different situation from a refusal
+                # with an open grant and must not read the same. Left
+                # unrecorded, "left searchable" would keep being written onto a
+                # row that is not, and nothing would count how often the
+                # bounded window runs out without the unit ever being found.
+                lapsed = watch_refusal_search_grant_lapsed(item, now)
+                if lapsed:
+                    item["last_event"] = (
+                        "watched series stopped reporting this as missing, no imported file was "
+                        "found for it, and its search grant expired; no longer searched by the "
+                        "autopilot"
+                    )
+                    watch_refusal_search_expired += 1
+                else:
+                    item["last_event"] = (
+                        "watched series stopped reporting this as missing, but no imported file "
+                        "was found for it -- left searchable"
+                    )
                 item["verify_refused_at"] = now
                 item["verify_refused_at_iso"] = now_iso(now)
+                # "Left searchable" has to be true of the scheduler too, not
+                # just of this row's state -- see the grant's own comment.
+                grant_watch_refusal_search(item, now)
                 verify_refused += 1
                 continue
             item["state"] = "verified"
             item["completed_at"] = now
             item["completed_at_iso"] = now_iso(now)
             item["last_event"] = WATCH_VERIFIED_EVENT
+            clear_watch_refusal_search(item)
             verified += 1
 
     # RETRACT THE RESIDUE -- but only if the lookup actually ran.
@@ -8874,6 +9328,11 @@ def merge_current_queue(queue, current, *, file_evidence=None):
                 # unsupported all along". Folding them would make the residue
                 # drain look like ordinary traffic.
                 "verify_retracted": verify_retracted,
+                # How often the bounded search grant ran out with the unit still
+                # unfound. A refusal count alone cannot separate "refused, still
+                # being looked for" from "refused, and nothing is looking any
+                # more", and only the second one loses books silently.
+                "watch_refusal_search_expired": watch_refusal_search_expired,
                 "current_missing": len(current),
             }
         )
@@ -8882,6 +9341,7 @@ def merge_current_queue(queue, current, *, file_evidence=None):
         "verified": verified,
         "verify_refused": verify_refused,
         "verify_retracted": verify_retracted,
+        "watch_refusal_search_expired": watch_refusal_search_expired,
         "current_missing": len(current),
     }
 
@@ -8943,7 +9403,7 @@ def startup_annotation_row_keys(queue, args):
     for key, item in items.items():
         if key in seen or not isinstance(item, dict):
             continue
-        missing_source_results = missing_required_source_result_sources(item)
+        missing_source_results = missing_required_source_result_sources(item, exclude_retraction_cap=True)
         if repeated_source_retry_should_cooldown(
             item,
             now,
@@ -10571,7 +11031,22 @@ def append_unique_queue_attempt(item, attempt, keep=240, *, dedupe_retry_state=T
     return True
 
 
-def queue_item_recorded_source_result_attempt_count(item, source):
+def queue_item_recorded_source_result_attempt_count(item, source, *, exclude_retraction_cap=False):
+    """Count recorded result rows for ``source``.
+
+    ``exclude_retraction_cap=True`` is for the missing-provider GUARD (the
+    callers of missing_required_source_result_sources() that decide
+    automatic_sources_exhausted, retry delays and cooldowns): it skips the
+    honest "did not run" record record_marker_settled_attempt() writes
+    (``marker_settled_as == "retraction_cap"``), so a provider that never
+    actually searched the row cannot read as having a result for those
+    decisions. The default (False) is for ROTATION/priority use --
+    missing_required_source_result_sources()'s caller in
+    update_pending_source_result_markers() and the bucket helpers -- where
+    the cap record must still count, so the row stops outbidding every other
+    row for the same provider slot. See retract_unsearched_source_started_markers()
+    and record_marker_settled_attempt() for why the record exists at all.
+    """
     if not isinstance(item, dict):
         return 0
     source_key = source_order_attempt_key(source)
@@ -10582,6 +11057,8 @@ def queue_item_recorded_source_result_attempt_count(item, source):
         if not isinstance(attempt, dict):
             continue
         if str(attempt.get("kind") or "").strip().lower() in NON_RESULT_SOURCE_ATTEMPT_KINDS:
+            continue
+        if exclude_retraction_cap and str(attempt.get("marker_settled_as") or "").strip().lower() == "retraction_cap":
             continue
         attempt_source = source_order_attempt_key(
             attempt.get("source")
@@ -14031,6 +14508,7 @@ def first_pass_due_row_count(queue, args, now=None):
     if now is None:
         now = time.time()
     allowed_series = set(getattr(args, "series", []) or [])
+    exclusions = series_exclusions()
     count = 0
     for item in (queue.get("items") or {}).values():
         if not isinstance(item, dict):
@@ -14041,7 +14519,9 @@ def first_pass_due_row_count(queue, args, now=None):
             continue
         if item.get("state") == "needs_you" and not getattr(args, "retry_needs_you", False):
             continue
-        if not item.get("present_in_watch", True):
+        if not queue_item_searchable(item, now):
+            continue
+        if series_excluded_by_database(item, exclusions):
             continue
         retry_after = retry_after_ts(item)
         if retry_after > now and not getattr(args, "force", False):
@@ -14060,6 +14540,7 @@ def broad_due_group_count(queue, args, now=None):
     if now is None:
         now = time.time()
     allowed_series = set(getattr(args, "series", []) or [])
+    exclusions = series_exclusions()
     groups = set()
     for item in (queue.get("items") or {}).values():
         if not isinstance(item, dict):
@@ -14070,7 +14551,9 @@ def broad_due_group_count(queue, args, now=None):
             continue
         if item.get("state") == "needs_you" and not getattr(args, "retry_needs_you", False):
             continue
-        if not item.get("present_in_watch", True):
+        if not queue_item_searchable(item, now):
+            continue
+        if series_excluded_by_database(item, exclusions):
             continue
         retry_after = retry_after_ts(item)
         if retry_after > now and not getattr(args, "force", False):
@@ -14539,7 +15022,7 @@ def series_starvation_tier(last_service_at, now=None):
 
     `last_service_at` is the per-series SERVICE clock, not a row's updated_at --
     generic observations refresh row timestamps without anything having searched
-    the series, which is the same masking defect #225 records for
+    the series, which is the same masking defect previously seen for
     wanted_items.updated_at.
 
     A series with no recorded service at all is treated as starved: never served
@@ -15067,7 +15550,7 @@ def due_series(queue, args):
         series = item.get("series") or ""
         if allowed_series and series not in allowed_series:
             continue
-        if not item.get("present_in_watch", True):
+        if not queue_item_searchable(item, now):
             continue
         group_key = due_group_key(item)
         group_slskd_service_at[group_key] = max(
@@ -15084,7 +15567,7 @@ def due_series(queue, args):
             continue
         if item.get("state") == "needs_you" and not args.retry_needs_you:
             continue
-        if not item.get("present_in_watch", True):
+        if not queue_item_searchable(item, now):
             continue
         if series_excluded_by_database(item, exclusions):
             continue
@@ -15668,10 +16151,14 @@ def process_series(queue, series, rows, args, progress=None, deadline=None, prov
             # Every row that still claims this pass started a search for it was
             # never accounted for by the result path. Take the claim back rather
             # than leaving it for the reaper to read as a provider going silent.
-            retracted = retract_unsearched_source_started_markers(rows, source, source_mark_ts)
+            marker_stats = {}
+            retracted = retract_unsearched_source_started_markers(rows, source, source_mark_ts, stats=marker_stats)
             if retracted:
                 summary["retracted_unsearched_markers"] = retracted
                 log("source_markers_retracted", series=series, source=source, rows=retracted)
+            if marker_stats:
+                summary.update(marker_stats)
+                log("source_markers_settled", series=series, source=source, **marker_stats)
             eligible = refresh_after_source(source)
             if eligible:
                 publish(source, finish_note)
@@ -15955,7 +16442,7 @@ def state_ready_import_count():
         return 0
     try:
         status_placeholders = ",".join("?" for _ in INKDROP_STATE_IMPORT_READY_STATUSES)
-        db_uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+        db_uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
         # Closed explicitly: `with` on a connection ends the transaction but
         # leaves the file handle open until the object is collected.
         con = sqlite3.connect(db_uri, uri=True, timeout=1.0)
@@ -16015,10 +16502,10 @@ def undiscoverable_ready_import_count():
         # Closed explicitly rather than via `with`: the context manager ends the
         # transaction but leaves the handle -- and the attached second database
         # file -- open.
-        con = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True, timeout=1.0)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True, timeout=1.0)
         try:
             con.execute("pragma busy_timeout = 500")
-            con.execute("attach database ? as impdb", (f"file:{IMPORTED_DB}?mode=ro",))
+            con.execute("attach database ? as impdb", (inkdrop_db.sqlite_readonly_uri(IMPORTED_DB),))
             try:
                 row = con.execute(
                     f"""
@@ -16456,9 +16943,168 @@ def build_status(queue, payload):
         "state": state,
         "queue_active": queue_active,
         "summary": summary,
+        "slskd_search_starvation": slskd_search_starvation(queue),
         **payload,
     }
     return status
+
+
+REAL_SLSKD_SEARCH_MARKER_FILENAME = "slskd-real-search-sent.json"  # kept in sync with inkdrop_slskd_source_probe.py
+SLSKD_MISSING_MARKER_BASELINE_FILENAME = "slskd-real-search-sent-missing-baseline.json"
+SLSKD_SEARCH_STARVATION_SECONDS = 3 * 60 * 60
+
+
+def _slskd_missing_marker_baseline_path():
+    return STATE_DIR / SLSKD_MISSING_MARKER_BASELINE_FILENAME
+
+
+def _slskd_missing_marker_baseline_at(now):
+    """First time we observed the real-search marker missing, persisted.
+
+    A fresh install, or the first pass after this alarm deploys, has no
+    marker yet and no history of one either. Without a baseline, that reads
+    as "idle forever" and alarms immediately. Seeding "since" at the first
+    observation -- and keeping it until a real search is sent or nothing is
+    waiting any more -- means the alarm only fires once rows have actually
+    been waiting SLSKD_SEARCH_STARVATION_SECONDS with no marker, the same as
+    it would once a marker exists.
+    """
+    path = _slskd_missing_marker_baseline_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        baseline = float(data.get("ts") or 0) if isinstance(data, dict) else 0.0
+        if baseline > 0:
+            return baseline
+    except Exception:
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temp_path.write_text(json.dumps({"ts": now}), encoding="utf-8")
+        os.replace(temp_path, path)
+    except Exception:
+        pass
+    return now
+
+
+def _clear_slskd_missing_marker_baseline():
+    try:
+        _slskd_missing_marker_baseline_path().unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def slskd_would_search_row(item, now=None):
+    """Whether SLSKD still has work to do for this row, for the starvation count.
+
+    More permissive than slskd_source_result_reprobe_due(): a row inside its
+    normal zero-result reprobe cooldown still counts here, because it will
+    come due well within SLSKD_SEARCH_STARVATION_SECONDS. What must NOT count
+    is a row SLSKD will not search again at all -- one with a cached safe
+    candidate waiting on autopick, or one whose last SLSKD result already
+    carries candidates (safe or not), detected files, or an auto-grab safe
+    count above zero. Those settle through review or autopick, not another
+    search, so counting them toward "rows waiting for SLSKD" is exactly the
+    over-count the alarm must avoid: a library where every row already has
+    such a result would otherwise alarm forever with nothing left to search.
+    """
+    if not isinstance(item, dict):
+        return False
+    if not slskd_attempted_at(item):
+        return True
+    if has_cached_safe_slskd_candidate(item):
+        return False
+    try:
+        candidate_count = int(item.get("last_slskd_candidate_count") or 0)
+        detected_count = int(item.get("last_slskd_detected_count") or 0)
+        safe_count = int(item.get("last_slskd_auto_grab_safe_count") or 0)
+    except (TypeError, ValueError):
+        return True
+    if candidate_count > 0 or detected_count > 0 or safe_count > 0:
+        return False
+    return True
+
+
+def last_real_slskd_search_sent_at():
+    """The last time this InkDrop instance actually POSTed a new SLSKD search.
+
+    Deliberately not slskd_attempted_at(): that reads per-row markers
+    (autopilot_slskd_attempted_at / last_slskd_at) that apply_slskd_checked()
+    and normalize_slskd_attempt_marker() also stamp on a cached-probe reuse or
+    a historical backfill, neither of which sent SLSKD anything. Measured
+    live 2026-09-23: those per-row stamps kept moving on cached reuse while no
+    real SLSKD search went out from 12:40Z to 21:35Z, which is exactly the gap
+    a health check reading them would miss.
+
+    This file is written in exactly one place --
+    inkdrop_slskd_source_probe.record_real_slskd_search_sent(), immediately
+    after a real POST /searches succeeds -- so it can only move on a genuine
+    submission. Returns 0.0 when no real search has ever been sent (a fresh
+    install, or the marker file is missing/unreadable for any reason).
+    """
+    try:
+        path = STATE_DIR / REAL_SLSKD_SEARCH_MARKER_FILENAME
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return float(data.get("ts") or 0) if isinstance(data, dict) else 0.0
+    except Exception:
+        return 0.0
+
+
+def slskd_search_starvation(queue, now=None, threshold_seconds=SLSKD_SEARCH_STARVATION_SECONDS):
+    """Report when SLSKD has had rows to search and has sent no real search for hours.
+
+    2026-09-23: no SLSKD search left the building from 12:40Z to 21:35Z while
+    this status kept saying "running normally", because every pass still
+    reached some provider. The signal that was missing is the one the
+    operator cares about: how long since SLSKD last actually ran a search,
+    against how many rows are queued for it.
+
+    Returns None when the lane is off, nothing SLSKD would actually search is
+    waiting, or SLSKD has been idle (by real marker, or by the missing-marker
+    baseline) for less than the threshold.
+    """
+
+    if not source_enabled("slskd"):
+        return None
+    now = time.time() if now is None else float(now)
+    last_search_at = last_real_slskd_search_sent_at()
+    waiting = 0
+    for item in ((queue or {}).get("items") or {}).values():
+        if not isinstance(item, dict):
+            continue
+        if item.get("state") != "queued" or not queue_item_searchable(item, now):
+            continue
+        if numeric_timestamp(item.get("retry_after")) > now:
+            continue
+        if "slskd" not in [str(value or "").strip().lower() for value in queue_item_source_order(item)]:
+            continue
+        if not slskd_would_search_row(item, now=now):
+            continue
+        waiting += 1
+    if not waiting or last_search_at > 0:
+        # Either there is nothing to alarm about, or a real marker exists and
+        # speaks for itself -- either way the missing-marker baseline (only
+        # meaningful while the marker is absent AND something is waiting on
+        # it) is stale and must not linger for a later gap to misread.
+        _clear_slskd_missing_marker_baseline()
+    if not waiting:
+        return None
+    if last_search_at > 0:
+        idle_seconds = now - last_search_at
+    else:
+        idle_seconds = now - _slskd_missing_marker_baseline_at(now)
+    if idle_seconds < float(threshold_seconds):
+        return None
+    return {
+        "waiting_rows": waiting,
+        "last_search_at": last_search_at or None,
+        "idle_seconds": round(idle_seconds, 1),
+        "threshold_seconds": float(threshold_seconds),
+    }
 
 
 def queue_progress_counts(queue):
@@ -16517,6 +17163,17 @@ def automatic_search_health(payload):
         return {
             "state": "late_provider_start",
             "label": "A source search started too late in this Automatic Search pass.",
+        }
+    starvation = payload.get("slskd_search_starvation")
+    if isinstance(starvation, dict) and starvation.get("waiting_rows"):
+        idle = starvation.get("idle_seconds")
+        idle_text = f"{idle / 3600:.1f} hours" if isinstance(idle, (int, float)) else "a long time"
+        return {
+            "state": "slskd_search_stalled",
+            "label": (
+                f"Automatic Search is running, but no SLSKD search has been sent for {idle_text} "
+                f"while {int(starvation['waiting_rows'])} rows wait for one."
+            ),
         }
     if maintenance_timed_out:
         return {
@@ -16615,6 +17272,28 @@ def write_progress_status(queue, payload):
     write_json(STATUS_FILE, status)
     record_worker_activity_status(status)
     return status
+
+
+def record_autopilot_pass_marker(event, marker):
+    """Log a pass boundary and record it as diagnostic history; a start with no finish means the pass died."""
+    log(event, **marker)
+    if inkdrop_state is None:
+        return None
+    try:
+        return inkdrop_state.record_history_event(
+            INKDROP_STATE_DB,
+            event_type=event,
+            entity_type="autopilot_pass",
+            entity_id=marker["pass_id"],
+            source="autopilot",
+            message=f"autopilot pass {marker.get('pass_outcome') or 'started'}",
+            raw={**marker, "history_kind": event},
+            timeout_seconds=5,
+            busy_timeout_ms=5000,
+        )
+    except Exception as exc:
+        log("autopilot_pass_marker_failed", pass_id=marker.get("pass_id"), error=f"{type(exc).__name__}: {exc}")
+        return None
 
 
 def startup_current_series(args):
@@ -16915,6 +17594,7 @@ def status_only_busy_response(args):
 
 
 def run(args):
+    run_started_at = time.time()
     setup_started_monotonic = time.monotonic()
     startup_phase_seconds = {}
 
@@ -17045,6 +17725,15 @@ def run(args):
         print(json.dumps(status, indent=2, sort_keys=True))
         clear_runtime_hard_exit(hard_exit_alarm)
         return status
+    pass_marker = None
+    if not getattr(args, "dry_run", False) and not getattr(args, "annotate_only", False):
+        pass_marker = {
+            "pass_id": f"autopilot-pass-{int(run_started_at * 1000)}-{os.getpid()}",
+            "started_at": run_started_at,
+            "started_at_iso": now_iso(run_started_at),
+            "max_series": int(getattr(args, "max_series", 0) or 0),
+        }
+        record_autopilot_pass_marker("autopilot_pass_started", pass_marker)
     if not getattr(args, "dry_run", False) and not getattr(args, "status_only", False):
         startup_phase("status_publication", lambda: write_startup_heartbeat(queue, args))
         startup_phase(
@@ -17161,6 +17850,7 @@ def run(args):
         )
 
     publish_progress(note="queue synced")
+    pass_stop_reason = "source_worker_pressure_yield" if source_worker_yield else "max_series_reached"
     if source_worker_yield:
         publish_progress(source="source_worker", note="dedicated source-worker pass is waiting; yielding autopilot source work")
     if not getattr(args, "annotate_only", False) and not source_worker_yield:
@@ -17173,10 +17863,12 @@ def run(args):
             try:
                 while len(processed) < int(args.max_series or 0):
                     if runtime_deadline_expired(run_deadline):
+                        pass_stop_reason = "runtime_budget_reached"
                         publish_progress(note="autopilot runtime budget reached; finishing this pass")
                         break
                     group_start_min_seconds = run_group_start_min_seconds()
                     if runtime_deadline_too_close(run_deadline, group_start_min_seconds):
+                        pass_stop_reason = "runtime_budget_too_close"
                         remaining = runtime_seconds_remaining(run_deadline) or 0
                         publish_progress(
                             note=(
@@ -17222,6 +17914,7 @@ def run(args):
                                     if row.get("hot_retry")
                                 )
                                 publish_progress(note="cached SLSKD retries finished after broad queue")
+                        pass_stop_reason = "due_work_exhausted" if hot_retries_finished else "hot_retries_deferred"
                         break
                     series, rows, group_key = next_group
                     consume_user_search_priority(rows)
@@ -17273,6 +17966,7 @@ def run(args):
                                 args.skip_slskd_broad_due_to_busy = True
                             publish_progress(note="cached SLSKD retries finished after provider work")
                     if runtime_deadline_expired(run_deadline):
+                        pass_stop_reason = "runtime_budget_reached"
                         publish_progress(note="autopilot runtime budget reached after series; finishing this pass")
                         break
             finally:
@@ -17363,6 +18057,25 @@ def run(args):
             last_processed_series=last_processed_series,
         ),
     )
+    if pass_marker is not None:
+        finished_at = time.time()
+        # Only "completed" means no unvisited due group remained when the pass stopped.
+        aborted = bool(fatal_error) or pass_stop_reason.startswith(("runtime_budget", "source_worker"))
+        pass_outcome = "aborted" if aborted else "completed" if pass_stop_reason == "due_work_exhausted" else "partial"
+        visited = {str(row.get("queue_identity") or row.get("series") or "").strip() for row in processed if isinstance(row, dict)}
+        record_autopilot_pass_marker("autopilot_pass_finished", {
+            **pass_marker,
+            "finished_at": finished_at,
+            "finished_at_iso": now_iso(finished_at),
+            "duration_seconds": round(finished_at - run_started_at, 3),
+            "pass_outcome": pass_outcome,
+            "stop_reason": pass_stop_reason,
+            "aborted_reason": (fatal_error or pass_stop_reason) if pass_outcome == "aborted" else None,
+            "units_visited": len(processed),
+            "visited_queue_identities": sorted(visited - {""}),
+            "searches_issued": int(sync_result.get("provider_call_count") or 0),
+            "searches_by_source": dict(sync_result.get("provider_calls_by_source") or {}),
+        })
     if runtime_budget_reached:
         print(json.dumps({
             "ok": status.get("ok"),
@@ -17402,8 +18115,8 @@ def normalize_autopilot_args(args):
 
     This tail used to sit inline at the bottom of `main()`, past every gate and
     every `apply_*_provider_defaults()` call, which made it unreachable from a
-    test: the #1198 smoke hands `auto_grab_max` straight to
-    `slskd_probe_command()` and the #1199 smoke pins constants, so neither could
+    test: the auto-grab smoke hands `auto_grab_max` straight to
+    `slskd_probe_command()` and the grab-ceiling smoke pins constants, so neither could
     see that the SLSKD grab limit was still being clamped to a literal 10 here --
     after the operator's stored 20 or 25 had already been read in. Named, it is
     one seam a smoke can drive with the real values.
@@ -17528,7 +18241,19 @@ def main():
             stall_seconds=accepted_handoff_gate.get("stall_seconds"),
             next_action="source_worker_download_client_handoff",
         )
-        return
+        # Exit 75, not 0. inkdrop-series-autopilot-cron.sh propagates the
+        # Python exit code and core/inkdrop_container_scheduler.py's
+        # completion_schedule() treats 75 as "deferred": it does not count as
+        # a failure and the job is retried after
+        # INKDROP_SCHEDULER_DEFERRED_RETRY_SECONDS (120s default) instead of
+        # waiting out the full 900s series-autopilot interval. A plain
+        # `return` here exits 0, which books the whole 15-minute slot on a
+        # pass that did no work -- confirmed live 2026-09-23: roughly half
+        # the passes from 14:00Z to 21:35Z exited in ~1.6s this way while
+        # real handoffs sat pending. The gate's own stall release (above)
+        # still hands priority back to search once a handoff genuinely never
+        # clears, so this only shortens the wait, it does not starve handoffs.
+        raise SystemExit(75)
     preflight_import_backlog_gate = import_backlog_priority_gate()
     if (
         preflight_import_backlog_gate.get("active")

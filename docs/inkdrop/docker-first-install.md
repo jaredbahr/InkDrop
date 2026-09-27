@@ -161,7 +161,11 @@ Existing library content is left alone — only the mount point itself is
 adjusted, which is enough for new imports to land with the right ownership. If
 you are moving over from a root-owned install and want the library reowned as
 well, set `INKDROP_CHOWN_LIBRARY=1` for one start; on a large library this can
-take a while. Set `INKDROP_SKIP_CHOWN=1` if you manage ownership yourself.
+take a while. Set `INKDROP_SKIP_CHOWN=1` if you manage ownership yourself --
+the entrypoint then changes no ownership at all, including InkDrop's own
+config and state directories, so every mount must already be owned by your
+`PUID:PGID`. Use `INKDROP_SKIP_CHOWN=mounts` to leave only the media and
+staging mount roots alone while config and state are still fixed.
 
 Leaving `PUID` and `PGID` unset keeps the existing root behaviour, so adding
 them later is opt-in and upgrading never changes it for you.

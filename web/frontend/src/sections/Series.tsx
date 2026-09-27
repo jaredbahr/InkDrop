@@ -11,6 +11,7 @@ import {
   seriesRibbonPublisher,
   seriesStatus,
 } from "./seriesTypes";
+import { seriesNav } from "../shellBridge";
 
 // The shell owns navigation, the Series toolbar (Update / RSS Sync / View /
 // Sort / Filter) and the search box; this island owns everything inside the
@@ -243,8 +244,9 @@ export function Series({ payload }: { payload: SeriesViewPayload }) {
     // Opening a series detail is shell-owned: it swaps the whole section for
     // the detail view and owns that view's data fetching. Call through rather
     // than reimplementing it here.
-    const shell = window as unknown as { InkDropSeriesNav?: { openDetail: (row: SeriesRow) => void } };
-    shell.InkDropSeriesNav?.openDetail(row);
+    // See src/shellBridge.ts: declared once, and optional there because the
+    // shell is a separate script that may not have wired this yet.
+    seriesNav().openDetail?.(row);
   }
 
   // Neither view keeps every row mounted as a real DOM node any more, so a

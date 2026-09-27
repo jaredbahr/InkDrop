@@ -20,6 +20,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from core import inkdrop_db
 
 
 _CACHE = {}
@@ -123,7 +124,7 @@ def build_acquisition_funnel(db_path, hours=12, now=None):
     started = time.perf_counter()
     if not path.exists():
         return {"ok": False, "error": "InkDrop state database not found", "hours": hours}
-    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     with sqlite3.connect(uri, uri=True, timeout=2.0) as con:
         con.row_factory = sqlite3.Row
         con.execute("pragma query_only=1")
@@ -577,7 +578,7 @@ def build_missing_backlog_accounting(
         return {"ok": False, "error": "InkDrop state database not found"}
     started = time.perf_counter()
     snapshot_stat = path.stat()
-    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     sql_deadline_seconds = missing_backlog_sql_deadline_seconds()
     sql_started = time.monotonic()
     # contextlib.closing() is the difference between "the transaction ended" and

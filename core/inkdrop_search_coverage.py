@@ -121,7 +121,9 @@ def schedulable_rows(con, *, now=None, states=DEFAULT_STATES, due_only=True):
         now=now,
     )
     where = " and ".join(clauses)
-    real_attempt_predicate = inkdrop_state.real_attempt_predicate_sql("sa")
+    real_attempts_cte = inkdrop_state.real_attempts_by_queue_cte_sql(
+        "sa", "join schedulable_queue sq on sq.id = sa.queue_id"
+    )
     sql = f"""
         with schedulable_queue as (
             select q.id, q.series_id, q.created_at
@@ -129,15 +131,7 @@ def schedulable_rows(con, *, now=None, states=DEFAULT_STATES, due_only=True):
             left join series s on s.id=q.series_id
             left join wanted_items w on w.id=q.wanted_id
             where {where}
-        ), real_attempts as (
-            select sa.queue_id,
-                   count(*) as real_attempt_count,
-                   max(coalesce(sa.completed_at, sa.started_at, 0)) as last_real_attempt_at
-            from source_attempts sa
-            join schedulable_queue sq on sq.id = sa.queue_id
-            where {real_attempt_predicate}
-            group by sa.queue_id
-        )
+        ), {real_attempts_cte}
         select sq.id as queue_id,
                sq.series_id as series_id,
                coalesce(ra.real_attempt_count, 0) as real_attempt_count,

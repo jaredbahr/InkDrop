@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import base64
+import binascii
 import contextlib
 import copy
 import datetime
@@ -6,6 +8,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import posixpath
 import re
@@ -22,6 +25,7 @@ from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit, urluns
 
 from core import inkdrop_import_evidence
 from core import inkdrop_review_reasons
+from core import inkdrop_manga_companion
 from core.inkdrop_display_labels import display_label
 from core import inkdrop_runtime_config
 from core import inkdrop_settings_registry
@@ -35,7 +39,11 @@ from core import inkdrop_manual_search_core
 from core import inkdrop_download_client_config
 from core import inkdrop_artifact_acceptance
 from core import inkdrop_library_identity
+from core import inkdrop_manga_unit_policy
+from core import inkdrop_history_presentation
 from core.inkdrop_release_dates import ReleaseDate
+
+LOGGER = logging.getLogger(__name__)
 
 try:
     from core.inkdrop_transfer import normalize_transfer_status
@@ -2233,7 +2241,7 @@ def init_schema_uncached(con):
             "insert into schema_meta(key, value) values('wanted_duplicate_reconcile_v1', '1') "
             "on conflict(key) do update set value=excluded.value"
         )
-    # Tracker #537. Same durable-marker shape as the sweep above, and for the
+    # Use the same durable-marker shape as the sweep above, and for the
     # same reason: background jobs run as fresh subprocesses, so an in-process
     # cache key would re-run this on every invocation.
     if not con.execute(
@@ -3036,7 +3044,7 @@ _REMOVED_SERIES_RESTORE_KEYS = (
 def restore_removed_series_work(con, series_id, now=None, source="inkdrop_state"):
     """Undo retire_removed_series_work() for a series that is no longer removed.
 
-    Retirement had no reversal anywhere in core/ (#729): `previous_state` was
+    Retirement had no reversal anywhere in core/: `previous_state` was
     written in ~25 places and read back in none, so a series removed and later
     re-added kept its work retired for ever -- tracked, and not worked.
 
@@ -4014,7 +4022,24 @@ def repair_media_file_identity(con):
 # fails identically at any size.
 MANAGED_MEDIA_AGING_SHARE = 5
 
-_MANAGED_MEDIA_CANDIDATE_SQL = """
+# SQL twin of media_file_normalized_path() for import_results.dest_path: backslashes to
+# slashes, runs of slashes collapsed (up to eight), a drive letter lower-cased, trailing
+# slash dropped. It is ONLY used to find a dest's ledger row (`md`) and to break age ties
+# so a dest's rows sit together. A run of more than eight slashes is left partly collapsed,
+# so the join finds nothing and the row falls back to its own ledger row or to age 0:
+# a weaker ordering, never a dropped row. It must not be used to decide what is in root.
+_MANAGED_MEDIA_DEST_SLASHED_SQL = (
+    "replace(replace(replace(replace(trim(ir.dest_path), char(92), '/'),"
+    " '//', '/'), '//', '/'), '//', '/')"
+)
+_MANAGED_MEDIA_DEST_NORM_SQL = (
+    f"rtrim(case when substr({_MANAGED_MEDIA_DEST_SLASHED_SQL}, 2, 2) = ':/'"
+    f" then lower(substr({_MANAGED_MEDIA_DEST_SLASHED_SQL}, 1, 1))"
+    f" || substr({_MANAGED_MEDIA_DEST_SLASHED_SQL}, 2)"
+    f" else {_MANAGED_MEDIA_DEST_SLASHED_SQL} end, '/')"
+)
+
+_MANAGED_MEDIA_CANDIDATE_SELECT_SQL = """
     select ir.id, ir.queue_id, ir.source_attempt_id, ir.series_id, ir.issue_id,
            ir.source_path, ir.dest_path, ir.status, ir.verified, ir.outcome,
            ir.display_phase, ir.completion_truth, ir.folder_imported,
@@ -4022,13 +4047,18 @@ _MANAGED_MEDIA_CANDIDATE_SQL = """
            ir.created_at, ir.raw_json,
            s.title as series_title, s.media_type as series_media_type,
            i.issue_number as issue_number, i.normalized_number as normalized_number,
-           q.wanted_id as queue_wanted_id
+           q.wanted_id as queue_wanted_id,
+           md.import_result_id as ledger_import_result_id
     from import_results ir
     left join series s on s.id = ir.series_id
     left join issues i on i.id = ir.issue_id
     left join queue_items q on q.id = ir.queue_id
-    left join media_files mf on mf.import_result_id = ir.id
-    where coalesce(ir.dest_path, '') != ''
+"""
+# The two ledger joins the aging order reads: `mf` is the row's own media row, `md` its dest's.
+_MANAGED_MEDIA_CANDIDATE_LEDGER_JOIN_SQL = f"""    left join media_files mf on mf.import_result_id = ir.id
+    left join media_files md on md.normalized_path = {_MANAGED_MEDIA_DEST_NORM_SQL}
+"""
+_MANAGED_MEDIA_CANDIDATE_WHERE_SQL = """    where coalesce(ir.dest_path, '') != ''
       and (
         coalesce(ir.verified, 0) = 1
         or coalesce(ir.folder_imported, 0) = 1
@@ -4041,9 +4071,51 @@ _MANAGED_MEDIA_CANDIDATE_SQL = """
         )
       )
     """
+_MANAGED_MEDIA_CANDIDATE_SQL = (
+    _MANAGED_MEDIA_CANDIDATE_SELECT_SQL
+    + _MANAGED_MEDIA_CANDIDATE_LEDGER_JOIN_SQL
+    + _MANAGED_MEDIA_CANDIDATE_WHERE_SQL
+)
+# The aging arm orders on every candidate, and sorting the wide rows (raw_json) is what costs,
+# so it orders these two narrow columns and loads the wide rows only for the ones it keeps.
+_MANAGED_MEDIA_AGING_KEY_SQL = (
+    "\n    select ir.id, ir.dest_path\n    from import_results ir\n"
+    + _MANAGED_MEDIA_CANDIDATE_LEDGER_JOIN_SQL
+    + _MANAGED_MEDIA_CANDIDATE_WHERE_SQL
+)
 
 MANAGED_MEDIA_RECENCY_ORDER = "order by coalesce(ir.created_at, 0) desc, ir.id desc"
-MANAGED_MEDIA_AGING_ORDER = "order by coalesce(mf.last_seen_at, 0) asc, ir.id asc"
+# The aging arm has two orders, chosen per pass by `:rotate` (see _managed_media_aging_rows).
+#
+# BY AGE (rotate = 0). A candidate's age is the age of its DEST's ledger row (`md`), falling
+# back to the row's own (`mf`) when the dest join finds nothing. Ageing by the row's own
+# media row left every superseded import_results row (one dest, several rows, only the
+# winner owns the ledger row) at 0 forever: 4,543 of 8,878 candidates on the
+# 2026-09-23T10:27Z snapshot. They filled the 1,000-row aging arm on every pass, so 2,028
+# of 4,287 in-root dests were never in a window at all. Ties (every dest written in one pass
+# shares one stamp) break by dest before row id, so a dest's rows sit together in the order.
+#
+# ROTATING (rotate = 1). An age only moves when a file is CREDITED, and a row the filename
+# check refuses -- a candidate whose issue disagrees with its numbered filename and has no
+# agreeing sibling -- is never credited, so it keeps its age and heads the age order on every
+# pass. So does a dest whose duplicate rows outnumber the budget and whose valid row sorts
+# after them. Enough of either fills the age order for good; every dest behind them, and
+# every winner among them, is unreachable (review-1311/verdict.md HIGH-1, HIGH-2). Progress
+# cannot depend on crediting a file, so every other pass walks the candidates in a fixed
+# order no outcome can change -- (dest_path, id) -- from where the last such pass stopped.
+# Everything ahead of that position is taken first, then the order wraps.
+#
+# Both live in this one constant so that replacing it replaces the whole aging arm.
+MANAGED_MEDIA_AGING_ORDER = (
+    "order by case when :rotate = 1 then ((ir.dest_path, ir.id) <= (:cursor_dest, :cursor_id))"
+    " else 0 end asc,"
+    " case when :rotate = 1 then 0 else coalesce(md.last_seen_at, mf.last_seen_at, 0) end asc,"
+    f" case when :rotate = 1 then ir.dest_path else {_MANAGED_MEDIA_DEST_NORM_SQL} end asc,"
+    " ir.id asc"
+)
+# The position and the pass count are one schema_meta value, the way the projection cursors
+# are, so this needs no schema change. A database with no schema_meta table keeps the age order.
+_MANAGED_MEDIA_AGING_STATE_KEY = "managed_media_sync_aging_state"
 
 
 def managed_media_sync_arm_bounds(limit):
@@ -4059,26 +4131,365 @@ def managed_media_sync_arm_bounds(limit):
     return limit - aging, aging
 
 
-def _managed_media_sync_candidates(con, limit):
+def _managed_media_dest_in_roots(dest_path, roots):
+    """The exact test sync_managed_media_files() applies before it stats a dest.
+
+    `roots` None means no filter. A dest outside every root is skipped there and never
+    gets a ledger row, so in an ordered window it would spend budget on nothing. The aging
+    arm decides this in Python, with the same two functions the sync uses, and steps over
+    such rows instead of counting them: a SQL twin of the path normalisation had to be
+    written as a superset and was not one (a slash run longer than its fixed number of
+    collapses dropped an in-root dest -- review-1311 MEDIUM-1).
+    """
+    if roots is None:
+        return True
+    normalized = media_file_normalized_path(str(dest_path or "").strip())
+    return bool(normalized) and path_under_any_root(normalized, roots)
+
+
+def _managed_media_aging_state(con):
+    """(pass count, dest_path, id) of the aging arm, or None when it cannot be kept."""
+    try:
+        row = con.execute(
+            "select value from schema_meta where key=? limit 1", (_MANAGED_MEDIA_AGING_STATE_KEY,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None  # no schema_meta table: no place to keep a position, so no rotation
+    try:
+        value = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    try:
+        count = int(value.get("n") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return count, str(value.get("dest") or ""), str(value.get("id") or "")
+
+
+def _managed_media_save_aging_state(con, count, dest_path, row_id):
+    con.execute(
+        "insert into schema_meta(key, value) values(?, ?)"
+        " on conflict(key) do update set value=excluded.value",
+        (_MANAGED_MEDIA_AGING_STATE_KEY, json.dumps({"n": count, "dest": dest_path, "id": row_id})),
+    )
+
+
+def _managed_media_aging_rows(con, budget, roots, taken):
+    """The aging arm's rows: `budget` in-root rows not already taken.
+
+    Passes alternate between the two orders in MANAGED_MEDIA_AGING_ORDER. A rotating pass
+    also advances the saved position past every row it examined, whether that row is
+    credited, refused or skipped later, which is the point of it. Rows outside every root and
+    rows in `taken` (already chosen by the recency arm, so being stat'd anyway) are stepped
+    over without spending budget.
+
+    The read is a SQL top-N, `budget` plus what can be stepped over plus some slack, and it
+    widens if that was not enough, so the work stays bounded exactly as a plain LIMIT was.
+    """
+    if budget <= 0:
+        return []
+    state = _managed_media_aging_state(con)
+    rotate = bool(state) and state[0] % 2 == 1
+    count, cursor_dest, cursor_id = state or (0, "", "")
+    read = budget + len(taken) + max(budget, 64)
+    while True:
+        rows = con.execute(
+            _MANAGED_MEDIA_AGING_KEY_SQL + MANAGED_MEDIA_AGING_ORDER + "\n    limit :read_limit\n",
+            {"rotate": int(rotate), "cursor_dest": cursor_dest, "cursor_id": cursor_id, "read_limit": read},
+        ).fetchall()
+        kept, last = {}, None
+        for row in rows:
+            last = row
+            if row["id"] in taken or row["id"] in kept or not _managed_media_dest_in_roots(row["dest_path"], roots):
+                continue
+            kept[row["id"]] = row
+            if len(kept) >= budget:
+                break
+        if len(kept) >= budget or len(rows) < read:
+            break
+        read *= 4
+    if state is not None:
+        if rotate and last is not None:
+            cursor_dest, cursor_id = str(last["dest_path"]), str(last["id"])
+        _managed_media_save_aging_state(con, count + 1, cursor_dest, cursor_id)
+    ids = list(kept)
+    loaded = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        for row in con.execute(
+            _MANAGED_MEDIA_CANDIDATE_SQL.rstrip()
+            + f"\n      and ir.id in ({','.join('?' * len(chunk))})\n    order by ir.id",
+            chunk,
+        ).fetchall():
+            loaded[row["id"]] = row
+    # SQLite gives no order for an IN list; hand the rows back in the order the arm chose them.
+    return [loaded[row_id] for row_id in ids if row_id in loaded]
+
+
+def _managed_media_sync_candidates(con, limit, roots=None):
     """Rows for one media sync pass: newest by import, plus longest-unchecked.
 
     At most `limit` rows. The union is de-duplicated on import_results.id, so
     overlap between the arms LOWERS the count and can never raise it -- the
     filesystem cost of a pass stays bounded exactly as it was when this was a
     single `order by created_at desc limit ?`.
+
+    Given `roots`, the aging arm steps over dests under none of them (see
+    _managed_media_dest_in_roots); the recency arm is never filtered.
     """
     recent, aging = managed_media_sync_arm_bounds(limit)
     selected = {}
-    for order_sql, bound in (
-        (MANAGED_MEDIA_RECENCY_ORDER, recent),
-        (MANAGED_MEDIA_AGING_ORDER, aging),
-    ):
-        for row in con.execute(
-            _MANAGED_MEDIA_CANDIDATE_SQL + order_sql + "\n    limit ?\n",
-            (bound,),
-        ).fetchall():
-            selected.setdefault(row["id"], row)
+    for row in con.execute(
+        _MANAGED_MEDIA_CANDIDATE_SQL + MANAGED_MEDIA_RECENCY_ORDER + "\n    limit ?\n", (recent,)
+    ).fetchall():
+        selected.setdefault(row["id"], row)
+    for row in _managed_media_aging_rows(con, aging, roots, set(selected)):
+        selected.setdefault(row["id"], row)
     return list(selected.values())
+
+
+def _managed_media_filename_issue_number(dest_path):
+    """The issue number the dest FILENAME alone names, or None.
+
+    extract_issue_number() reads the parent folder together with the stem, so
+    a span-shaped folder name can steal the read from a correctly numbered
+    file inside it ('Volume 01 (2012)/Prophet 021' -> 1). Attribution must
+    trust only what the file itself is named.
+
+    A chapter-marked name is deliberately left unparsed here rather than
+    routed through a chapter-aware reader: `_issue_number_from_text()` has no
+    notion of a decimal chapter, so 'Choujin X c77.1' read as 1 (the digits
+    after the dot) and 'Kingdom v19 c196' read as 19 (the volume), silently
+    dropping correctly credited chapter files out of every sync pass
+    (review-1309/verdict.md finding 1). Returning None for those names falls
+    back to today's per-dest ordering, same as an unnumbered filename.
+    """
+    stem = Path(str(dest_path or "")).stem
+    if not stem:
+        return None
+    from core import inkdrop_completed_import as completed_import
+
+    if completed_import.filename_has_chapter_token(dest_path):
+        return None
+    return completed_import._issue_number_from_text(stem)
+
+
+def _managed_media_issue_number_as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _managed_media_row_has_no_issue(row):
+    """True when the import row itself names no issue (issue_id unset/blank).
+
+    Keyed on the row's own claim, not on the joined issue's number: an import
+    whose issue_id points at a blank-number placeholder issue (for example
+    `kapowarr:128:issue:`) does claim an issue, and the ledger write copies
+    that issue_id, so it is treated as disagreeing rather than untyped.
+    """
+    return not str(row["issue_id"] or "").strip()
+
+
+def _managed_media_row_field(row, key):
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
+def _managed_media_winner_rank(row, folders=None):
+    """Which row of a dest's pool wins the ledger row: the highest rank.
+
+    A row that names a real issue beats one that does not: a blank-number
+    placeholder or untyped incumbent must not outrank a row that names the
+    dest's real issue merely because it already owns the ledger row
+    (rereview2-1311/verdict.md finding 2 -- `owns` used to be ranked first,
+    which let a placeholder/untyped sticky owner survive next to a row
+    naming the real issue). Only among rows that tie on that does stickiness
+    decide: the row that already owns the dest's ledger row beats another row
+    that ties with it, so stickiness only breaks ties among equally good
+    rows, never overrides a strictly better one. The remaining ties break by
+    the newest import, then the id, so the order is total and explicit.
+
+    Before stickiness, a row whose series folder is known to hold the dest beats
+    one whose folder is unknown, which beats one whose known folder does not hold
+    it; two unknown folders tie and fall through. The import that put the file
+    there beats a reconcile proof (`suppressed_completed`) that only credited
+    it: Coda (2018)'s proof owned `Coda (2023)/Coda #004` for good because it
+    arrived 18 minutes before that folder-verified import (audit 2026-09-26 H1).
+    """
+    names_an_issue = bool(str(row["issue_number"] or "").strip())
+    folder = media_file_normalized_path((folders or {}).get(str(row["series_id"] or "")))
+    dest = media_file_normalized_path(str(row["dest_path"] or "").strip()) or ""
+    if not folder:
+        in_own_folder = 1
+    elif dest.lower().startswith(folder.rstrip("/").lower() + "/"):
+        in_own_folder = 2
+    else:
+        in_own_folder = 0
+    imported_the_file = str(row["status"] or "").strip().lower() != "suppressed_completed"
+    owns = _managed_media_row_field(row, "ledger_import_result_id") == row["id"]
+    created_at = _managed_media_issue_number_as_float(row["created_at"]) or 0.0
+    return (names_an_issue, in_own_folder, imported_the_file, owns, created_at, str(row["id"]))
+
+
+def newer_same_title_volume_years(con, series_id, title, year, completed_import):
+    """Start years of the library's other volumes of `title` begun after `year`.
+
+    Sameness is the completed-import normalizer's, so `Love & Rockets` and
+    `Love and Rockets` are one title; the query cannot pre-filter on the
+    literal title without dropping such a match.
+    """
+    try:
+        rows = con.execute(
+            "select title, year from series where id<>?",
+            (str(series_id or ""),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return completed_import.newer_volume_years(
+        {"title": title, "year": year}, [{"title": r[0], "year": r[1]} for r in rows]
+    )
+
+
+def _managed_media_series_folders(con, rows):
+    """Each candidate series' library folder, for the rank's own-folder test.
+
+    Read on the side rather than joined into the candidate query, so a store
+    whose `series` table has no folder column ranks as before. A series with
+    no `library_path` is placed by its `library_adapter_path`, resolved the
+    way the importer's own target loader resolves it.
+    """
+    from core.inkdrop_completed_import import host_path_from_kavita_path
+
+    ids = sorted({str(row["series_id"]) for row in rows if row["series_id"]})
+    folders = {}
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            marks = ",".join("?" * len(chunk))
+            for series_id, folder, adapter_folder in con.execute(
+                f"select id, library_path, library_adapter_path from series where id in ({marks})", chunk
+            ):
+                folders[str(series_id)] = str(folder or "").strip() or host_path_from_kavita_path(adapter_folder)
+    except sqlite3.OperationalError:
+        return {}
+    return folders
+
+
+def _managed_media_load_incumbent_row(con, incumbent_id, normalized):
+    """The CURRENT ledger owner's own candidate row, when this pass's window did not
+    load it (see the incumbent handling in `_managed_media_select_candidates`).
+
+    Returns None when the id no longer names an eligible candidate at all, or when it
+    does but for a DIFFERENT dest -- a stale or mis-credited ledger row whose
+    `import_result_id` points at an import for some other file entirely is not a
+    legitimate incumbent to protect, and the dest stays free to be corrected exactly as
+    it was before this fix (row1207-wrong-attachments/report.md shape, probes.py
+    'slash-form-ledger-exists').
+    """
+    row = con.execute(
+        _MANAGED_MEDIA_CANDIDATE_SQL.rstrip() + "\n      and ir.id = ?\n", (incumbent_id,)
+    ).fetchone()
+    if row is None or media_file_normalized_path(str(row["dest_path"] or "").strip()) != normalized:
+        return None
+    return row
+
+
+def _managed_media_select_candidates(con, rows):
+    """Drop, per dest, any candidate whose issue disagrees with its filename.
+
+    `_managed_media_sync_candidates()` can return several import_results rows
+    for the same dest -- a superseded row recorded the wrong issue and a
+    later correction recorded the right one, both still 'verified'. Upserting
+    every row in list order let whichever ran last win the shared
+    `normalized_path`, which was often the superseded one
+    (row1207-wrong-attachments/report.md R1). A row whose issue the filename
+    names now beats one that disagrees, regardless of order; among rows that
+    agree (or, when the filename carries no number at all, among every row
+    for that dest) that rank decides who wins. When every candidate for
+    a numbered dest disagrees with its own filename -- including a lone
+    candidate -- none of them wins: the dest is left out of this pass rather
+    than overwriting today's ledger attribution with an unconfirmed number.
+    A candidate that records no issue at all is neither: it ranks below an
+    agreeing row and above a disagreeing one, and a dest whose only rows are
+    untyped is refreshed as before. That ranking holds only among the rows
+    fetched in one bounded pass: an agreeing row outside the pass is not seen
+    here, so an untyped row inside it can still be the one refreshed.
+
+    Among the rows left in a dest's pool the winner is picked by
+    `_managed_media_winner_rank`: a row naming the real issue beats one that
+    does not, and only among rows that tie on that does the row already
+    owning the dest's ledger row keep it -- not by position in `rows`.
+
+    The dest's CURRENT ledger owner (`ledger_import_result_id`, from the `md`
+    join in `_MANAGED_MEDIA_CANDIDATE_SQL`) is the persistent incumbent across
+    passes, not just within one: when a dest's rows straddle more than one
+    pass and the owner's own row is absent from this pass's raw candidates,
+    its full row is loaded on the side (`_managed_media_load_incumbent_row`)
+    and folded into the dest's pool so the winner is picked over the dest's
+    whole eligible pool, not just whichever of its other rows this pass's
+    window happened to load (rereview2-1311/verdict.md finding 1 -- real data
+    showed a dest's owner flip to a blank placeholder at pass 48 of a 60-pass
+    replay purely because the owner's row was not in that pass's window). A
+    ledger row whose `import_result_id` names an import for a DIFFERENT dest
+    entirely -- a stale or mis-credited row, not a live incumbent -- is not
+    folded in, so that dest stays free to be corrected exactly as before.
+    """
+    groups = {}
+    passthrough = []
+    for row in rows:
+        normalized = media_file_normalized_path(str(row["dest_path"] or "").strip())
+        if not normalized:
+            passthrough.append(row)
+            continue
+        groups.setdefault(normalized, []).append(row)
+
+    extra_by_dest = {}
+    pool_ids_by_dest = {}
+    for normalized, group in groups.items():
+        incumbent_id = _managed_media_row_field(group[0], "ledger_import_result_id")
+        if incumbent_id is not None and incumbent_id not in {row["id"] for row in group}:
+            incumbent_row = _managed_media_load_incumbent_row(con, incumbent_id, normalized)
+            if incumbent_row is not None:
+                extra_by_dest[normalized] = incumbent_row
+                group = group + [incumbent_row]
+        filename_number = _managed_media_filename_issue_number(group[0]["dest_path"])
+        if filename_number is None:
+            pool_ids_by_dest[normalized] = {row["id"] for row in group}
+            continue
+        agreeing = {
+            row["id"] for row in group
+            if _managed_media_issue_number_as_float(row["issue_number"]) == filename_number
+        }
+        # A row whose issue_id is unset makes no claim the filename could
+        # contradict, so it is not a disagreeing row: it keeps the earlier
+        # behaviour of being refreshed. It ranks below a row that agrees with
+        # the filename and above one that disagrees. A row whose issue_id names
+        # a blank-number placeholder issue does make a claim and is disagreeing.
+        untyped = {row["id"] for row in group if _managed_media_row_has_no_issue(row)}
+        # empty pool: every candidate carries a different issue, so none wins this pass
+        pool_ids_by_dest[normalized] = agreeing or untyped
+
+    winners = {}
+    folders = _managed_media_series_folders(con, list(rows) + list(extra_by_dest.values()))
+    for row in list(rows) + list(extra_by_dest.values()):
+        normalized = media_file_normalized_path(str(row["dest_path"] or "").strip())
+        if not normalized or row["id"] not in pool_ids_by_dest.get(normalized, ()):
+            continue
+        current = winners.get(normalized)
+        if current is None or _managed_media_winner_rank(row, folders) > _managed_media_winner_rank(current, folders):
+            winners[normalized] = row
+    # An out-of-window incumbent loaded via extra_by_dest can win the ranking (freezing
+    # the dest -- nothing here belongs in THIS pass's output) but is never itself
+    # emitted: it was not observed by this pass, so its filesystem state must not be
+    # (re)written as if it had been.
+    winner_ids = {row["id"] for row in winners.values()}
+    return passthrough + [row for row in rows if row["id"] in winner_ids]
 
 
 def sync_managed_media_files(con, now=None, limit=5000):
@@ -4089,7 +4500,9 @@ def sync_managed_media_files(con, now=None, limit=5000):
     if not normalized_roots:
         return {"observed": 0, "present": 0, "missing": 0, "skipped": 0}
     identity_repair = repair_media_file_identity(con)
-    rows = _managed_media_sync_candidates(con, limit)
+    rows = _managed_media_select_candidates(
+        con, _managed_media_sync_candidates(con, limit, normalized_roots)
+    )
     observed = 0
     present = 0
     missing = 0
@@ -6075,7 +6488,7 @@ def upsert_series(con, row, now):
         # The counterpart to the eleven retire_removed_series_work() call
         # sites. Removal retires the series' queue and wanted rows; nothing
         # brought them back, so a series removed and later re-added stayed
-        # tracked and unworked for ever (#729).
+        # tracked and unworked for ever.
         #
         # AFTER the series write, not before: restore_removed_series_work()
         # asks series_id_user_removed(), which reads the series row, and would
@@ -6207,11 +6620,36 @@ def _apply_series_media_type_override(con, series_id, media_type, now):
     }
 
 
-def upsert_issue(con, series_id, issue, now):
+def upsert_issue(con, series_id, issue, now, *, prefer_stored_provider=False):
     number = str(issue.get("issueNumber") or issue.get("issue") or "").strip()
     issue_provider, explicit_metadata_id = metadata_identity(issue)
     metadata_id = explicit_metadata_id or issue.get("id") or issue.get("issue_id")
     issue_id = f"{series_id}:issue:{metadata_id or normalize_issue_number(number)}"
+    if prefer_stored_provider or not issue_provider:
+        # Ask the row that is already there before taking the payload's word
+        # for it. Two callers need this for different reasons.
+        #
+        # Any payload that says nothing (sync_queue's five-key rebuild, for
+        # one) must not overrule a writer that knew something -- otherwise the
+        # stored label is downgraded to the guess below on every pass.
+        #
+        # `prefer_stored_provider` goes further and lets the stored label beat
+        # a payload that DOES carry one. Only a caller whose payload provider
+        # is not independent evidence may ask for that: the autopilot queue
+        # file's `issue_metadata_provider` is itself re-copied out of
+        # `issues.metadata_provider` by
+        # inkdrop_series_autopilot.current_missing_from_inkdrop_state(), so
+        # honouring it there just feeds a stale copy of this column back into
+        # this column, and a correction made in between (a catalog refresh
+        # retagging a chapter `mangadex`) is undone on the next sync. Callers
+        # holding a provider's own answer -- record_provider_series_catalog(),
+        # sync_watches() -- must keep the default and stay able to relabel.
+        stored = con.execute(
+            "select metadata_provider from issues where id=?", (issue_id,)
+        ).fetchone()
+        stored_provider = metadata_provider_key(stored[0] if stored else "")
+        if stored_provider:
+            issue_provider = stored_provider
     if not issue_provider:
         issue_provider = "comicvine" if metadata_id and not str(metadata_id).startswith("kapowarr-") else "kapowarr"
     normalized_number = normalize_issue_number(number)
@@ -6960,18 +7398,65 @@ def active_manga_companion_series_ids(db_path):
     }
 
 
-def manga_companion_pair_is_linked(db_path, *, comicvine_series_id, mangadex_series_id):
+def manga_companion_pair_is_linked(db_path, *, comicvine_series_id, mangadex_series_id, statuses=("linked",)):
+    statuses = tuple(statuses) or ("linked",)
     with connect(Path(db_path), configure_wal=False) as con:
         init_schema(con)
         row = con.execute(
-            """
+            f"""
             select 1 from manga_companion_links
-            where comicvine_series_id=? and mangadex_series_id=? and status='linked'
+            where comicvine_series_id=? and mangadex_series_id=? and status in ({",".join("?" * len(statuses))})
             limit 1
             """,
-            (str(comicvine_series_id or ""), str(mangadex_series_id or "")),
+            (str(comicvine_series_id or ""), str(mangadex_series_id or ""), *statuses),
         ).fetchone()
     return bool(row)
+
+
+def manga_chapter_lane_owned_volumes(con, mangadex_series_id):
+    """Volumes the linked volume lane holds, as the chapter-lane depth rule reads them.
+
+    The one input to inkdrop_manga_companion.chapter_behind_volume_lane() for
+    every writer of MangaDex chapter wants (first link, companion refresh, the
+    metadata-only reconciler), so they cannot disagree. Empty -- the rule then
+    holds nothing back -- unless the pair is linked or preparing. A volume
+    counts only when satisfied AND backed by an active media file: a bare
+    satisfied status can outlive its file, and holding chapters back behind a
+    volume nobody has would leave them searched by no lane. Numbers above the
+    highest volume MangaDex tags on this series' chapters are dropped: a
+    ComicVine lane can mix chapter-numbered issues (Hunter x Hunter 320-411)
+    in with its volumes, and those are not volumes.
+    """
+    link = con.execute(
+        "select comicvine_series_id from manga_companion_links where mangadex_series_id=?"
+        " and status in ('linked','preparing') order by status='linked' desc limit 1",
+        (str(mangadex_series_id or ""),),
+    ).fetchone()
+    if not link:
+        return set()
+    tags = [
+        inkdrop_manga_companion.unit_number(json_loads(row[0] or "{}", {}).get("volume"))
+        for row in con.execute("select raw_json from issues where series_id=?", (str(mangadex_series_id),))
+    ]
+    cap = max((tag for tag in tags if tag is not None), default=None)
+    if cap is None:
+        return set()
+    rows = con.execute(
+        """
+        select distinct i.normalized_number from wanted_items w join issues i on i.id=w.issue_id
+        where w.series_id=? and w.status='satisfied'
+          and exists(select 1 from media_files m where m.issue_id=i.id and m.active=1)
+        """,
+        (str(link[0]),),
+    ).fetchall()
+    owned = {str(row[0]) for row in rows if row[0] is not None}
+    return {number for number in owned if (volume := inkdrop_manga_companion.unit_number(number)) is not None and volume <= cap}
+
+
+def chapter_lane_owned_volumes(db_path, mangadex_series_id):
+    with connect(Path(db_path), configure_wal=False) as con:
+        init_schema(con)
+        return manga_chapter_lane_owned_volumes(con, mangadex_series_id)
 
 
 def manga_companion_reconcile_backoff_series_ids(db_path, *, now=None):
@@ -7031,17 +7516,51 @@ def due_mangadex_companion_links(db_path, *, limit=3, min_age_seconds=6 * 3600, 
     return [dict(row) for row in rows]
 
 
+MANGADEX_METADATA_ID_SHAPE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
 def provider_issue_metadata_ids(db_path, series_id, provider):
+    """Which of this series' issue rows already hold an id belonging to `provider`.
+
+    The caller -- the MangaDex companion refresh -- uses this to decide what in
+    a feed is new, so the answer has to be about the identity in the row, not
+    the label beside it. The label is not reliable: `sync_queue()` rebuilds an
+    issue payload from the autopilot queue file with no provider on it, and
+    `upsert_issue()`'s fallback then writes "comicvine" for any non-kapowarr
+    id. Every chapter that has ever been queued comes back tagged comicvine
+    while still holding its MangaDex chapter UUID -- 887 of the 1,086 issue
+    rows under MangaDex-sourced series on 2026-09-22, including 99 of Hunter x
+    Hunter's 104 chapters. Matching on the label alone hid all of them from
+    their own refresh, which then re-reported them as new every six hours and
+    spent its three-links-per-pass budget rediscovering what it already had.
+
+    Widening this by shape is safe in exactly one direction and only there: a
+    MangaDex chapter id is a UUID and a ComicVine issue id is a decimal number,
+    so a same-series ComicVine row can never be read as a chapter. Nothing is
+    widened for any other provider, because no other pair has that guarantee.
+    """
+    provider = metadata_provider_key(provider)
     with connect(Path(db_path), configure_wal=False) as con:
         init_schema(con)
         rows = con.execute(
             """
-            select metadata_id from issues
-            where series_id=? and metadata_provider=? and coalesce(metadata_id, '')<>''
+            select metadata_id, metadata_provider from issues
+            where series_id=? and coalesce(metadata_id, '')<>''
             """,
-            (str(series_id or ""), metadata_provider_key(provider)),
+            (str(series_id or ""),),
         ).fetchall()
-    return {str(row["metadata_id"]) for row in rows if row["metadata_id"] not in (None, "")}
+    found = set()
+    for row in rows:
+        if row["metadata_id"] in (None, ""):
+            continue
+        metadata_id = str(row["metadata_id"])
+        if metadata_provider_key(row["metadata_provider"]) == provider:
+            found.add(metadata_id)
+        elif provider == "mangadex" and MANGADEX_METADATA_ID_SHAPE.match(metadata_id):
+            found.add(metadata_id)
+    return found
 
 
 def record_manga_companion_refresh(db_path, link_id, *, status, raw=None, now=None):
@@ -7907,7 +8426,7 @@ def replace_series_metadata(
 # satisfactions that HELD have no queue event after them at all.
 #
 # THE RULE, AND WHY IT IS NOT "NEVER OVERWRITE SATISFIED". A blanket guard
-# reintroduces row #767: a wanted row must still be projected AWAY from
+# is wrong: a wanted row must still be projected AWAY from
 # satisfied when its evidence does NOT stand, because a false `satisfied` is a
 # book removed from the library's future with nobody told. So the question is
 # never "is it satisfied" but "is it satisfied AND does the proof still hold",
@@ -7940,14 +8459,14 @@ def verified_import_satisfies_unit(
     reconcile_duplicate_issue_number_wanted_statuses (6,938 firings all-time),
     and reconcile_collected_edition_coverage (0 all-time).
 
-    That is #889's churn shape under a new name: a repair and an un-repair
+    That is the same churn shape under a new name: a repair and an un-repair
     racing to net zero. THE EVENT STREAM CANNOT SHOW IT, which is why it took a
     row-level read to find -- `_record_search_history` de-duplicates on a
     deterministic id, so the second satisfaction of the same row writes nothing
     and the absence of a later event is not evidence that nothing happened.
 
     One predicate, three consumers, rather than the same judgement copied into
-    each site -- which is the divergence #889's own rollout existed to remove.
+    each site -- which is the divergence the earlier rollout existed to remove.
     """
     if not verified_import_for_queue(
         con,
@@ -8037,6 +8556,135 @@ def wanted_satisfaction_identity_conflict(con, series_id, issue_id):
         # satisfaction. Both cost a re-search; the other way costs the book,
         # because nobody goes looking for a unit the system says it already has.
         return True
+
+
+def verified_proof_is_another_units_file(con, series_id, issue_id):
+    """True when the newest proof demonstrably names another unit's file.
+
+    Either authority alone is too noisy to reopen a unit on, measured on
+    snapshot inkdrop-state-20260923T102706Z-48d4a7bf0520 over its 4,190
+    verified queue rows: the ledger conflict flags 91 -- 69 a twin series id
+    holding the same book, 15 a stale ledger entry corrects -- and the
+    destination verdict alone flags 61. Both together flag 2, and both are
+    credited with another book: The Metabarons #8, whose proof points at
+    `The Metabarons #001 (2015).cbz` (ledger: #1, name: 001), and Love and
+    Rockets #4 at `#003`. Nothing inferred from an absent ledger row, proof or
+    number refuses. The exception is an issue-total marker: its own unit keys
+    prove the old parser credited the total, so no ledger corroboration is
+    needed.
+    """
+    proof = con.execute(
+        """
+        select * from import_results
+             indexed by idx_import_results_series_issue_verified_keyset
+        where series_id=? and issue_id=? and verified=1
+        order by coalesce(created_at, 0) desc, id desc
+        limit 1
+        """,
+        (series_id, issue_id),
+    ).fetchone()
+    context = import_result_identity_context(con, series_id, issue_id)
+    if stale_issue_total_proof_evidence(proof, context):
+        return True
+    if not wanted_satisfaction_identity_conflict(con, series_id, issue_id):
+        return False
+    try:
+        return proof_file_belongs_to_another_work(
+            con, series_id, row_value(proof, "dest_path") if proof else None
+        ) or import_result_destination_contradicts_unit(con, proof, context)
+    except Exception:
+        # The ledger already names another unit; an unreadable destination
+        # verdict takes the false negative, as the ledger guard itself does.
+        return True
+
+
+def proof_file_belongs_to_another_work(con, series_id, dest_path):
+    """True when the ledger files this proof's file under a different work.
+
+    Different means another title, or, for western comics, another start year:
+    Beast (2009) #1 sat satisfied on Invincible Universe: Battle Beast #001
+    through 133 projection refusals, and Coda (2018) #4 on Coda (2023)'s #004
+    (audit 2026-09-26 H1/H2). Manga twins disagree on the year across providers
+    (Chainsaw Man 2018/2019), so a manga year gap only exempts demonstrable
+    twins (manga_provider_twins); Dororo 1967/2018 are two works. Left to the
+    destination verdict: a twin id of the same title, and a file inside this series' own folder, where the ledger
+    is the suspect (Civil War II #007 filed under Civil War).
+    """
+    normalized = media_file_normalized_path(dest_path)
+    if not normalized:
+        return False
+    series_sql = "select s.id, s.title, s.year, s.media_type, s.metadata_provider, s.library_path from series s"
+    owner = con.execute(
+        series_sql + " join media_files m on s.id=m.series_id where m.normalized_path=? limit 1", (normalized,)
+    ).fetchone()
+    mine = con.execute(series_sql + " where s.id=? limit 1", (series_id,)).fetchone()
+    if not owner or not mine or str(row_value(owner, "id")) == str(series_id):
+        return False
+    own_folder = media_file_normalized_path(row_value(mine, "library_path"))
+    if own_folder and normalized.lower().startswith(own_folder.rstrip("/").lower() + "/"):
+        return False
+
+    def title_words(row):
+        return re.findall(r"[a-z0-9]+", str(row_value(row, "title") or "").lower())
+
+    if title_words(owner) != title_words(mine):
+        return True
+    years = (row_value(owner, "year"), row_value(mine, "year"))
+    if not (all(years) and str(years[0]) != str(years[1])):
+        return False
+    if any(str(row_value(row, "media_type") or "comic").lower() == "manga" for row in (owner, mine)):
+        return not manga_provider_twins(con, owner, mine)
+    return True
+
+
+def manga_provider_twins(con, left, right):
+    """True only for demonstrable catalog twins of one manga work.
+
+    Same title is not enough: Dororo (1967) and Dororo (2018) are two works.
+    Twins are two providers' records of one work -- a linked companion pair, or
+    different providers filing into one library folder. Anything else takes the
+    false negative.
+    """
+    ids = [str(row_value(row, "id") or "") for row in (left, right)]
+    if frozenset(ids) in linked_manga_companion_pair_keys(con):
+        return True
+    providers = [str(row_value(row, "metadata_provider") or "").lower() for row in (left, right)]
+    folders = [media_file_normalized_path(row_value(row, "library_path")) for row in (left, right)]
+    return bool(providers[0] and providers[1] and providers[0] != providers[1]
+                and folders[0] and folders[0].lower() == folders[1].lower())
+
+
+def record_identity_refusal_once(con, *, event_type, entity_type, entity_id, series_id, issue_id, message, raw):
+    """Record an identity refusal once per refused proof, not once per cycle.
+
+    The same stale proof is re-offered every pass, so an unconditional event
+    counted cycles rather than refusals: 133 for Beast (2009) #1 alone, 7,954
+    across 43 rows on snapshot 2026-09-26T10:27:07Z. A new proof records again.
+    """
+    proof = con.execute(
+        """
+        select id from import_results
+             indexed by idx_import_results_series_issue_verified_keyset
+        where series_id=? and issue_id=? and verified=1
+        order by coalesce(created_at, 0) desc, id desc
+        limit 1
+        """,
+        (series_id, issue_id),
+    ).fetchone()
+    proof_id = str(row_value(proof, "id") or "") if proof else ""
+    earlier = con.execute(
+        "select raw_json from history_events where entity_type=? and entity_id=? and event_type=?",
+        (entity_type, entity_id, event_type),
+    ).fetchall()
+    for row in earlier:
+        recorded = json_loads(row_value(row, "raw_json") or "{}", {})
+        if isinstance(recorded, dict) and recorded.get("proof_id") == proof_id:
+            return None
+    return _record_search_history(
+        con, event_type=event_type, entity_type=entity_type, entity_id=entity_id, series_id=series_id,
+        issue_id=issue_id, message=message, raw=dict(raw or {}, proof_id=proof_id), source="inkdrop_state",
+        now=time.time(),
+    )
 
 
 def wanted_satisfaction_is_evidenced(con, wanted_id, *, queue_id=None):
@@ -8134,7 +8782,11 @@ def wanted_projection_status(
         if identity is not None and wanted_satisfaction_identity_conflict(
             con, row_value(identity, "series_id"), row_value(identity, "issue_id")
         ):
-            _record_search_history(
+            # Stamped with when the refusal happened, not the caller's `now`:
+            # several sites pass a historical timestamp, and 22 of the first 24
+            # events on the sibling refusal landed back-dated by up to three
+            # weeks because of exactly that. Once per refused proof, not per pass.
+            record_identity_refusal_once(
                 con,
                 event_type="wanted_projection_refused_identity_conflict",
                 entity_type="wanted_item",
@@ -8152,12 +8804,6 @@ def wanted_projection_status(
                     "site": site,
                     "caller_now": now,
                 },
-                source="inkdrop_state",
-                # Stamped with when the refusal happened, not the caller's
-                # `now`: several sites pass a historical timestamp, and 22 of
-                # the first 24 events on the sibling refusal landed back-dated
-                # by up to three weeks because of exactly that.
-                now=time.time(),
             )
             # Take the false negative and keep searching. A wrong "you have it"
             # costs the book silently; a wrong "still missing" costs a re-search.
@@ -8532,7 +9178,7 @@ def park_series_automation(
         # a routine "clean up a confusing duplicate" removal can silently kill a
         # series' only chapter-discovery path (Fire Punch, Hunter X Hunter both
         # broke this way on 2026-08-07). Block by default; require an explicit
-        # override, mirroring the allow_reactivating_user_removal guard #480
+        # override, mirroring the allow_reactivating_user_removal guard
         # added to the restore direction.
         discovery_only_link = con.execute(
             "select id, comicvine_series_id from manga_companion_links "
@@ -12207,14 +12853,217 @@ SLSKD_RESERVATION_TERMINAL_STATUSES = SLSKD_TERMINAL_RECOVERY_STATUSES | {
 }
 
 
-def slskd_durable_manga_volume_type(series, series_raw, issue, queue_raw):
-    """Infer a volume only from exact durable manga metadata."""
+SERIES_UNIT_SETTING_KEYS = ("unit_type", "unitType", "source_unit", "manga_unit_model")
+DURABLE_UNIT_TYPE_KEYS = ("unit_type", "source_unit")
+# ComicVine manga rows also carry the camel-case spelling the autopilot queue
+# writes (Hunter X Hunter #409 "Negotiation 3": unitType chapter). The volume
+# predicate may only answer for a row that states no unit, so for those series
+# the gate reads it too -- the probe already does.
+COMICVINE_MANGA_UNIT_TYPE_KEYS = ("unit_type", "unitType", "source_unit")
+
+
+def durable_explicit_unit_types(*payloads, keys=DURABLE_UNIT_TYPE_KEYS):
+    """The unit types durable rows state for themselves."""
+    types = set()
+    for payload in payloads:
+        payload = payload if isinstance(payload, dict) else {}
+        for key in keys:
+            value = str(payload.get(key) or "").strip().lower().replace("-", "_")
+            if value:
+                types.add(value)
+                break
+    return types
+
+
+SERIES_UNIT_VOLUME_SETTINGS = {"volume", "volumes", "manga_volume", "tankobon"}
+
+
+def comicvine_manga_series_unit_setting(series_raw):
+    """What a series' own unit setting says about volumes: "volume",
+    "not_volume", or "" when it says nothing.
+
+    The operator's series "Manga Unit" (Series detail, stored as
+    ``manga_unit_model_override`` and read the way manual search reads it)
+    comes first: "volume" is volumes, "chapter" / "mixed_chapter_preferred"
+    is not volumes, anything else ("mixed_volume_preferred", "pack",
+    "unknown/manual") states no series-wide answer. Then the older explicit
+    series unit keys (SERIES_UNIT_SETTING_KEYS), which answer directly.
+    """
+    series_raw = series_raw if isinstance(series_raw, dict) else {}
+    override = inkdrop_manga_unit_policy.series_manga_unit_override({"raw_json": series_raw})
+    if override == "volume":
+        return "volume"
+    if override and inkdrop_manga_unit_policy.manga_unit_model_prefers_chapter(override):
+        return "not_volume"
+    for key in SERIES_UNIT_SETTING_KEYS:
+        setting = str(series_raw.get(key) or "").strip().lower()
+        if setting:
+            return "volume" if setting in SERIES_UNIT_VOLUME_SETTINGS else "not_volume"
+    return ""
+
+
+def comicvine_manga_series_refuses_volume(series_raw):
+    """True when the series' own unit setting says its issues are not volumes."""
+    return comicvine_manga_series_unit_setting(series_raw) == "not_volume"
+
+
+def comicvine_manga_series_volume_evidence(con, series_id, series_raw=None, issue_number=None):
+    """Proof that issue ``issue_number`` of a ComicVine manga series is a volume.
+
+    In order:
+
+    * The series' own unit setting (comicvine_manga_series_unit_setting)
+      answers directly -- an operator who set Manga Unit to volume is
+      trusted, one who set chapter is obeyed.
+    * A library file named as an issue (``Akira #001``) says no.
+    * ComicVine's release cadence for the series and this issue decides
+      (inkdrop_library_identity.comicvine_release_cadence_verdict): volumes
+      ship months apart, comic-format runs monthly, chapters weekly.
+    * Only when the series has too few dated consecutive issues for cadence
+      to answer at all does an existing volume-N library binding retain the
+      fallback. A readable non-volume cadence cannot be overridden by
+      library names, so files cannot reinforce a known monthly/chapter run.
+
+    No evidence is a refusal to guess -- see
+    inkdrop_library_identity.comicvine_manga_issue_is_volume.
+    """
+    series_raw = series_raw if isinstance(series_raw, dict) else {}
+    setting = comicvine_manga_series_unit_setting(series_raw)
+    if setting:
+        return setting == "volume"
+    series_id = str(series_id or "").strip()
+    if not series_id:
+        return False
+    files = []
+    if table_exists(con, "media_files"):
+        files = [
+            (row[0], row[1])
+            for row in con.execute(
+                """
+                select m.path, i.normalized_number
+                from media_files m join issues i on i.id = m.issue_id
+                where m.series_id=? and m.active=1 and i.series_id=m.series_id
+                """,
+                (series_id,),
+            ).fetchall()
+        ]
+    if inkdrop_library_identity.library_files_name_issues(files):
+        return False
+    dated = con.execute(
+        "select normalized_number, release_date from issues where series_id=?",
+        (series_id,),
+    ).fetchall()
+    verdict = inkdrop_library_identity.comicvine_release_cadence_verdict(
+        ((row[0], row[1]) for row in dated), issue_number,
+    )
+    if verdict != inkdrop_library_identity.CADENCE_UNKNOWN:
+        return verdict == inkdrop_library_identity.CADENCE_VOLUME
+    series_row = con.execute("select year from series where id=?", (series_id,)).fetchone()
+    series_year = (series_row[0] if series_row else None) or series_raw.get("year") or series_raw.get("start_year")
+    return inkdrop_library_identity.library_files_bind_issues_as_volumes(
+        files, series_year=series_year,
+    )
+
+
+def comicvine_manga_library_omnibus_conflict(con, series_id, issue_id, issue_number):
+    """True when the series' library already names ``issue_number`` (as a
+    volume) for an issue other than ``issue_id``. See
+    inkdrop_library_identity.library_volume_leaf_bound_to_other_issue."""
+    series_id = str(series_id or "").strip()
+    if not series_id or not issue_number or not table_exists(con, "media_files"):
+        return False
+    rows = con.execute(
+        "select path, issue_id from media_files where series_id=? and active=1",
+        (series_id,),
+    ).fetchall()
+    return inkdrop_library_identity.library_volume_leaf_bound_to_other_issue(
+        ((row[0], row[1]) for row in rows), issue_number, issue_id
+    )
+
+
+def comicvine_manga_durable_unit_inputs(con, queue_id):
+    """The inputs the durable gate reads to decide a ComicVine manga row's unit.
+
+    The SLSKD probe reads these through here so the probe and the handoff gate
+    (slskd_candidate_exact_unit_binding) ask comicvine_manga_issue_is_volume
+    the same question with the same answers: the durable issue title, the
+    unit type the Wanted/issue rows state, and the series-level evidence.
+    """
+    queue_id = str(queue_id or "").strip()
+    if not queue_id:
+        return {}
+    queue_row = con.execute("select * from queue_items where id=?", (queue_id,)).fetchone()
+    if not queue_row:
+        return {}
+    queue = dict(queue_row)
+    wanted_row = con.execute("select raw_json from wanted_items where id=?", (queue.get("wanted_id"),)).fetchone() if queue.get("wanted_id") else None
+    issue_row = con.execute("select * from issues where id=?", (queue.get("issue_id"),)).fetchone() if queue.get("issue_id") else None
+    series_row = con.execute("select * from series where id=?", (queue.get("series_id"),)).fetchone() if queue.get("series_id") else None
+    if not issue_row or not series_row:
+        return {}
+    issue = dict(issue_row)
+    series = dict(series_row)
+    series_raw = json_loads(series.get("raw_json") or "{}", {})
+    series_raw = series_raw if isinstance(series_raw, dict) else {}
+    wanted_raw = json_loads((wanted_row[0] if wanted_row else "") or "{}", {})
+    issue_raw = json_loads(issue.get("raw_json") or "{}", {})
+    explicit = durable_explicit_unit_types(wanted_raw, issue_raw, keys=COMICVINE_MANGA_UNIT_TYPE_KEYS)
+    return {
+        "series_id": series.get("id"),
+        "issue_title": str(issue.get("title") or "").strip(),
+        "issue_number": normalize_issue_number(issue.get("normalized_number")),
+        "explicit_unit_type": next(iter(explicit)) if len(explicit) == 1 else ("conflicting" if explicit else ""),
+        "series_volume_evidence": comicvine_manga_series_volume_evidence(
+            con, series.get("id"), series_raw, issue.get("normalized_number")
+        ),
+        "series_unit_refuses_volume": comicvine_manga_series_refuses_volume(series_raw),
+        "library_omnibus_conflict": comicvine_manga_library_omnibus_conflict(
+            con, series.get("id"), issue.get("id"), issue.get("normalized_number")
+        ),
+    }
+
+
+def slskd_durable_manga_volume_type(
+    series, series_raw, issue, queue_raw, *, series_volume_evidence=False, library_omnibus_conflict=False,
+    series_unit_refuses_volume=False,
+):
+    """Infer a volume only from exact durable manga metadata.
+
+    ``series_unit_refuses_volume``: the operator set the series' Manga Unit to
+    chapters (comicvine_manga_series_refuses_volume). Nothing is inferred to
+    be a volume then, a "Vol. N" title included; the row keeps its default.
+    """
     media_type = str(series.get("media_type") or series_raw.get("media_type") or "").strip().lower()
-    if media_type != "manga":
+    if media_type != "manga" or series_unit_refuses_volume:
         return ""
     title = str(issue.get("title") or "").strip()
     match = re.fullmatch(r"(?:vol(?:ume)?|book)\.?\s*#?\s*([0-9]+(?:\.[0-9]+)?)", title, flags=re.IGNORECASE)
     if not match:
+        # ComicVine lists some manga's collected volumes as issues ("Vol. 1:
+        # Mission", "Moro's Wish") and other manga's comic issues or chapters
+        # the same way, so this is a volume only on positive evidence. The
+        # probe asks the same question with the same inputs; see
+        # comicvine_manga_issue_is_volume and comicvine_manga_durable_unit_inputs.
+        queue_issue = normalize_issue_number(queue_raw.get("issue_number") or queue_raw.get("issue"))
+        queue_chapter = normalize_issue_number(queue_raw.get("chapter_number") or queue_raw.get("chapter"))
+        return "volume" if (
+            queue_issue
+            and queue_issue == queue_chapter
+            and queue_issue == normalize_issue_number(issue.get("normalized_number"))
+            and inkdrop_library_identity.comicvine_manga_issue_is_volume(
+                media_type,
+                series.get("metadata_provider") or series_raw.get("metadata_provider"),
+                queue_issue,
+                queue_chapter,
+                title,
+                series_volume_evidence=series_volume_evidence,
+                library_omnibus_conflict=library_omnibus_conflict,
+            )
+        ) else ""
+    # A title spelled exactly "Book N" (digits) is the same omnibus-numbering
+    # ambiguity comicvine_manga_issue_is_volume guards for the word-numbered
+    # case ("Book Three") -- see library_omnibus_conflict there.
+    if library_omnibus_conflict and title.strip().lower().startswith("book"):
         return ""
     title_number = normalize_issue_number(match.group(1))
     issue_number = normalize_issue_number(issue.get("normalized_number"))
@@ -12255,13 +13104,24 @@ def slskd_candidate_exact_unit_binding(con, queue, attempt, *, validate_corrobor
     wanted_raw = wanted_raw if isinstance(wanted_raw, dict) else {}
     issue_raw = json_loads(issue.get("raw_json") or "{}", {})
     issue_raw = issue_raw if isinstance(issue_raw, dict) else {}
-    explicit_types = {
-        str(payload.get("unit_type") or payload.get("source_unit") or "").strip().lower().replace("-", "_")
-        for payload in (wanted_raw, issue_raw)
-        if str(payload.get("unit_type") or payload.get("source_unit") or "").strip()
-    }
+    comicvine_manga = (
+        str(series.get("metadata_provider") or series_raw.get("metadata_provider") or "").strip().lower() == "comicvine"
+        and str(series.get("media_type") or series_raw.get("media_type") or "").strip().lower() == "manga"
+    )
+    explicit_types = durable_explicit_unit_types(
+        wanted_raw, issue_raw, keys=COMICVINE_MANGA_UNIT_TYPE_KEYS if comicvine_manga else DURABLE_UNIT_TYPE_KEYS,
+    )
     if not explicit_types:
-        inferred_type = slskd_durable_manga_volume_type(series, series_raw, issue, queue_raw)
+        inferred_type = slskd_durable_manga_volume_type(
+            series, series_raw, issue, queue_raw,
+            series_volume_evidence=comicvine_manga and comicvine_manga_series_volume_evidence(
+                con, series_id, series_raw, issue.get("normalized_number")
+            ),
+            series_unit_refuses_volume=comicvine_manga and comicvine_manga_series_refuses_volume(series_raw),
+            library_omnibus_conflict=comicvine_manga and comicvine_manga_library_omnibus_conflict(
+                con, series_id, issue.get("id"), issue.get("normalized_number")
+            ),
+        )
         if inferred_type:
             explicit_types.add(inferred_type)
     if len(explicit_types) > 1:
@@ -12927,6 +13787,9 @@ def recover_completed_slskd_candidate_task(
                             "issue_number": identity_row.get("issue_number") or binding.get("unit_number"),
                             "normalized_number": identity_row.get("normalized_number") or binding.get("unit_number"),
                             "issue_title": identity_row.get("issue_title"),
+                            "newer_volume_years": newer_same_title_volume_years(
+                                con, task.get("series_id"), identity_row.get("series_title"),
+                                identity_row.get("year"), completed_import),
                             "metadata_provider": identity_row.get("issue_metadata_provider") or identity_row.get("series_metadata_provider"),
                             "metadata_id": identity_row.get("issue_metadata_id") or identity_row.get("series_metadata_id"),
                         }
@@ -14584,6 +15447,8 @@ def direct_import_destination_unit_gate(con, queue, dest_path, raw, *, already_s
         "normalized_number": row_value(row, "normalized_number") or trusted_issue,
         "issue_title": row_value(row, "issue_title"),
         "target_source": "inkdrop_series",
+        "newer_volume_years": newer_same_title_volume_years(
+            con, queue.get("series_id"), title, row_value(row, "year"), completed_import),
         "metadata_provider": row_value(row, "issue_metadata_provider") or row_value(row, "series_metadata_provider"),
         "metadata_id": row_value(row, "issue_metadata_id") or row_value(row, "series_metadata_id"),
     }
@@ -18013,12 +18878,65 @@ def bad_source_candidate_summary_payload(
     }
 
 
-def bad_source_candidate_select_columns(con, include_raw_json=False):
+def bad_source_candidate_table_shape(con):
+    """What bad_source_candidates actually looks like on *this* database.
+
+    Returns the column names present and whether last_seen_at is declared
+    NOT NULL. Both answers come from the database in front of us rather than
+    from the create-table text in this file, because an installation upgraded
+    from an older build keeps the table shape it was created with -- "create
+    table if not exists" never rewrites one that is already there.
+    """
+
     columns = set()
+    last_seen_notnull = False
     try:
-        columns = {row["name"] for row in con.execute("pragma table_info(bad_source_candidates)")}
+        rows = list(con.execute("pragma table_info(bad_source_candidates)"))
     except sqlite3.Error:
-        columns = set()
+        return columns, last_seen_notnull
+    for row in rows:
+        name = row["name"]
+        columns.add(name)
+        if name == "last_seen_at":
+            last_seen_notnull = bool(int(row["notnull"] or 0))
+    return columns, last_seen_notnull
+
+
+def bad_source_candidate_last_seen_expr(last_seen_notnull):
+    """The sort/range expression for last_seen_at that this database allows.
+
+    SQLite matches an index to an ORDER BY only when the sort terms are the
+    indexed columns themselves. `coalesce(last_seen_at, 0) desc` is not
+    `last_seen_at desc` to that matcher, so the default Blocklist page scanned
+    idx_bad_source_candidates_default_order and then sorted all 120,000
+    entries in a temporary B-tree anyway before handing back 80 rows
+    (measured: 11.159 ms vs 0.030 ms for the same 80 ids, offset 0). The
+    wrapper only ever mattered for a nullable column, so it is kept exactly
+    when the column is nullable and dropped when the schema guarantees it
+    cannot be NULL.
+    """
+
+    return "last_seen_at" if last_seen_notnull else "coalesce(last_seen_at, 0)"
+
+
+def bad_source_candidate_order_sql(last_seen_notnull):
+    """The default ("all") Blocklist ordering, matching the declared index.
+
+    `id` is the final tiebreak because `title` alone is not unique; without it
+    two same-titled rows straddling a page boundary could be skipped or
+    repeated. Every caller that pages this table has to use this exact order
+    or the index stops covering the sort.
+    """
+
+    return f"order by {bad_source_candidate_last_seen_expr(last_seen_notnull)} desc, failure_count desc, title, id"
+
+
+def bad_source_candidate_select_columns(con, include_raw_json=False, columns=None):
+    if columns is None:
+        try:
+            columns = {row["name"] for row in con.execute("pragma table_info(bad_source_candidates)")}
+        except sqlite3.Error:
+            columns = set()
     scope_sql = "scope_key" if "scope_key" in columns else "'' as scope_key"
     revision_sql = "revision" if "revision" in columns else "1 as revision"
     raw_sql = ", raw_json" if include_raw_json else ""
@@ -18212,9 +19130,10 @@ def bad_source_candidate_rollup(con, recent_seconds=7 * 86400, limit=10, include
             "source_memory_summary": source_memory_summary,
         }
     recent_after = time.time() - max(1, int(recent_seconds or (7 * 86400)))
+    columns, last_seen_notnull = bad_source_candidate_table_shape(con)
     total_row = con.execute("select count(*) as count from bad_source_candidates").fetchone()
     recent_row = con.execute(
-        "select count(*) as count from bad_source_candidates where coalesce(last_seen_at, 0) >= ?",
+        f"select count(*) as count from bad_source_candidates where {bad_source_candidate_last_seen_expr(last_seen_notnull)} >= ?",
         (recent_after,),
     ).fetchone()
     by_reason = {
@@ -18253,7 +19172,7 @@ def bad_source_candidate_rollup(con, recent_seconds=7 * 86400, limit=10, include
     top_rows = []
     for row in con.execute(
         f"""
-        select {bad_source_candidate_select_columns(con)}
+        select {bad_source_candidate_select_columns(con, columns=columns)}
         from bad_source_candidates
         order by failure_count desc, last_seen_at desc, title
         limit ?
@@ -18341,7 +19260,7 @@ _BAD_SOURCE_SIMPLE_MATCH_SQL = """(
     )"""
 
 
-def _bad_source_compound_filter_sql(raw):
+def _bad_source_compound_filter_sql(raw, last_seen_expr="coalesce(last_seen_at, 0)"):
     clauses = []
     params = []
     for term in raw.split(","):
@@ -18368,7 +19287,7 @@ def _bad_source_compound_filter_sql(raw):
             except (TypeError, ValueError):
                 days = 0
             if days > 0:
-                clauses.append("coalesce(last_seen_at, 0) >= ?")
+                clauses.append(f"{last_seen_expr} >= ?")
                 params.append(time.time() - days * 86400)
         elif prefix == "q":
             like = f"%{value.lower()}%"
@@ -18385,16 +19304,24 @@ def _bad_source_compound_filter_sql(raw):
     return raw, "where " + " and ".join(clauses), params
 
 
-def bad_source_candidate_filter_sql(source_filter):
+def bad_source_candidate_filter_sql(source_filter, last_seen_notnull=False):
+    # last_seen_notnull is the caller's reading of this database's own column
+    # declaration (bad_source_candidate_table_shape). Left False -- the safe
+    # default for a caller with no connection in hand -- the predicates keep
+    # the coalesce() wrapper they have always had. A recent-window threshold is
+    # always positive, so the two forms select the same rows either way; the
+    # bare column is used only because it lets the window run as an indexed
+    # range (measured: 0.546 ms vs 4.126 ms over 120,000 candidates).
     value = bad_source_candidate_filter_key(source_filter)
+    last_seen_expr = bad_source_candidate_last_seen_expr(last_seen_notnull)
     if ":" in value or "," in value:
-        return _bad_source_compound_filter_sql(value)
+        return _bad_source_compound_filter_sql(value, last_seen_expr)
     if value in {"all", "impact"}:
         return value, "", []
     if value == "recent":
         return (
             value,
-            "where coalesce(last_seen_at, 0) >= ?",
+            f"where {last_seen_expr} >= ?",
             [time.time() - BAD_SOURCE_CANDIDATE_RECENT_SECONDS],
         )
     return (
@@ -18439,7 +19366,40 @@ def bad_source_candidate_specific_evidence_bits(raw):
     return bits
 
 
-def bad_source_candidate_row_from_record(row):
+BAD_SOURCE_CANDIDATE_LINK_HINT_KEYS = ("wanted_id", "queue_id", "issue_id", "series_id")
+
+
+def bad_source_candidate_link_hints(evidence):
+    """The four ids bad_source_candidate_linked_entity looks for in a
+    candidate's evidence, lifted out of it.
+
+    `evidence` is a _nested_source_memory_index() of the payload, so this reads
+    the same values that function's own recursive search would find -- looking
+    them up again on the small dict this returns finds them at the top level.
+    That is what lets a compact read keep the evidence out of the row without
+    changing which series or issue the row resolves to.
+    """
+
+    hints = {}
+    for key in BAD_SOURCE_CANDIDATE_LINK_HINT_KEYS:
+        value = _nested_source_memory_pick(evidence, key)
+        if value not in (None, ""):
+            hints[key] = value
+    return hints
+
+
+def bad_source_candidate_row_from_record(row, include_raw=True):
+    """One Blocklist row.
+
+    `include_raw` decides whether the parsed evidence payload travels on in
+    the row. It has to be parsed either way -- the row's detail text and its
+    four diagnostic fields are read out of it, and the only alternative would
+    be persisting derived copies that go stale when the extraction rules
+    change. What it does not have to do is stay alive: with include_raw
+    False the row carries only the link hints, so a page of eighty rows holds
+    one parsed payload at a time instead of eighty.
+    """
+
     raw = json_loads(row["raw_json"] or "{}", {})
     if not isinstance(raw, dict):
         raw = {}
@@ -18475,14 +19435,17 @@ def bad_source_candidate_row_from_record(row):
         text = str(value or "").strip()
         return text[:limit] if text else None
 
-    blocked_issue_number = _diag_text(_nested_source_memory_value(raw, "issue_number", "issue"), 40)
+    # One walk of the evidence, five answers -- see _nested_source_memory_index.
+    evidence = _nested_source_memory_index(raw)
+    blocked_issue_number = _diag_text(_nested_source_memory_pick(evidence, "issue_number", "issue"), 40)
     release_filename = _diag_text(
-        _nested_source_memory_value(raw, "filename", "detected_filename", "filename_leaf", "candidate_path"), 300
+        _nested_source_memory_pick(evidence, "filename", "detected_filename", "filename_leaf", "candidate_path"), 300
     )
-    detected_path = _diag_text(_nested_source_memory_value(raw, "detected_path"), 400)
+    detected_path = _diag_text(_nested_source_memory_pick(evidence, "detected_path"), 400)
     failure_detail = _diag_text(
-        _nested_source_memory_value(raw, "detail", "failure_reason", "failure_label", "queue_last_event"), 400
+        _nested_source_memory_pick(evidence, "detail", "failure_reason", "failure_label", "queue_last_event"), 400
     )
+    link_hints = None if include_raw else bad_source_candidate_link_hints(evidence)
     return {
         "kind": "bad_source_candidate",
         "id": row["id"],
@@ -18507,7 +19470,7 @@ def bad_source_candidate_row_from_record(row):
         "last_seen_at": row["last_seen_at"],
         "last_seen_at_iso": utc_stamp(row["last_seen_at"]) if row["last_seen_at"] else None,
         "activity_at": row["last_seen_at"],
-        "raw": raw,
+        "raw": raw if include_raw else link_hints,
         "status": reason,
         "state": "source_memory",
         "display_state": "source_memory",
@@ -18541,6 +19504,71 @@ def _nested_source_memory_value(payload, *keys):
         elif isinstance(item, (list, tuple)):
             stack.extend(item)
     return None
+
+
+# Every key any Blocklist row reads out of a candidate's evidence. Collected in
+# one place so one traversal can answer all of them.
+BAD_SOURCE_EVIDENCE_KEYS = frozenset({
+    "issue_number", "issue",
+    "filename", "detected_filename", "filename_leaf", "candidate_path",
+    "detected_path",
+    "detail", "failure_reason", "failure_label", "queue_last_event",
+    "wanted_id", "queue_id", "issue_id", "series_id",
+})
+
+
+def _nested_source_memory_index(payload, wanted=BAD_SOURCE_EVIDENCE_KEYS):
+    """First occurrence of each wanted key, with its position in the walk.
+
+    Building one row used to walk its whole evidence payload five separate
+    times -- once per _nested_source_memory_value() call -- and each walk is
+    unbounded in the payload's size. This does the same walk once and records
+    where each key was found, so _nested_source_memory_pick() below can answer
+    any of those questions from the result.
+
+    The traversal is character for character the one _nested_source_memory_value
+    does, including the LIFO stack, the id()-based cycle guard, the
+    `value not in (None, "")` test and the order containers are pushed in. It
+    differs only in not stopping at the first hit, which cannot change where a
+    given key is FIRST seen.
+    """
+
+    found = {}
+    order = 0
+    stack = [payload]
+    seen = set()
+    while stack:
+        item = stack.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, dict):
+            for key, value in item.items():
+                text = str(key)
+                if text in wanted and value not in (None, "") and text not in found:
+                    found[text] = (order, value)
+                    order += 1
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append(value)
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return found
+
+
+def _nested_source_memory_pick(index, *keys):
+    """What _nested_source_memory_value(payload, *keys) would have returned.
+
+    That function returns the first value in its walk whose key is any of the
+    wanted ones -- traversal order decides, not argument order -- so this picks
+    the candidate key that was seen earliest.
+    """
+
+    best = None
+    for key in keys:
+        hit = index.get(str(key))
+        if hit is not None and (best is None or hit[0] < best[0]):
+            best = hit
+    return best[1] if best is not None else None
 
 
 def _bad_source_candidate_link_rows(con, candidates):
@@ -18646,10 +19674,8 @@ def bad_source_candidate_linked_entity(con, candidate, link_rows=None):
     }
 
 
-def bad_source_candidate_rows(db_path, limit=80, source_filter=None, offset=0):
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return []
+def bad_source_candidate_page_bounds(limit, offset):
+    """The clamped (limit, offset) every Blocklist reader pages with."""
     limit = max(1, min(int(limit or 80), 5000))
     # A real SQL OFFSET, backed by idx_bad_source_candidates_default_order --
     # paginating this table used to mean "always return the first `limit`
@@ -18661,27 +19687,158 @@ def bad_source_candidate_rows(db_path, limit=80, source_filter=None, offset=0):
         offset = max(0, min(int(offset or 0), 1000000))
     except (TypeError, ValueError):
         offset = 0
+    return limit, offset
+
+
+BAD_SOURCE_CANDIDATE_CURSOR_VERSION = 1
+
+
+def bad_source_candidate_cursor_token(row, filter_key):
+    """A position in the Blocklist's order, as an opaque token.
+
+    Carries the four sort keys of the row it was built from and the filter the
+    page was read under. It is not a capability and is not signed: it can only
+    name a position in a list the caller can already read, so tampering with it
+    selects a different page and nothing else. The filter is inside it so a
+    token from one filter cannot be replayed against another, where the same
+    position means something different.
+    """
+
+    row = row if isinstance(row, dict) else {}
+    if not row.get("id"):
+        return None
+    payload = {
+        "v": BAD_SOURCE_CANDIDATE_CURSOR_VERSION,
+        "f": str(filter_key or "all"),
+        "k": [
+            row.get("last_seen_at"),
+            int(row.get("failure_count") or 0),
+            row.get("title"),
+            row.get("id"),
+        ],
+    }
+    return base64.urlsafe_b64encode(json_dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def bad_source_candidate_cursor_keys(token, filter_key):
+    """The four sort keys a token names, or a refusal.
+
+    Returns (keys, reason). `reason` is set when the token exists but cannot be
+    used: a malformed token, a version this build does not understand, or one
+    built under a different filter. None of those fall back to an offset --
+    quietly serving position N of a different list is how a pager shows the
+    wrong page and calls it success.
+    """
+
+    token = str(token or "").strip()
+    if not token:
+        return None, None
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        payload = json_loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"), None)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None, "cursor_malformed"
+    if not isinstance(payload, dict):
+        return None, "cursor_malformed"
+    if int(payload.get("v") or 0) != BAD_SOURCE_CANDIDATE_CURSOR_VERSION:
+        return None, "cursor_version_unsupported"
+    if str(payload.get("f") or "") != str(filter_key or "all"):
+        return None, "cursor_filter_mismatch"
+    keys = payload.get("k")
+    if not isinstance(keys, list) or len(keys) != 4 or keys[3] in (None, ""):
+        return None, "cursor_malformed"
+    return keys, None
+
+
+def bad_source_candidate_keyset_sql(keys, last_seen_notnull):
+    """The predicate for "strictly after this position" in the default order.
+
+    Written as a leading range the index can seek on (`last_seen_at <= ?`)
+    followed by the exact tie-break inside it. That shape matters: the tie-break
+    alone is a disjunction, and SQLite will not turn a disjunction into an index
+    range, so the seek that should have been constant-time went back to walking
+    the whole index. With the guard in front the plan reads
+    "SEARCH ... (last_seen_at<?)".
+
+    Measured on a 120,000-candidate fixture, same 80 ids as the equivalent
+    OFFSET, five-run medians:
+
+        all,        offset 110,000     3.67 ms -> 0.158 ms
+        bad_archive, offset 20,000    88.88 ms -> 0.603 ms
+        reason+source, offset 10,000  49.27 ms -> 0.540 ms
+
+    The filtered rows are where this matters most: their predicate is not
+    index-backed, so OFFSET had to evaluate it against every row it stepped
+    past, while the seek starts at the right index position and evaluates it
+    only against the rows it returns.
+    """
+
+    last_seen, failure_count, title, identifier = keys
+    expr = bad_source_candidate_last_seen_expr(last_seen_notnull)
+    clause = (
+        f"({expr} <= ?"
+        f" and ({expr} < ?"
+        f" or failure_count < ?"
+        f" or (failure_count = ? and title > ?)"
+        f" or (failure_count = ? and title = ? and id > ?)))"
+    )
+    params = [
+        last_seen, last_seen,
+        failure_count,
+        failure_count, title,
+        failure_count, title, identifier,
+    ]
+    return clause, params
+
+
+def bad_source_candidate_rows_from_connection(con, limit=80, source_filter=None, offset=0, include_raw=True, cursor_keys=None):
+    limit, offset = bad_source_candidate_page_bounds(limit, offset)
     if bad_source_candidate_filter_key(source_filter) == "impact":
-        return source_memory_impact_rows(db_path, limit)
-    _filter, where_sql, params = bad_source_candidate_filter_sql(source_filter)
+        return source_memory_impact_rows_from_connection(con, limit)
+    if not table_exists(con, "bad_source_candidates"):
+        return []
+    # One pragma read answers both "which columns does this database have"
+    # and "can last_seen_at be NULL here", so the filter predicate and the
+    # ORDER BY can both be written in the form the index actually covers.
+    columns, last_seen_notnull = bad_source_candidate_table_shape(con)
+    _filter, where_sql, params = bad_source_candidate_filter_sql(source_filter, last_seen_notnull)
+    if cursor_keys:
+        # A cursor names the position, so the offset is not applied as well --
+        # doing both would skip a page.
+        keyset_sql, keyset_params = bad_source_candidate_keyset_sql(cursor_keys, last_seen_notnull)
+        where_sql = f"{where_sql} and {keyset_sql}" if where_sql else f"where {keyset_sql}"
+        params = [*params, *keyset_params]
+        offset = 0
+    cursor = con.execute(
+        f"""
+        select {bad_source_candidate_select_columns(con, include_raw_json=True, columns=columns)}
+        from bad_source_candidates
+        {where_sql}
+        {bad_source_candidate_order_sql(last_seen_notnull)}
+        limit ? offset ?
+        """,
+        (*params, limit, offset),
+    )
+    # Stepped, not fetchall(). The evidence column is unbounded, so materialising
+    # the whole page first held every row's raw_json text and every parsed copy
+    # of it at once; stepping frees each one as soon as its row is built.
+    output = [bad_source_candidate_row_from_record(row, include_raw=include_raw) for row in cursor]
+    link_rows = _bad_source_candidate_link_rows(con, output)
+    for candidate in output:
+        candidate["linked_entities"] = bad_source_candidate_linked_entity(con, candidate, link_rows=link_rows)
+    return output
+
+
+def bad_source_candidate_rows(db_path, limit=80, source_filter=None, offset=0, cursor_keys=None):
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return []
     with connect_read(db_path) as con:
-        if not table_exists(con, "bad_source_candidates"):
-            return []
-        rows = con.execute(
-            f"""
-            select {bad_source_candidate_select_columns(con, include_raw_json=True)}
-            from bad_source_candidates
-            {where_sql}
-            order by coalesce(last_seen_at, 0) desc, failure_count desc, title, id
-            limit ? offset ?
-            """,
-            (*params, limit, offset),
-        ).fetchall()
-        output = [bad_source_candidate_row_from_record(row) for row in rows]
-        link_rows = _bad_source_candidate_link_rows(con, output)
-        for candidate in output:
-            candidate["linked_entities"] = bad_source_candidate_linked_entity(con, candidate, link_rows=link_rows)
-        return output
+        return bad_source_candidate_rows_from_connection(con, limit, source_filter, offset, cursor_keys=cursor_keys)
+
+
+def source_memory_impact_rows_from_connection(con, limit=80):
+    return list(source_memory_impact_rollup(con, limit=limit).get("source_memory_impact_top") or [])[: max(1, min(int(limit or 80), 5000))]
 
 
 def source_memory_impact_rows(db_path, limit=80):
@@ -18689,78 +19846,164 @@ def source_memory_impact_rows(db_path, limit=80):
     if not db_path.exists():
         return []
     with connect_read(db_path) as con:
-        return list(source_memory_impact_rollup(con, limit=limit).get("source_memory_impact_top") or [])[: max(1, min(int(limit or 80), 5000))]
+        return source_memory_impact_rows_from_connection(con, limit)
 
 
-def source_memory_impact_count(db_path):
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return 0
-    with connect_read(db_path) as con:
+def bad_source_candidate_count_from_connection(con, source_filter=None):
+    if bad_source_candidate_filter_key(source_filter) == "impact":
         return int(source_memory_impact_rollup(con, limit=1).get("source_memory_impact_groups") or 0)
+    if not table_exists(con, "bad_source_candidates"):
+        return 0
+    _columns, last_seen_notnull = bad_source_candidate_table_shape(con)
+    _filter, where_sql, params = bad_source_candidate_filter_sql(source_filter, last_seen_notnull)
+    row = con.execute(f"select count(*) as count from bad_source_candidates {where_sql}", params).fetchone()
+    return int(row["count"] or 0) if row else 0
 
 
 def bad_source_candidate_count(db_path, source_filter=None):
     db_path = Path(db_path)
     if not db_path.exists():
         return 0
-    if bad_source_candidate_filter_key(source_filter) == "impact":
-        return source_memory_impact_count(db_path)
-    _filter, where_sql, params = bad_source_candidate_filter_sql(source_filter)
     with connect_read(db_path) as con:
-        if not table_exists(con, "bad_source_candidates"):
-            return 0
-        row = con.execute(f"select count(*) as count from bad_source_candidates {where_sql}", params).fetchone()
-        return int(row["count"] or 0) if row else 0
+        return bad_source_candidate_count_from_connection(con, source_filter)
 
 
-def bad_source_candidate_filter_options(db_path, include_impact_count=True):
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return [{"value": "all", "label": "All", "count": 0}, {"value": "recent", "label": "Recent", "count": 0}, {"value": "impact", "label": "Impact", "count": 0}]
-    with connect_read(db_path) as con:
-        if not table_exists(con, "bad_source_candidates"):
-            impact_count = source_memory_impact_count(db_path) if include_impact_count else 0
-            return [{"value": "all", "label": "All", "count": 0}, {"value": "recent", "label": "Recent", "count": 0}, {"value": "impact", "label": "Impact", "count": impact_count}]
+BAD_SOURCE_CANDIDATE_FACET_LIMIT = 12
+
+
+def sqlite_ascii_lower(value):
+    """SQLite's lower() -- which, without ICU, folds only A-Z.
+
+    Python's str.lower() also folds non-ASCII, so a Python-side regrouping
+    that used it would put a key like "SLSKD\u0130" in a different bucket than
+    the SQL it replaces. This exists so the two can be proved equal.
+    """
+
+    return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in str(value))
+
+
+def bad_source_candidate_facet_rows(counts):
+    """The per-column facet rows, regrouped from counts already read.
+
+    Reproduces exactly what
+
+        select lower(replace(coalesce(nullif(<column>,''),'unknown'),'-','_')) as value,
+               count(*) as count
+        from bad_source_candidates
+        group by 1 order by count(*) desc, value limit 12
+
+    returns, given the same column's un-normalized group counts (which
+    bad_source_candidate_rollup already reads for its own by_reason /
+    by_source / by_provider maps). Every normalized bucket is a union of
+    un-normalized ones, so summing is exact. `value` sorts by SQLite's
+    default BINARY collation, which compares UTF-8 bytes -- the same order
+    Python's str comparison gives, because UTF-8 preserves code-point order.
+
+    This is the point of C02: those three facet group-bys were a second full
+    pass over the table for numbers the rollup's own pass had already
+    counted. Measured at 120,000 candidates they cost ~158 ms of a ~400 ms
+    compact request.
+    """
+
+    buckets = {}
+    for key, count in (counts or {}).items():
+        bucket = sqlite_ascii_lower(str(key).replace("-", "_"))
+        buckets[bucket] = buckets.get(bucket, 0) + int(count or 0)
+    ordered = sorted(buckets.items(), key=lambda item: (-item[1], item[0]))
+    return ordered[:BAD_SOURCE_CANDIDATE_FACET_LIMIT]
+
+
+def bad_source_candidate_empty_filter_options(impact_count=0):
+    return [
+        {"value": "all", "label": "All", "count": 0},
+        {"value": "recent", "label": "Recent", "count": 0},
+        {"value": "impact", "label": "Impact", "count": int(impact_count or 0)},
+    ]
+
+
+def bad_source_candidate_filter_options_from_connection(con, include_impact_count=True, rollup=None):
+    """The Blocklist's filter chips.
+
+    `rollup` is a bad_source_candidate_rollup() result from this same request.
+    When it is supplied every count here is derived from it -- the total, the
+    recent window, the impact groups and all three facet columns -- so a page
+    load counts the table once instead of four times and groups it three times
+    instead of six. Without it the function still answers from its own
+    queries, and inkdrop-blocklist-aggregate-reuse-smoke.py asserts the two
+    paths agree.
+    """
+
+    if not table_exists(con, "bad_source_candidates"):
+        impact_count = 0
+        if include_impact_count:
+            impact_count = int(
+                (rollup or {}).get("source_memory_impact_groups")
+                if rollup is not None
+                else source_memory_impact_rollup(con, limit=1).get("source_memory_impact_groups")
+                or 0
+            )
+        return bad_source_candidate_empty_filter_options(impact_count)
+
+    if rollup is not None:
+        total_count = int(rollup.get("bad_source_candidates") or 0)
+        recent_count = int(rollup.get("bad_source_candidates_recent") or 0)
+        # The rollup's impact sample is the wider one (it reads up to
+        # limit*500 attempts, where this used to ask for limit=1 and so read
+        # 500). Reusing it means the Impact chip and the Impact summary now
+        # report the same number instead of two differently-sized samples.
+        impact_count = int(rollup.get("source_memory_impact_groups") or 0) if include_impact_count else 0
+        facet_counts = {
+            "reason": rollup.get("bad_source_candidates_by_reason") or {},
+            "source": rollup.get("bad_source_candidates_by_source") or {},
+            "provider": rollup.get("bad_source_candidates_by_provider") or {},
+        }
+    else:
         recent_after = time.time() - BAD_SOURCE_CANDIDATE_RECENT_SECONDS
-        options = [
-            {"value": "all", "label": "All", "count": table_count(con, "bad_source_candidates")},
-            {
-                "value": "recent",
-                "label": "Recent",
-                "count": int((con.execute("select count(*) as count from bad_source_candidates where coalesce(last_seen_at, 0) >= ?", (recent_after,)).fetchone() or {"count": 0})["count"] or 0),
-            },
-            {
-                "value": "impact",
-                "label": "Impact",
-                "count": int(source_memory_impact_rollup(con, limit=1).get("source_memory_impact_groups") or 0) if include_impact_count else 0,
-                "deferred": not bool(include_impact_count),
-            },
-        ]
-        seen = {"all", "recent"}
+        _columns, last_seen_notnull = bad_source_candidate_table_shape(con)
+        recent_expr = bad_source_candidate_last_seen_expr(last_seen_notnull)
+        total_count = table_count(con, "bad_source_candidates")
+        recent_count = int(
+            (con.execute(f"select count(*) as count from bad_source_candidates where {recent_expr} >= ?", (recent_after,)).fetchone() or {"count": 0})["count"] or 0
+        )
+        impact_count = int(source_memory_impact_rollup(con, limit=1).get("source_memory_impact_groups") or 0) if include_impact_count else 0
+        facet_counts = {}
         for column in ("reason", "source", "provider"):
-            for row in con.execute(
-                f"""
-                select lower(replace(coalesce(nullif({column}, ''), 'unknown'), '-', '_')) as value,
-                       count(*) as count
-                from bad_source_candidates
-                group by lower(replace(coalesce(nullif({column}, ''), 'unknown'), '-', '_'))
-                order by count(*) desc, value
-                limit 12
-                """
-            ):
-                value = str(row["value"] or "unknown").strip().lower()
-                if not value or value == "unknown" or value in seen:
-                    continue
-                seen.add(value)
-                options.append(
-                    {
-                        "value": value,
-                        "label": source_display_label(value) if column in {"source", "provider"} else bad_source_candidate_detail_label(value),
-                        "count": int(row["count"] or 0),
-                    }
+            facet_counts[column] = {
+                row["key"]: int(row["count"] or 0)
+                for row in con.execute(
+                    f"""
+                    select coalesce(nullif({column}, ''), 'unknown') as key, count(*) as count
+                    from bad_source_candidates
+                    group by coalesce(nullif({column}, ''), 'unknown')
+                    """
                 )
-        return options
+            }
+
+    options = [
+        {"value": "all", "label": "All", "count": total_count},
+        {"value": "recent", "label": "Recent", "count": recent_count},
+        {
+            "value": "impact",
+            "label": "Impact",
+            "count": impact_count,
+            "deferred": not bool(include_impact_count),
+        },
+    ]
+    seen = {"all", "recent"}
+    for column in ("reason", "source", "provider"):
+        for key, count in bad_source_candidate_facet_rows(facet_counts.get(column)):
+            value = str(key or "unknown").strip().lower()
+            if not value or value == "unknown" or value in seen:
+                continue
+            seen.add(value)
+            options.append(
+                {
+                    "value": value,
+                    "label": source_display_label(value) if column in {"source", "provider"} else bad_source_candidate_detail_label(value),
+                    "count": int(count or 0),
+                }
+            )
+    return options
 
 
 BAD_SOURCE_PACK_HINT_RE = re.compile(
@@ -19798,6 +21041,114 @@ def collection_guard_record_from_download_task(task, _queue=None):
     }
 
 
+def retract_reopened_queue_completion_fence_tasks(con, queue_id, reason, now):
+    """Demote a download_task still reading as verified once its own queue
+    row's authoritative state has moved off 'verified'.
+
+    reserve_slskd_candidate()'s completion fence (candidate_completion_fence)
+    trusts any download_task that looks verified for the queue, regardless of
+    what the queue row itself now says. When the row's own truth moves away
+    from verified -- most commonly sync_download_reconciliation's import
+    recheck failing and writing "A recheck could not confirm this import.
+    Searching again." -- the task must be demoted in the SAME PASS that
+    reopens the row, before the queue_items update below (production runs
+    sync_state with autocommit, so this is not one atomic transaction --
+    each statement commits on its own; the retract-first ordering is what
+    keeps it safe), or every real candidate for the unit stays blocked
+    behind a task nothing still believes in. Live: The Legend of Korra --
+    Turf Wars #1 (comicvine:103098) sat unpickable for 8+ hours behind task
+    974827b3..., which still said "verified" while the queue row said the
+    recheck failed; three safe candidates scored 73-90 were all refused with
+    candidate_completion_fence.
+
+    Scoped to direct ownership (task.queue_id == queue_id): the row that
+    reopened is the row whose own fence must fall. A task that does not
+    itself read as verified (slskd_verified_completion_task()) is left
+    alone -- prefer leaving a stale fence in place over demoting a task
+    nothing has shown is wrong. Also scoped to
+    download_task_is_slskd(task), matching the precedent
+    retract_collection_single_part_verified_download_tasks(): the fence this
+    exists to unblock (reserve_slskd_candidate's candidate_completion_fence)
+    only ever reads SLSKD-owned rows, so a page-pack/SAB/qBit/no-client task
+    is left alone even when it also reads as a verified completion.
+
+    Does not bump updated_at forward to `now`: recover_retryable_failed_
+    staged_import_ready_records() (core/inkdrop_reconcile_imports.py) orders
+    its 300-row, cursor-less staged-retry window by
+    coalesce(updated_at, completed_at, ...) desc. Advancing updated_at here
+    would move every demoted staged-client task to the head of that window
+    and keep it there for days, displacing genuinely recent retryable
+    failures. The row's own clock is left as-is; only completed_at (not read
+    by that ordering while updated_at is set) reflects this pass.
+    """
+    already_demoted_statuses = {
+        "reopen_completion_fence_retracted",
+        "collection_single_part_completion_retracted",
+        "wrong_unit_quarantined",
+    }
+    tasks = [
+        dict(row) for row in con.execute(
+            "select * from download_tasks where queue_id=?", (queue_id,)
+        ).fetchall()
+    ]
+    retracted = 0
+    for task in tasks:
+        if not slskd_verified_completion_task(task):
+            continue
+        if not download_task_is_slskd(task):
+            continue
+        if str(task.get("status") or "").strip().lower() in already_demoted_statuses:
+            continue
+        task_id = task.get("id")
+        raw = download_task_raw_payload(task)
+        raw.update(
+            {
+                "previous_status": task.get("status"),
+                "previous_state": task.get("state"),
+                "previous_lifecycle_phase": task.get("lifecycle_phase"),
+                "reopen_completion_fence_retracted_reason": reason,
+                "reopen_completion_fence_retracted_at": now,
+                "reopen_completion_fence_retracted_at_iso": utc_stamp(now),
+            }
+        )
+        con.execute(
+            """
+            update download_tasks
+            set status='reopen_completion_fence_retracted', state='failed',
+                lifecycle_phase='failed_candidate', failure_reason=?, retry_eligible=1,
+                outcome='problem', display_phase='retry_later',
+                updated_at=coalesce(updated_at, ?),
+                completed_at=max(coalesce(completed_at, 0), ?), raw_json=?
+            where id=?
+            """,
+            (reason, now, now, json_dumps(raw), task_id),
+        )
+        updated = dict(task)
+        updated.update(
+            {
+                "status": "reopen_completion_fence_retracted",
+                "state": "failed",
+                "lifecycle_phase": "failed_candidate",
+                "failure_reason": reason,
+                "retry_eligible": 1,
+                "outcome": "problem",
+                "display_phase": "retry_later",
+                # This local dict is only the input to
+                # record_download_task_history_event() below, which stamps
+                # the history event's created_at from it -- the event must
+                # be dated `now` (when the demotion actually ran), even
+                # though the download_tasks row's own updated_at column is
+                # deliberately left alone by the update above.
+                "updated_at": now,
+                "completed_at": max(safe_float(task.get("completed_at"), 0) or 0, now),
+                "raw_json": json_dumps(raw),
+            }
+        )
+        record_download_task_history_event(con, updated)
+        retracted += 1
+    return retracted
+
+
 def retract_collection_single_part_verified_download_tasks(con, queue, reason, now):
     """Retract only completion tasks whose own evidence is the rejected single part."""
     queue = dict(queue or {})
@@ -20290,7 +21641,23 @@ def reconciliation_wrong_unit_page_pack_evidence(con, record, queue):
     if not row:
         return {}
     evidence = wrong_unit_page_pack_import_row(row, con=con)
-    return evidence if isinstance(evidence, dict) else {}
+    if not isinstance(evidence, dict) or not evidence:
+        return {}
+    if evidence.get("stale_issue_total_proof"):
+        return {
+            "proof_type": "stale_issue_total",
+            "evidence": evidence,
+            "evidence_field": "stale_issue_total_proof_evidence",
+            "reason": STALE_ISSUE_TOTAL_PROOF_REASON,
+            "message": STALE_ISSUE_TOTAL_PROOF_MESSAGE,
+        }
+    return {
+        "proof_type": "wrong_unit_page_pack",
+        "evidence": evidence,
+        "evidence_field": "wrong_unit_page_pack_evidence",
+        "reason": WRONG_UNIT_PAGE_PACK_PROOF_REASON,
+        "message": WRONG_UNIT_PAGE_PACK_PROOF_MESSAGE,
+    }
 
 
 def cleanup_collection_single_part_verified_queue_rows(con, now, limit=5000):
@@ -20452,6 +21819,64 @@ def cleanup_collection_single_part_verified_queue_rows(con, now, limit=5000):
         )
         reopened += 1
     return reopened
+
+
+def cleanup_reopened_recheck_stale_completion_fences(con, now, limit=5000):
+    """Heal an existing recheck-reopen / completion-fence contradiction.
+
+    retract_reopened_queue_completion_fence_tasks() demotes the fencing task
+    the moment sync_download_reconciliation() reopens a row, inside the same
+    transaction -- but that only fires for rows the download client's
+    reconciliation feed still reports on a given pass. A row whose
+    triggering client record already aged out of that feed keeps its stale
+    "verified" task fencing every real candidate forever, with no further
+    write ever touching it. This sweep reads queue_items directly instead,
+    so it finds and heals those already-contradictory pairs on a normal
+    pass, with no hand DB write required. Measured on the 2026-09-23
+    16:27:08Z snapshot: 142 queue rows across 36 series were stuck this way,
+    including The Legend of Korra -- Turf Wars #1 (comicvine:103098), whose
+    task 974827b3... said "verified" for 8+ hours after its own queue row
+    said "A recheck could not confirm this import. Searching again."
+
+    Never marks anything satisfied: only demotes a task whose own queue row
+    has already, independently, moved off 'verified'. Unlike the live
+    sync_download_reconciliation() call, this sweep does not follow a fresh
+    settle_queue_items_with_verified_imports() pass in the same call, so it
+    cannot rely on that having already moved a genuinely-completed row's
+    state off 'verified' first: it re-checks
+    verified_import_for_queue(..., require_existing_destination=True) itself
+    for each candidate row and skips any row that still has a strictly
+    valid verified import, so a same-queue genuine completion is never
+    demoted just because its last_event text happens to match (only ~140
+    rows on a representative snapshot, so the extra check per row is
+    cheap).
+    """
+    rows = con.execute(
+        """
+        select id, state, last_event, series_id, issue_id
+        from queue_items
+        where coalesce(active, 0) = 1
+          and lower(coalesce(state, '')) in ('searching', 'queued')
+          and last_event like '%recheck could not confirm this import%'
+        order by coalesce(updated_at, created_at, 0) desc
+        limit ?
+        """,
+        (max(1, int(limit or 5000)),),
+    ).fetchall()
+    managed_roots = media_management_roots_from_connection(con)
+    healed = 0
+    for row in rows:
+        if verified_import_for_queue(
+            con, row["id"], row["series_id"], row["issue_id"],
+            managed_roots=managed_roots, require_existing_destination=True,
+        ):
+            # The row's own truth is not actually off 'verified' -- a
+            # strictly valid import still stands for this unit. Leave the
+            # task fencing in place rather than demote a genuine completion.
+            continue
+        reason = f"queue_reopened_recheck_failed:{row['state']}"
+        healed += retract_reopened_queue_completion_fence_tasks(con, row["id"], reason, now)
+    return healed
 
 
 def normalized_download_client(value):
@@ -21585,7 +23010,10 @@ def retire_expired_transfer_evidence_download_tasks(
     now = safe_float(now, None) or time.time()
     attempt_identity = str(attempt.get("candidate_identity") or "").strip()
     attempt_external = str(
-        attempt.get("external_id") or attempt.get("slskd_transfer_id") or ""
+        attempt.get("external_id")
+        or attempt.get("slskd_transfer_id")
+        or attempt.get("transfer_id")
+        or ""
     ).strip()
     attempt_path_key = normalize_download_task_identity(download_task_local_path(attempt))
     placeholders = ",".join("?" for _ in EXPIRED_TRANSFER_EVIDENCE_RETIRABLE_STATUSES)
@@ -25626,6 +27054,48 @@ def reconciliation_queue_match_candidates(con):
     return candidates
 
 
+RECONCILIATION_LEGACY_SUFFIX_TOKENS = {
+    "book",
+    "ch",
+    "chapter",
+    "collection",
+    "complete",
+    "deluxe",
+    "digital",
+    "edition",
+    "issue",
+    "omnibus",
+    "part",
+    "pt",
+    "v",
+    "vol",
+    "volume",
+}
+
+
+def reconciliation_match_phrase(text, phrase):
+    """Allow a queue title prefix followed by record-side release metadata.
+
+    Legacy reconciliation records have no durable queue owner, so containment
+    is not identity: Batman inside The Batman and Robin names another title.
+    Keep the useful old shapes (Saga deluxe edition and a title followed by a
+    unit number), but never borrow metadata carried only by an issue-specific
+    queue candidate.
+    """
+    text_tokens = str(text or "").strip().split()
+    phrase_tokens = str(phrase or "").strip().split()
+    if not text_tokens or not phrase_tokens:
+        return False
+    if len(text_tokens) <= len(phrase_tokens) or text_tokens[: len(phrase_tokens)] != phrase_tokens:
+        return False
+    suffix = text_tokens[len(phrase_tokens)]
+    if suffix.isdigit() or suffix in RECONCILIATION_LEGACY_SUFFIX_TOKENS:
+        return True
+    if re.fullmatch(r"(?:v|vol|volume|book|issue|chapter|ch|part|pt)0*\d+", suffix):
+        return True
+    return False
+
+
 def queue_match_by_reconciliation_query(con, record, candidates=None):
     terms = []
     for key in ("query", "title", "pending_key"):
@@ -25644,10 +27114,8 @@ def queue_match_by_reconciliation_query(con, record, candidates=None):
             for candidate in keys:
                 if term == candidate:
                     score = max(score, 4)
-                elif term.startswith(candidate + " ") or candidate.startswith(term + " "):
+                elif reconciliation_match_phrase(term, candidate):
                     score = max(score, 3)
-                elif candidate in term:
-                    score = max(score, 2)
         if score:
             scored.append((score, updated_at, row))
     if not scored:
@@ -25666,7 +27134,26 @@ def queue_match_by_reconciliation_query(con, record, candidates=None):
     return fresh
 
 
+def reconciliation_pending_queue_id(record):
+    pending_key = str((record or {}).get("pending_key") or "").strip()
+    prefix = "inkdrop:"
+    if not pending_key.lower().startswith(prefix):
+        return ""
+    return pending_key[len(prefix):].strip()
+
+
 def queue_match_for_reconciliation(con, record, candidates=None):
+    queue_id = reconciliation_pending_queue_id(record)
+    if queue_id:
+        # The import adapter wrote the queue owner into this record. Never
+        # discard that identity and guess from title text: "Berserk 3" is a
+        # substring of "Berserk 34", and a bounded fuzzy-candidate snapshot
+        # once credited volume 34's completed file to volume 3. If the owner
+        # no longer exists, take the false negative instead of another row.
+        return con.execute(
+            f"{RECONCILIATION_QUEUE_MATCH_COLUMNS_SQL} where q.id = ?",
+            (queue_id,),
+        ).fetchone()
     match = queue_match_by_download_hash(con, (record or {}).get("download_url_hash"))
     if match:
         return match
@@ -25777,7 +27264,7 @@ def sync_download_reconciliation(con, state_dir, now):
         if current_state == "verified" and queue_state != "verified":
             continue
         collection_block_reason = ""
-        wrong_unit_page_pack_evidence = {}
+        wrong_unit_proof = {}
         if queue_state == "verified":
             collection_block_reason = collection_target_single_part_block_reason(queue, record)
             if collection_block_reason:
@@ -25786,12 +27273,12 @@ def sync_download_reconciliation(con, state_dir, now):
                 record["reason"] = collection_block_reason
                 queue_state = reconciliation_queue_state(record.get("lifecycle_state"))
             else:
-                wrong_unit_page_pack_evidence = reconciliation_wrong_unit_page_pack_evidence(con, record, queue)
-                if wrong_unit_page_pack_evidence:
+                wrong_unit_proof = reconciliation_wrong_unit_page_pack_evidence(con, record, queue)
+                if wrong_unit_proof:
                     record = dict(record)
                     record["lifecycle_state"] = WRONG_UNIT_PAGE_PACK_PROOF_STATUS
-                    record["reason"] = WRONG_UNIT_PAGE_PACK_PROOF_REASON
-                    record["wrong_unit_page_pack_evidence"] = wrong_unit_page_pack_evidence
+                    record["reason"] = wrong_unit_proof["reason"]
+                    record[wrong_unit_proof["evidence_field"]] = wrong_unit_proof["evidence"]
                     queue_state = reconciliation_queue_state(record.get("lifecycle_state"))
         ts = (
             safe_float(record.get("verified_at"))
@@ -25804,8 +27291,8 @@ def sync_download_reconciliation(con, state_dir, now):
         message = reconciliation_message(record, queue_state)
         if collection_block_reason:
             message = "Single-part file does not satisfy collection target; retrying source ladder"
-        elif wrong_unit_page_pack_evidence:
-            message = WRONG_UNIT_PAGE_PACK_PROOF_MESSAGE
+        elif wrong_unit_proof:
+            message = wrong_unit_proof["message"]
         attempt = {
             "source": "download_client",
             "provider": record.get("client"),
@@ -25822,10 +27309,11 @@ def sync_download_reconciliation(con, state_dir, now):
             "matched_local_path": record.get("matched_local_path"),
             "matched_series": record.get("matched_series"),
             "lifecycle_state": record.get("lifecycle_state"),
-            "wrong_unit_page_pack_evidence": wrong_unit_page_pack_evidence,
             "kind": "download_reconciliation",
             "ts": ts,
         }
+        if wrong_unit_proof:
+            attempt[wrong_unit_proof["evidence_field"]] = wrong_unit_proof["evidence"]
         attempt_id = stable_id("download_reconciliation", record.get("pending_key"), queue["id"], record.get("lifecycle_state"), ts)
         record_source_attempt(
             con,
@@ -25899,6 +27387,19 @@ def sync_download_reconciliation(con, state_dir, now):
             else:
                 queue_state = "searching"
                 message = "A recheck could not confirm this import. Searching again."
+                # Same pass, retract before the queue_items update below (this
+                # connection runs autocommit in production, so these are two
+                # separately-committed statements, not one atomic transaction
+                # -- retracting first is what keeps the ordering safe): the
+                # row's authoritative state is moving off "verified" right
+                # here, so any download_task still fencing candidates for
+                # this queue as a verified completion must fall with it.
+                # Otherwise every safe candidate keeps being refused with
+                # candidate_completion_fence against a task nothing here
+                # still believes in (Korra Turf Wars #1, comicvine:103098).
+                retract_reopened_queue_completion_fence_tasks(
+                    con, queue["id"], "download_reconciliation_recheck_failed", ts,
+                )
         active = 0 if queue_state == "verified" else 1
         if queue_state == "verified":
             queue_outcome = "verified"
@@ -27154,7 +28655,7 @@ MEDIA_MANAGEMENT_SETTING_HELP = {
     "library_visibility_checks_enabled": "Collect optional frontend visibility evidence after folder completion.",
     "frontend_sync_after_import": "Ask enabled library frontends to rescan after a managed import.",
     "library_visibility_provider_order": "Preferred library frontend order for visibility checks and sync requests.",
-    "cover_injection_enabled": "Write the series' cover art into the first page of its lowest-numbered book, so Kavita and Komga show it as the series cover. Both readers build a series' cover from the first page of book one and ignore the cover InkDrop stores, which is why a volume that opens on a title page or a scanlator's banner shows that instead -- verified against real Kavita and Komga instances. With this on, a newly imported book that becomes the series' new lowest volume gets the cover moved to it automatically, and a corrected cover is rewritten into the archive. This edits the archive files in your library: the cover is added as a new first page (nothing is replaced), the original is kept in the quarantine folder so it can be restored, and any file whose chapter/volume classification would change is skipped rather than rewritten. Off by default. Leave it off and use the manual sweep on the Library page if you would rather review each run before it touches anything.",
+    "cover_injection_enabled": "Write the series' cover art into the first page of its lowest-numbered book, so Kavita and Komga show it as the series cover. When enabled, completed-import placements and the MangaDex front-cover refresh recheck the folder, move an existing injection when a lower unit arrives, and record the per-series result in History. Pack imports, MangaDex-direct placements, and ComicVine display-metadata refreshes catch up on a later completed import or CLI sweep. Shared folders have one deterministic owner, so competing rows do not flip the archive. This edits archive files in your library: the cover is added as a new first page (nothing is replaced), the original is kept in quarantine so it can be restored, and any unsafe archive is refused with its reason recorded. Off by default. The cover-injection CLI sweep is the existing dry-run/apply backfill for books already in the library.",
     "manga_companion_folder_convergence": "When a MangaDex companion tracks new chapters ahead of a volume-based series, place them in the same folder as the canonical series instead of a separate one. Both Kavita and Komga group by physical folder, not by matching metadata across folders -- verified live against a real Kavita instance on 2026-07-28, a companion in its own folder always displays as a second, incomplete series tile, and whichever folder gets scanned most recently silently drops the other's chapters from the reader's index. Turn this off only if you deliberately want companion chapters kept in a separate folder for some other reason.",
 }
 
@@ -28745,8 +30246,11 @@ def manual_source_resolved_has_existing_destination(row, db_path=None):
 
 
 def issue_number_keys_in_text(value):
+    from core import inkdrop_completed_import as completed_import
+
     keys = set()
-    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", str(value or "")):
+    text = completed_import.strip_issue_total_markers(value)
+    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", text):
         keys |= issue_number_keys(raw)
     return {key for key in keys if key}
 
@@ -29068,7 +30572,22 @@ def sync_queue(
             "kapowarrIssueId": item.get("kapowarr_issue_id"),
             "date": item.get("issue_date"),
         }
-        issue_id = upsert_issue(con, series_id, issue, now)
+        # The queue item already records which catalog the issue's metadata came
+        # from -- upsert_queue_item_from_watch_issue() writes it from the issue's
+        # own identity. Rebuilding the payload without it left upsert_issue() with
+        # nothing but the shape of the id to go on, so every queued MangaDex
+        # chapter came back labelled comicvine while still holding its UUID.
+        # Only the label is carried: issue_metadata_id is deliberately left out,
+        # because the row's internal id is keyed on the id resolved here and
+        # must not move.
+        queue_issue_provider = metadata_provider_key(item.get("issue_metadata_provider"))
+        if queue_issue_provider:
+            issue["issue_metadata_provider"] = queue_issue_provider
+        # ...but the stored row still wins when it has an answer: the label on
+        # the queue item is a copy of this same column taken at some earlier
+        # moment, never a fresh reading from a provider, so a sync must not be
+        # able to undo a correction made since that copy was taken.
+        issue_id = upsert_issue(con, series_id, issue, now, prefer_stored_provider=True)
         queue_id = item.get("key") or str(queue_key)
         state = effective_state
         resolved_row = manual_source_resolved_row_for_item(item, resolved_by_queue, resolved_by_issue, ambiguous_issue_keys)
@@ -29448,6 +30967,66 @@ def sync_queue(
                         (now, wanted_id),
                     )
                     state = "searching"
+        # A VERIFIED QUEUE ROW IS NOT EVIDENCE WHEN ITS PROOF IS ANOTHER UNIT'S FILE.
+        # The strict check refuses such a proof on its destination name, but a
+        # `verified` label survives it here: the durable-snapshot fallback above,
+        # and every queue-mode pass (verify_filesystem=False), accept the label on
+        # linkage alone. upsert_wanted() then writes `satisfied`, because this
+        # site consults wanted_projection_status() only for demoting projections.
+        # The Metabarons #8's only proof points at
+        # `The Metabarons #001 (2015).cbz`, and it was re-satisfied 214 times in
+        # five days with zero refusals. The watcher re-lists the unit each cycle,
+        # retire_queue_items_from_inkdrop_state() copies `verified` and the old
+        # last_event back from queue_items, and this write closed the loop.
+        #
+        # Checked AFTER the proof write so a manual resolution that mints a
+        # cross-unit proof in this same pass is caught before the pass ends.
+        # Demoting the queue row, not just the wanted row, is what stops the
+        # loop: with no terminal row here there is nothing left to copy back.
+        if state == "verified" and issue_id and verified_proof_is_another_units_file(con, series_id, issue_id):
+            refused_event = "The file this was verified against belongs to another issue. Searching again."
+            raw_item = dict(raw_item)
+            raw_item.update(
+                {
+                    "raw_state": "verified",
+                    "effective_state": "searching",
+                    "state_resolution": "cross_unit_verified_proof_rejected",
+                    "verified_snapshot_rejected_reason": "proof_names_another_units_file",
+                    "verified_snapshot_rejected_at": now,
+                    "verified_snapshot_rejected_at_iso": utc_stamp(now),
+                    "verified_snapshot_rejected_last_event": last_event,
+                }
+            )
+            con.execute(
+                """
+                update queue_items
+                   set state='searching',active=1,current_source=null,last_event=?,
+                       updated_at=?,raw_json=?
+                 where id=?
+                """,
+                (refused_event, now, json_dumps(raw_item), queue_id),
+            )
+            con.execute(
+                """
+                update wanted_items set status='in_progress',updated_at=?
+                where id=? and lower(coalesce(status,'')) not in ('ignored','removed_by_user')
+                """,
+                (now, wanted_id),
+            )
+            record_identity_refusal_once(
+                con,
+                event_type="queue_verified_refused_identity_conflict",
+                entity_type="queue_item",
+                entity_id=queue_id,
+                series_id=series_id,
+                issue_id=issue_id,
+                message="Queue sync refused a verified state whose import proof names another unit's file",
+                raw={"wanted_id": wanted_id, "refused_last_event": last_event, "site": "sync_queue"},
+            )
+            state = "searching"
+            last_event = refused_event
+            item = dict(item)
+            item["last_event"] = refused_event
         for attempt in item.get("attempts") or []:
             if not isinstance(attempt, dict):
                 continue
@@ -29804,6 +31383,24 @@ def mark_queue_verified_for_import(con, queue_id, wanted_id, ts, message=None, c
     # window has expired. No-op immediately rather than relying on every
     # current and future caller to remember to check state first.
     if str(queue["state"] or "") == "verified":
+        return False
+    # The fourth direct `satisfied` writer asks the same question sync_queue
+    # does, or a proof naming another work's file re-satisfies the row every
+    # cycle behind the projection's refusal (audit 2026-09-26 H2). It asks
+    # before the proof check below because that check can refuse the same file
+    # first (a filename dated inside a newer same-title volume), and the refusal
+    # is still owed its one record.
+    if queue["issue_id"] and verified_proof_is_another_units_file(con, queue["series_id"], queue["issue_id"]):
+        record_identity_refusal_once(
+            con,
+            event_type="queue_verified_refused_identity_conflict",
+            entity_type="queue_item",
+            entity_id=queue_id,
+            series_id=queue["series_id"],
+            issue_id=queue["issue_id"],
+            message="Import verification refused a proof that names another unit's file",
+            raw={"wanted_id": queue["wanted_id"] or wanted_id, "site": "mark_queue_verified_for_import"},
+        )
         return False
     # This re-derives proof rather than trusting the caller's, so it stays an
     # independent second check. It has to know about sibling issue ids for the
@@ -30205,12 +31802,29 @@ def reconcile_monitored_metadata_only_wanted(con, now, *, limit=250, series_id=N
           coalesce(s.updated_at, s.created_at, 0) desc,
           s.title asc,
           cast(coalesce(nullif(i.normalized_number, ''), i.issue_number, '999999') as real) asc
-        limit ?
         """,
-        (today, series_id, series_id, int(limit or 250)),
+        (today, series_id, series_id),
     ).fetchall()
-    changed = 0
+    # The chapter-lane depth rule holds these back at the refresh; without it
+    # here, the next full sync would want them anyway. It is also the re-check:
+    # when the boundary drops, the chapters it held come back through here. The
+    # limit applies after the rule, so held-back rows cannot fill it.
+    owned_by_series = {}
+    promotable = []
     for row in rows:
+        if len(promotable) >= int(limit or 250):
+            break
+        if metadata_provider_key(row["series_metadata_provider"]) == "mangadex":
+            if row["series_id"] not in owned_by_series:
+                owned_by_series[row["series_id"]] = manga_chapter_lane_owned_volumes(con, row["series_id"])
+            issue_raw = json_loads(row["issue_raw_json"] or "{}", {})
+            if inkdrop_manga_companion.chapter_behind_volume_lane(
+                issue_raw if isinstance(issue_raw, dict) else {}, owned_by_series[row["series_id"]]
+            ):
+                continue
+        promotable.append(row)
+    changed = 0
+    for row in promotable:
         series_raw = json_loads(row["series_raw_json"] or "{}", {})
         issue_raw = json_loads(row["issue_raw_json"] or "{}", {})
         watch = dict(series_raw) if isinstance(series_raw, dict) else {}
@@ -30660,7 +32274,7 @@ def dedupe_series_wanted_issue_id_collisions(con, series_id, now):
 def archive_and_retire_manual_source_retracted_resolved(con, now):
     """Preserve the frozen retraction entries, then take the key out of use.
 
-    Tracker #537. `manual_source_retracted_resolved` has no writer anywhere in
+    `manual_source_retracted_resolved` has no writer anywhere in
     the tree and has not had one since the root commit. Three modules read it
     to build a set of review ids to skip, and a loader default keeps
     re-creating it as an empty list, so it reads as a live filter to anyone
@@ -30678,7 +32292,7 @@ def archive_and_retire_manual_source_retracted_resolved(con, now):
     raise KeyError out of init_schema. Pinned by arm 4b of
     tests/inkdrop-manual-source-retraction-retired-smoke.py.
 
-    It matters beyond accuracy: the open question on #537 is whether these six
+    It matters beyond accuracy: the open question is whether these six
     are honoured, migrated or retired, and that will be decided by someone
     reading this. Three of them record no reason for their own retraction.
 
@@ -32703,38 +34317,9 @@ def import_result_strict_completion_valid(con, row, series_id, issue_id, managed
         return False
     if not isinstance(archive_check, dict) or not archive_check.get("ok"):
         return False
-    identity_row = con.execute(
-        """
-        select s.title as series, s.media_type, s.raw_json as series_raw_json,
-               i.title as issue_title, i.issue_number, i.normalized_number,
-               i.raw_json as issue_raw_json
-        from series s
-        left join issues i on i.id=?
-        where s.id=?
-        limit 1
-        """,
-        (issue_id, series_id),
-    ).fetchone()
-    if not identity_row:
+    queue_context = import_result_identity_context(con, series_id, issue_id)
+    if not queue_context:
         return False
-    series_raw = json_loads(identity_row["series_raw_json"] or "{}", {})
-    issue_raw = json_loads(identity_row["issue_raw_json"] or "{}", {})
-    queue_context = {
-        "series_id": series_id,
-        "issue_id": issue_id,
-        "raw_json": json_dumps({
-            **(series_raw if isinstance(series_raw, dict) else {}),
-            **(issue_raw if isinstance(issue_raw, dict) else {}),
-            "media_type": identity_row["media_type"],
-        }),
-        **dict(identity_row),
-    }
-    queue_context["query"] = " ".join(
-        value for value in (
-            str(queue_context.get("series") or "").strip(),
-            str(queue_context.get("issue_title") or queue_context.get("issue_number") or "").strip(),
-        ) if value
-    )
     if collection_target_single_part_block_reason(
         queue_context,
         collection_guard_record_from_import_result(row, queue_context),
@@ -32790,11 +34375,98 @@ def import_result_strict_completion_valid(con, row, series_id, issue_id, managed
     # inkdrop-collected-edition-coverage-settlement-smoke, which passes on qa and
     # went red on the first version of this change. Over-refusal here un-satisfies
     # books that are genuinely present, which is worse than the leak being closed.
+    return not import_result_destination_contradicts_unit(con, row, queue_context)
+
+
+def import_result_identity_context(con, series_id, issue_id):
+    """The unit's identity, shaped as the queue context the unit gates read."""
+    identity_row = con.execute(
+        """
+        select s.title as series, s.media_type, s.raw_json as series_raw_json,
+               i.title as issue_title, i.issue_number, i.normalized_number,
+               i.raw_json as issue_raw_json
+        from series s
+        left join issues i on i.id=?
+        where s.id=?
+        limit 1
+        """,
+        (issue_id, series_id),
+    ).fetchone()
+    if not identity_row:
+        return None
+    series_raw = json_loads(identity_row["series_raw_json"] or "{}", {})
+    issue_raw = json_loads(identity_row["issue_raw_json"] or "{}", {})
+    queue_context = {
+        "series_id": series_id,
+        "issue_id": issue_id,
+        "raw_json": json_dumps({
+            **(series_raw if isinstance(series_raw, dict) else {}),
+            **(issue_raw if isinstance(issue_raw, dict) else {}),
+            "media_type": identity_row["media_type"],
+        }),
+        **dict(identity_row),
+    }
+    queue_context["query"] = " ".join(
+        value for value in (
+            str(queue_context.get("series") or "").strip(),
+            str(queue_context.get("issue_title") or queue_context.get("issue_number") or "").strip(),
+        ) if value
+    )
+    return queue_context
+
+
+def import_result_destination_contradicts_unit(con, row, queue_context):
+    """True when the proof's destination names a unit, and it is not this one.
+
+    The destination half of import_result_strict_completion_valid(), askable
+    without the file: it grades the dest path's name, so it holds when the
+    library mount cannot be read. Absent evidence -- a destination that names
+    no unit -- is not a contradiction.
+    """
+    if not row or not queue_context:
+        return False
+    raw = json_loads(row_value(row, "raw_json") or "{}", {})
+    raw = raw if isinstance(raw, dict) else {}
     destination_verdict = direct_import_destination_unit_gate(
-        con, queue_context, dest_path, raw, already_satisfied_destination=True,
+        con, queue_context, row_value(row, "dest_path"), raw, already_satisfied_destination=True,
     )
     destination_reason = str((destination_verdict or {}).get("reason") or "")
-    return destination_reason_is_absent_evidence(destination_reason)
+    return not destination_reason_is_absent_evidence(destination_reason)
+
+
+def completed_import_total_marker_present(path):
+    from core import inkdrop_completed_import as completed_import
+
+    basename = Path(str(path or "").replace("\\", "/")).name
+    return bool(basename and completed_import.strip_issue_total_markers(basename) != basename)
+
+
+def stale_issue_total_proof_evidence(row, context=None):
+    """Evidence that an old proof mistook an of-N total for its unit."""
+    if not row or import_result_is_bad_or_retracted(row) or not completed_import_total_marker_present(row_value(row, "dest_path")):
+        return {}
+    from core import inkdrop_completed_import as completed_import
+
+    basename = Path(str(row_value(row, "dest_path") or "").replace("\\", "/")).name
+    context = context if isinstance(context, dict) else row
+    canonical = row_value(context, "normalized_number") or row_value(context, "issue_number")
+    wanted = issue_number_keys(canonical)
+    actual = issue_number_keys_in_text(basename)
+    unstripped = set()
+    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", basename):
+        unstripped |= issue_number_keys(raw)
+    removed_total_units = unstripped - actual
+    if not wanted or wanted & actual or not wanted & removed_total_units:
+        return {}
+    return {
+        "reason": "stale_issue_total_marker",
+        "canonical_issue": canonical,
+        "destination_units": sorted(actual),
+        "removed_total_units": sorted(removed_total_units),
+        "destination_basename": basename,
+        "trusted_issue_mismatch": completed_import.trusted_issue_mismatch_reason(basename, canonical),
+        "stale_issue_total_proof": True,
+    }
 
 
 def import_result_download_task_ids(raw):
@@ -35855,6 +37527,12 @@ WRONG_UNIT_SEMANTICS_RECHECK_SECONDS = int(
 WRONG_UNIT_CLEANUP_PASS_BUDGET_SECONDS = float(
     os.environ.get("INKDROP_WRONG_UNIT_CLEANUP_PASS_BUDGET_SECONDS", 45)
 )
+# The no-cursor production callers walk this many positive import proofs per
+# pass. The keyset index makes the read proportional to this window, while the
+# persisted schema_meta cursor eventually covers the whole table without
+# materializing every marker/provenance candidate on every sync.
+WRONG_UNIT_CLEANUP_CANDIDATE_WALK_LIMIT = 256
+WRONG_UNIT_CLEANUP_CURSOR_SCHEMA_KEY = "wrong_unit_page_pack_cleanup_cursor_v1"
 
 # Same rollback trap, different stage: the folder-presence backfills verify
 # on-disk archives (decompress + PIL over CIFS) for every active queue/wanted
@@ -35870,6 +37548,9 @@ FOLDER_PRESENCE_BACKFILL_PASS_BUDGET_SECONDS = float(
 WRONG_UNIT_PAGE_PACK_PROOF_MESSAGE = "That download was chapters, not the volume this series collects. Searching again."
 WRONG_UNIT_PAGE_PACK_PROOF_REASON = "A chapter archive cannot complete a series that is set to collect volumes"
 WRONG_UNIT_PAGE_PACK_PROOF_EVENT = "wrong_unit_page_pack_proof_retracted"
+STALE_ISSUE_TOTAL_PROOF_MESSAGE = "This file's issue count was mistaken for its issue number. Searching again."
+STALE_ISSUE_TOTAL_PROOF_REASON = "An issue-total marker was mistaken for the target issue number"
+STALE_ISSUE_TOTAL_PROOF_EVENT = "stale_issue_total_proof_retracted"
 PROVENANCE_IDENTITY_RETRACTION_EVENT = "completion_provenance_identity_retracted"
 PROVENANCE_IDENTITY_RETRACTION_MESSAGE = "The download that claimed to finish this does not match what InkDrop asked for. Searching again."
 WRONG_UNIT_PAGE_PACK_CHAPTER_NATIVE_PROVIDERS = {"mangadex", "suwayomi", "tachiyomi"}
@@ -36213,6 +37894,9 @@ def wrong_unit_page_pack_source_evidence(row, raw_dicts=None):
 def wrong_unit_page_pack_import_row(row, *, fresh_archive_semantics=False, con=None):
     if not row:
         return {}
+    stale_total = stale_issue_total_proof_evidence(row)
+    if stale_total:
+        return stale_total
     if import_result_is_bad_or_retracted(row):
         status_bits = import_result_positive_status_bits(row)
         half_retracted_verified = bool(int(row_value(row, "verified") or 0)) and "wrong_unit" in status_bits
@@ -36342,30 +38026,50 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
     except Exception:
         limit = 5000
     semantic_scan_limit = max(1, min(limit, 100))
-    cursor = cursor if isinstance(cursor, dict) else None
-    cursor_created = safe_float((cursor or {}).get("created_at")) if cursor else None
-    cursor_id = str((cursor or {}).get("id") or "")
+    walk_limit = min(limit, WRONG_UNIT_CLEANUP_CANDIDATE_WALK_LIMIT)
+    explicit_cursor = isinstance(cursor, dict)
+    walk_cursor = cursor if explicit_cursor else None
+    if not explicit_cursor:
+        stored_cursor = con.execute(
+            "select value from schema_meta where key=?",
+            (WRONG_UNIT_CLEANUP_CURSOR_SCHEMA_KEY,),
+        ).fetchone()
+        stored_cursor = json_loads(row_value(stored_cursor, "value") or "{}", {})
+        walk_cursor = stored_cursor if isinstance(stored_cursor, dict) else {}
+    cursor_created = safe_float((walk_cursor or {}).get("created_at"), None)
+    cursor_id = str((walk_cursor or {}).get("id") or "")
     cursor_clause = ""
     cursor_params = []
-    if cursor is not None and (cursor_created is not None or cursor_id):
+    if cursor_created is not None or cursor_id:
         cursor_created = cursor_created or 0
-        cursor_clause = "and (coalesce(ir.created_at,0)>? or (coalesce(ir.created_at,0)=? and ir.id>?))"
-        cursor_params = [cursor_created, cursor_created, cursor_id]
-    # json_extract raises sqlite3.OperationalError on malformed JSON text
-    # rather than returning NULL, and this ordering has no per-row recovery.
-    # coalesce(ir.raw_json, '{}') only covers NULL; guard with json_valid too
-    # so a corrupt raw_json string degrades this row's sort key instead of
-    # aborting the whole pass -- this cleanup can run under
-    # inkdrop_state_maintenance.py, which has no catch-all around it.
-    ir_raw_or_empty = "case when json_valid(ir.raw_json) then ir.raw_json else '{}' end"
-    order_sql = (
-        "coalesce(ir.created_at,0) asc, ir.id asc"
-        if cursor is not None
-        else f"""case when json_extract({ir_raw_or_empty}, '$.wrong_unit_archive_semantics_checked_at') is null then 0 else 1 end,
-          coalesce(json_extract({ir_raw_or_empty}, '$.wrong_unit_archive_semantics_checked_at'), 0) asc,
-          coalesce(ir.created_at, 0) asc, ir.id asc"""
+        cursor_clause = "and (coalesce(ir.created_at,0), ir.id) > (?, ?)"
+        cursor_params = [cursor_created, cursor_id]
+    walk_rows = con.execute(
+        f"""
+        select ir.id, coalesce(ir.created_at,0) as integrity_created_at
+        from import_results ir indexed by idx_import_results_created_keyset
+        where (
+            coalesce(ir.verified, 0)=1
+            or coalesce(ir.imported_count, 0)>0
+            or coalesce(ir.folder_imported, 0)=1
+          )
+          {cursor_clause}
+        order by coalesce(ir.created_at,0) asc, ir.id asc
+        limit ?
+        """,
+        (*cursor_params, walk_limit),
+    ).fetchall()
+    next_cursor = (
+        {
+            "created_at": walk_rows[-1]["integrity_created_at"],
+            "id": walk_rows[-1]["id"],
+        }
+        if len(walk_rows) >= walk_limit
+        else None
     )
-    rows = con.execute(
+    walk_ids = [row["id"] for row in walk_rows]
+    candidate_id_sql = ",".join("?" for _ in walk_ids) or "null"
+    candidate_rows = con.execute(
         f"""
         select ir.id, ir.queue_id, q.wanted_id, ir.source_attempt_id,
                ir.series_id, ir.issue_id, ir.source_path, ir.dest_path,
@@ -36386,61 +38090,75 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                sa.download_client as attempt_download_client, sa.title as attempt_title,
                sa.status as attempt_status, sa.outcome as attempt_outcome,
                sa.lifecycle_phase as attempt_lifecycle_phase, sa.raw_json as attempt_raw_json,
-               coalesce(ir.created_at,0) as integrity_created_at
+               coalesce(ir.created_at,0) as integrity_created_at,
+               (
+                 instr(lower(coalesce(ir.dest_path, '')), '(of ') > 0
+                 or instr(lower(coalesce(ir.dest_path, '')), '[of ') > 0
+                 or instr(lower(coalesce(ir.dest_path, '')), '_of_') > 0
+                 or instr(lower(coalesce(ir.dest_path, '')), ' of ') > 0
+               ) as marker_prefilter_match,
+               (
+                 lower(coalesce(sa.source, '')) in ('mangadex','suwayomi','pack_import','local_pack','folder_presence')
+                 or lower(coalesce(sa.provider_id, '')) in ('mangadex','suwayomi','local_pack','page_pack')
+                 or lower(coalesce(sa.download_client, '')) in ('inkdrop_page_pack','inkdrop_local_pack')
+                 or exists (
+                   select 1 from import_results neg
+                   where neg.id <> ir.id
+                     and (neg.queue_id = ir.queue_id or neg.issue_id = ir.issue_id)
+                     and lower(coalesce(neg.dest_path, '')) = lower(coalesce(ir.dest_path, ''))
+                     and coalesce(neg.verified, 0)=0
+                     and lower(coalesce(neg.status, '')) <> '{WRONG_UNIT_PAGE_PACK_PROOF_STATUS}'
+                     and coalesce(neg.source_attempt_id, '') <> ''
+                     and neg.source_attempt_id = ir.source_attempt_id
+                     and (
+                       lower(coalesce(neg.status, '')) like '%wrong_unit%'
+                       or lower(coalesce(neg.status, '')) like '%single_part_file%'
+                       or lower(coalesce(neg.raw_json, '')) like '%rejected_wrong_unit%'
+                     )
+                 )
+               ) as page_pack_provenance_match
         from import_results ir
         join series s on s.id = ir.series_id
         left join issues i on i.id = ir.issue_id
         left join queue_items q on q.id = ir.queue_id
         left join wanted_items w on w.id = q.wanted_id
         left join source_attempts sa on sa.id = ir.source_attempt_id
-        where (
-            coalesce(ir.verified, 0)=1
-            or coalesce(ir.imported_count, 0)>0
-            or coalesce(ir.folder_imported, 0)=1
-          )
-          and (
-            -- Structured provenance only. The four raw_json LIKE clauses that
-            -- used to sit here ('%mangadex%' and friends) selected proofs by
-            -- substring over the whole blob: measured live 2026-07-29, 891 of
-            -- 1,049 quarantined rows were source-evidence retractions and the
-            -- worst-hit series were comicvine volumes whose raw JSON mentions
-            -- mangadex BY DESIGN via the companion-series bridge (One Piece:
-            -- 316 retracted, 1 genuinely page-pack). The structured fields
-            -- below caught that 1 -- they are the precise signal.
-            lower(coalesce(sa.source, '')) in ('mangadex','suwayomi','pack_import','local_pack','folder_presence')
-            or lower(coalesce(sa.provider_id, '')) in ('mangadex','suwayomi','local_pack','page_pack')
-            or lower(coalesce(sa.download_client, '')) in ('inkdrop_page_pack','inkdrop_local_pack')
-            or exists (
-                select 1 from import_results neg
-                where neg.id <> ir.id
-                  and (neg.queue_id = ir.queue_id or neg.issue_id = ir.issue_id)
-                  and lower(coalesce(neg.dest_path, '')) = lower(coalesce(ir.dest_path, ''))
-                  and coalesce(neg.verified, 0)=0
-                  -- A row this cleanup itself quarantined must not come back
-                  -- as the wrong-unit neighbour that justifies retracting its
-                  -- verified sibling at the same path -- that loop manufactured
-                  -- its own evidence, one retraction per pass.
-                  and lower(coalesce(neg.status, '')) <> '{WRONG_UNIT_PAGE_PACK_PROOF_STATUS}'
-                  -- And the neighbour must share provenance with this row (same
-                  -- source attempt), not merely a dest_path: unrelated attempts
-                  -- landing on the same file say nothing about THIS proof.
-                  and coalesce(neg.source_attempt_id, '') <> ''
-                  and neg.source_attempt_id = ir.source_attempt_id
-                  and (
-                    lower(coalesce(neg.status, '')) like '%wrong_unit%'
-                    or lower(coalesce(neg.status, '')) like '%single_part_file%'
-                    or lower(coalesce(neg.raw_json, '')) like '%rejected_wrong_unit%'
-                  )
-            )
-          )
-          {cursor_clause}
-        order by {order_sql}
-        limit ?
+        where ir.id in ({candidate_id_sql})
         """,
-        (*cursor_params, semantic_scan_limit),
+        walk_ids,
     ).fetchall()
+    candidate_by_id = {row["id"]: row for row in candidate_rows}
+    rows = []
+    # Walk position of each admitted row, so an early exit resumes the cursor
+    # just past the last row actually handled instead of past the whole walk.
+    walk_positions = {}
+    for walk_index, walk_row in enumerate(walk_rows):
+        row = candidate_by_id.get(walk_row["id"])
+        if not row:
+            continue
+        marker_prefilter_match = bool(row["marker_prefilter_match"])
+        page_pack_provenance_match = bool(row["page_pack_provenance_match"])
+        if not marker_prefilter_match and not page_pack_provenance_match:
+            continue
+        if (
+            marker_prefilter_match
+            and not page_pack_provenance_match
+            and not completed_import_total_marker_present(row["dest_path"])
+        ):
+            continue
+        rows.append(row)
+        walk_positions[row["id"]] = walk_index
+        if len(rows) >= semantic_scan_limit:
+            if walk_index < len(walk_rows) - 1:
+                next_cursor = {
+                    "created_at": walk_row["integrity_created_at"],
+                    "id": walk_row["id"],
+                }
+            break
     counts = {
         "import_results": 0,
+        "media_files": 0,
+        "stale_issue_total_proofs": 0,
         "queue_items": 0,
         "download_tasks": 0,
         "source_attempts": 0,
@@ -36451,12 +38169,28 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
     for row in rows:
         if time.time() - pass_started > WRONG_UNIT_CLEANUP_PASS_BUDGET_SECONDS:
             # Stop, don't starve: rows finished this pass keep their stamps
-            # when the surrounding sync commits, and the unstamped-first
-            # ordering resumes exactly here next pass. Without this bound a
-            # heavy batch outlived the import child, the kill rolled back the
-            # whole transaction, and no audit ever persisted.
+            # when the surrounding sync commits, and the persisted candidate
+            # cursor keeps the bounded walk moving across later passes.
+            # Without this bound a heavy batch outlived the import child, the
+            # kill rolled back the whole transaction, and no audit persisted.
             counts["pass_budget_exhausted"] = 1
+            walk_index = walk_positions[row["id"]]
+            if walk_index > 0:
+                handled = walk_rows[walk_index - 1]
+                next_cursor = {
+                    "created_at": handled["integrity_created_at"],
+                    "id": handled["id"],
+                }
+            else:
+                next_cursor = walk_cursor or None
             break
+        stale_total_evidence = stale_issue_total_proof_evidence(row)
+        if (
+            not stale_total_evidence
+            and completed_import_total_marker_present(row["dest_path"])
+            and not wrong_unit_page_pack_volume_managed_manga_target(row)
+        ):
+            continue
         # A row audited recently is verified against its PERSISTED archive
         # identity with a central-directory read (milliseconds) instead of the
         # full decompress-and-PIL pass (10-30s over CIFS). A signature match
@@ -36473,7 +38207,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             > now - WRONG_UNIT_SEMANTICS_RECHECK_SECONDS
         )
         signature_mismatch = False
-        if stamp_fresh:
+        if stamp_fresh and not stale_total_evidence:
             if str(row["status"] or "").strip().lower() == WRONG_UNIT_PAGE_PACK_PROOF_STATUS:
                 counts["stamp_skipped"] = counts.get("stamp_skipped", 0) + 1
                 continue
@@ -36496,7 +38230,9 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
         # size) cache key, so only a forced re-read can see the new members.
         # Everywhere else the cache key is sufficient and fresh=True would
         # just re-decompress unchanged archives.
-        evidence = wrong_unit_page_pack_import_row(row, fresh_archive_semantics=signature_mismatch, con=con)
+        evidence = stale_total_evidence or wrong_unit_page_pack_import_row(
+            row, fresh_archive_semantics=signature_mismatch, con=con
+        )
         if not evidence:
             raw = json_loads(row["import_raw_json"] or "{}", {})
             raw = raw if isinstance(raw, dict) else {}
@@ -36520,15 +38256,32 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             con.execute("update import_results set raw_json=? where id=?", (json_dumps(raw), row["id"]))
             counts["archive_semantics_audited"] += int(con.execute("select changes()").fetchone()[0] or 0)
             continue
+        retraction_event = STALE_ISSUE_TOTAL_PROOF_EVENT if stale_total_evidence else WRONG_UNIT_PAGE_PACK_PROOF_EVENT
+        retraction_reason = STALE_ISSUE_TOTAL_PROOF_REASON if stale_total_evidence else WRONG_UNIT_PAGE_PACK_PROOF_REASON
+        retraction_message = STALE_ISSUE_TOTAL_PROOF_MESSAGE if stale_total_evidence else WRONG_UNIT_PAGE_PACK_PROOF_MESSAGE
+        if stale_total_evidence:
+            retraction_raw = {
+                "stale_issue_total_proof_retracted": True,
+                "stale_issue_total_proof_import_result_id": row["id"],
+                "stale_issue_total_proof_reason": retraction_reason,
+                "stale_issue_total_proof_evidence": evidence,
+                "stale_issue_total_proof_retracted_at": now,
+                "stale_issue_total_proof_retracted_at_iso": utc_stamp(now),
+            }
+        else:
+            retraction_raw = {
+                "wrong_unit_page_pack_proof_retracted": True,
+                "wrong_unit_page_pack_import_result_id": row["id"],
+                "wrong_unit_page_pack_reason": retraction_reason,
+                "wrong_unit_page_pack_evidence": evidence,
+                "wrong_unit_page_pack_retracted_at": now,
+                "wrong_unit_page_pack_retracted_at_iso": utc_stamp(now),
+            }
         raw = json_loads(row["import_raw_json"] or "{}", {})
         raw = raw if isinstance(raw, dict) else {}
         raw.update(
             {
-                "wrong_unit_page_pack_proof_retracted": True,
-                "wrong_unit_page_pack_reason": WRONG_UNIT_PAGE_PACK_PROOF_REASON,
-                "wrong_unit_page_pack_evidence": evidence,
-                "wrong_unit_page_pack_retracted_at": now,
-                "wrong_unit_page_pack_retracted_at_iso": utc_stamp(now),
+                **retraction_raw,
                 # Also a completed semantics check: without this stamp the
                 # retracted row re-qualifies next pass just to be re-read once
                 # more before the audit branch finally stamps it.
@@ -36539,9 +38292,9 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                 "previous_outcome": row["outcome"],
                 "previous_display_phase": row["display_phase"],
                 "previous_completion_truth": row["completion_truth"],
-                # The update below also overwrites these two, and until row #1125
-                # nothing recorded them -- the same silence #1055 fixed in the
-                # stale-folder sweep. Measured on the 2026-09-13T02:35:28Z snapshot:
+                # The update below also overwrites these two. Earlier code recorded
+                # neither value, leaving the same silence as the stale-folder sweep.
+                # Measured on the 2026-09-13T02:35:28Z snapshot:
                 # 0 of 737 page-pack retractions carry either key, and on 36 of 737
                 # the original payload holds neither value, so they are gone.
                 # library_visibility_status had to be added to the SELECT above;
@@ -36551,6 +38304,8 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                 "repair_status": WRONG_UNIT_PAGE_PACK_PROOF_STATUS,
             }
         )
+        if stale_total_evidence:
+            counts["stale_issue_total_proofs"] += 1
         con.execute(
             """
             update import_results
@@ -36567,6 +38322,22 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             (WRONG_UNIT_PAGE_PACK_PROOF_STATUS, json_dumps(raw), row["id"]),
         )
         counts["import_results"] += int(con.execute("select changes()").fetchone()[0] or 0)
+        if stale_total_evidence:
+            con.execute(
+                """
+                update media_files
+                   set status=?, active=0, completion_truth='wrong_unit',
+                       folder_imported=0, last_seen_at=?
+                 where issue_id=? and normalized_path=?
+                """,
+                (
+                    WRONG_UNIT_PAGE_PACK_PROOF_STATUS,
+                    now,
+                    row["issue_id"],
+                    media_file_normalized_path(row["dest_path"]),
+                ),
+            )
+            counts["media_files"] += int(con.execute("select changes()").fetchone()[0] or 0)
         con.execute(
             """
             insert or ignore into history_events(
@@ -36575,14 +38346,14 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             ) values(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                stable_id(WRONG_UNIT_PAGE_PACK_PROOF_EVENT, "import_result", row["id"]),
+                stable_id(retraction_event, "import_result", row["id"]),
                 "import_result",
                 row["id"],
                 row["series_id"],
                 row["issue_id"],
-                WRONG_UNIT_PAGE_PACK_PROOF_EVENT,
+                retraction_event,
                 "inkdrop_state",
-                WRONG_UNIT_PAGE_PACK_PROOF_REASON,
+                retraction_reason,
                 "problem",
                 "retry_later",
                 now,
@@ -36601,17 +38372,16 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             (row["queue_id"],),
         ).fetchall() if row["queue_id"] else []
         for task in task_rows:
-            if not wrong_unit_page_pack_task_or_attempt_matches(task, row, con=con):
+            if not (
+                wrong_unit_page_pack_task_or_attempt_matches(task, row, con=con)
+                or (stale_total_evidence and download_task_matches_missing_folder_proof(task, row))
+            ):
                 continue
             task_raw = json_loads(task["raw_json"] or "{}", {})
             task_raw = task_raw if isinstance(task_raw, dict) else {}
             task_raw.update(
                 {
-                    "wrong_unit_page_pack_proof_retracted": True,
-                    "wrong_unit_page_pack_import_result_id": row["id"],
-                    "wrong_unit_page_pack_reason": WRONG_UNIT_PAGE_PACK_PROOF_REASON,
-                    "wrong_unit_page_pack_retracted_at": now,
-                    "wrong_unit_page_pack_retracted_at_iso": utc_stamp(now),
+                    **retraction_raw,
                     "previous_status": task["status"],
                     "previous_state": task["state"],
                 }
@@ -36633,7 +38403,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                 """,
                 (
                     WRONG_UNIT_PAGE_PACK_PROOF_STATUS,
-                    WRONG_UNIT_PAGE_PACK_PROOF_REASON,
+                    retraction_reason,
                     now,
                     now,
                     json_dumps(task_raw),
@@ -36658,11 +38428,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             attempt_raw = attempt_raw if isinstance(attempt_raw, dict) else {}
             attempt_raw.update(
                 {
-                    "wrong_unit_page_pack_proof_retracted": True,
-                    "wrong_unit_page_pack_import_result_id": row["id"],
-                    "wrong_unit_page_pack_reason": WRONG_UNIT_PAGE_PACK_PROOF_REASON,
-                    "wrong_unit_page_pack_retracted_at": now,
-                    "wrong_unit_page_pack_retracted_at_iso": utc_stamp(now),
+                    **retraction_raw,
                     "previous_status": attempt["status"],
                     "previous_outcome": attempt["outcome"],
                     "previous_lifecycle_phase": attempt["lifecycle_phase"],
@@ -36683,7 +38449,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                 """,
                 (
                     WRONG_UNIT_PAGE_PACK_PROOF_STATUS,
-                    WRONG_UNIT_PAGE_PACK_PROOF_REASON,
+                    retraction_reason,
                     now,
                     json_dumps(attempt_raw),
                     attempt["id"],
@@ -36705,11 +38471,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                 "previous_state": row["queue_state"],
                 "previous_active": row["queue_active"],
                 "previous_last_event": row["queue_last_event"],
-                "wrong_unit_page_pack_proof_retracted": True,
-                "wrong_unit_page_pack_import_result_id": row["id"],
-                "wrong_unit_page_pack_reason": WRONG_UNIT_PAGE_PACK_PROOF_REASON,
-                "wrong_unit_page_pack_retracted_at": now,
-                "wrong_unit_page_pack_retracted_at_iso": utc_stamp(now),
+                **retraction_raw,
             }
         )
         con.execute(
@@ -36731,7 +38493,7 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
                    raw_json=?
              where id=?
             """,
-            (WRONG_UNIT_PAGE_PACK_PROOF_MESSAGE, now, now, utc_stamp(now), json_dumps(queue_raw), queue_id),
+            (retraction_message, now, now, utc_stamp(now), json_dumps(queue_raw), queue_id),
         )
         changed = int(con.execute("select changes()").fetchone()[0] or 0)
         counts["queue_items"] += changed
@@ -36752,28 +38514,38 @@ def cleanup_wrong_unit_page_pack_import_proofs(con, now, limit=5000, *, cursor=N
             ) values(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                stable_id(WRONG_UNIT_PAGE_PACK_PROOF_EVENT, "queue_item", queue_id, row["id"]),
+                stable_id(retraction_event, "queue_item", queue_id, row["id"]),
                 "queue_item",
                 queue_id,
                 row["series_id"],
                 row["issue_id"],
-                WRONG_UNIT_PAGE_PACK_PROOF_EVENT,
+                retraction_event,
                 "inkdrop_state",
-                WRONG_UNIT_PAGE_PACK_PROOF_MESSAGE,
+                retraction_message,
                 "retry_later",
                 "queued",
                 now,
                 json_dumps(queue_raw),
             ),
         )
-    if cursor is not None:
-        counts["_progress"] = {
-            "examined": len(rows),
-            "cursor": (
-                {"created_at": rows[-1]["integrity_created_at"], "id": rows[-1]["id"]}
-                if len(rows) >= semantic_scan_limit else None
+    if not explicit_cursor:
+        con.execute(
+            """
+            insert into schema_meta(key, value) values(?, ?)
+            on conflict(key) do update set value=excluded.value
+            """,
+            (
+                WRONG_UNIT_CLEANUP_CURSOR_SCHEMA_KEY,
+                json_dumps(next_cursor or {}),
             ),
-        }
+        )
+    counts["_progress"] = {
+        "examined": len(walk_rows),
+        "selected": len(candidate_rows),
+        "actionable": len(rows),
+        "walk_limit": walk_limit,
+        "cursor": next_cursor,
+    }
     return counts
 
 
@@ -36849,7 +38621,8 @@ def mark_import_wrong(db_path, import_result_id, *, reason=None, marked_by="inkd
                 "previous_completion_truth": row["completion_truth"],
                 # The update below overwrites these two as well; recording them is
                 # what lets a mistaken Mark Wrong be undone from the row itself
-                # (row #1125, the rule #1055 settled). Neither column was selected
+                # under the rule that a mistaken Mark Wrong must be reversible.
+                # Neither column was selected
                 # before, so the SELECT above had to widen with the stamp.
                 "previous_folder_imported": row["folder_imported"],
                 "previous_library_visibility_status": row["library_visibility_status"],
@@ -39010,6 +40783,7 @@ def sync_state(state_dir, db_path=None, *, retire_absent_json=False):
             counts["folder_presence_backfill"] = backfill_existing_folder_presence_import_results(con, now)
             counts["folder_presence_wanted_backfill"] = backfill_existing_folder_presence_wanted_items(con, now)
             counts["collection_single_part_verified_reopened"] = cleanup_collection_single_part_verified_queue_rows(con, now)
+            counts["reopened_recheck_stale_completion_fences_healed"] = cleanup_reopened_recheck_stale_completion_fences(con, now)
             counts["superseded_duplicates"] = supersede_duplicate_queue_items(con, now)
             counts["duplicate_verified_activity_attempts_removed"] = cleanup_duplicate_verified_activity_attempts(con)
             counts["media_files"] = sync_managed_media_files(con, now)
@@ -39329,7 +41103,7 @@ def _restore_manga_companion_discovery_locked(
         # in core/ -- upsert_series()'s reactivation branch and this one -- and
         # only this one can be reached without going through upsert_series at
         # all, so a companion restored here would come back un-removed with its
-        # retired queue and wanted rows still retired. That is #729's defect
+        # retired queue and wanted rows still retired. That is the same defect
         # through a path the other hook does not cover.
         #
         # Only under `allow_reactivating_user_removal`: the guard above returns
@@ -39432,7 +41206,7 @@ def reconcile_discovery_only_companion_staleness(db_path, *, now=None, limit=25)
     legitimate parked state. Safe to auto-repair without asking again: the
     confirmation already happened whichever time discovery_mode was set.
 
-    Found 3 of 5 companions #347 healed on 2026-08-05 (Fire Punch,
+    Found 3 of 5 companions healed on 2026-08-05 (Fire Punch,
     Gachiakuta, Hunter X Hunter) back in exactly this state on 2026-08-11,
     four to six days after they broke and unnoticed until a manual re-audit
     -- this closes that observability gap by running every autopilot pass
@@ -49643,7 +51417,32 @@ def forget_reopened_unit_file_proofs(con):
     )
 
 
-def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=None, budget=None, cache=None):
+def review_exception_unit_ledger_rows(con, issue_id):
+    """The ordered ledger rows whose fields can decide one unit's file proof."""
+    return con.execute(
+        "select id, path, series_id, issue_id, coalesce(size_bytes,0) as size_bytes from media_files"
+        " where issue_id=? and coalesce(active,0)=1 and lower(coalesce(status,''))='present'"
+        " order by coalesce(size_bytes,0) desc, id asc limit ?",
+        (str(issue_id or "").strip(), REVIEW_EXCEPTION_FILE_PROOF_MAX_LEDGER_ROWS),
+    ).fetchall()
+
+
+def review_exception_unit_ledger_signature(rows):
+    """Stable identity of every ledger field consulted by a unit file proof."""
+    return tuple(
+        (
+            str(row_value(row, "id") or ""),
+            str(row_value(row, "path") or ""),
+            str(row_value(row, "series_id") or ""),
+            str(row_value(row, "issue_id") or ""),
+            int(row_value(row, "size_bytes") or 0),
+        )
+        for row in rows or ()
+    )
+
+
+def review_exception_unit_file_proof(
+        con, series_id, issue_id, managed_roots=None, budget=None, cache=None, ledger_rows=None):
     """The file that may retire this unit's review exception, or why none does.
 
     `media_files` is DURABLE SCAN METADATA, not a live reading. On snapshot
@@ -49687,12 +51486,7 @@ def review_exception_unit_file_proof(con, series_id, issue_id, managed_roots=Non
         return {"ok": False, "reason": "no_unit"}
     series_id = str(series_id or "").strip()
     roots = managed_roots if managed_roots is not None else media_management_roots_from_connection(con)
-    ledger_rows = con.execute(
-        "select id, path, series_id from media_files"
-        " where issue_id=? and coalesce(active,0)=1 and lower(coalesce(status,''))='present'"
-        " order by coalesce(size_bytes,0) desc, id asc limit ?",
-        (issue_id, REVIEW_EXCEPTION_FILE_PROOF_MAX_LEDGER_ROWS),
-    ).fetchall()
+    ledger_rows = review_exception_unit_ledger_rows(con, issue_id) if ledger_rows is None else ledger_rows
     reason = "no_present_ledger_row"
     for ledger in ledger_rows:
         owner = str(row_value(ledger, "series_id") or "").strip()
@@ -49997,6 +51791,50 @@ def unwanted_file_review_retirements(db_path, rows, origin, proof_cache=None):
     return decisions
 
 
+def review_exception_sync_plan(db_path, rows, origin, unwanted):
+    """Identity and satisfied-unit proofs for a sync, read before the write lock is taken.
+
+    Under the lock they held the writer 1.6 s and 0.9 s of every scheduled pass
+    (snapshot inkdrop-state-20260925T162707Z-db3ad90a96f1, as_of_utc
+    2026-09-25T16:27:07Z). A failed read plans nothing: identity resolves under
+    the lock as before and no unit retires this pass.
+    """
+    plan = {"identity": {}, "proofs": {}}
+    try:
+        with connect_read(db_path, timeout_seconds=10.0, busy_timeout_ms=10000) as con:
+            con.row_factory = sqlite3.Row
+            for row in rows or []:
+                exception_id = f"review:{origin}:{normalize_review_exception_id(row)}" if isinstance(row, dict) else ""
+                if exception_id and exception_id not in unwanted:
+                    plan["identity"][exception_id] = resolve_review_exception_identity(con, row)
+            satisfied = {row[0] for row in con.execute(
+                "select issue_id from wanted_items where lower(coalesce(status, '')) = 'satisfied' intersect"
+                " select issue_id from media_files where coalesce(active, 0) = 1"
+                " and lower(coalesce(status, '')) = 'present'"
+            )}
+            units = set(plan["identity"].values()) | {
+                (row["series_id"], row["issue_id"]) for row in con.execute(
+                    "select series_id, issue_id from review_exceptions where active=1 and origin<>?", (origin,)
+                )
+            }
+            managed_roots = media_management_roots_from_connection(con)
+            budget = {"archive_reads": REVIEW_EXCEPTION_FILE_PROOF_ARCHIVE_READ_BUDGET}
+            for series_id, issue_id in sorted(units, key=lambda unit: (str(unit[0] or ""), str(unit[1] or ""))):
+                if issue_id and issue_id in satisfied:
+                    ledger_rows = review_exception_unit_ledger_rows(con, issue_id)
+                    plan["proofs"][(series_id, issue_id)] = {
+                        "proof": review_exception_unit_file_proof(
+                            con, series_id, issue_id, managed_roots=managed_roots,
+                            budget=budget, ledger_rows=ledger_rows,
+                        ),
+                        "ledger_rows": review_exception_unit_ledger_signature(ledger_rows),
+                    }
+    except (sqlite3.Error, OSError) as exc:
+        LOGGER.warning("Review exception sync plan failed for origin %s: %s", origin, exc)
+        return {"identity": {}, "proofs": {}}
+    return plan
+
+
 def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
     def _sync():
         path = Path(db_path)
@@ -50009,6 +51847,7 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
         parked = 0
         proof_cache = {"writes": {}, "drops": set()}
         unwanted = unwanted_file_review_retirements(path, rows, origin, proof_cache=proof_cache) if path.exists() else {}
+        plan = review_exception_sync_plan(path, rows, origin, unwanted) if path.exists() else {"identity": {}, "proofs": {}}
         with connect(path) as con:
             init_schema(con)
             store_review_exception_file_proofs(con, proof_cache)
@@ -50051,14 +51890,23 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
                 is_parked = bool(row.get("manual_review_parked") or not is_actionable)
                 actionable += int(is_actionable)
                 parked += int(is_parked)
-                resolved_series_id, resolved_issue_id = resolve_review_exception_identity(con, row)
-                existing = con.execute("select state, raw_json from review_exceptions where id=?", (exception_id,)).fetchone()
+                resolved_series_id, resolved_issue_id = plan["identity"].get(exception_id) or resolve_review_exception_identity(con, row)
+                existing = con.execute(
+                    "select active, state, series_id, issue_id, raw_json from review_exceptions where id=?",
+                    (exception_id,),
+                ).fetchone()
                 raw_row = dict(row)
                 if resolved_series_id:
                     raw_row["series_id"] = resolved_series_id
                 if resolved_issue_id:
                     raw_row["issue_id"] = resolved_issue_id
                 raw_json = json_dumps(raw_row)
+                if (existing is not None and int(existing["active"] or 0) == 1
+                        and str(existing["state"] or "") == state
+                        and str(existing["series_id"] or "") == str(resolved_series_id or "")
+                        and str(existing["issue_id"] or "") == str(resolved_issue_id or "")
+                        and str(existing["raw_json"] or "") == raw_json):
+                    continue
                 con.execute(
                     """
                     insert into review_exceptions(
@@ -50107,7 +51955,7 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
                 )
                 if existing is None:
                     inserted += 1
-                elif str(existing["state"] or "") != state or str(existing["raw_json"] or "") != raw_json:
+                else:
                     updated += 1
                 history_id = stable_id("review_exception", exception_id, state, row.get("review_reason") or row.get("reason"))
                 con.execute(
@@ -50204,32 +52052,39 @@ def sync_review_exceptions(db_path, rows, origin="legacy_manual_review"):
             # 2026-09-13T02:35:28Z) were last seen before the most recent scan
             # day, and a fixture built on the production function retired a
             # review exception on a row naming a file that was never there.
-            managed_roots = media_management_roots_from_connection(con)
-            proof_budget = {"archive_reads": REVIEW_EXCEPTION_FILE_PROOF_ARCHIVE_READ_BUDGET}
-            satisfied_rows = con.execute(
-                """
-                select re.id, re.series_id, re.issue_id, re.source, re.raw_json
-                from review_exceptions re
-                join wanted_items w on w.issue_id = re.issue_id
-                where re.active = 1
-                  and re.issue_id is not null and re.issue_id <> ''
-                  and lower(coalesce(w.status, '')) = 'satisfied'
-                  and exists (
-                      select 1 from media_files m
-                      where m.issue_id = re.issue_id
-                        and coalesce(m.active, 0) = 1
-                        and lower(coalesce(m.status, '')) = 'present'
-                  )
-                """
-            ).fetchall()
-            for row in satisfied_rows:
-                proof = review_exception_unit_file_proof(
-                    con,
-                    row["series_id"],
-                    row["issue_id"],
-                    managed_roots=managed_roots,
-                    budget=proof_budget,
+            # The proofs were read before the lock; the predicate is asked again
+            # per proved unit, so a unit that changed since stays open a pass.
+            satisfied_rows = []
+            for (series_id, issue_id), planned in plan["proofs"].items():
+                review_rows = con.execute(
+                    "select id, series_id, issue_id, source, raw_json from review_exceptions"
+                    " where active=1 and issue_id is not null and issue_id<>''"
+                    " and issue_id=? and series_id is ?",
+                    (issue_id, series_id),
+                ).fetchall()
+                if not review_rows:
+                    continue
+                proof = planned["proof"]
+                current_ledger = review_exception_unit_ledger_signature(
+                    review_exception_unit_ledger_rows(con, issue_id)
                 )
+                if current_ledger != planned["ledger_rows"]:
+                    proof = {
+                        "ok": False,
+                        "reason": "ledger_changed_since_proof",
+                        "planned_ledger_rows": planned["ledger_rows"],
+                        "current_ledger_rows": current_ledger,
+                    }
+                    satisfied_rows += [(row, proof) for row in review_rows]
+                    continue
+                want_still_satisfied = con.execute(
+                    "select 1 from wanted_items where issue_id=?"
+                    " and lower(coalesce(status,''))='satisfied' limit 1",
+                    (issue_id,),
+                ).fetchone()
+                if want_still_satisfied and current_ledger:
+                    satisfied_rows += [(row, proof) for row in review_rows]
+            for row, proof in satisfied_rows:
                 if not proof.get("ok"):
                     # Say out loud that the sweep declined, so a row that stays
                     # open has a findable reason instead of looking like one the
@@ -61165,7 +63020,7 @@ def _manual_review_canonical_snapshot_build(db_path, limit=5000):
             text = raw_state.replace("_", " ").strip()
             state_label = (text[:1].upper() + text[1:]) if text else ""
         row["state_label"] = state_label
-        # Tracker #820. The source pill also needs to know whether `source` is
+        # The source pill also needs to know whether `source` is
         # a filesystem path, because source_display_label() above title-cases
         # whatever it is given, so a staged-file path comes back with every
         # segment title-cased -- a mutated path presented as InkDrop's own
@@ -64787,6 +66642,19 @@ def update_series_image_metadata(db_path, series_id, image, *, source="comicvine
                 ),
             ),
         )
+    try:
+        from core import inkdrop_cover_injection
+        cover_injection = inkdrop_cover_injection.maybe_inject_for_series(
+            series_id, db_path=db_path, reason="cover_change"
+        )
+    except Exception as exc:
+        cover_injection = {
+            "series_id": series_id,
+            "changed": False,
+            "ok": False,
+            "reason": "unhandled_error",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
     return {
         "ok": True,
         "updated": True,
@@ -64794,6 +66662,7 @@ def update_series_image_metadata(db_path, series_id, image, *, source="comicvine
         "series_id": series_id,
         "title": row["title"],
         "image": series_image_from_raw(raw),
+        "cover_injection": cover_injection,
     }
 
 
@@ -67523,6 +69392,12 @@ NON_ATTEMPT_SOURCE_ATTEMPT_STATUSES = frozenset({
     "superseded_duplicate", "superseded_duplicate_owner",
     "provider_wait_superseded", "stale_staged_signal_cleared",
     "stale_failed_transfer_cleared", "reservation_expired",
+    # post-transfer lifecycle records of a grab already counted at grab time,
+    # the same class as downloading/transfer_in_progress above -- counting
+    # these made the retry ceiling fire and undo itself every ~12 minutes on
+    # rows stuck cycling through them (780 of 1,391 ceiling firings ever came
+    # from these three statuses on 12 units)
+    "transfer_evidence_expired", "verification_pending", "staged_filename_mismatch",
 })
 
 
@@ -67623,14 +69498,113 @@ def real_attempt_predicate_sql(alias):
     )
 
 
+# Statuses the manual-source autoresolve pass re-records for the same stuck
+# download_task on every ~10-minute pass. Before the writer keyed its attempt id
+# on the candidate, each pass minted a fresh source_attempts row: one unit
+# logged 603 rows for a single candidate over 12.8 days. The rows are evidence
+# and stay; the count treats one (queue, status, review, candidate, transfer)
+# as one try however many passes re-observed it.
+LIFECYCLE_REPLAY_ATTEMPT_STATUSES = frozenset({
+    "transfer_succeeded_missing_stage",
+    "preview_not_importable",
+})
+
+
+def _raw_json_text_sql(alias, key):
+    return (
+        f"coalesce(case when json_valid({alias}.raw_json) "
+        f"then json_extract({alias}.raw_json, '$.{key}') end, '')"
+    )
+
+
+def lifecycle_replay_row_sql(alias):
+    """True for a row the autoresolve pass may have re-recorded per pass."""
+    statuses = ",".join("'%s'" % value for value in sorted(LIFECYCLE_REPLAY_ATTEMPT_STATUSES))
+    return (
+        f"({alias}.id like 'manual-source:%' "
+        f"and lower(coalesce({alias}.status, '')) in ({statuses}))"
+    )
+
+
+def _lifecycle_replay_key_sql(alias):
+    return " || char(31) || ".join((
+        f"coalesce({alias}.queue_id, '')",
+        f"lower(coalesce({alias}.status, ''))",
+        _raw_json_text_sql(alias, "review_id"),
+        f"coalesce({alias}.candidate_identity, '')",
+        _raw_json_text_sql(alias, "transfer_id"),
+    ))
+
+
+def real_attempts_by_queue_cte_sql(alias, join_sql):
+    """CTE list that yields ``real_attempts(queue_id, real_attempt_count, last_real_attempt_at)``.
+
+    The grouped form of real_attempt_count_expr_sql(), for the scheduler and
+    coverage passes that count every schedulable row in one query. Putting
+    count(distinct ...) in the same GROUP BY as the plain sum makes SQLite add
+    a temp b-tree over every attempt row and cost about 60% more (4.7s -> 7.4s
+    on the live-shaped snapshot), although only the replay rows need the
+    distinct. So the distinct runs over the replay rows alone, the sum and the
+    last-attempt clock run over everything, and the two are joined. Same
+    counts as the expression, at the cost of the plain count(*).
+
+    ``join_sql`` restricts source_attempts (aliased ``alias``) to the wanted
+    set, e.g. ``join schedulable_queue sq on sq.id = sa.queue_id``. The text
+    starts with a CTE name, not ``with``; splice it after an existing CTE list.
+    """
+    replay = lifecycle_replay_row_sql(alias)
+    predicate = real_attempt_predicate_sql(alias)
+    key = _lifecycle_replay_key_sql(alias)
+    statuses = ",".join("'%s'" % value for value in sorted(LIFECYCLE_REPLAY_ATTEMPT_STATUSES))
+    return f"""real_attempt_replay_keys as (
+            select {alias}.queue_id, count(distinct {key}) as replay_keys
+            from source_attempts {alias}
+            {join_sql}
+            where lower(coalesce({alias}.status, '')) in ({statuses})
+              and {replay} and {predicate}
+            group by {alias}.queue_id
+        ), real_attempt_totals as (
+            select {alias}.queue_id,
+                   coalesce(sum(case when {replay} then 0 else 1 end), 0) as other_attempts,
+                   max(coalesce({alias}.completed_at, {alias}.started_at, 0)) as last_real_attempt_at
+            from source_attempts {alias}
+            {join_sql}
+            where {predicate}
+            group by {alias}.queue_id
+        ), real_attempts as (
+            select t.queue_id,
+                   t.other_attempts + coalesce(k.replay_keys, 0) as real_attempt_count,
+                   t.last_real_attempt_at
+            from real_attempt_totals t
+            left join real_attempt_replay_keys k on k.queue_id = t.queue_id
+        )"""
+
+
+def real_attempt_count_expr_sql(alias):
+    """Aggregate expression: genuine provider attempts in the rows being grouped.
+
+    Rows the autoresolve pass re-records (LIFECYCLE_REPLAY_ATTEMPT_STATUSES,
+    ids starting manual-source:) count once per distinct (queue, status,
+    review_id, candidate_identity, transfer_id) rather than once per row, so a
+    stuck task observed 600 times is one try, past rows included. Every other
+    row counts one each. The predicate still decides which rows are attempts;
+    this only changes how repeats of one observation are counted. Use it in
+    place of count(*) over rows already filtered by real_attempt_predicate_sql().
+    """
+    replay = lifecycle_replay_row_sql(alias)
+    key = _lifecycle_replay_key_sql(alias)
+    return (
+        f"(coalesce(sum(case when {replay} then 0 else 1 end), 0)"
+        f" + count(distinct case when {replay} then {key} end))"
+    )
+
+
 def real_attempt_count_sql(alias, join_column, join_value, *, stop_at=None):
     """SQL scalar subquery counting only genuine provider attempts.
 
-    stop_at bounds the count: the subquery stops reading once it has seen that
-    many rows, and the result saturates there. Callers that only need to know
-    "at least N" should pass it -- the worst live row carries 2,483 real
-    attempts and counting all of them, for every row, on every scheduler pass,
-    is most of the query's cost for none of its answer.
+    stop_at caps the result: it saturates at that value. No caller passes it
+    today; the cap does not stop the read early, because the per-observation
+    dedupe in real_attempt_count_expr_sql() needs the whole group.
 
     The filter comes from real_attempt_predicate_sql() rather than being spelled
     out again here. An earlier revision of this extraction restated the three
@@ -67639,17 +69613,16 @@ def real_attempt_count_sql(alias, join_column, join_value, *, stop_at=None):
     the exact figure the ceiling is supposed to exclude ledger rows from.
     Composing the predicate makes that particular mistake unavailable.
     """
-    predicate = f"""
+    body = f"""select {real_attempt_count_expr_sql(alias)}
+          from source_attempts {alias}
           where {alias}.{join_column} = {join_value}
             and {real_attempt_predicate_sql(alias)}"""
     if stop_at is None:
         return f"""
-        (select count(*) from source_attempts {alias}{predicate})
+        ({body})
     """
     return f"""
-        (select count(*) from (
-            select 1 from source_attempts {alias}{predicate}
-            limit {int(stop_at)}))
+        (select min({int(stop_at)}, ({body})))
     """
 
 
@@ -69135,7 +71108,7 @@ def attach_real_attempt_counts(db_path, items, now=None):
         # retry ceiling acts on.
         for row in con.execute(
             f"""
-            select sa.wanted_id, count(*) as n from source_attempts sa
+            select sa.wanted_id, {real_attempt_count_expr_sql('sa')} as n from source_attempts sa
              where sa.wanted_id in ({placeholders})
                and {real_attempt_predicate_sql('sa')}
              group by sa.wanted_id
@@ -72412,23 +74385,51 @@ def history_download_taxonomy(row, raw=None):
     return result
 
 
-def history_row_from_record(row):
+def history_row_from_record(row, stats_only=False):
+    """One History row, hydrated for the table -- or, with stats_only, only as
+    far as the taxonomy actually reads.
+
+    WHY THE FLAG. history_filter_options() and history_outcome_rollup() build
+    History's facet counts and stat cards by running the same classifiers the
+    table uses over a recent sample: 1,000 rows for the facets, 4,000 for the
+    outcomes. Both went through this function in full, so a 40-row History
+    page constructed 5,040 fully hydrated rows -- and 1,040 even with both
+    summary caches warm. Profiled on a 6,000-event fixture that was 81% of the
+    whole view, against 4% for every SQL statement it ran.
+
+    Those two consumers read exactly two things: history_filter_matches_row()
+    reads history_kind, lifecycle_phase, status, message, event_type,
+    entity_type, source/display_source, download_outcome_terminal and
+    history_view_bucket; history_outcome_bucket() reads display_phase and
+    outcome. Everything skipped below is display payload -- the linked-entity
+    map, the ownership/source-of-truth block and its two JSON parses, the
+    compact download-task payload, the human-readable activity summary, the
+    detail excerpt and the phase label. None of it is read by either
+    classifier, and inkdrop-history-stats-hydration-smoke.py asserts that over
+    a corpus rather than leaving it as an argument.
+
+    It is one function with one branch rather than a second narrow builder on
+    purpose: a copy of this classification would drift from it, and the
+    classification is the part that must not.
+    """
+
     out = dict(row or {})
     created_at = safe_float(out.get("created_at"))
-    if created_at:
+    if created_at and not stats_only:
         out["created_at_iso"] = utc_stamp(created_at)
     event_type = str(out.get("event_type") or "history")
     entity_type = str(out.get("entity_type") or "").strip()
     entity_id = out.get("entity_id")
-    out["linked_entities"] = linked_entities(
-        series_id=out.get("series_id") or (entity_id if entity_type == "series" else None),
-        issue_id=out.get("issue_id"),
-        wanted_id=out.get("wanted_id") or (entity_id if entity_type == "wanted_item" else None),
-        queue_id=out.get("queue_id") or (entity_id if entity_type == "queue_item" else None),
-        source_attempt_id=out.get("source_attempt_id") or (entity_id if entity_type == "source_attempt" else None),
-        download_task_id=out.get("download_task_id") or (entity_id if entity_type == "download_task" else None),
-        import_id=out.get("import_id") or (entity_id if entity_type == "import_result" else None),
-    )
+    if not stats_only:
+        out["linked_entities"] = linked_entities(
+            series_id=out.get("series_id") or (entity_id if entity_type == "series" else None),
+            issue_id=out.get("issue_id"),
+            wanted_id=out.get("wanted_id") or (entity_id if entity_type == "wanted_item" else None),
+            queue_id=out.get("queue_id") or (entity_id if entity_type == "queue_item" else None),
+            source_attempt_id=out.get("source_attempt_id") or (entity_id if entity_type == "source_attempt" else None),
+            download_task_id=out.get("download_task_id") or (entity_id if entity_type == "download_task" else None),
+            import_id=out.get("import_id") or (entity_id if entity_type == "import_result" else None),
+        )
     source_provider_id = str(out.get("source_provider_id") or out.get("download_task_provider_id") or "").strip()
     source = str(source_provider_id or out.get("source") or out.get("download_task_source") or out.get("queue_current_source") or "").strip()
     provider = str(out.get("source_provider") or out.get("download_task_provider") or "").strip()
@@ -72444,7 +74445,7 @@ def history_row_from_record(row):
             raw.setdefault("display_phase", stored_display_phase)
     if isinstance(raw, dict):
         source_provider_id = source_provider_id or str(raw.get("provider_id") or "").strip()
-    ownership = history_row_ownership(row=out)
+    ownership = None if stats_only else history_row_ownership(row=out)
     if ownership:
         out.update({
             "owner": ownership["owner"],
@@ -72490,7 +74491,7 @@ def history_row_from_record(row):
     if event_type == "provider_health" and isinstance(raw, dict):
         raw_health = raw.get("health") if isinstance(raw.get("health"), dict) else {}
         status = raw_health.get("state") or raw_health.get("label") or status
-    if out.get("download_task_id"):
+    if out.get("download_task_id") and not stats_only:
         out["download_task"] = compact_download_task_payload(
             {
                 "id": out.get("download_task_id"),
@@ -72732,29 +74733,9 @@ def history_row_from_record(row):
         message=message,
         raw=raw,
     )
-    bits = []
-    if history_kind:
-        bits.append(history_kind_summary_label(history_kind, event_type))
-    if provider_key:
-        bits.append(source_display_label(provider_key))
-    elif source:
-        bits.append(source)
-    if lifecycle_phase:
-        bits.append(lifecycle_phase.replace("_", " "))
-    if provider and provider != source:
-        bits.append(provider)
-    if download_client and download_client not in {source, provider}:
-        bits.append(download_client)
-    if status:
-        status_label = str(status).replace("_", " ")
-        if not lifecycle_phase or status_label.lower() != lifecycle_phase.replace("_", " ").lower():
-            bits.append(status_label)
-    if message:
-        bits.append(message)
     out["status"] = status
     out["outcome"] = outcome
     out["display_phase"] = display_phase
-    out["display_phase_label"] = DISPLAY_PHASE_LABELS.get(display_phase, str(display_phase or "").replace("_", " ").title())
     out["history_kind"] = history_kind
     out["provider_id"] = provider_key or None
     out["provider_key"] = provider_key or None
@@ -72764,10 +74745,31 @@ def history_row_from_record(row):
     out["failure_reason"] = failure_reason or None
     out["retry_eligible"] = retry_eligible
     out["display_source"] = provider_key or source or provider or download_client
-    out["activity_summary"] = " · ".join(str(bit) for bit in bits if bit not in (None, ""))
     out["next_action"] = next_action
-    out["details"] = compact_history_details(raw)
     out["raw_available"] = bool(raw)
+    if not stats_only:
+        bits = []
+        if history_kind:
+            bits.append(history_kind_summary_label(history_kind, event_type))
+        if provider_key:
+            bits.append(source_display_label(provider_key))
+        elif source:
+            bits.append(source)
+        if lifecycle_phase:
+            bits.append(lifecycle_phase.replace("_", " "))
+        if provider and provider != source:
+            bits.append(provider)
+        if download_client and download_client not in {source, provider}:
+            bits.append(download_client)
+        if status:
+            status_label = str(status).replace("_", " ")
+            if not lifecycle_phase or status_label.lower() != lifecycle_phase.replace("_", " ").lower():
+                bits.append(status_label)
+        if message:
+            bits.append(message)
+        out["display_phase_label"] = DISPLAY_PHASE_LABELS.get(display_phase, str(display_phase or "").replace("_", " ").title())
+        out["activity_summary"] = " · ".join(str(bit) for bit in bits if bit not in (None, ""))
+        out["details"] = compact_history_details(raw)
     download_taxonomy = history_download_taxonomy(out, raw)
     out.update(download_taxonomy)
     if history_kind == "import":
@@ -72776,6 +74778,21 @@ def history_row_from_record(row):
         out["history_view_bucket"] = "verification"
     elif history_kind == "cleanup":
         out["history_view_bucket"] = "cleanup"
+    if not stats_only:
+        # Event kind, phase and result are three different questions, and the
+        # answers are computed once here rather than re-derived by each UI from
+        # the same lowercased blob. Two independent regex ladders over these
+        # strings had already drifted into saying a scheduled retry had been
+        # performed, and a verification failure had succeeded.
+        #
+        # Display payload, so it is skipped for a statistics row like the rest:
+        # neither history_filter_matches_row nor history_outcome_bucket reads
+        # event_label, event_icon, result_label or result_tone, and
+        # inkdrop-history-stats-hydration-smoke.py asserts the two hydrations
+        # classify identically. Running it over the 4,000-row sample would put
+        # back a slice of exactly the per-sample-row display work that sample
+        # exists not to do.
+        out.update(inkdrop_history_presentation.presentation_fields(out))
     out.pop("queue_raw_json", None)
     out.pop("series_source", None)
     out.pop("series_metadata_provider", None)
@@ -73190,13 +75207,30 @@ def history_filter_matches_fields(history_filter, event_type, entity_type="", so
     return True
 
 
-def history_filter_matches_row(history_filter, row):
+def history_row_filter_fields(row):
+    """The four normalised strings every filter test reads off a row.
+
+    history_filter_options() asks thirteen filters about each of a thousand
+    sample rows. Deriving these inside the per-filter test meant lowering and
+    stripping the same four values thirteen times per row -- 52,000 string
+    operations for one page of History, measured at about a fifth of the whole
+    warm request. They depend only on the row, so they are computed once and
+    handed in.
+    """
+
+    row = row or {}
+    return (
+        str(row.get("history_kind") or "").strip().lower(),
+        str(row.get("lifecycle_phase") or "").strip().lower(),
+        str(row.get("status") or "").strip().lower(),
+        str(row.get("message") or "").strip().lower(),
+    )
+
+
+def history_filter_matches_row(history_filter, row, fields=None):
     value = history_filter_key(history_filter)
     row = row or {}
-    kind = str(row.get("history_kind") or "").strip().lower()
-    lifecycle_phase = str(row.get("lifecycle_phase") or "").strip().lower()
-    status = str(row.get("status") or "").strip().lower()
-    message = str(row.get("message") or "").strip().lower()
+    kind, lifecycle_phase, status, message = fields if fields is not None else history_row_filter_fields(row)
     if value == "all":
         return True
     if kind:
@@ -73266,7 +75300,33 @@ HISTORY_OUTCOME_ROLLUP_TTL_SECONDS = 60
 HISTORY_OUTCOME_ROLLUP_CACHE = {}
 
 
-def history_outcome_rollup(db_path, sample_limit=4000):
+HISTORY_OUTCOME_SAMPLE_LIMIT = 4000
+
+
+def history_outcome_rollup_cached(db_path, sample_limit=4000):
+    """The cached rollup, or None -- a peek with no side effects.
+
+    history_state_view asks this before deciding how large a statistics sample
+    to read: on a cache hit the 4,000-row outcome sample is not needed at all
+    and the 1,000-row facet sample is the whole cost.
+    """
+
+    sample_limit = max(1, min(int(sample_limit or HISTORY_OUTCOME_SAMPLE_LIMIT), 10000))
+    cached = HISTORY_OUTCOME_ROLLUP_CACHE.get((str(Path(db_path)), sample_limit))
+    if cached and time.time() - float(cached.get("ts") or 0) <= HISTORY_OUTCOME_ROLLUP_TTL_SECONDS:
+        return clone_jsonish(cached.get("rollup"))
+    return None
+
+
+def history_outcome_rollup(db_path, sample_limit=4000, rows=None):
+    """History's outcome stat cards, over a bounded recent sample.
+
+    `rows` is a sample the caller already read for its own purposes -- it must
+    be the same window this would have read (the `all` filter, newest first,
+    at least sample_limit rows or as many as exist). Passing it is what stops
+    one History request reading the same window twice.
+    """
+
     db_path = Path(db_path)
     sample_limit = max(1, min(int(sample_limit or 4000), 10000))
     cache_key = (str(db_path), sample_limit)
@@ -73274,26 +75334,52 @@ def history_outcome_rollup(db_path, sample_limit=4000):
     if cached and time.time() - float(cached.get("ts") or 0) <= HISTORY_OUTCOME_ROLLUP_TTL_SECONDS:
         return clone_jsonish(cached.get("rollup"))
 
-    rows = recent_history(db_path, sample_limit, history_filter="all")
-    counts = {"completed": 0, "failed": 0, "retried": 0, "needs_review": 0}
-    for row in rows:
-        bucket = history_outcome_bucket(row)
-        if bucket:
-            counts[bucket] += 1
-    total_events = history_filter_count(db_path, "all")
-    sample_size = len(rows)
-    rollup = {
-        "completed": counts["completed"],
-        "failed": counts["failed"],
-        "retried": counts["retried"],
-        "needs_review": counts["needs_review"],
-        "sample_size": sample_size,
-        "sampled": sample_size < total_events,
-        "total_events": total_events,
-    }
-    if len(HISTORY_OUTCOME_ROLLUP_CACHE) >= 32:
-        HISTORY_OUTCOME_ROLLUP_CACHE.clear()
-    HISTORY_OUTCOME_ROLLUP_CACHE[cache_key] = {"ts": time.time(), "rollup": clone_jsonish(rollup)}
+    def _build():
+        sample = list(rows)[:sample_limit] if rows is not None else recent_history(
+            db_path, sample_limit, history_filter="all", stats_only=True
+        )
+        counts = {"completed": 0, "failed": 0, "retried": 0, "needs_review": 0}
+        for row in sample:
+            bucket = history_outcome_bucket(row)
+            if bucket:
+                counts[bucket] += 1
+        total_events = history_filter_count(db_path, "all")
+        sample_size = len(sample)
+        # Wrapped in an ok-carrying envelope purely so state_summary_single_flight
+        # recognises it as a servable payload; the rollup itself is unchanged, and
+        # the envelope is discarded below rather than reaching any caller.
+        return {
+            "ok": True,
+            "rollup": {
+                "completed": counts["completed"],
+                "failed": counts["failed"],
+                "retried": counts["retried"],
+                "needs_review": counts["needs_review"],
+                "sample_size": sample_size,
+                "sampled": sample_size < total_events,
+                "total_events": total_events,
+            },
+        }
+
+    # Same stampede this file already solved once for the operational summary:
+    # when the sixty-second TTL expires under concurrent History requests, each
+    # one used to classify its own four-thousand-row sample. A deterministic
+    # four-caller probe produced four independent computations.
+    envelope = state_summary_single_flight(
+        ("history_outcome_rollup", cache_key),
+        _build,
+        stale_payload={"ok": True, "rollup": cached.get("rollup")} if cached and cached.get("rollup") else None,
+        stale_age_seconds=(time.time() - float(cached.get("ts") or 0)) if cached else None,
+    )
+    envelope = envelope if isinstance(envelope, dict) else {}
+    rollup = clone_jsonish(envelope.get("rollup")) or {}
+    # Only the caller that built it stores it: the helper stamps summary_cache
+    # onto a follower's payload ("stale_refreshing" or "coalesced") and leaves
+    # the leader's alone, so an absent stamp is this caller's own build.
+    if rollup and envelope.get("summary_cache") is None:
+        if len(HISTORY_OUTCOME_ROLLUP_CACHE) >= 32:
+            HISTORY_OUTCOME_ROLLUP_CACHE.clear()
+        HISTORY_OUTCOME_ROLLUP_CACHE[cache_key] = {"ts": time.time(), "rollup": clone_jsonish(rollup)}
     return rollup
 
 
@@ -73379,7 +75465,14 @@ def history_filter_clause(history_filter):
     return value, "", []
 
 
-def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0):
+def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0, stats_only=False):
+    """History rows, newest first.
+
+    `stats_only` hydrates each row only as far as the taxonomy reads it -- see
+    history_row_from_record. It is for the facet and outcome samples, never for
+    rows handed to the table.
+    """
+
     db_path = Path(db_path)
     if not db_path.exists():
         return []
@@ -73654,7 +75747,7 @@ def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0)
             ).fetchall()
         out = []
         for row in rows:
-            item = history_row_from_record(row)
+            item = history_row_from_record(row, stats_only=stats_only)
             if history_filter_matches_row(history_filter, item):
                 out.append(item)
                 if len(out) >= limit:
@@ -73736,7 +75829,7 @@ def recent_history(db_path, limit=40, history_filter=None, focus=None, offset=0)
                 """,
             (*where_params, int(limit), int(offset)),
         ).fetchall()
-        return [history_row_from_record(row) for row in rows]
+        return [history_row_from_record(row, stats_only=stats_only) for row in rows]
 
 
 def history_filter_count(db_path, history_filter):
@@ -73753,7 +75846,19 @@ def history_filter_count(db_path, history_filter):
     return int(row["count"] or 0) if row else 0
 
 
-def history_filter_options(db_path, exact_download_count=True):
+HISTORY_FACET_SAMPLE_LIMIT = 1000
+
+
+def history_filter_options(db_path, exact_download_count=True, rows=None):
+    """History's filter-tab counts.
+
+    Deliberately uncached -- inkdrop-operational-summary-ttl-cache-smoke.py
+    pins that, because this page reads its own facet counts back immediately
+    after a write. `rows` does not change that: it is a sample the caller read
+    in this same request, not a stored one, so sharing it removes a duplicate
+    read without introducing any staleness.
+    """
+
     db_path = Path(db_path)
     if not db_path.exists():
         return []
@@ -73761,12 +75866,16 @@ def history_filter_options(db_path, exact_download_count=True):
     # Downloads facet ran the terminal taxonomy predicate over the complete
     # history_events table (including correlated lookups), which could make
     # the normal History page time out on long-lived installations.
-    sample_limit = 1000
+    sample_limit = HISTORY_FACET_SAMPLE_LIMIT
     counts = {value: 0 for value in HISTORY_FILTERS}
-    rows = recent_history(db_path, sample_limit, history_filter="all")
+    if rows is None:
+        rows = recent_history(db_path, sample_limit, history_filter="all", stats_only=True)
+    else:
+        rows = list(rows)[:sample_limit]
     for row in rows:
+        fields = history_row_filter_fields(row)
         for value in HISTORY_FILTERS:
-            if history_filter_matches_row(value, row):
+            if history_filter_matches_row(value, row, fields):
                 counts[value] += 1
     options = [
         {
@@ -73802,11 +75911,40 @@ def history_view_summary(db_path):
     cache_key = str(path)
     cached = HISTORY_VIEW_SUMMARY_CACHE.get(cache_key)
     cached_at = float(cached.get("ts") or 0) if cached else 0
+    cached_payload = cached.get("summary") if cached else None
     if cached and time.time() - cached_at <= HISTORY_VIEW_SUMMARY_TTL_SECONDS:
-        hit = clone_jsonish(cached.get("summary"))
+        hit = clone_jsonish(cached_payload)
         if isinstance(hit, dict):
             hit["summary_cache_age_seconds"] = round(time.time() - cached_at, 1)
         return hit
+    summary = state_summary_single_flight(
+        ("history_view_summary", cache_key),
+        lambda: _history_view_summary_build(path),
+        stale_payload=cached_payload,
+        stale_age_seconds=(time.time() - cached_at) if cached_at else None,
+    )
+    if isinstance(summary, dict) and summary.get("ok") and summary.get("summary_cache") == "history_fast_path":
+        # Only the caller that actually built it stores it. A follower's
+        # payload is either the previous one (deliberately stale, labelled
+        # with its age) or a clone of the leader's, and re-storing either
+        # would reset the cache's age to zero -- the cache lying about its
+        # own freshness.
+        HISTORY_VIEW_SUMMARY_CACHE[cache_key] = {"summary": summary, "ts": time.time()}
+    return summary
+
+
+def _history_view_summary_build(path):
+    """The nine counts behind History's summary. Run once per key at a time --
+    state_summary_single_flight above is what makes that true.
+
+    Before that, this was a plain check/compute/store: when the twenty-second
+    TTL expired under concurrent History requests, every one of them computed
+    the whole bundle. A deterministic four-caller probe, all released at their
+    first read, produced four independent computations. Now one computes and
+    the others take the previous payload (labelled stale_refreshing, with its
+    age) or wait for the leader's.
+    """
+
     try:
         mtime_ns = path.stat().st_mtime_ns
     except OSError:
@@ -73849,7 +75987,6 @@ def history_view_summary(db_path):
             "provider_configs": table_count(con, "provider_configs"),
             "app_settings": table_count(con, "app_settings"),
         }
-    HISTORY_VIEW_SUMMARY_CACHE[cache_key] = {"summary": summary, "ts": time.time()}
     return summary
 
 
@@ -73988,7 +76125,24 @@ def history_state_view(db_path, limit=80, history_filter=None, focus=None, summa
         focused_count_sampled = focused_match_count >= fetch_limit
         rows = rows[: max(1, min(int(limit or 80), 300))]
     loaded_count = len(rows)
-    filters = history_filter_options(path)
+    # One statistics sample for both consumers. The facet counts read the
+    # newest 1,000 rows of the "all" filter and the outcome rollup reads the
+    # newest 4,000 of the same window, so the smaller is a prefix of the
+    # larger and reading both separately read the first 1,000 twice. The
+    # rollup is cached for 60s; when that cache is warm the 4,000-row read is
+    # not needed at all, which is why its size is decided from a peek rather
+    # than assumed. Hydration is stats_only: neither consumer reads a row's
+    # display payload, and building it for 5,000 sample rows was 81% of this
+    # view on a 6,000-event fixture.
+    cached_outcome = history_outcome_rollup_cached(path, HISTORY_OUTCOME_SAMPLE_LIMIT)
+    stats_sample_size = HISTORY_FACET_SAMPLE_LIMIT if cached_outcome is not None else max(
+        HISTORY_FACET_SAMPLE_LIMIT, HISTORY_OUTCOME_SAMPLE_LIMIT
+    )
+    stats_sample = recent_history(path, stats_sample_size, history_filter="all", stats_only=True)
+    filters = history_filter_options(path, rows=stats_sample)
+    outcome_summary = cached_outcome if cached_outcome is not None else history_outcome_rollup(
+        path, HISTORY_OUTCOME_SAMPLE_LIMIT, rows=stats_sample
+    )
     selected_filter = next((item for item in filters if item.get("value") == history_filter), None)
     if search_matches is not None:
         total_count = loaded_count
@@ -74032,7 +76186,7 @@ def history_state_view(db_path, limit=80, history_filter=None, focus=None, summa
         "history_search": search or None,
         "history_search_matches": search_matches,
         "filters": filters,
-        "outcome_summary": history_outcome_rollup(path),
+        "outcome_summary": outcome_summary,
         "related_views": [
             {
                 "view": "source_memory",
@@ -75520,7 +77674,7 @@ ISSUE_COMPACT_ROW_KEYS = {
 
 
 MANUAL_REVIEW_COMPACT_ROW_KEYS = QUEUE_COMPACT_ROW_KEYS | {
-    # Tracker #572, the operator's own words: "we need to ensure that it says what
+    # The compact row must say what
     # series and expected item was. then what we found so a user can decide
     # the correct action." decision_evidence() already builds exactly that
     # (core/inkdrop_import_evidence.py) and this allowlist was throwing it
@@ -75530,7 +77684,7 @@ MANUAL_REVIEW_COMPACT_ROW_KEYS = QUEUE_COMPACT_ROW_KEYS | {
     #
     # Deliberately ONLY this key. reason_detail, reason_tone,
     # reason_label_source, source_label and state_label are dropped here too,
-    # and restoring them belongs with #580: under #814 alone a composite
+    # and restoring them belongs with a follow-up: with this change alone a composite
     # reason returns label_source='prose' and both lines render raw, so
     # delivering them now would replace a working fallback with a visible
     # regression.
@@ -75539,7 +77693,7 @@ MANUAL_REVIEW_COMPACT_ROW_KEYS = QUEUE_COMPACT_ROW_KEYS | {
     # so +12.6 KB and +4.2 KB per request -- which is why this is a fatter
     # row and not a detail endpoint.
     "decision_evidence",
-    # Tracker #980. The same shape of leak, one surface further along: the
+    # The same shape of leak, one surface further along: the
     # escalation writer records WHICH check refused WHAT and how often, and
     # this allowlist dropped all three so only the generic reason_label
     # ("Automation exhausted") reached either client. Both compactors read this
@@ -80933,7 +83087,7 @@ def operational_row_sort_value(row, sort_key):
     return (safe_float(row.get("updated_at") or row.get("last_activity_at") or row.get("created_at"), 0.0), stable_id)
 
 
-def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None):
+def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None, cursor=None):
     perf_started_at = time.perf_counter()
     key = str(view or "").strip().lower()
     key = STATE_VIEW_ALIAS_MAP.get(key, key)
@@ -81074,25 +83228,84 @@ def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None
         except (TypeError, ValueError):
             fetch_offset = 0
         focus_entities = normalize_focus_entities(focus)
-        rows = bad_source_candidate_rows(path, fetch_limit, source_filter=source_filter, offset=fetch_offset)
-        total_count = bad_source_candidate_count(path, source_filter)
         normalized_row_mode = normalize_state_view_row_mode(row_mode)
-        try:
-            with connect_read(path) as con:
-                rollup = bad_source_candidate_rollup(con, limit=8, include_impact=include_impact)
-        except Exception:
-            recent_count = bad_source_candidate_count(path, "recent")
-            rollup = {
-                "bad_source_candidates": total_count,
-                "bad_source_candidates_recent": recent_count,
-                "bad_source_candidates_by_reason": {},
-                "bad_source_candidates_by_provider": {},
-                "bad_source_candidates_by_source": {},
-                "bad_source_candidates_top": [],
-                **empty_source_memory_impact(),
-                "source_memory_impact_deferred": not include_impact,
-                "source_memory_summary": bad_source_candidate_summary_payload(total_count, recent_count),
+        # A cursor names a position in this exact order under this exact
+        # filter. One that does not is refused rather than dropped: serving
+        # position N of a different list is how a pager shows the wrong page
+        # and reports success.
+        cursor_keys, cursor_refusal = (None, None) if impact_filter else bad_source_candidate_cursor_keys(cursor, source_filter)
+        if cursor_refusal:
+            return {
+                "ok": False,
+                "reason": cursor_refusal,
+                "view": "source_memory",
+                "db_path": str(path),
+                "source_filter": source_filter,
             }
+        # One read connection for the whole request. This used to open six --
+        # rows, the filtered count, the rollup, an "all" count, a "recent"
+        # count and the filter chips -- and the last three re-counted and
+        # re-grouped the same table the rollup had just read. Worse, the two
+        # explicit counts below were overwritten by `**rollup` in the same
+        # dict literal, so they were computed and thrown away on every page
+        # load, page turn and filter switch.
+        rollup = None
+        with connect_read(path) as con:
+            if impact_filter:
+                # Rows and total have to come from the *same* impact rollup.
+                # They did not: the rows read source_memory_impact_rollup at
+                # the page's own limit (up to 5,000 sampled attempts) while
+                # the total read it at limit=1 (500), so has_more was computed
+                # against a narrower sample than the rows it was describing.
+                impact_rollup = source_memory_impact_rollup(con, limit=fetch_limit)
+                rows = list(impact_rollup.get("source_memory_impact_top") or [])[:fetch_limit]
+                total_count = int(impact_rollup.get("source_memory_impact_groups") or 0)
+            else:
+                # A compact row keeps none of the evidence payload
+                # (SOURCE_MEMORY_COMPACT_ROW_KEYS has no "raw"), so there is no
+                # reason to carry eighty parsed copies of it to the projection
+                # that throws them away.
+                rows = bad_source_candidate_rows_from_connection(
+                    con,
+                    fetch_limit,
+                    source_filter=source_filter,
+                    offset=fetch_offset,
+                    include_raw=normalized_row_mode not in COMPACT_ROW_MODES,
+                    cursor_keys=cursor_keys,
+                )
+                total_count = None
+            try:
+                rollup = bad_source_candidate_rollup(con, limit=8, include_impact=include_impact)
+            except Exception:
+                rollup = None
+            if total_count is None:
+                # "all" and "recent" are the rollup's own two counts, over the
+                # same table with the same predicate -- counting them again
+                # here is the duplication this change exists to remove.
+                if rollup is not None and source_filter == "all":
+                    total_count = int(rollup.get("bad_source_candidates") or 0)
+                elif rollup is not None and source_filter == "recent":
+                    total_count = int(rollup.get("bad_source_candidates_recent") or 0)
+                else:
+                    total_count = bad_source_candidate_count_from_connection(con, source_filter)
+            if rollup is None:
+                recent_count = bad_source_candidate_count_from_connection(con, "recent")
+                rollup = {
+                    "bad_source_candidates": total_count,
+                    "bad_source_candidates_recent": recent_count,
+                    "bad_source_candidates_by_reason": {},
+                    "bad_source_candidates_by_provider": {},
+                    "bad_source_candidates_by_source": {},
+                    "bad_source_candidates_top": [],
+                    **empty_source_memory_impact(),
+                    "source_memory_impact_deferred": not include_impact,
+                    "source_memory_summary": bad_source_candidate_summary_payload(total_count, recent_count),
+                }
+                filters = bad_source_candidate_filter_options_from_connection(con, include_impact_count=include_impact)
+            else:
+                filters = bad_source_candidate_filter_options_from_connection(
+                    con, include_impact_count=include_impact, rollup=rollup
+                )
         return {
             "ok": True,
             "view": "source_memory",
@@ -81100,8 +83313,6 @@ def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None
                 "ok": True,
                 "db_path": str(path),
                 "summary_mode": "compact" if compact_mode else "full",
-                "bad_source_candidates": bad_source_candidate_count(path, "all"),
-                "bad_source_candidates_recent": bad_source_candidate_count(path, "recent"),
                 **rollup,
             },
             "count": len(rows),
@@ -81116,7 +83327,15 @@ def state_view(db_path, view, limit=80, source_filter=None, provider_filter=None
             "focus": focus_entities,
             "focused": False,
             "source_filter": source_filter,
-            "filters": bad_source_candidate_filter_options(path, include_impact_count=include_impact),
+            # Present only on a full page: a short page has no next position,
+            # and handing one out would invite a request that returns nothing.
+            "next_cursor": (
+                bad_source_candidate_cursor_token(rows[-1], source_filter)
+                if rows and len(rows) >= fetch_limit and not impact_filter
+                else None
+            ),
+            "cursor": str(cursor or "") or None,
+            "filters": filters,
         }
     if key in {"workers", "worker_activity", "worker-activity", "activity_workers", "automation_workers"}:
         return worker_activity_view(

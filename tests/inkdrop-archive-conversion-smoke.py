@@ -36,7 +36,7 @@ COMICINFO = (
 # A real 16x16 page, not a 1x1 placeholder. The soundness gate calls any
 # member under 8px on a side implausible_image, and it is right to: a single
 # pixel is not a comic page. These fixtures were 1x1 and passed only because
-# the gate never ran on the converter's temp file (#723).
+# the gate never ran on the converter's temp file.
 PIXEL = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000100000001008020000"
     "00909168360000001a4944415478da638cca5bc0400a606220118c6a"

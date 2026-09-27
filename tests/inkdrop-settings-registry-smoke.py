@@ -43,6 +43,45 @@ def main():
         pass
     else:
         raise AssertionError("unbounded stale window should be rejected")
+    # An integer field is integer-valued, not integer-rounded. The numeric
+    # validator parsed a float, bounds-checked it, then applied int() -- so
+    # 1.9 days of backup interval was accepted and silently stored as 1,
+    # changing what the operator asked for instead of telling them the field
+    # takes whole numbers. Every integer spec in the registry is checked, so
+    # a new one cannot be added back into the truncating branch.
+    integer_keys = [key for key, spec in registry.NUMBER_SPECS.items() if spec.get("integer")]
+    require(integer_keys, "control: the registry must actually declare some integer fields")
+    for key in integer_keys:
+        spec = registry.NUMBER_SPECS[key]
+        fractional = spec["min"] + 0.5
+        require(fractional < spec["max"], f"fixture for {key} must stay inside its own range")
+        try:
+            registry.validate_value(key, fractional)
+        except ValueError as exc:
+            require("whole number" in str(exc), f"{key} rejected {fractional} with an unclear error: {exc}")
+        else:
+            raise AssertionError(f"{key} is an integer field and must reject {fractional}")
+        # The control: the whole number at the same bound still passes, so
+        # the rejection above is about the fraction and not about the range.
+        require(
+            registry.validate_value(key, spec["min"]) == spec["min"],
+            f"{key} must still accept the whole number at its own minimum",
+        )
+
+    # Input forms that already worked keep working: a numeric string, and a
+    # float that happens to be whole, both carry no fractional component.
+    require(registry.validate_value("backup.interval_days", "2.0") == 2, "a whole-valued numeric string stays accepted")
+    require(registry.validate_value("backup.interval_days", 2.0) == 2, "a whole-valued float stays accepted")
+    require(isinstance(registry.validate_value("backup.interval_days", "2.0"), int), "an integer field returns an int")
+
+    # Fractional-hour fields are declared integer: False and must keep
+    # accepting fractions -- this is the arm that proves the check reads the
+    # spec rather than rejecting every fraction everywhere.
+    require(
+        registry.validate_value("automation.queue_watchdog_slskd_never_started_hours", 1.5) == 1.5,
+        "a non-integer field must still accept a fractional value",
+    )
+
     require(registry.classify_environment_name("INKDROP_SABNZBD_API_KEY") == "secret", "secret classified")
     require(registry.classify_environment_name("INKDROP_STATE_DIR") == "container_bootstrap", "bootstrap classified")
     contract = registry.environment_contract({"INKDROP_STATE_DIR": "/state", "INKDROP_SABNZBD_API_KEY": "secret-value"})
@@ -103,6 +142,25 @@ def main():
             policy = inkdrop_state.queue_watchdog_policy(con)
         require(policy["enabled"] is False, "watchdog reads SQLite setting")
         require(policy["slskd_stale_seconds"] == 60 * 60, "watchdog did not consume saved SLSKD threshold")
+        # The same rejection has to hold through the save path the settings
+        # route actually calls, not just through the validator in isolation,
+        # and a rejected save must leave the stored value untouched.
+        try:
+            inkdrop_state.update_app_setting(db, "automation.queue_watchdog_slskd_stale_minutes", 60.5)
+        except ValueError as exc:
+            require("whole number" in str(exc), f"the save path rejected a fraction with an unclear error: {exc}")
+        else:
+            raise AssertionError("saving a fractional value to an integer setting should be rejected")
+        require(
+            inkdrop_state.app_setting(db, "automation.queue_watchdog_slskd_stale_minutes")["value"] == 60,
+            "a rejected fractional save changed the stored integer setting",
+        )
+        inkdrop_state.update_app_setting(db, "automation.queue_watchdog_slskd_stale_minutes", "90.0")
+        require(
+            inkdrop_state.app_setting(db, "automation.queue_watchdog_slskd_stale_minutes")["value"] == 90,
+            "a whole-valued numeric string must still save through the settings route",
+        )
+
         try:
             inkdrop_state.update_app_setting(db, "media_management.minimum_free_space_gb", "NaN")
         except ValueError:

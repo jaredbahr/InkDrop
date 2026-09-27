@@ -3,18 +3,44 @@
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from unittest import mock
 
-from core import inkdrop_auth_contracts
-from core import inkdrop_manual_search
-from core import inkdrop_manual_search_core as core
-from core import inkdrop_manual_search_executor as executor
-from core import inkdrop_slskd_source_probe as slskd
-from core import inkdrop_state
+# inkdrop_slskd_source_probe fixes STATE_DIR (and the real-search marker path
+# under it) once, at import, from INKDROP_STATE_DIR and friends, falling back
+# to the real default state dir otherwise. This file exercises slskd_search()
+# with only slskd_post() mocked, so the real record_real_slskd_search_sent()
+# runs and writes slskd-real-search-sent.json -- into the real default state
+# dir (D:\state on Windows) unless isolated here, before the import.
+_ISOLATED_ROOT = tempfile.mkdtemp(prefix="tmp-manual-search-slskd-smoke-")
+atexit.register(shutil.rmtree, _ISOLATED_ROOT, True)
+for _var, _rel in (
+    ("INKDROP_CONFIG_DIR", "config"),
+    ("INKDROP_STATE_DIR", "state"),
+    ("INKDROP_LOCK_DIR", "state/locks"),
+    ("INKDROP_LOG_DIR", "state/logs"),
+    ("INKDROP_CACHE_DIR", "state/cache"),
+    ("INKDROP_BACKUP_DIR", "state/backups"),
+    ("INKDROP_STAGING_DIR", "staging"),
+    ("INKDROP_MANUAL_INBOX_DIR", "manual-inbox"),
+    ("INKDROP_QUARANTINE_DIR", "state/quarantine"),
+):
+    _path = os.path.join(_ISOLATED_ROOT, _rel)
+    os.makedirs(_path, exist_ok=True)
+    os.environ[_var] = _path
+
+from core import inkdrop_auth_contracts  # noqa: E402
+from core import inkdrop_manual_search  # noqa: E402
+from core import inkdrop_manual_search_core as core  # noqa: E402
+from core import inkdrop_manual_search_executor as executor  # noqa: E402
+from core import inkdrop_slskd_source_probe as slskd  # noqa: E402
+from core import inkdrop_state  # noqa: E402
 
 
 def require(value, message):
@@ -249,7 +275,7 @@ def wrapper_fixtures():
         serialized = json.dumps(evidence)
         require("private" not in serialized and "offline" not in serialized and "late" not in serialized, "failure evidence must be count-only and privacy-safe")
 
-    # tracker #312a: a zero reached after a query's response set hit
+    # A zero reached after a query's response set hit
     # Soulseek's own 250-peer ceiling must not read the same as a genuine
     # exhaustive zero -- only the fastest-answering 250 peers were ever
     # examined, sorted by nothing to do with content, and a real supply

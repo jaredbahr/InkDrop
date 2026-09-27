@@ -36,11 +36,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 
+from core import inkdrop_validation
 from core.inkdrop_display_labels import display_label
 
 
@@ -76,7 +78,12 @@ DEFAULT_RATE_LIMIT_PER_HOUR = 20
 # library in a week, with no corresponding new download. A 1h window still
 # lets same-day re-verifications spaced further apart than that slip
 # through; 24h is the window that was actually proven to fully suppress it.
+# 0 is in range for this one and means "do not suppress duplicates at all":
+# reserve_new_delivery() skips the duplicate lookup entirely on a zero window.
 DEFAULT_DEDUP_WINDOW_SECONDS = 86400
+# Total sends, not retries on top of the first: 5 is one send plus four
+# retries. 0 is in range and means "never retry", which still owes the one
+# initial send -- see _attempt_send() in core/inkdrop_notifications.py.
 DEFAULT_RETRY_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BACKOFF_SECONDS = 300
 DEFAULT_HISTORY_RETENTION_DAYS = 30
@@ -115,6 +122,10 @@ DEFAULT_SUPPRESSION_RETENTION_SECONDS = 2 * 86400
 NOTIFICATION_HISTORY_MAX_ROWS = 50000
 
 SCHEMA_SQL = """
+create table if not exists schema_meta (
+    key text primary key,
+    value text not null
+);
 create table if not exists notification_connectors (
     id text primary key,
     type text not null,
@@ -184,7 +195,189 @@ create table if not exists notification_watch_state (
 );
 """
 
+# Bump when SCHEMA_SQL changes in a way an existing database has to be
+# brought up to. Every connection compares this against what the database
+# carries; a mismatch re-runs the (idempotent) schema script and the
+# legacy-channel migration, and a match does nothing at all.
+SCHEMA_VERSION_KEY = "notification_schema_version"
+SCHEMA_VERSION = "1"
+
 GLOBAL_SETTINGS_ID = "global"
+
+# Weekday vocabulary for quiet hours. Lives here, next to the contract that
+# publishes it, because _in_quiet_hours() in core/inkdrop_notifications.py
+# indexes the same seven names by time.struct_time.tm_wday and the two
+# spellings must not be free to drift apart.
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+# Fields the store owns and the caller does not set. get_settings() returns
+# them, so a caller round-tripping a settings dict straight back in -- a
+# restore, a "save what I just read" -- would otherwise be refused for
+# sending a key it never chose.
+SERVER_OWNED_SETTING_KEYS = frozenset({"updated_at"})
+
+
+class SettingsValidationError(inkdrop_validation.ValidationError):
+    """One notification setting was refused. The request was understood.
+
+    A ValidationError, so the API guard answers 400 and logs one line instead
+    of a stack trace, and a ValueError underneath that, so everything already
+    catching ValueError around this writer keeps catching it.
+    """
+
+
+# The one contract for these settings.
+#
+# Before this existed the store coerced whatever it was handed: bool("false")
+# is True, so the *string* "false" switched quiet hours on; "25:99" persisted
+# as a start time and then made _in_quiet_hours() return False for every
+# comparison, so the window read back as configured while never being in
+# effect; ['noday'] persisted as a weekday list nothing would ever match. The
+# HTTP route hands the parsed request body straight to save_settings(), so
+# each of those was reachable from one request.
+#
+# Numeric policy lives here and only here. The settings form used to carry
+# its own copy and had already drifted -- it capped the dedup window at
+# 86,400 seconds against the store's 604,800 -- so the form now reads these
+# bounds off the config payload instead of restating them.
+SETTINGS_CONTRACT = {
+    "quiet_hours_enabled": {"kind": "boolean", "default": False},
+    "quiet_hours_start": {"kind": "time", "default": "22:00"},
+    "quiet_hours_end": {"kind": "time", "default": "07:00"},
+    "quiet_hours_days": {
+        "kind": "enum_list", "choices": WEEKDAYS, "default": (),
+        "note": "empty means every day",
+    },
+    "quiet_hours_urgent_events": {
+        "kind": "enum_list", "choices": EVENT_TYPES, "default": DEFAULT_URGENT_EVENTS,
+    },
+    "rate_limit_max_per_hour": {
+        "kind": "integer", "min": 1, "max": 1000, "default": DEFAULT_RATE_LIMIT_PER_HOUR,
+    },
+    "dedup_window_seconds": {
+        "kind": "integer", "min": 0, "max": 604800, "default": DEFAULT_DEDUP_WINDOW_SECONDS,
+        "zero_means": "send every occurrence; no duplicate suppression",
+    },
+    "retry_max_attempts": {
+        "kind": "integer", "min": 0, "max": 20, "default": DEFAULT_RETRY_MAX_ATTEMPTS,
+        "note": "total sends, not retries on top of the first",
+        "zero_means": "never retry a failed send",
+    },
+    "retry_backoff_seconds": {
+        "kind": "integer", "min": 30, "max": 3600, "default": DEFAULT_RETRY_BACKOFF_SECONDS,
+    },
+    "history_retention_days": {
+        "kind": "integer", "min": 1, "max": 365, "default": DEFAULT_HISTORY_RETENTION_DAYS,
+    },
+}
+
+
+def settings_contract():
+    """The contract, JSON-safe, for the settings form to build itself from."""
+    published = {}
+    for key, spec in SETTINGS_CONTRACT.items():
+        row = {"kind": spec["kind"]}
+        if "choices" in spec:
+            row["choices"] = list(spec["choices"])
+        for field in ("min", "max", "note", "zero_means"):
+            if field in spec:
+                row[field] = spec[field]
+        default = spec["default"]
+        row["default"] = list(default) if isinstance(default, tuple) else default
+        published[key] = row
+    return published
+
+
+def _validated_boolean(key, value):
+    # Strictly bool, the same bar the settings registry holds. Accepting
+    # truthy strings is what turned "false" into True.
+    if not isinstance(value, bool):
+        raise SettingsValidationError(f"{key} must be true or false")
+    return value
+
+
+def _validated_time(key, value):
+    raw = str(value if value is not None else "").strip()
+    hours, _, minutes = raw.partition(":")
+    try:
+        hours, minutes = int(hours), int(minutes)
+    except ValueError:
+        raise SettingsValidationError(f"{key} must be a time of day as HH:MM") from None
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        raise SettingsValidationError(f"{key} must be between 00:00 and 23:59")
+    # Canonical zero-padded form: the settings form feeds this straight into
+    # an <input type="time">, which only renders HH:MM.
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _validated_enum_list(key, value, choices):
+    if not isinstance(value, (list, tuple)):
+        raise SettingsValidationError(f"{key} must be a list")
+    seen, cleaned = set(), []
+    for item in value:
+        name = str(item if item is not None else "").strip().lower()
+        if name not in choices:
+            raise SettingsValidationError(
+                f"{key} contains an unknown value: {item!r} (expected one of: {', '.join(choices)})"
+            )
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    return cleaned
+
+
+def _validated_integer(key, value, spec):
+    # bool is an int in Python, and True would sail through as 1.
+    if isinstance(value, bool):
+        raise SettingsValidationError(f"{key} must be a whole number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise SettingsValidationError(f"{key} must be a whole number") from None
+    if not math.isfinite(parsed) or parsed != int(parsed):
+        raise SettingsValidationError(f"{key} must be a whole number")
+    parsed = int(parsed)
+    if parsed < spec["min"] or parsed > spec["max"]:
+        raise SettingsValidationError(f"{key} must be between {spec['min']} and {spec['max']}")
+    return parsed
+
+
+def validate_settings_patch(patch):
+    """Validate a whole settings patch before any of it is written.
+
+    Returns the cleaned values for exactly the keys the patch carried. Raises
+    on the first bad field, having written nothing -- which is the point: a
+    patch carrying one bad time used to leave the other nine fields updated
+    and the tenth silently wrong.
+
+    None, and the empty string a cleared form field sends, mean "use this
+    field's default" rather than "write nothing" -- zero is a value, and
+    conflating the two is what B01 fixed in the storage layer.
+    """
+    patch = dict(patch or {})
+    for key in SERVER_OWNED_SETTING_KEYS:
+        patch.pop(key, None)
+    unknown = sorted(set(patch) - set(SETTINGS_CONTRACT))
+    if unknown:
+        raise SettingsValidationError(f"unknown notification setting: {', '.join(unknown)}")
+    cleaned = {}
+    for key, value in patch.items():
+        spec = SETTINGS_CONTRACT[key]
+        if value is None or value == "":
+            default = spec["default"]
+            cleaned[key] = list(default) if isinstance(default, tuple) else default
+            continue
+        kind = spec["kind"]
+        if kind == "boolean":
+            cleaned[key] = _validated_boolean(key, value)
+        elif kind == "time":
+            cleaned[key] = _validated_time(key, value)
+        elif kind == "enum_list":
+            cleaned[key] = _validated_enum_list(key, value, spec["choices"])
+        else:
+            cleaned[key] = _validated_integer(key, value, spec)
+    return cleaned
+
 
 
 def ensure_schema(con):
@@ -192,13 +385,69 @@ def ensure_schema(con):
     return True
 
 
+def _initialized_version(con):
+    """The notification schema version this database already carries.
+
+    None when it cannot say -- no schema_meta table (an ordinary first run),
+    no row, or an unreadable value. None always means "initialise", so being
+    unable to answer is never mistaken for being up to date.
+    """
+    try:
+        row = con.execute(
+            "select value from schema_meta where key=?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+    return str(value or "").strip() or None
+
+
+def _ensure_initialized(con):
+    """Bring this database up to the current schema, if it is not already.
+
+    WHY THIS IS A PROBE AND NOT A PROCESS CACHE. Every _connect() used to run
+    the whole schema script and the legacy-channel migration check before the
+    caller's own statement -- 11 CREATEs and a commit on a plain settings
+    read, against an already-initialised database, on a connection that had
+    to be writable to do it.
+
+    The obvious fix is to remember in the process that this path was
+    initialised. It is also wrong: a database can be REPLACED underneath a
+    running process -- a restore from backup, an operator swapping the file --
+    and a cache keyed on the path would then report a brand-new database as
+    initialised and skip the schema it actually needs. Keying on inode or
+    mtime only moves the guess, and st_ino is not meaningful on Windows,
+    which is a supported development platform here.
+
+    So the check is one SELECT against the database in front of us. It costs a
+    single indexed lookup instead of 11 CREATEs, it cannot go stale because
+    it is not a memory of anything, and a swapped file answers for itself.
+
+    Returns True when it wrote, which is what the read-path assertion in the
+    smoke test reads.
+    """
+    if _initialized_version(con) == SCHEMA_VERSION:
+        return False
+    # CREATE TABLE IF NOT EXISTS is idempotent and SQLite serialises writers,
+    # so two processes arriving here together is safe: one wins the write
+    # lock, the other re-runs harmless DDL and re-stamps the same version.
+    ensure_schema(con)
+    _migrate_legacy_channels(con)
+    con.execute(
+        "insert into schema_meta(key,value) values(?,?) on conflict(key) do update set value=excluded.value",
+        (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
+    )
+    con.commit()
+    return True
+
+
 def _connect(db_path):
     con = sqlite3.connect(Path(db_path), timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute("pragma foreign_keys=on")
-    ensure_schema(con)
-    _migrate_legacy_channels(con)
-    con.commit()
+    _ensure_initialized(con)
     return con
 
 
@@ -220,6 +469,17 @@ def _json(value, fallback):
     return parsed if isinstance(parsed, type(fallback)) else fallback
 
 
+def _stored_int(value, default):
+    """Read one integer settings column.
+
+    `value or default` cannot express a setting whose off switch is zero:
+    0 and NULL are both falsy, so an operator who turned dedup or retries
+    off read the default back and the control looked untouched. Only a
+    NULL column -- a row written before the column existed -- falls back.
+    """
+    return int(default if value is None else value)
+
+
 def _dump(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -239,6 +499,7 @@ def _new_id(prefix):
 # --------------------------------------------------------------------------
 
 MIGRATE_LEGACY_CHANNELS_SCHEMA_KEY = "notification_connectors_legacy_migration_v1"
+
 
 # Old provider_configs field name -> new, unprefixed per-connector settings
 # key. Migration-only: new connectors (of any type, including a second
@@ -498,11 +759,11 @@ def _settings_row(row):
         "quiet_hours_end": row["quiet_hours_end"] or "07:00",
         "quiet_hours_days": list(_json(row["quiet_hours_days_json"], [])),
         "quiet_hours_urgent_events": list(_json(row["quiet_hours_urgent_events_json"], list(DEFAULT_URGENT_EVENTS))),
-        "rate_limit_max_per_hour": int(row["rate_limit_max_per_hour"] or DEFAULT_RATE_LIMIT_PER_HOUR),
-        "dedup_window_seconds": int(row["dedup_window_seconds"] or DEFAULT_DEDUP_WINDOW_SECONDS),
-        "retry_max_attempts": int(row["retry_max_attempts"] or DEFAULT_RETRY_MAX_ATTEMPTS),
-        "retry_backoff_seconds": int(row["retry_backoff_seconds"] or DEFAULT_RETRY_BACKOFF_SECONDS),
-        "history_retention_days": int(row["history_retention_days"] or DEFAULT_HISTORY_RETENTION_DAYS),
+        "rate_limit_max_per_hour": _stored_int(row["rate_limit_max_per_hour"], DEFAULT_RATE_LIMIT_PER_HOUR),
+        "dedup_window_seconds": _stored_int(row["dedup_window_seconds"], DEFAULT_DEDUP_WINDOW_SECONDS),
+        "retry_max_attempts": _stored_int(row["retry_max_attempts"], DEFAULT_RETRY_MAX_ATTEMPTS),
+        "retry_backoff_seconds": _stored_int(row["retry_backoff_seconds"], DEFAULT_RETRY_BACKOFF_SECONDS),
+        "history_retention_days": _stored_int(row["history_retention_days"], DEFAULT_HISTORY_RETENTION_DAYS),
         "updated_at": row["updated_at"],
     }
 
@@ -516,35 +777,20 @@ def get_settings(db_path):
 
 
 def save_settings(db_path, patch):
-    patch = dict(patch or {})
+    """Apply a validated patch to the global notification settings.
+
+    The whole patch is validated before the connection is opened, so a patch
+    carrying one bad field writes none of its fields rather than leaving the
+    other nine applied and the tenth quietly wrong.
+    """
+    cleaned = validate_settings_patch(patch)
     now = time.time()
     with _connection(db_path) as con:
         row = con.execute(
             "select * from notification_settings where id=?", (GLOBAL_SETTINGS_ID,)
         ).fetchone()
         current = _settings_row(row)
-        if "quiet_hours_enabled" in patch:
-            current["quiet_hours_enabled"] = bool(patch["quiet_hours_enabled"])
-        if "quiet_hours_start" in patch:
-            current["quiet_hours_start"] = str(patch["quiet_hours_start"] or "22:00").strip()
-        if "quiet_hours_end" in patch:
-            current["quiet_hours_end"] = str(patch["quiet_hours_end"] or "07:00").strip()
-        if "quiet_hours_days" in patch:
-            current["quiet_hours_days"] = [str(d).strip().lower() for d in (patch["quiet_hours_days"] or []) if str(d).strip()]
-        if "quiet_hours_urgent_events" in patch:
-            current["quiet_hours_urgent_events"] = [
-                str(e).strip() for e in (patch["quiet_hours_urgent_events"] or []) if str(e).strip() in EVENT_TYPES
-            ]
-        if "rate_limit_max_per_hour" in patch:
-            current["rate_limit_max_per_hour"] = max(1, min(1000, int(patch["rate_limit_max_per_hour"] or DEFAULT_RATE_LIMIT_PER_HOUR)))
-        if "dedup_window_seconds" in patch:
-            current["dedup_window_seconds"] = max(0, min(604800, int(patch["dedup_window_seconds"] or DEFAULT_DEDUP_WINDOW_SECONDS)))
-        if "retry_max_attempts" in patch:
-            current["retry_max_attempts"] = max(0, min(20, int(patch["retry_max_attempts"] or DEFAULT_RETRY_MAX_ATTEMPTS)))
-        if "retry_backoff_seconds" in patch:
-            current["retry_backoff_seconds"] = max(30, min(3600, int(patch["retry_backoff_seconds"] or DEFAULT_RETRY_BACKOFF_SECONDS)))
-        if "history_retention_days" in patch:
-            current["history_retention_days"] = max(1, min(365, int(patch["history_retention_days"] or DEFAULT_HISTORY_RETENTION_DAYS)))
+        current.update(cleaned)
         con.execute(
             """insert into notification_settings(
                 id, quiet_hours_enabled, quiet_hours_start, quiet_hours_end, quiet_hours_days_json,

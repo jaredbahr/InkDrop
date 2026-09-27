@@ -29,7 +29,7 @@ So the shape here is deliberate:
 
 **Pack containment, and why this value is what it is.** Whether a multi-unit
 pack may be auto-grabbed because it declares a range containing the wanted
-unit is tracker #209: the 2026-08-15 ruling is that any needed unit justifies
+unit follows the 2026-08-15 ruling: any needed unit justifies
 taking the whole pack. The proof that implements it lives in
 :func:`inkdrop_candidate_matching.pack_title_range_membership`, and the
 reason it was held -- a range proof that accepted the wrong series,
@@ -66,7 +66,7 @@ REVIEW = "review"
 REFUSE = "refuse"
 SEVERITIES = (ADMIT, REVIEW, REFUSE)
 
-# Which unit an operator wants a series in. The default is both (tracker #51):
+# Which unit an operator wants a series in. The default is both:
 # completeness beats format preference in the moment, and preference is
 # expressed later as replacement, never as a refusal at acquisition.
 UNIT_PREFERENCE_BOTH = "both"
@@ -98,13 +98,13 @@ SETTING_COLLECTED_EDITION_SHORT = "collected_edition_policy"
 SETTINGS_SNAPSHOT_KEY = "acquisition_settings_snapshot"
 
 # A collected edition that contains the wanted unit is content, and content
-# comes first (owner ruling 2026-09-16, tracker #209). The matcher applies
+# comes first (owner ruling 2026-09-16). The matcher applies
 # this only once containment is proven -- manifest, range or exact unit
 # number -- and composes an unproven edition with UNIDENTIFIED_UNIT_DEFAULT
 # below, so "admit" never grabs a release on the strength of its title alone.
 COLLECTED_EDITION_DEFAULT = ADMIT
 
-# Tracker #209, decided 2026-09-16: a range that provably holds the wanted
+# A range that provably holds the wanted
 # unit justifies the whole pack. Kept separate from the edition question on
 # purpose: whether an omnibus is an acceptable EDITION and whether a
 # range-spanning release CONTAINS the wanted unit are two answers, and the
@@ -211,7 +211,7 @@ def resolve(wanted_item=None, settings=None, series=None):
         # Not one of POLICY_KEYS: never required, never validated, purely a
         # diagnostic so a caller passing settings=None with no snapshot on the
         # row is visible in the output instead of indistinguishable from a
-        # caller that deliberately wants the shipped default. See tracker #588.
+        # caller that deliberately wants the shipped default.
         "settings_source": settings_source,
         "unit_preference": _unit_preference(
             _first_present(sources, "unit_preference", SETTING_UNIT_PREFERENCE, "manga_unit_preference"),
@@ -302,7 +302,7 @@ def severity_for(policy, aspect):
 def accepts_unit_type(policy, unit_type):
     """Whether the operator's unit preference admits this unit.
 
-    Per the #51 ruling this is never a refusal at acquisition time -- a
+    By design this is never a refusal at acquisition time -- a
     preference is expressed later as replacement -- so a non-preferred unit is
     still accepted. The value is here for the replacement pass to read, and
     for the setting to mean something without also becoming a gate.

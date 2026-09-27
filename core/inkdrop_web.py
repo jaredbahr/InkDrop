@@ -8,6 +8,7 @@ if str(_ROOT) not in _sys.path:
 import base64
 import contextlib
 import collections
+import concurrent.futures
 import functools
 import calendar
 import faulthandler
@@ -108,6 +109,7 @@ except Exception:
 
 
 from core.inkdrop_web_config import *  # noqa: F401,F403 -- re-exports every name below for inkdrop_web.NAME callers
+from core import inkdrop_db
 
 
 INKDROP_UI_SHELL_FILE = _ROOT / "web" / "templates" / "inkdrop-shell.html"
@@ -1484,8 +1486,17 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
     }
 
     function inkdropHistoryEventLabel(row={}) {
+      // The row carries the canonical label now, computed once in
+      // core/inkdrop_history_presentation.py and served to this shell and to
+      // the React island alike -- two ladders over the same strings had
+      // already drifted into describing the same row differently.
+      if (row?.event_label) return String(row.event_label);
       const raw = String(row?.event_type || row?.history_kind || row?.status || "event").toLowerCase();
       const rules = [
+        // Failure rules first, always: /verified|verification/ sitting above
+        // them matched "verification_failed" and rendered it as a success.
+        [/verif\w*[_ -]*fail|fail\w*[_ -]*verif/, "Verification Failed"],
+        [/retry.*exhaust|exhaust.*retry/, "Retries Exhausted"],
         [/manual.*decision|decision.*manual/, "Manual Decision"],
         [/candidate.*reject|reject.*candidate/, "Candidate Rejected"],
         [/retry/, "Retry Scheduled"],
@@ -6075,10 +6086,26 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       return false;
     }
 
+    function refreshStatusFromTimer() {
+      // A background tab pays for /status.json and for every panel
+      // refreshStatus() re-renders off it -- the header, source health,
+      // automation, the autopilot and workflow panels, the activity list and
+      // a follow-up worker-activity fetch -- for a document nobody is
+      // looking at. scheduleInkdropCoreRefresh's timer body already skips
+      // while document.hidden for the same reason; these two timers did not.
+      //
+      // Only the TIMERS are gated. A refreshStatus() called because the user
+      // did something still runs, and the visibilitychange handler below
+      // does exactly one fresh read on return, so a tab coming back is
+      // current rather than waiting up to a minute for the next tick.
+      if (document.hidden) return null;
+      return refreshStatus();
+    }
+
     function updateStatusFastPoll(data) {
       if (statusNeedsFastPoll(data)) {
         if (!statusFastPollTimer) {
-          statusFastPollTimer = setInterval(refreshStatus, INKDROP_FAST_POLL_MS);
+          statusFastPollTimer = setInterval(refreshStatusFromTimer, INKDROP_FAST_POLL_MS);
         }
       } else if (statusFastPollTimer) {
         clearInterval(statusFastPollTimer);
@@ -17146,12 +17173,12 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       if (labelled) return labelled;
       const raw = String(row?.source || row?.current_source || row?.download_client || "").trim();
       if (!raw) return "";
-      // Tracker #820: `source` carries a filesystem path on staged-file rows,
+      // The `source` field carries a filesystem path on staged-file rows,
       // and every naming function here title-cases what it is handed -- which
       // turns a path into one that no longer resolves and hands the operator a
       // broken string to copy. The only caller today guards on sourceIsPath
       // before reaching this, so a path cannot arrive; the check is repeated
-      // INSIDE so a second caller added later cannot reopen #820 by omitting
+      // INSIDE so a second caller added later cannot reopen that defect by omitting
       // the guard it does not know about.
       if (/^([A-Za-z]:[\\/]|\/)/.test(raw) || /[\\/]/.test(raw)) return raw;
       return sourceBucketLabel(raw) || raw;
@@ -17303,19 +17330,26 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       if (!confirmed) return;
       let ignored = 0;
       let failed = 0;
+      const results = [];
       for (const item of items) {
+        const label = item.series || item.title || item.query || "Manual Review item";
         try {
           await api("/api/manual-review/ignore", {review_id: item.review_id});
           ignored += 1;
-        } catch (_err) {
+          // "completed": the row is ignored once the call returns, with no
+          // later work to wait on -- unlike a queued search.
+          results.push({action: "Ignore", label, state: "completed"});
+        } catch (err) {
           failed += 1;
+          results.push({action: "Ignore", label, state: "failed", reason: inkdropFailureReason(err)});
         }
       }
+      recordInkdropActionResults(results);
       closeManualReviewDecisionModal();
       await loadInkdropSection("manual_review", null, {keepExisting: true});
       loadInkdropCore(false);
       refreshStatus();
-      toast(`Ignored ${ignored} Manual Review item${ignored === 1 ? "" : "s"}${failed ? `, ${failed} failed` : ""}.`, failed === 0, "inkdropSectionPanel");
+      toast(`Ignored ${ignored} Manual Review item${ignored === 1 ? "" : "s"}${failed ? `, ${failed} failed — see Action results` : ""}.`, failed === 0, "inkdropSectionPanel");
     }
 
     function appendManualReviewDecisionFact(parent, label, value) {
@@ -21839,21 +21873,31 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       }
       let queued = 0;
       let failed = 0;
+      // Per item, not just a count. "37 queued, 3 failed" could not say which
+      // three, and the failure reason was being discarded in the catch.
+      const results = [];
       for (const row of rows) {
+        const label = `${row.series || "Wanted item"}${row.issue_number ? ` #${row.issue_number}` : ""}`;
+        const focus = {wanted_id: row.wanted_id || row.id, series_id: row.series_id, issue_id: row.issue_id};
         try {
           await runWantedSearch(
             {id: row.wanted_id || row.id, series: row.series, series_id: row.series_id, issue_id: row.issue_id},
             {quiet: true, reload: false}
           );
           queued += 1;
-        } catch (_err) {
+          // "accepted", not "completed": the search has been queued, and
+          // whether it finds anything is a later event this cannot know.
+          results.push({action: "Search", label, state: "accepted", focus});
+        } catch (err) {
           failed += 1;
+          results.push({action: "Search", label, state: "failed", reason: inkdropFailureReason(err), focus});
         }
       }
+      recordInkdropActionResults(results);
       await loadInkdropSection("wanted", null);
       loadInkdropCore(false);
       refreshStatus();
-      toast(`Selected Wanted search complete: ${queued} queued${failed ? `, ${failed} failed` : ""}.`, failed < rows.length, {section: "queue", filter: "all", label: "Queue · All"});
+      toast(`Selected Wanted search complete: ${queued} queued${failed ? `, ${failed} failed — see Action results` : ""}.`, failed < rows.length, {section: "queue", filter: "all", label: "Queue · All"});
     }
 
     async function runWantedSearch(row, options={}) {
@@ -22133,6 +22177,99 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
           fileChip.className = keepFiles ? "good" : "bad";
         }
       }
+    }
+
+    // Per-item outcomes for bulk row actions, for the session.
+    //
+    // The bulk helpers kept counts and threw the details away -- `catch (_err)
+    // { failed += 1; }` -- so a batch of forty reported "37 queued, 3 failed"
+    // and could not say WHICH three or why. The shared row-action hook is
+    // deliberately even quieter: it keeps one current error, lets a newer
+    // success retire an older failure, and clears row labels during its
+    // coalesced reload. That is right for a banner, which is about the click
+    // in front of you, and wrong as the only record, which is what it was.
+    //
+    // So this is a log, not a banner. A later success never erases an earlier
+    // failure from it; superseding is the banner's job and stays there.
+    //
+    // WHY "QUEUED" IS ITS OWN STATE. Handing a search to the queue is not the
+    // search finishing, and an import being accepted is not an import being
+    // verified. Collapsing those into "done" would make this drawer claim
+    // outcomes nothing has observed yet -- exactly the overstatement the
+    // History pill was corrected for. `accepted` says the request was taken;
+    // only `completed` says the work finished.
+    const INKDROP_ACTION_RESULT_LIMIT = 200;
+    const inkdropActionResults = [];
+
+    function recordInkdropActionResults(entries) {
+      const stamped = (entries || []).filter(Boolean).map(entry => ({
+        at: Date.now(),
+        action: String(entry.action || "action"),
+        label: String(entry.label || "Item"),
+        // "accepted" | "completed" | "failed"
+        state: String(entry.state || "accepted"),
+        reason: String(entry.reason || ""),
+        focus: entry.focus || null,
+      }));
+      if (!stamped.length) return stamped;
+      // Newest first, bounded. Oldest entries fall off rather than growing a
+      // list nobody has asked to keep -- persistence is a later increment,
+      // and pretending this survives a reload would be the same kind of
+      // overstatement the states above avoid.
+      inkdropActionResults.unshift(...stamped.reverse());
+      inkdropActionResults.length = Math.min(inkdropActionResults.length, INKDROP_ACTION_RESULT_LIMIT);
+      updateInkdropActionResultsButton();
+      return stamped;
+    }
+
+    function inkdropActionResultsSnapshot() {
+      return inkdropActionResults.slice();
+    }
+
+    function inkdropFailureReason(error) {
+      // What the operator needs is why the item failed, not the shape of the
+      // error. An empty message is worse than a generic one: a chip reading
+      // "Failed:" says nothing at all.
+      const message = String(error?.message || "").trim();
+      return message || "The request failed without a reason.";
+    }
+
+    function updateInkdropActionResultsButton() {
+      const button = $("inkdropActionResultsButton");
+      if (!button) return;
+      const failures = inkdropActionResults.filter(entry => entry.state === "failed").length;
+      button.hidden = inkdropActionResults.length === 0;
+      button.textContent = failures
+        ? `Action results (${failures} failed)`
+        : `Action results (${inkdropActionResults.length})`;
+      button.classList.toggle("has-failures", failures > 0);
+    }
+
+    function openInkdropActionResultsModal() {
+      const entries = inkdropActionResultsSnapshot();
+      if (!entries.length) {
+        toast("No row actions have run in this session yet.", true, "inkdropCore");
+        return Promise.resolve(false);
+      }
+      const failed = entries.filter(entry => entry.state === "failed");
+      const stateWord = {accepted: "queued", completed: "done", failed: "failed"};
+      return openInkdropConfirmModal({
+        title: "Action results",
+        actionTitle: `${entries.length} result${entries.length === 1 ? "" : "s"} this session`,
+        copy: "Every row action run in this browser session, newest first. Queued means the request was accepted -- not that the search or import has finished.",
+        subject: failed.length ? `${failed.length} failed` : "No failures",
+        meta: [`${entries.length} recorded`, `limit ${INKDROP_ACTION_RESULT_LIMIT}`],
+        details: entries.map(entry => ({
+          text: `${new Date(entry.at).toLocaleTimeString()} · ${entry.label} · ${entry.action} ${stateWord[entry.state] || entry.state}${entry.reason ? ` — ${entry.reason}` : ""}`,
+          tone: entry.state === "failed" ? "bad" : entry.state === "completed" ? "good" : "warn",
+        })),
+        // Read-only. A failed item is retried by acting on its row again --
+        // this drawer never replays a mutation on its own, because an item
+        // whose response was lost may well have been applied.
+        hideCancel: true,
+        confirmLabel: "Close",
+        tone: failed.length ? "warn" : "good",
+      });
     }
 
     function openInkdropConfirmModal(options={}) {
@@ -22794,6 +22931,15 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
 
     document.addEventListener("click", event => {
       if (!event.target?.closest?.("details.arr-table-menu, .arr-table-menu-panel-portal")) closeInkdropArrTableMenus();
+    });
+
+    // Delegated, because the button lives in the shell chrome that is present
+    // from first paint but stays hidden until a bulk action has actually run.
+    document.addEventListener("click", event => {
+      if (event.target?.closest?.("#inkdropActionResultsButton")) {
+        event.preventDefault();
+        void openInkdropActionResultsModal();
+      }
     });
 
     window.addEventListener("resize", scheduleInkdropArrTableMenuPosition);
@@ -26945,7 +27091,9 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       const quietText = settings.quiet_hours_enabled
         ? `Quiet hours ${settings.quiet_hours_start || "22:00"}–${settings.quiet_hours_end || "07:00"}`
         : "Quiet hours off";
-      label.textContent = `${quietText} · ${settings.rate_limit_max_per_hour ?? 20}/hr max · ${settings.retry_max_attempts ?? 5} retries · ${settings.history_retention_days ?? 30}d history`;
+      const maxSends = settings.retry_max_attempts ?? 5;
+      const retryText = maxSends <= 1 ? "no retries" : `${maxSends - 1} retries`;
+      label.textContent = `${quietText} · ${settings.rate_limit_max_per_hour ?? 20}/hr max · ${retryText} · ${settings.history_retention_days ?? 30}d history`;
       const controls = document.createElement("div");
       controls.className = "settings-provider-form-control";
       const editButton = document.createElement("button");
@@ -27018,9 +27166,50 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       document.body.dataset.notificationsLimitsModalOpen = "false";
     }
 
+    // A cleared number field is "leave this at the default", which the
+    // settings store spells as null. It is NOT zero: zero is a value an
+    // operator can now actually choose for the dedup window and the retry
+    // count, so `Number(input.value) || fallback` -- which collapses a blank
+    // field and a deliberate 0 into the same branch -- would either resurrect
+    // the default over a chosen 0 or silently switch dedup off on a blank.
+    function numericSettingValue(input) {
+      const raw = String(input?.value ?? "").trim();
+      if (raw === "") return null;
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    // The store publishes one contract for these settings -- bounds,
+    // vocabularies, defaults and what a zero means -- and the form builds
+    // itself from it. Restating the numbers here is how the dedup field came
+    // to cap at 86,400 seconds while the store accepted 604,800.
+    const DEFAULT_NOTIFICATION_SETTINGS_CONTRACT = {};
+
+    function contractSpec(contract, key) {
+      return (contract && contract[key]) || DEFAULT_NOTIFICATION_SETTINGS_CONTRACT;
+    }
+
+    function contractNumberInput(contract, key, settings) {
+      const spec = contractSpec(contract, key);
+      const input = document.createElement("input");
+      input.type = "number";
+      if (spec.min !== undefined) input.min = String(spec.min);
+      if (spec.max !== undefined) input.max = String(spec.max);
+      input.step = "1";
+      // `??`, not `||`: 0 is a value the operator may have chosen.
+      input.value = settings[key] ?? spec.default ?? "";
+      return input;
+    }
+
+    function contractZeroNote(contract, key) {
+      const meaning = contractSpec(contract, key).zero_means;
+      return meaning ? `Set to 0 to ${meaning}.` : "";
+    }
+
     function appendNotificationsQuietHours(parent, config, onSaved) {
       appendSettingsFormSectionTitle(parent, "Quiet hours");
       const settings = config.settings || {};
+      const contract = config.settings_contract || {};
       const intro = document.createElement("p");
       intro.className = "setting-description";
       intro.textContent = "During this window, non-urgent notifications wait instead of firing immediately. Events you mark below as always-notify (health issues, by default) still go out right away.";
@@ -27033,20 +27222,23 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
 
       const startInput = document.createElement("input");
       startInput.type = "time";
-      startInput.value = settings.quiet_hours_start || "22:00";
+      startInput.value = settings.quiet_hours_start || contractSpec(contract, "quiet_hours_start").default || "22:00";
       appendProviderSettingRow(parent, "Starts", startInput, {description: "Local server time."});
 
       const endInput = document.createElement("input");
       endInput.type = "time";
-      endInput.value = settings.quiet_hours_end || "07:00";
+      endInput.value = settings.quiet_hours_end || contractSpec(contract, "quiet_hours_end").default || "07:00";
       appendProviderSettingRow(parent, "Ends", endInput, {description: "Can be earlier than the start time -- that just means the window crosses midnight."});
 
       const daysWrap = document.createElement("div");
       daysWrap.className = "settings-form-row";
-      const DAY_LABELS = [["mon", "Mon"], ["tue", "Tue"], ["wed", "Wed"], ["thu", "Thu"], ["fri", "Fri"], ["sat", "Sat"], ["sun", "Sun"]];
+      // The day vocabulary is the contract's, so a name the form can offer
+      // is a name the store will accept. Labels are the capitalised form.
+      const dayValues = contractSpec(contract, "quiet_hours_days").choices || ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
       const dayInputs = {};
       const activeDays = new Set(settings.quiet_hours_days || []);
-      for (const [value, label] of DAY_LABELS) {
+      for (const value of dayValues) {
+        const label = value.charAt(0).toUpperCase() + value.slice(1);
         const dayLabel = document.createElement("label");
         dayLabel.className = "checkline";
         const dayInput = document.createElement("input");
@@ -27075,41 +27267,21 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       appendProviderSettingRow(parent, "Always notify for", urgentWrap, {description: "These events fire immediately even during quiet hours."});
 
       appendSettingsFormSectionTitle(parent, "Delivery limits");
-      const rateInput = document.createElement("input");
-      rateInput.type = "number";
-      rateInput.min = "1";
-      rateInput.max = "1000";
-      rateInput.value = settings.rate_limit_max_per_hour ?? 20;
+      const rateInput = contractNumberInput(contract, "rate_limit_max_per_hour", settings);
       appendProviderSettingRow(parent, "Max per channel per hour", rateInput, {description: "Once a channel hits this many sends in a rolling hour, further notifications wait until it has room again."});
 
-      const dedupInput = document.createElement("input");
-      dedupInput.type = "number";
-      dedupInput.min = "0";
-      dedupInput.max = "86400";
-      dedupInput.value = settings.dedup_window_seconds ?? 3600;
-      appendProviderSettingRow(parent, "Dedup window (seconds)", dedupInput, {description: "The same event for the same item won't notify twice within this window."});
+      const dedupInput = contractNumberInput(contract, "dedup_window_seconds", settings);
+      appendProviderSettingRow(parent, "Dedup window (seconds)", dedupInput, {description: `The same event for the same item won't notify twice within this window. ${contractZeroNote(contract, "dedup_window_seconds")}`.trim()});
 
       appendSettingsFormSectionTitle(parent, "Retries");
-      const retryAttemptsInput = document.createElement("input");
-      retryAttemptsInput.type = "number";
-      retryAttemptsInput.min = "0";
-      retryAttemptsInput.max = "20";
-      retryAttemptsInput.value = settings.retry_max_attempts ?? 5;
-      appendProviderSettingRow(parent, "Max retry attempts", retryAttemptsInput, {description: "How many times to retry a send that failed for a transient reason (timeout, 5xx, rate limited by the provider)."});
+      const retryAttemptsInput = contractNumberInput(contract, "retry_max_attempts", settings);
+      appendProviderSettingRow(parent, "Max sends per notification", retryAttemptsInput, {description: `Total attempts for one notification, counting the first send — so 5 is one send plus four retries. Retries only happen for transient failures (timeout, 5xx, rate limited by the provider). ${contractZeroNote(contract, "retry_max_attempts")}`.trim()});
 
-      const retryBackoffInput = document.createElement("input");
-      retryBackoffInput.type = "number";
-      retryBackoffInput.min = "30";
-      retryBackoffInput.max = "3600";
-      retryBackoffInput.value = settings.retry_backoff_seconds ?? 300;
+      const retryBackoffInput = contractNumberInput(contract, "retry_backoff_seconds", settings);
       appendProviderSettingRow(parent, "Retry backoff (seconds)", retryBackoffInput, {description: "Wait time before the first retry; it doubles after each further attempt."});
 
       appendSettingsFormSectionTitle(parent, "History");
-      const retentionInput = document.createElement("input");
-      retentionInput.type = "number";
-      retentionInput.min = "1";
-      retentionInput.max = "365";
-      retentionInput.value = settings.history_retention_days ?? 30;
+      const retentionInput = contractNumberInput(contract, "history_retention_days", settings);
       appendProviderSettingRow(parent, "History retention (days)", retentionInput, {description: "How long a sent or failed notification stays in the delivery history. Rows that record a non-send — a duplicate suppressed by the dedup window, a series filtered out, a channel switched off — are cleared after two days instead, since they are the bulk of the history and nothing reads them back."});
 
       const saveRow = document.createElement("div");
@@ -27130,13 +27302,15 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
             quiet_hours_enabled: enabledInput.checked,
             quiet_hours_start: startInput.value || "22:00",
             quiet_hours_end: endInput.value || "07:00",
-            quiet_hours_days: days.length === 7 ? [] : days,
+            // Empty means "every day" to the store, so a full selection is
+            // sent as empty rather than as the whole vocabulary.
+            quiet_hours_days: days.length === dayValues.length ? [] : days,
             quiet_hours_urgent_events: Object.entries(urgentInputs).filter(([, input]) => input.checked).map(([id]) => id),
-            rate_limit_max_per_hour: Number(rateInput.value) || 20,
-            dedup_window_seconds: Number(dedupInput.value) || 0,
-            retry_max_attempts: Number(retryAttemptsInput.value) || 0,
-            retry_backoff_seconds: Number(retryBackoffInput.value) || 300,
-            history_retention_days: Number(retentionInput.value) || 30,
+            rate_limit_max_per_hour: numericSettingValue(rateInput),
+            dedup_window_seconds: numericSettingValue(dedupInput),
+            retry_max_attempts: numericSettingValue(retryAttemptsInput),
+            retry_backoff_seconds: numericSettingValue(retryBackoffInput),
+            history_retention_days: numericSettingValue(retentionInput),
           });
           toast("Quiet hours and limits saved.", true, "inkdropSettings");
           if (onSaved) await onSaved();
@@ -37495,7 +37669,7 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       // entirely, leaving those cards stuck at 0 until the 2-minute interval
       // below first fired.
       scheduleInkdropCoreRefresh(6000);
-      setInterval(refreshStatus, 60000);
+      setInterval(refreshStatusFromTimer, 60000);
       setInterval(() => scheduleInkdropCoreRefresh(1000), 120000);
       // scheduleInkdropCoreRefresh's timer body skips while document.hidden
       // -- correct for not burning queries in background tabs, but it meant
@@ -37504,7 +37678,12 @@ HTML = INKDROP_UI_SHELL_FILE.read_text(encoding="utf-8") + r"""  <script>
       // so every masthead stat card sat at 0 until the 2-minute interval
       // happened to fire while visible. Refresh promptly on return instead.
       document.addEventListener("visibilitychange", () => {
-        if (!document.hidden) scheduleInkdropCoreRefresh(1500);
+        if (document.hidden) return;
+        scheduleInkdropCoreRefresh(1500);
+        // One fresh read on return, not a minute of stale panels. refreshStatus
+        // deduplicates against a request already in flight, so a rapid
+        // hide/show does not queue a second one.
+        refreshStatusFromTimer();
       });
     }
     window.addEventListener("inkdrop-auth-ready", startInkdropApplication, {once: true});
@@ -37970,19 +38149,171 @@ def is_import_lock_busy_error(exc):
     )
 
 
-def read_json_body(handler, max_bytes=8192):
-    length = int(handler.headers.get("Content-Length") or "0")
-    if length <= 0 or length > int(max_bytes or 8192):
+# The default body cap. Unchanged in value -- what changed is that exceeding
+# it is now answered rather than silently substituted with an empty object.
+MAX_REQUEST_BODY_BYTES = 8192
+
+# How much of a body nobody read we are willing to pull off the socket just to
+# keep a connection reusable. Above this the connection is closed instead: a
+# refusal must never become a reason to read an unbounded amount.
+MAX_UNREAD_BODY_DRAIN_BYTES = 65536
+
+
+class RequestEnvelopeError(ValueError):
+    """The request could not be accepted as framed, so no route ran.
+
+    read_json_body could not make this distinction: it answered `{}` for a
+    nonpositive or oversized Content-Length -- what an intentionally empty body
+    produces -- so dispatch continued and a mutation ran with none of the
+    submitted parameters. See
+    tests/inkdrop-a-refused-body-is-not-an-empty-body-smoke.py.
+
+    A ValueError subclass so every verb handler's existing `except Exception`
+    still catches it; `status` is what makes it answerable as itself.
+    """
+
+    def __init__(self, message, *, status=400):
+        super().__init__(message)
+        self.status = int(status)
+
+
+def _content_length_values(headers):
+    """Every Content-Length token this request declared, in order.
+
+    Both spellings of a conflict -- two headers, or one header carrying a comma
+    list -- flatten to the same list and are judged by the same rule.
+    """
+    declared = []
+    try:
+        raw = headers.get_all("Content-Length") if headers is not None else None
+    except AttributeError:
+        raw = None
+    if raw is None and headers is not None:
+        single = headers.get("Content-Length")
+        raw = [single] if single is not None else []
+    for value in raw or []:
+        declared.extend(part.strip() for part in str(value).split(",") if part.strip())
+    return declared
+
+
+def request_declared_body_length(headers, max_bytes):
+    """How many body bytes this request declares, or refuse the envelope.
+
+    Refuses rather than guesses: treating a malformed length as zero dispatches
+    the route with no parameters, and picking one of a conflicting pair leaves
+    the difference in the socket for the next parse to read as a request line.
+    """
+    try:
+        encodings = headers.get_all("Transfer-Encoding") if headers is not None else None
+    except AttributeError:
+        encodings = None
+    tokens = [
+        token.strip().lower()
+        for value in (encodings or [])
+        for token in str(value).split(",")
+        if token.strip()
+    ]
+    if any(token != "identity" for token in tokens):
+        raise RequestEnvelopeError(
+            "InkDrop does not accept a transfer-encoded request body; send Content-Length instead",
+            status=501,
+        )
+
+    values = _content_length_values(headers)
+    if not values:
+        return 0
+    if len(set(values)) > 1:
+        raise RequestEnvelopeError(
+            f"Content-Length is declared more than once with different values: {values}",
+            status=400,
+        )
+    raw = values[0]
+    # isdigit() and not int(): int() accepts "-1", "+5", surrounding
+    # whitespace and Unicode digits, and "-1" is the value that used to fall
+    # through the `length <= 0` branch into an empty-object dispatch.
+    if not raw.isdigit() or not raw.isascii():
+        raise RequestEnvelopeError(
+            f"Content-Length is not a non-negative integer: {raw!r}",
+            status=400,
+        )
+    length = int(raw)
+    if length > int(max_bytes or MAX_REQUEST_BODY_BYTES):
+        raise RequestEnvelopeError(
+            f"request body is {length} bytes; this endpoint accepts at most "
+            f"{int(max_bytes or MAX_REQUEST_BODY_BYTES)}",
+            status=413,
+        )
+    return length
+
+
+def unread_body_length_for_framing(headers):
+    """Body bytes still in the socket, or -1 when that cannot be known.
+
+    Never raises: it runs in a `finally` after the response has gone out, where
+    the only outcomes are "drain it" and "close". -1 means close.
+    """
+    try:
+        return request_declared_body_length(headers, max_bytes=float("inf"))
+    except Exception:
+        return -1
+
+
+def read_request_body_bytes(handler, max_bytes):
+    """Read exactly the declared body, or refuse it as an envelope failure."""
+    length = request_declared_body_length(getattr(handler, "headers", None), max_bytes)
+    if length <= 0:
+        handler._inkdrop_body_consumed = True
+        return b""
+    raw = handler.rfile.read(length)
+    if len(raw) != length:
+        # The declared length never arrived, so what IS in the socket is
+        # unknowable. Not marked consumed on purpose: the framing rule closes.
+        raise RequestEnvelopeError(
+            f"request body ended after {len(raw)} of {length} declared bytes",
+            status=400,
+        )
+    handler._inkdrop_body_consumed = True
+    return raw
+
+
+def is_understood_refusal(exc):
+    """Whether this failure is the request's fault rather than InkDrop's.
+
+    A ValidationError was understood and refused; a RequestEnvelopeError was
+    not well enough formed to be understood. Neither is a fault, so neither
+    deserves a stack trace -- and the envelope case is reachable by anyone who
+    can open the port, so a trace per malformed request floods the log.
+    """
+    return isinstance(exc, (ValidationError, RequestEnvelopeError))
+
+
+def read_json_body(handler, max_bytes=MAX_REQUEST_BODY_BYTES):
+    raw = read_request_body_bytes(handler, max_bytes)
+    if not raw:
         return {}
-    return json.loads(handler.rfile.read(length).decode("utf-8"))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise RequestEnvelopeError("request body is not valid UTF-8", status=400) from None
+    except ValueError as exc:
+        raise RequestEnvelopeError(f"request body is not valid JSON: {exc}", status=400) from None
+    if not isinstance(payload, dict):
+        # A valid JSON array or scalar used to reach the route and fail at the
+        # first `.get()`, so the caller was told which attribute was missing
+        # rather than that the body was the wrong shape.
+        raise RequestEnvelopeError(
+            f"request body must be a JSON object, not {type(payload).__name__}",
+            status=400,
+        )
+    return payload
 
 
 def read_strict_json_body(handler, max_bytes):
-    length = int(handler.headers.get("Content-Length") or "0")
-    if length <= 0 or length > int(max_bytes):
-        raise ValueError("request JSON body has an invalid size")
+    raw = read_request_body_bytes(handler, max_bytes)
+    if not raw:
+        raise RequestEnvelopeError("request JSON body has an invalid size", status=400)
     return inkdrop_backup_restore.parse_strict_json_object(
-        handler.rfile.read(length),
+        raw,
         max_bytes=max_bytes,
         label="request JSON body",
     )
@@ -38366,7 +38697,7 @@ def inkdrop_auth_action_policy(path, method):
     explicit = INKDROP_AUTH_ACTION_POLICIES.get((method, path))
     if explicit:
         return dict(explicit)
-    if method == "GET":
+    if method in {"GET", "HEAD"}:
         # `/api/inkdrop-debug/` joins the diagnostics prefix rather than getting a
         # gate of its own. Both routes under it report server topology --
         # background-threads enumerates every live thread with its native_id, the
@@ -38762,7 +39093,7 @@ def normalize_manga_number(value):
 
 def connect_imported_db(readonly=False):
     if readonly:
-        con = sqlite3.connect(f"file:{IMPORTED_DB}?mode=ro", timeout=8, uri=True)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(IMPORTED_DB), timeout=8, uri=True)
     else:
         con = sqlite3.connect(IMPORTED_DB, timeout=8)
     con.execute(f"pragma busy_timeout={IMPORTED_DB_BUSY_TIMEOUT_MS}")
@@ -39178,7 +39509,7 @@ def stale_completion_queue_links(row, limit=6):
         issue_params.extend([key, key, normalized or key])
 
     try:
-        db_uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+        db_uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
         with sqlite3.connect(db_uri, uri=True, timeout=1.0) as con:
             con.row_factory = sqlite3.Row
             con.execute("pragma query_only = 1")
@@ -41053,23 +41384,60 @@ def mangadex_chapter_row(item, settings, series_title=""):
     }
 
 
+def mangadex_feed_chapter_key(row):
+    """The identity a feed row collapses onto: one row survives per key."""
+    row = row if isinstance(row, dict) else {}
+    if row.get("unitType") == "oneshot":
+        return f"oneshot:{row.get('metadataId') or row.get('chapterId') or ''}"
+    return f"volume:{row.get('volume') or 'none'}:chapter:{row.get('chapter') or row.get('metadataId') or ''}"
+
+
 def mangadex_feed_chapters(manga_id, max_chapters=500, title=None, latest_first=False):
+    """The latest (or earliest) `max_chapters` DISTINCT chapters of a feed.
+
+    The budget counts chapters, not feed rows, and that distinction is the
+    whole of this function. MangaDex's feed returns one row per scanlation
+    group, so a chapter a dozen groups have translated is a dozen rows, and
+    collapsing the rows AFTER the page loop stopped -- which is what this used
+    to do -- meant a 100-row window could be six chapters. Everything below the
+    collapsed window then fell out of the companion refresh silently: it only
+    ever looks at the rows this hands back, and nothing backfills what it
+    missed, so a current chapter that slipped past the window was never
+    evaluated again. So the loop folds each page into the deduplicated set as
+    it arrives and keeps paging until `max_chapters` distinct chapters are in
+    hand, the feed runs out, or the row/page cap stops it.
+
+    Ordering is chapter-first. The old request asked for `order[volume]` ahead
+    of `order[chapter]`, and a chapter that has not been collected into a
+    volume yet -- which is the normal state of the newest chapters, the ones
+    that matter most here -- carries a null volume, for which MangaDex
+    documents no placement in an ordered feed. Rather than bet the newest
+    chapters on where a null sorts, volume is simply not part of the order any
+    more. No caller depends on it: all three read `chapters`, which is sorted
+    by chapter number here before it is returned.
+    """
+
     manga_id = str(manga_id or "").strip()
     if not manga_id:
         raise ValueError("MangaDex id is required")
     settings = load_mangadex_settings()
     max_chapters = max(1, min(int(max_chapters or 500), 1000))
-    rows = []
+    order = "desc" if latest_first else "asc"
+    best = {}
+    duplicates = []
+    fetched = 0
+    pages = 0
     offset = 0
-    page_limit = 100
     total = None
-    while len(rows) < max_chapters and (total is None or offset < total):
-        order = "desc" if latest_first else "asc"
+    row_cap_reached = False
+    while len(best) < max_chapters and (total is None or offset < total):
+        if pages >= MANGADEX_FEED_MAX_PAGES or fetched >= MANGADEX_FEED_MAX_ROWS:
+            row_cap_reached = True
+            break
         params = [
-            ("limit", min(page_limit, max_chapters - len(rows))),
+            ("limit", min(MANGADEX_FEED_PAGE_LIMIT, MANGADEX_FEED_MAX_ROWS - fetched)),
             ("offset", offset),
             ("includes[]", "scanlation_group"),
-            ("order[volume]", order),
             ("order[chapter]", order),
             ("order[publishAt]", order),
         ]
@@ -41084,28 +41452,27 @@ def mangadex_feed_chapters(manga_id, max_chapters=500, title=None, latest_first=
                 total = len(page)
         if not page:
             break
-        rows.extend(mangadex_chapter_row(item, settings, title or "") for item in page if isinstance(item, dict))
+        pages += 1
+        for item in page:
+            if not isinstance(item, dict):
+                continue
+            row = mangadex_chapter_row(item, settings, title or "")
+            fetched += 1
+            key = mangadex_feed_chapter_key(row)
+            current = best.get(key)
+            rank = (1 if row.get("downloadable") else 0, int(row.get("pages") or 0), str(row.get("publishAt") or ""))
+            current_rank = (
+                1 if current and current.get("downloadable") else 0,
+                int((current or {}).get("pages") or 0),
+                str((current or {}).get("publishAt") or ""),
+            )
+            if current is None or rank > current_rank:
+                if current is not None:
+                    duplicates.append(current)
+                best[key] = row
+            else:
+                duplicates.append(row)
         offset += len(page)
-    best = {}
-    duplicates = []
-    for row in rows:
-        if row.get("unitType") == "oneshot":
-            key = f"oneshot:{row.get('metadataId') or row.get('chapterId') or ''}"
-        else:
-            key = f"volume:{row.get('volume') or 'none'}:chapter:{row.get('chapter') or row.get('metadataId') or ''}"
-        current = best.get(key)
-        rank = (1 if row.get("downloadable") else 0, int(row.get("pages") or 0), str(row.get("publishAt") or ""))
-        current_rank = (
-            1 if current and current.get("downloadable") else 0,
-            int((current or {}).get("pages") or 0),
-            str((current or {}).get("publishAt") or ""),
-        )
-        if current is None or rank > current_rank:
-            if current is not None:
-                duplicates.append(current)
-            best[key] = row
-        else:
-            duplicates.append(row)
     chapters = sorted(best.values(), key=mangadex_chapter_sort_key)
     return {
         "mangadexId": manga_id,
@@ -41115,9 +41482,12 @@ def mangadex_feed_chapters(manga_id, max_chapters=500, title=None, latest_first=
         "metadataOnlyCount": sum(1 for row in chapters if not row.get("downloadable")),
         "duplicateCount": len(duplicates),
         "duplicates": duplicates[:50],
-        "totalReturned": len(rows),
+        "totalReturned": fetched,
         "totalAvailable": total,
         "window": "latest" if latest_first else "earliest",
+        "pagesFetched": pages,
+        "rowCap": MANGADEX_FEED_MAX_ROWS,
+        "rowCapReached": row_cap_reached,
     }
 
 
@@ -41139,19 +41509,31 @@ def mangadex_verified_coverage(series_id, title, coverage_series_id=None):
 
 
 def mangadex_covered_metadata_ids(series_id, title, chapters, coverage_series_id=None):
+    """Feed chapters that must not become Wanted: owned already, or the volume lane's.
+
+    Shared by the first-link add and the companion refresh so the two apply one
+    rule. A 'preparing' link counts: that is the link's state while the
+    companion job runs the first-link add.
+    """
     coverage_series_id = str(coverage_series_id or "").strip() or None
     if coverage_series_id and not inkdrop_state.manga_companion_pair_is_linked(
         INKDROP_STATE_DB,
         comicvine_series_id=coverage_series_id,
         mangadex_series_id=series_id,
+        statuses=("linked", "preparing"),
     ):
         coverage_series_id = None
     coverage = mangadex_verified_coverage(series_id, title, coverage_series_id=coverage_series_id)
+    owned_volumes = inkdrop_state.chapter_lane_owned_volumes(INKDROP_STATE_DB, series_id)
     covered = set()
     for chapter in chapters or []:
         chapter_number = normalize_manga_number(chapter.get("chapter") or chapter.get("issueNumber"))
         trusted_volume = normalize_manga_number(chapter.get("volume"))
-        if chapter_number in coverage["chapters"] or (trusted_volume and trusted_volume in coverage["volumes"]):
+        if (
+            chapter_number in coverage["chapters"]
+            or (trusted_volume and trusted_volume in coverage["volumes"])
+            or inkdrop_manga_companion.chapter_behind_volume_lane(chapter, owned_volumes)
+        ):
             metadata_id = str(chapter.get("metadataId") or "")
             if metadata_id:
                 covered.add(metadata_id)
@@ -44006,7 +44388,8 @@ def manual_source_resolved_has_existing_destination(row):
 
 def issue_number_keys_in_text(value):
     keys = set()
-    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", str(value or "")):
+    text = inkdrop_completed_import.strip_issue_total_markers(value)
+    for raw in re.findall(r"(?<!\d)\d{1,4}(?:\.\d+)?(?!\d)", text):
         keys |= issue_number_keys(raw)
     return {key for key in keys if key}
 
@@ -45635,6 +46018,15 @@ def bounded_timeout_command(duration, *, kill_after=SERIES_QUEUE_RUNNER_TIMEOUT_
     ]
 
 
+# flock's own "could not take the lock" exit code for this one synchronous
+# web run. It must not be 75: the worker script itself now exits 75 when a
+# pending download handoff defers the pass (see accepted_handoff_gate in
+# core/inkdrop_series_autopilot.py main()), and that is a different situation
+# from "a second run is already in progress" -- the caller needs to tell them
+# apart to show the right message (see the two branches below).
+SERIES_AUTOPILOT_RUN_LOCK_BUSY_EXIT_CODE = 76
+
+
 def run_series_autopilot(payload):
     if not SERIES_AUTOPILOT_SCRIPT.exists():
         raise RuntimeError("series autopilot worker is not installed")
@@ -45643,7 +46035,7 @@ def run_series_autopilot(payload):
     cmd = [
         "/usr/bin/flock",
         "-E",
-        "75",
+        str(SERIES_AUTOPILOT_RUN_LOCK_BUSY_EXIT_CODE),
         "-w",
         "5",
         str(SERIES_AUTOPILOT_LOCK_PATH),
@@ -45677,11 +46069,25 @@ def run_series_autopilot(payload):
     proc = inkdrop_process_lifecycle.run_tracked(cmd, check=False, capture_output=True, text=True, timeout=timeout)
     output = (proc.stdout or "").strip()
     error = (proc.stderr or "").strip()
-    if proc.returncode == 75:
+    if proc.returncode == SERIES_AUTOPILOT_RUN_LOCK_BUSY_EXIT_CODE:
         current = autopilot_public_status()
         current["skipped_busy"] = True
         current["state"] = "busy"
         current["note"] = "Series autopilot is already running; this request did not start a second queue pass."
+        return current
+    if proc.returncode == 75:
+        # The run took the lock and started, but a pending download handoff
+        # holds priority (accepted_download_handoff_priority_gate) and the
+        # worker deferred this pass rather than searching. Distinct from the
+        # busy case above: nothing is already running, this pass just did not
+        # search yet and the background scheduler will retry it shortly.
+        current = autopilot_public_status()
+        current["gated"] = True
+        current["state"] = "deferred"
+        current["note"] = (
+            "Series autopilot deferred this pass: a pending download handoff has priority. "
+            "It will retry automatically."
+        )
         return current
     if proc.returncode != 0:
         raise RuntimeError(error or output or f"command failed: {proc.returncode}")
@@ -46092,7 +46498,7 @@ def queue_runner_state_import_ready_count():
         return 0
     try:
         status_placeholders = ",".join("?" for _ in INKDROP_STATE_IMPORT_READY_STATUSES)
-        db_uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+        db_uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
         with sqlite3.connect(db_uri, uri=True, timeout=1.0) as con:
             con.execute("pragma query_only = 1")
             con.execute("pragma busy_timeout = 500")
@@ -48698,7 +49104,7 @@ def download_client_db_snapshots(client_id, limit=300):
         "nzbget": ("nzbget",),
     }.get(client_id, (client_id,))
     placeholders = ",".join("?" for _ in aliases)
-    uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
     with sqlite3.connect(uri, uri=True, timeout=1.5) as con:
         con.row_factory = sqlite3.Row
         con.execute("pragma query_only=1")
@@ -51080,7 +51486,7 @@ def redact_operational_detail(payload):
     return state["withheld"]
 
 
-def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None):
+def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filter=None, queue_filter=None, wanted_filter=None, series_filter=None, issue_filter=None, history_filter=None, import_filter=None, download_filter=None, manual_review_filter=None, focus=None, summary_mode=None, row_mode=None, offset=0, sort_key=None, sort_direction=None, history_search=None, cursor=None):
     started_at = time.perf_counter()
     try:
         view = str(view or "").strip().lower()
@@ -51155,6 +51561,7 @@ def inkdrop_state_view_public(view, limit=80, source_filter=None, provider_filte
             sort_key=sort_key,
             sort_direction=sort_direction,
             history_search=history_search,
+            cursor=cursor,
         )
         if isinstance(settlement, dict) and settlement.get("skipped"):
             payload["queue_settlement"] = settlement
@@ -51199,7 +51606,7 @@ def inkdrop_history_event_raw(event_id):
         }
 
     try:
-        db_uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+        db_uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
         with sqlite3.connect(db_uri, uri=True, timeout=1.0) as con:
             con.row_factory = sqlite3.Row
             con.execute("pragma query_only = 1")
@@ -51415,7 +51822,7 @@ def source_order_policy_summary(source_order=None, provider_health=None):
         error = "InkDrop state database is not available."
     else:
         try:
-            db_uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+            db_uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
             with sqlite3.connect(db_uri, uri=True, timeout=0.25) as con:
                 con.row_factory = sqlite3.Row
                 con.execute("pragma query_only = 1")
@@ -54312,8 +54719,8 @@ def runtime_provider_settings():
         only_when_stored=True,
         # A probe script existing inside InkDrop's own image never meant the
         # user runs SLSKD -- not for seeding the card, and not for its enabled
-        # state either. #637 fixed the first half (only_when_stored above) and
-        # left this reading SLSKD_SOURCE_PROBE_SCRIPT.exists(), which is True on
+        # state either. An earlier fix handled the first half (only_when_stored
+        # above) and left this reading SLSKD_SOURCE_PROBE_SCRIPT.exists(), which is True on
         # every install because we ship that file. So every install that already
         # had the row kept showing "Enabled" with no client behind it.
         enabled=legacy_slskd_card_configured(),
@@ -55673,7 +56080,7 @@ PROVIDER_FIELD_HELP = {
         "frontend_sync_after_import": "Tell Kavita and Komga to rescan once the file is in place. InkDrop does not wait for them.",
         "library_visibility_provider_order": "Preferred library adapters to ask for visibility after folder completion.",
         "manga_companion_folder_convergence": "Kavita and Komga group by physical folder, not by matching metadata across folders -- a companion tracking chapters ahead of a volume release will otherwise show as a second, incomplete series tile. On by default; turn off only if you deliberately want companion chapters kept separate.",
-        "cover_injection_enabled": "Both readers take a series' cover from the first page of its lowest-numbered book, so a volume that opens on a title page or a scanlator's banner becomes the series' face no matter what cover InkDrop stores. Turning this on writes the real cover into that book as a new first page, and moves it when an earlier volume shows up. It edits archive files in your library: nothing is replaced, the original goes to quarantine so it can be restored, and any file whose chapter/volume classification would change is skipped. Off by default -- use the Library sweep first if you want to review a run before it touches anything.",
+        "cover_injection_enabled": "Both readers take a series' cover from the first page of its lowest-numbered book. When enabled, completed-import placements and the MangaDex front-cover refresh recheck the folder, move the injection when an earlier unit arrives, and record the per-series result in History. Pack imports, MangaDex-direct placements, and ComicVine display-metadata refreshes catch up on a later completed import or CLI sweep. Shared folders use one deterministic owner, so competing rows do not flip the archive. Archive originals go to quarantine and unsafe rewrites are refused with their reason recorded. Off by default. For books already in the library, use the cover-injection CLI sweep in dry-run mode before applying it.",
         "import_conflict_policy": "skip_existing avoids replacing files until replacement/upgrade quality profiles exist.",
         "minimum_free_space_gb": "Managed imports will refuse the planned path if the comic or manga root would fall below this floor.",
     },
@@ -57747,6 +58154,10 @@ def notifications_config_public():
         "connector_types": inkdrop_notifications.connector_types_catalog(),
         "notifications_enabled": inkdrop_notifications.master_switch_enabled(INKDROP_STATE_DB),
         "settings": inkdrop_notification_store.get_settings(INKDROP_STATE_DB),
+        # The form builds its own bounds and vocabularies from this instead
+        # of restating them. It had already drifted: the dedup field capped
+        # at 86,400 seconds against the store's real 604,800.
+        "settings_contract": inkdrop_notification_store.settings_contract(),
         "event_types": [
             {"id": event_id, "label": inkdrop_notifications.EVENT_LABELS.get(event_id, event_id)}
             for event_id in inkdrop_notifications.EVENT_TYPES
@@ -58515,7 +58926,7 @@ def load_manual_review_actions():
         data["manual_source_waiting"] = {}
     if not isinstance(data.get("manual_source_resolved"), list):
         data["manual_source_resolved"] = []
-    # Tracker #537: manual_source_retracted_resolved is retired. The default
+    # manual_source_retracted_resolved is retired. The default
     # used to be re-created here on every load, which is what made a key with
     # no writer look like a supported field. Its readers are gone and the six
     # entries that existed are archived in history_events. Do not add it back;
@@ -65070,7 +65481,7 @@ def fast_state_count_snapshot(timeout_seconds=0.25):
         timeout = 0.25
     snapshot = {"count_snapshot": True}
     try:
-        con = sqlite3.connect(f"file:{INKDROP_STATE_DB}?mode=ro", uri=True, timeout=timeout)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB), uri=True, timeout=timeout)
         con.row_factory = sqlite3.Row
         try:
             for table, key in (
@@ -67055,6 +67466,7 @@ def setup_required_status_payload():
         "status_partial": False,
         "source_health": {},
         "system_health": {},
+        "overload_refusal_count": web_overload_refusal_status()["count"],
         "inkdrop_state": {},
     }
 
@@ -67591,6 +68003,10 @@ class Handler(BaseHTTPRequestHandler):
         "_state_endpoint_acquired": False,
         "_state_endpoint_wait_seconds": 0.0,
         "_active_request_id": None,
+        # Whether this request's body was taken off the socket. Reset with the
+        # rest, because a connection carries more than one request and the
+        # previous one's answer is not this one's.
+        "_inkdrop_body_consumed": False,
     }
 
     def setup(self):
@@ -67673,8 +68089,70 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     # Telemetry must never be the reason a request fails.
                     pass
+            # Before the connection is handed back for another request, and
+            # after every path that could have answered without reading -- an
+            # authorization refusal, a 404, an envelope refusal, a GET that
+            # arrived with a body.
+            self.enforce_request_framing()
             self.release_state_endpoint_slot()
             self.finish_request_trace()
+
+    def enforce_request_framing(self):
+        """Never let a body nobody read be parsed as the next request.
+
+        HTTP/1.1 is the default, so a connection carries more than one request,
+        and every early return that answered without consuming the body left
+        those bytes where the next parse reads them as a request line. One rule
+        in one place: drain when draining is cheap and bounded, close
+        otherwise. Closing is always correct because the response carries
+        Content-Length; draining exists so an ordinary small POST refused for
+        another reason can still reuse its connection.
+        """
+        if getattr(self, "close_connection", True):
+            return
+        if getattr(self, "_inkdrop_body_consumed", False):
+            return
+        length = unread_body_length_for_framing(getattr(self, "headers", None))
+        if length == 0:
+            return
+        if length < 0 or length > MAX_UNREAD_BODY_DRAIN_BYTES:
+            self.close_connection = True
+            return
+        try:
+            drained = self.rfile.read(length)
+        except Exception:
+            self.close_connection = True
+            return
+        if len(drained) != length:
+            self.close_connection = True
+
+    def envelope_refusal_headers(self):
+        """Tell the client we are closing, when the framing rule will close.
+
+        enforce_request_framing runs after the response is on the wire and can
+        only set the flag; deciding it here turns a silent hang-up into a
+        `Connection: close` the client was told about.
+        """
+        if getattr(self, "_inkdrop_body_consumed", False):
+            return {"Cache-Control": "no-store"}
+        length = unread_body_length_for_framing(getattr(self, "headers", None))
+        if length == 0:
+            return {"Cache-Control": "no-store"}
+        if length < 0 or length > MAX_UNREAD_BODY_DRAIN_BYTES:
+            return {"Cache-Control": "no-store", "Connection": "close"}
+        return {"Cache-Control": "no-store"}
+
+    def mutation_error_status(self, exc, is_client_api):
+        """The status an exception out of a mutation handler deserves.
+
+        An envelope failure answers as itself: 413 over the cap, 501 for a
+        transfer-encoding this server does not read, 400 for a length or JSON
+        shape it cannot accept. Everything else is unchanged -- the
+        staged migration owns the rest and this converts none of it.
+        """
+        if isinstance(exc, RequestEnvelopeError):
+            return exc.status
+        return download_client_error_status(exc) if is_client_api else 400
 
     def end_headers(self):
         # Every response ends its headers here, including send_error's, so this
@@ -68375,7 +68853,7 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/api/inkdrop-settings/backup/archives/download" and not path.startswith("/opds/v1.2/"):
             self.send_bytes(b"", "text/plain; charset=utf-8", status=405, headers={"Allow": "GET"})
             return
-        if not self.ensure_authorized(path, "GET"):
+        if not self.ensure_authorized(path, "HEAD"):
             return
         if path == "/api/inkdrop-settings/backup/archives/download":
             # HEAD is how a resuming client checks size and validator before
@@ -68727,7 +69205,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "download task id is required"}, status=400)
             else:
                 try:
-                    db_uri = f"file:{INKDROP_STATE_DB}?mode=ro"
+                    db_uri = inkdrop_db.sqlite_readonly_uri(INKDROP_STATE_DB)
                     with sqlite3.connect(db_uri, uri=True, timeout=1.5) as con:
                         con.row_factory = sqlite3.Row
                         con.execute("pragma query_only=1")
@@ -69006,6 +69484,7 @@ class Handler(BaseHTTPRequestHandler):
                     sort_key=(query.get("sort") or query.get("sort_key") or [None])[0],
                     sort_direction=(query.get("direction") or query.get("sort_direction") or [None])[0],
                     history_search=(query.get("history_search") or query.get("historySearch") or [None])[0],
+                    cursor=(query.get("cursor") or [None])[0],
                 )
                 # Same privacy policy as /api/inkdrop-state/queue -- this
                 # older ?view=queue entry point returns the identical payload,
@@ -69066,6 +69545,7 @@ class Handler(BaseHTTPRequestHandler):
                 sort_key=(query.get("sort") or query.get("sort_key") or [None])[0],
                 sort_direction=(query.get("direction") or query.get("sort_direction") or [None])[0],
                 history_search=(query.get("history_search") or query.get("historySearch") or [None])[0],
+                cursor=(query.get("cursor") or [None])[0],
             )
             if not self._apply_operational_detail_privacy(view, query, payload):
                 return
@@ -69159,6 +69639,11 @@ class Handler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
                 handle.flush()
                 os.fsync(handle.fileno())
+            # This route reads the body itself rather than through
+            # read_request_body_bytes, so it marks its own consumption. Without
+            # this the framing rule sees an unread multi-gigabyte body and
+            # closes a connection that is in fact clean.
+            self._inkdrop_body_consumed = True
             try:
                 preview = inkdrop_backup_restore.restore_backup_archive(temp_path, apply=False)
             except (ValueError, OSError, zipfile.BadZipFile) as exc:
@@ -70164,7 +70649,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.send_auth_error(exc):
                 return
             is_client_api = str(locals().get("path") or "").startswith("/api/" + "download-clients")
-            status = download_client_error_status(exc) if is_client_api else 400
+            status = self.mutation_error_status(exc, is_client_api)
             # The response deliberately carries only str(exc) and that does not
             # change here -- it is operator-facing and must not grow internals.
             # But stringifying was also the only record this guard kept, and it
@@ -70175,7 +70660,7 @@ class Handler(BaseHTTPRequestHandler):
             # 2026-08-20: a symptom and no location. Mirrors the print +
             # print_exc the outer request guard already does at the same layer.
             failed_path = str(locals().get("path") or self.path or "")
-            # Tracker #535, phase 1. A ValidationError means the request was
+            # Validation phase 1. A ValidationError means the request was
             # understood and refused -- a bad field, an unknown id, a
             # disallowed transition. The operator needs the message; nobody
             # needs the stack. Same reasoning the outer request guard already
@@ -70187,12 +70672,17 @@ class Handler(BaseHTTPRequestHandler):
             # exactly as it does today; the traceback simply stops firing for
             # the sites that later opt in. Flipping the default for
             # unconverted faults is phase 3 and ships on its own.
-            if isinstance(exc, ValidationError):
+            if is_understood_refusal(exc):
                 print(f"InkDrop API rejected: {self.command} {failed_path}: {exc}", flush=True)
             else:
                 print(f"InkDrop API handler failed: {self.command} {failed_path}: {exc}", flush=True)
                 traceback.print_exc()
-            self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
+            envelope_headers = self.envelope_refusal_headers() if isinstance(exc, RequestEnvelopeError) else None
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                status=status,
+                headers=envelope_headers or ({"Cache-Control": "no-store"} if is_client_api else None),
+            )
 
     def _apply_operational_detail_privacy(self, view, query, payload):
         """Hold every state view to the filesystem-privacy promise Series
@@ -70289,8 +70779,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.send_auth_error(exc):
                 return
             is_client_api = str(locals().get("path") or "").startswith("/api/" + "download-clients")
-            status = download_client_error_status(exc) if is_client_api else 400
-            self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
+            status = self.mutation_error_status(exc, is_client_api)
+            envelope_headers = self.envelope_refusal_headers() if isinstance(exc, RequestEnvelopeError) else None
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                status=status,
+                headers=envelope_headers or ({"Cache-Control": "no-store"} if is_client_api else None),
+            )
 
     def do_PUT(self):
         try:
@@ -70305,8 +70800,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.send_auth_error(exc):
                 return
             is_client_api = str(locals().get("path") or "").startswith("/api/" + "download-clients")
-            status = download_client_error_status(exc) if is_client_api else 400
-            self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
+            status = self.mutation_error_status(exc, is_client_api)
+            envelope_headers = self.envelope_refusal_headers() if isinstance(exc, RequestEnvelopeError) else None
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                status=status,
+                headers=envelope_headers or ({"Cache-Control": "no-store"} if is_client_api else None),
+            )
 
     def do_DELETE(self):
         try:
@@ -70339,8 +70839,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.send_auth_error(exc):
                 return
             is_client_api = str(locals().get("path") or "").startswith("/api/" + "download-clients")
-            status = download_client_error_status(exc) if is_client_api else 400
-            self.send_json({"ok": False, "error": str(exc)}, status=status, headers={"Cache-Control": "no-store"} if is_client_api else None)
+            status = self.mutation_error_status(exc, is_client_api)
+            envelope_headers = self.envelope_refusal_headers() if isinstance(exc, RequestEnvelopeError) else None
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                status=status,
+                headers=envelope_headers or ({"Cache-Control": "no-store"} if is_client_api else None),
+            )
 
 
 def web_embedded_loops_enabled(environ=None):
@@ -70420,6 +70925,164 @@ def _web_background_bootstrap():
     # whatever the flag says: the cache it fills is read by the request paths in
     # THIS process, and a cache filled in another process fills nothing here.
     threading.Thread(target=source_health_live_sweep_loop, name="inkdrop-source-health-sweep", daemon=True).start()
+    # Its own thread so a blocked disk can stall only the refusal record.
+    start_web_overload_refusal_persister()
+
+
+# How many connections may be in flight at once.
+#
+# The stdlib threading server creates a thread per ACCEPTED connection, with no
+# ceiling: the listen backlog below bounds how many wait to be accepted, and
+# nothing bounds how many are accepted. Every connection costs a thread, its
+# stack and its buffers, and the 30-second socket timeout is an INACTIVITY
+# limit rather than a total one, so a client that sends a byte every twenty
+# seconds holds its thread indefinitely. The route-level semaphores inside the
+# handler cannot help: by the time one is reached, the thread already exists.
+#
+# 200 is chosen for browsers, not for benchmarks. A cold page load opens six to
+# eight parallel connections and keeps them alive, so this is roughly
+# twenty-five simultaneous browsers plus the reader apps polling OPDS -- far
+# more than a household InkDrop sees, and far less than a number that would let
+# an unbounded client population exhaust the container.
+WEB_MAX_CONNECTIONS = max(1, int(os.environ.get("INKDROP_WEB_MAX_CONNECTIONS") or 200))
+# How long a new connection may wait for a slot before it is refused.
+#
+# ZERO by default, which means "decide now". The obvious choice is a short
+# wait, so a momentary burst is admitted rather than refused -- but the wait
+# happens ON THE ACCEPT LOOP, which is single-threaded. At saturation a
+# half-second wait per connection means the server accepts two connections a
+# second, and a client population large enough to keep every slot busy would
+# hold the accept loop there indefinitely. That converts a bounded-resource
+# problem into a throughput one, which is a worse trade than the refusal it
+# was trying to avoid: the kernel's 128-deep listen backlog is already the
+# queue for a burst, and a 503 with Retry-After is something a client can act
+# on. An operator who would rather wait can set this, and pays accept-loop
+# latency for it knowingly.
+WEB_ADMISSION_WAIT_SECONDS = max(0.0, float(os.environ.get("INKDROP_WEB_ADMISSION_WAIT_SECONDS") or 0.0))
+
+_OVERLOADED_BODY = json.dumps({
+    "ok": False,
+    "error": "server_busy",
+    "detail": "InkDrop is handling too many connections right now. Retry in a moment.",
+}, indent=2).encode("utf-8")
+_OVERLOADED_RESPONSE = b"".join([
+    b"HTTP/1.1 503 Service Unavailable\r\n",
+    b"Content-Type: application/json; charset=utf-8\r\n",
+    b"Content-Length: " + str(len(_OVERLOADED_BODY)).encode("ascii") + b"\r\n",
+    b"Cache-Control: no-store\r\n",
+    b"Retry-After: 1\r\n",
+    b"Connection: close\r\n",
+    b"\r\n",
+    _OVERLOADED_BODY,
+])
+# The accept loop sends the static response, then hands the socket to this
+# fixed-size closer pool. The longer Windows close grace can therefore make
+# the 503 observable without throttling acceptance to 20/s.
+_OVERLOADED_DRAIN_SECONDS = 0.050
+_OVERLOADED_DRAIN_MAX_BYTES = 512 * 1024
+_OVERLOADED_REFUSAL_WORKERS = 4
+_OVERLOADED_REFUSAL_MAX_PENDING = 128
+# Refusals are counted in memory on the accept loop and never written from it:
+# a slow disk would otherwise delay every 503 and worsen the overload being
+# reported. One daemon thread, start_web_overload_refusal_persister(), wakes
+# every OVERLOAD_REFUSAL_PERSIST_SECONDS and appends a record only when the
+# count moved, so a burst of refusals becomes one record. It is its own thread
+# so that a blocked disk stalls only this thread, never a real background loop,
+# and so that its cadence does not stretch with those loops' work or backoff.
+#
+# Each record carries the cumulative count for this process run, not a batch
+# count. An append that raises after writing is retried next tick as a second
+# record with the same or a larger total, so the count for a run is the largest
+# refusal_count seen for its process_started_at; summing records would count
+# twice. There is no shutdown flush: the container stops this process with a
+# signal, so a close hook would never run in production. Refusals are persisted
+# within one interval plus successful write time only while ticks and writes
+# succeed. Every failed tick (write or status-read exception) adds another
+# interval. A blocked write or scheduler/process delay can extend it further.
+# The live status payload count stays exact while the process runs; refusals
+# since the last record are lost when the process exits.
+OVERLOAD_REFUSAL_PERSIST_SECONDS = 60
+_OVERLOAD_REFUSAL_WARNING_SECONDS = 600
+_OVERLOAD_REFUSAL_PERSIST_LOCK = threading.Lock()
+_OVERLOAD_REFUSAL_PERSISTED_COUNT = 0
+_OVERLOAD_REFUSAL_WARNED_AT = None
+_OVERLOAD_REFUSAL_PERSISTER = None
+_OVERLOAD_REFUSAL_PERSISTER_START_LOCK = threading.Lock()
+
+
+def _warn_overload_refusal_persist(message):
+    """Report to stderr on the first failure in a row, then once per window."""
+    global _OVERLOAD_REFUSAL_WARNED_AT
+    now = time.monotonic()
+    if _OVERLOAD_REFUSAL_WARNED_AT is not None and now - _OVERLOAD_REFUSAL_WARNED_AT < _OVERLOAD_REFUSAL_WARNING_SECONDS:
+        return
+    _OVERLOAD_REFUSAL_WARNED_AT = now
+    try:
+        print(f"Warning: {message}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def persist_web_overload_refusals():
+    """Record the cumulative refusal count if it moved since the last record.
+
+    Returns True when a record was written, False when the write raised (the
+    cursor stays where it was, so the next call retries with the newer total),
+    and None when there was nothing new or another call was already writing.
+    """
+    global _OVERLOAD_REFUSAL_PERSISTED_COUNT, _OVERLOAD_REFUSAL_WARNED_AT
+    if not _OVERLOAD_REFUSAL_PERSIST_LOCK.acquire(blocking=False):
+        return None
+    try:
+        count = web_overload_refusal_status()["count"]
+        previous = _OVERLOAD_REFUSAL_PERSISTED_COUNT
+        if count <= previous:
+            return None
+        try:
+            watch_log("web_overload_refusal", {
+                "status": 503,
+                "refusal_count": count,
+                "previous_refusal_count": previous,
+                "process_started_at": WEB_RUNTIME_STARTED_AT,
+            })
+        except Exception as exc:
+            _warn_overload_refusal_persist(
+                f"overload refusal record failed; count {count} stays in the "
+                f"status payload and will be retried: {exc}"
+            )
+            return False
+        _OVERLOAD_REFUSAL_PERSISTED_COUNT = count
+        _OVERLOAD_REFUSAL_WARNED_AT = None
+        return True
+    finally:
+        _OVERLOAD_REFUSAL_PERSIST_LOCK.release()
+
+
+def _overload_refusal_persister_loop(interval_seconds):
+    # An Event nobody sets: wait() is a plain timed sleep that tests patching
+    # time.sleep for the other loops cannot reach.
+    tick = threading.Event()
+    while True:
+        tick.wait(interval_seconds)
+        try:
+            persist_web_overload_refusals()
+        except Exception as exc:
+            _warn_overload_refusal_persist(f"overload refusal persister: {exc}")
+
+
+def start_web_overload_refusal_persister(interval_seconds=None):
+    """Start the persister once per process; later calls return the same thread."""
+    global _OVERLOAD_REFUSAL_PERSISTER
+    with _OVERLOAD_REFUSAL_PERSISTER_START_LOCK:
+        if _OVERLOAD_REFUSAL_PERSISTER is None or not _OVERLOAD_REFUSAL_PERSISTER.is_alive():
+            _OVERLOAD_REFUSAL_PERSISTER = threading.Thread(
+                target=_overload_refusal_persister_loop,
+                args=(interval_seconds or OVERLOAD_REFUSAL_PERSIST_SECONDS,),
+                name="inkdrop-overload-refusal-persister",
+                daemon=True,
+            )
+            _OVERLOAD_REFUSAL_PERSISTER.start()
+        return _OVERLOAD_REFUSAL_PERSISTER
 
 
 class InkDropThreadingHTTPServer(ThreadingHTTPServer):
@@ -70431,6 +71094,117 @@ class InkDropThreadingHTTPServer(ThreadingHTTPServer):
     # before the server ever accepted it, which looks to the browser like the
     # server being down rather than being busy.
     request_queue_size = 128
+
+    def __init__(self, *args, max_connections=None, **kwargs):
+        limit = WEB_MAX_CONNECTIONS if max_connections is None else max(1, int(max_connections))
+        self.connection_limit = limit
+        self.connection_slots = threading.BoundedSemaphore(limit)
+        self.refused_connections = 0
+        super().__init__(*args, **kwargs)
+        self._overloaded_refusal_slots = threading.BoundedSemaphore(_OVERLOADED_REFUSAL_MAX_PENDING)
+        self._overloaded_refusal_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_OVERLOADED_REFUSAL_WORKERS,
+            thread_name_prefix="inkdrop-overload-close",
+        )
+
+    def _run_overloaded_drain(self, request, drain_deadline):
+        try:
+            remaining = _OVERLOADED_DRAIN_MAX_BYTES
+            while remaining > 0:
+                wait = drain_deadline - time.monotonic()
+                if wait <= 0:
+                    break
+                request.settimeout(wait)
+                chunk = request.recv(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self.close_request(request)
+            except OSError:
+                pass
+            self._overloaded_refusal_slots.release()
+
+    def _defer_overloaded_drain(self, request):
+        if not self._overloaded_refusal_slots.acquire(blocking=False):
+            return False
+        try:
+            self._overloaded_refusal_executor.submit(
+                self._run_overloaded_drain,
+                request,
+                time.monotonic() + _OVERLOADED_DRAIN_SECONDS,
+            )
+        except RuntimeError:
+            self._overloaded_refusal_slots.release()
+            return False
+        return True
+
+    def server_close(self):
+        self._overloaded_refusal_executor.shutdown(wait=True, cancel_futures=False)
+        super().server_close()
+
+    def process_request(self, request, client_address):
+        """Admit a connection, or refuse it before it costs a thread.
+
+        The slot is taken on the accept loop: taking it in the worker would
+        mean the thread already exists, which is the thing being bounded.
+        """
+        if WEB_ADMISSION_WAIT_SECONDS > 0:
+            admitted = self.connection_slots.acquire(timeout=WEB_ADMISSION_WAIT_SECONDS)
+        else:
+            admitted = self.connection_slots.acquire(blocking=False)
+        if not admitted:
+            self.refuse_overloaded(request, client_address)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # The worker never started, so nothing else will give the slot back.
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
+
+    def refuse_overloaded(self, request, client_address):
+        """Say no, in a way a client can act on, without starting a handler thread.
+
+        Written straight to the socket, since a handler is what this refuses to
+        create. A dropped connection would be indistinguishable from InkDrop
+        having crashed.
+
+        Once the response is sent, half-close the write side and briefly drain
+        request bytes that the client already queued. Closing with unread
+        received data can reset TCP and make the peer discard the 503. Both the
+        drain's byte count, wall time, worker count and pending population are
+        bounded. The accept loop never waits for the close grace.
+        """
+        self.refused_connections += 1
+        record_web_overload_refusal()
+        drain_deferred = False
+        try:
+            request.settimeout(2.0)
+            request.sendall(_OVERLOADED_RESPONSE)
+            request.shutdown(socket.SHUT_WR)
+            drain_deferred = self._defer_overloaded_drain(request)
+        except OSError:
+            pass
+        finally:
+            if not drain_deferred:
+                # The 128 pending grace sockets already match the kernel listen
+                # backlog. Beyond that hard bound, shed immediately rather than
+                # let an overload exhaust descriptors. The response was sent,
+                # but Windows may still reset this overflow connection.
+                try:
+                    self.close_request(request)
+                except OSError:
+                    pass
 
 
 def main():

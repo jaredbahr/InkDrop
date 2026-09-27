@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { request, InkDropApiError } from "../api";
+import { useLatestOnly } from "../latestOnly";
 import { useRowActions } from "../rowActions";
+import { SelectAllCheckbox, SelectionStatus, useFocusRetention } from "../selection";
 import type { ManualReviewRow, ManualReviewViewPayload } from "./manualReviewTypes";
 import { rowStateLabel } from "./stateLabel";
 
@@ -114,7 +116,7 @@ function reasonText(row: ManualReviewRow): string {
 
 // Distinguishes a stuck IMPORT (file downloaded, verification/import failed)
 // from a stuck SEARCH -- Reopen Import only makes sense for the former.
-// #572, the operator's request: say what series and unit were expected, and what we
+// The operator asked for this: say what series and unit were expected, and what we
 // actually found, so the operator can decide. The server already builds this
 // (decision_evidence(), core/inkdrop_import_evidence.py); it reaches the row
 // because MANUAL_REVIEW_COMPACT_ROW_KEYS now carries it.
@@ -123,7 +125,7 @@ function reasonText(row: ManualReviewRow): string {
 // judgement existing in two places with two answers is the most recurrent
 // defect on this project, so both surfaces read the same fields and use the
 // server's own sentence:
-//   no evidence      -> render nothing (payload predates #572)
+//   no evidence      -> render nothing (legacy payload)
 //   incomplete       -> say we do not know, never an empty Expected/Found pair
 //   otherwise        -> expected / found / why
 function evidenceBlock(row: ManualReviewRow) {
@@ -243,7 +245,7 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkIgnoring, setBulkIgnoring] = useState(false);
-  const { pendingIds, doneIds, actionError, clearActionError, runRowAction } = useRowActions(() => loadPage(offset));
+  const { pendingIds, doneIds, actionError, actionOutcome, clearActionError, runRowAction } = useRowActions(() => loadPage(offset));
 
   // A fresh `payload` reference arrives whenever the surrounding shell
   // re-fetched this section on our behalf -- filter change, section
@@ -264,22 +266,28 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
     setSelectedIds(new Set());
   }, [payload]);
 
+  // Only the newest list request may write to this section's state.
+  const listRequest = useLatestOnly();
+
   async function loadPage(nextOffset: number, nextSort?: string) {
+    const isCurrent = listRequest.begin();
     setLoading(true);
     setError(null);
     try {
       const data = await request<{ ok: boolean; view: ManualReviewViewPayload }>(
         buildEndpoint(nextOffset, manualReviewFilter, nextSort ?? sort),
       );
+      if (!isCurrent()) return;
       const view = data.view;
       setRows(view.rows || []);
       setOffset(view.offset ?? nextOffset);
       setTotalCount(view.total_count || 0);
       setHasMore(Boolean(view.has_more));
     } catch (cause) {
+      if (!isCurrent()) return;
       setError(cause instanceof InkDropApiError ? cause.message : "Could not load Manual Review page.");
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -366,7 +374,10 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
   // the pager text must describe what's actually on screen.
   const pageEnd = offset + visibleRows.length;
   const selectedCount = selectedIds.size;
-  const allSelectableSelected = selectableRows.length > 0 && selectableRows.every((row) => selectedIds.has(row.id));
+  const selectableIds = selectableRows.map((row) => row.id);
+  // See Wanted.tsx: acting on a review row removes it, and focus would
+  // otherwise land on <body> after every decision.
+  const tableRef = useFocusRetention(selectableIds.join(","));
 
   function toggleRowSelected(rowId: string, checked: boolean) {
     setSelectedIds((prev) => {
@@ -398,7 +409,7 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
   }
 
   return (
-    <div className="inkdrop-react-manual-review">
+    <div className="inkdrop-react-manual-review" ref={tableRef}>
       {(error || actionError) && (
         <div className="inkdrop-react-error-banner" role="alert">
           {error || actionError}
@@ -415,6 +426,7 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
             Ignore Selected
           </button>
           <span className="arr-table-selection-count">{selectedCount} selected</span>
+          <SelectionStatus selectableIds={selectableIds} selectedIds={selectedIds} outcome={actionOutcome} />
         </div>
         <div className="arr-table-controlbar-right">
           <label className="mr-sort-select">
@@ -440,12 +452,10 @@ export function ManualReview({ payload }: { payload: ManualReviewViewPayload }) 
         <thead>
           <tr>
             <th>
-              <input
-                type="checkbox"
-                aria-label="Select all visible rows"
-                checked={allSelectableSelected}
-                disabled={selectableRows.length === 0}
-                onChange={(event) => toggleSelectAll(event.target.checked)}
+              <SelectAllCheckbox
+                selectableIds={selectableIds}
+                selectedIds={selectedIds}
+                onChange={toggleSelectAll}
               />
             </th>
             <th>Series / Issue</th>

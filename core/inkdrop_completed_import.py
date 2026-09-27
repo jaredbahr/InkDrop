@@ -10,6 +10,7 @@ import atexit
 import errno
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import posixpath
@@ -1335,6 +1336,41 @@ def copy_collection_archive(source, dest, collection):
     return {"normalized_archive": False}
 
 
+_PUBLISH_LINK = os.link
+
+
+def _copy_file_no_clobber(source, dest):
+    """Copy through a durable sibling, then atomically publish without overwrite."""
+    source = Path(source)
+    dest = Path(dest)
+    placeholder_created = False
+    published = False
+    tmp = None
+    try:
+        with dest.open("xb"):
+            placeholder_created = True
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
+        os.close(fd)
+        tmp = Path(tmp_name)
+        shutil.copy2(source, tmp)
+        with tmp.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, dest)
+        tmp = None
+        published = True
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        if placeholder_created and not published:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+
+
 def place_import_file(source, dest, *, hardlink=False):
     """Place source at dest, preserving the source bytes exactly.
 
@@ -1356,13 +1392,13 @@ def place_import_file(source, dest, *, hardlink=False):
     dest = Path(dest)
     if hardlink:
         try:
-            os.link(source, dest)
+            _PUBLISH_LINK(source, dest)
             return {"placement_method": "hardlink"}
         except OSError as exc:
             fallback_reason = "cross_device" if getattr(exc, "errno", None) == errno.EXDEV else "hardlink_failed"
-            shutil.copy2(source, dest)
+            _copy_file_no_clobber(source, dest)
             return {"placement_method": "copy", "hardlink_requested": True, "hardlink_fallback_reason": fallback_reason}
-    shutil.copy2(source, dest)
+    _copy_file_no_clobber(source, dest)
     return {"placement_method": "copy"}
 
 
@@ -3452,6 +3488,10 @@ def write_json_atomic(path, payload):
     os.replace(temporary, path)
 
 
+_IMPORT_STATUS_EVENT_SEQUENCE = itertools.count()
+_IMPORT_STATUS_EVENT_SEQUENCE_LOCK = threading.Lock()
+
+
 def persist_import_status_event(payload):
     """Keep each completed import until state reconciliation commits it."""
     events_dir = STATE_DIR / "import-status-events"
@@ -3460,7 +3500,14 @@ def persist_import_status_event(payload):
     if len(serialized.encode("utf-8")) > MAX_IMPORT_STATUS_EVENT_BYTES:
         raise RuntimeError("completed import status is too large to persist safely")
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
-    event_name = f"{time.time_ns()}-{os.getpid()}-{digest}.json"
+    # write_json_atomic ends in os.replace, which silently overwrites. Two
+    # identical payloads from one process inside one clock tick (15.6 ms on
+    # Windows) used to share a name, so one completed import was lost. The
+    # per-process sequence makes every name unique; it is zero-padded so the
+    # consumer's lexical sort (pending_import_status_events) keeps write order.
+    with _IMPORT_STATUS_EVENT_SEQUENCE_LOCK:
+        sequence = next(_IMPORT_STATUS_EVENT_SEQUENCE)
+    event_name = f"{time.time_ns()}-{os.getpid()}-{sequence:012d}-{digest}.json"
     write_json_atomic(events_dir / event_name, payload)
     return events_dir / event_name
 
@@ -3622,6 +3669,53 @@ def append_manual_review(reason, payload, db_path=None):
         pass
 
 
+# A CRC pass decompresses every member, so its cost is set by what the archive
+# expands to rather than by how big the archive is. zipfile.testzip() has no
+# budget of its own: it will expand a 100:1 member to whatever it expands to,
+# on a file this function is being asked to form an opinion about precisely
+# because it may be malformed. These bound the pass; exceeding them is the
+# "undetermined" outcome, never "invalid" -- a check that was refused for cost
+# proves nothing about the bytes.
+ARCHIVE_CRC_MAX_BYTES = 8 * 1024 * 1024 * 1024
+ARCHIVE_CRC_MAX_SECONDS = float(os.environ.get("INKDROP_ARCHIVE_CRC_MAX_SECONDS") or 120)
+ARCHIVE_CRC_CHUNK_BYTES = 1024 * 1024
+
+
+def _crc_check_bounded(archive):
+    """testzip(), under a byte budget and a deadline.
+
+    Returns (bad_member, read_error, budget_note) -- exactly one is truthy, or
+    none of them when every member verified. Reading a member to EOF is what
+    validates its CRC; zipfile raises BadZipFile naming the member, which is
+    the same verdict testzip() reports by returning that name.
+    """
+    deadline = time.monotonic() + ARCHIVE_CRC_MAX_SECONDS
+    total = 0
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        try:
+            with archive.open(info) as member:
+                while True:
+                    if time.monotonic() > deadline:
+                        return None, None, f"CRC check exceeded {ARCHIVE_CRC_MAX_SECONDS:g}s"
+                    chunk = member.read(ARCHIVE_CRC_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > ARCHIVE_CRC_MAX_BYTES:
+                        return None, None, f"CRC check exceeded {ARCHIVE_CRC_MAX_BYTES} decompressed bytes"
+        except zipfile.BadZipFile as exc:
+            # A CRC mismatch is a verdict about this member. Anything else
+            # BadZipFile covers is our read failing, not a proven mismatch.
+            if "crc" in str(exc).lower():
+                return info.filename, None, ""
+            return None, str(exc), ""
+        except Exception as exc:  # noqa: BLE001 -- same breadth testzip() had here
+            return None, str(exc), ""
+    return None, None, ""
+
+
 def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
     """Classify an archive as valid, invalid, or not-determinable.
 
@@ -3666,12 +3760,7 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
                     if not info.is_dir() and Path(info.filename).suffix.lower() in COMIC_IMAGE_EXTS
                 ]
                 payload_size = sum(info.file_size for info in images)
-                try:
-                    bad_member = archive.testzip()
-                    bad_member_error = None
-                except Exception as exc:
-                    bad_member = None
-                    bad_member_error = str(exc)
+                bad_member, bad_member_error, budget_note = _crc_check_bounded(archive)
         except zipfile.BadZipFile:
             return {"ok": False, "outcome": "invalid", "reason": "bad_zip_archive", "page_count": 0, "payload_size": 0}
         except OSError as exc:
@@ -3700,7 +3789,7 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
                 "bad_member": bad_member,
             }
         if bad_member_error:
-            # testzip() itself raised. That is our read failing part-way, not
+            # The read itself raised. That is our read failing part-way, not
             # a proven CRC mismatch, so it cannot be reported as a bad member.
             return {
                 "ok": False,
@@ -3709,6 +3798,19 @@ def validate_comic_archive(path, min_pages=3, min_payload_bytes=1024 * 1024):
                 "page_count": len(images),
                 "payload_size": payload_size,
                 "error": bad_member_error,
+            }
+        if budget_note:
+            # The check was refused for cost, not failed for content. That is
+            # the third outcome this function exists to keep separate: nothing
+            # was proven about these bytes, so it must not be counted as
+            # corruption by the library-wide integrity scan.
+            return {
+                "ok": False,
+                "outcome": "undetermined",
+                "reason": "archive_check_budget_exceeded",
+                "page_count": len(images),
+                "payload_size": payload_size,
+                "error": budget_note,
             }
         if len(images) < min_pages:
             return {"ok": False, "outcome": "invalid", "reason": "too_few_image_pages", "page_count": len(images), "payload_size": payload_size}
@@ -4890,28 +4992,57 @@ def maybe_inject_covers_after_import(folders):
     correctly. Returns the folders whose archives actually changed so the caller
     can refresh exactly those.
     """
+    folders = sorted(folders or [])
     try:
         from core import inkdrop_cover_injection
-
         result = inkdrop_cover_injection.maybe_inject_for_folders(
-            sorted(folders or []), reason="import", refresh=False
+            folders, db_path=INKDROP_STATE_DB, reason="import", refresh=False
         )
     except Exception as exc:
-        log({"event": "cover_injection_after_import_failed",
-             "error": f"{type(exc).__name__}: {exc}"})
-        return {"changed_folders": [], "ok": False}
-    if result.get("changed_folders"):
+        error = f"{type(exc).__name__}: {exc}"
+        log({"event": "cover_injection_after_import_failed", "folders": folders, "error": error})
+        return {"changed_folders": [], "renamed_folders": [], "ok": False,
+                "reason": "unhandled_error", "error": error}
+
+    for row in result.get("results") or []:
         log({
-            "event": "cover_injection_after_import",
-            "changed_folders": result["changed_folders"],
-            "series": [
-                {"series_id": row.get("series_id"), "title": row.get("title"),
-                 "reason": row.get("reason")}
-                for row in result.get("results") or []
-                if row.get("changed")
-            ],
+            "event": "cover_injection_series_outcome",
+            "series_id": row.get("series_id"),
+            "title": row.get("title"),
+            "folder": row.get("folder"),
+            "status": row.get("status"),
+            "reason": row.get("reason"),
+            "changed": bool(row.get("changed")),
+            "history_event": row.get("history_event"),
         })
     return result
+
+
+def refresh_cover_injection_readers(cover_injection):
+    """Finish reader-specific refreshes after the normal folder sync."""
+    # Kavita keeps its cached cover through a scan, even a forced one, so a
+    # rewritten archive needs its metadata refresh on top of the sync.
+    for folder in cover_injection.get("changed_folders") or []:
+        try:
+            trigger_kavita_cover_refresh_folder(folder)
+        except Exception as exc:
+            log({
+                "event": "cover_injection_kavita_refresh_failed",
+                "folder": folder,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    # A republished CBR lands under a new CBZ name, and a retarget can
+    # restore that CBZ to its original CBR name. Komga soft-deletes the old
+    # book, so either direction needs trash emptied after the scan.
+    for folder in cover_injection.get("renamed_folders") or []:
+        try:
+            trigger_komga_empty_trash_folder(folder)
+        except Exception as exc:
+            log({
+                "event": "cover_injection_komga_empty_trash_failed",
+                "folder": folder,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
 
 def trigger_komga_empty_trash_folder(host_folder):
@@ -6285,6 +6416,31 @@ def unique_dest_name(dest_dir, filename):
         counter += 1
 
 
+def matching_existing_file(candidate, source, *, direct=False):
+    """Return candidate when it represents the same unit as source.
+
+    A byte-identical file (size, then sha256) always matches.  InkDrop rewrites
+    or converts every imported archive, so a completed import no longer equals
+    its source; for the exact planned canonical path (direct=True, where the
+    caller chose the path) a structurally valid archive also matches.  A
+    same-named file elsewhere in the tree is not proof of the same unit.
+    """
+    candidate = Path(candidate)
+    try:
+        if not candidate.is_file():
+            return None
+        try:
+            if candidate.stat().st_size == Path(source).stat().st_size and sha256(candidate) == sha256(source):
+                return candidate
+        except OSError:
+            pass
+        if direct and validate_comic_archive(candidate, min_pages=1, min_payload_bytes=1).get("ok"):
+            return candidate
+        return None
+    except OSError:
+        return None
+
+
 def existing_canonical_dest(target_dir, canonical, source):
     if not canonical:
         return None
@@ -6300,38 +6456,19 @@ def existing_canonical_dest(target_dir, canonical, source):
         names.append(base.name)
     if source.suffix.lower() in {".cbr", ".zip"} or source.name.lower().endswith(".cbz.zip"):
         names.append(base.with_suffix(".cbz").name)
-    try:
-        source_size = source.stat().st_size
-    except OSError:
-        return None
-    source_digest = None
-    # A shared filename is not proof of shared content: two different
-    # volumes/series can land on the same canonical name. Only report a
-    # candidate here once its bytes are confirmed identical to the source,
-    # the same size-then-sha256 identity check used elsewhere for duplicate
-    # detection (see find_same_file above).
+    # A shared filename is not proof of shared content: only the direct
+    # top-level canonical path may match on structure alone; subfolder matches
+    # need identical bytes (see matching_existing_file).
     for name in dict.fromkeys(names):
-        candidates = [Path(target_dir) / name]
+        direct_path = Path(target_dir) / name
+        candidates = [direct_path]
         try:
             candidates.extend(Path(target_dir).rglob(name))
         except OSError:
             pass
         for candidate in dict.fromkeys(candidates):
-            try:
-                if not candidate.is_file() or candidate.stat().st_size != source_size:
-                    continue
-            except OSError:
-                continue
-            if source_digest is None:
-                try:
-                    source_digest = sha256(source)
-                except OSError:
-                    return None
-            try:
-                if sha256(candidate) == source_digest:
-                    return candidate
-            except OSError:
-                continue
+            if matching_existing_file(candidate, source, direct=candidate == direct_path):
+                return candidate
     return None
 
 
@@ -6358,14 +6495,14 @@ def find_same_file(dest_dir, source, digest):
 COPY_SUFFIX_RE = re.compile(r"^(?P<stem>.+?) \((?P<counter>[2-9][0-9]*)\)(?P<suffix>\.[^.]+)$")
 
 
-def suffixless_existing_dest(dest):
-    """Return the base file when a generated '(2)' style destination already exists."""
+def suffixless_existing_dest(dest, source):
+    """Return the base file only when it matches source or is a complete archive."""
     dest = Path(dest)
     match = COPY_SUFFIX_RE.match(dest.name)
     if not match:
         return None
     base = dest.with_name(f"{match.group('stem')}{match.group('suffix')}")
-    return base if base.exists() else None
+    return matching_existing_file(base, source, direct=True)
 
 
 def clean_words(value):
@@ -6440,8 +6577,89 @@ def safe_filename_part(value):
     return cleaned or "Unknown"
 
 
+def _parent_names_a_numeric_span(parent_name):
+    # A range-pack folder like "1992 The Spectre v3 (00 - 62 +extra) (1992)"
+    # or "Kingdom v01-v06 (001-037)" names the whole span it holds, not one
+    # unit -- so its own volume/issue-shaped tokens must not outrank a number
+    # already present in the file's own stem.
+    return bool(re.search(r"\b\d{1,4}\s*-\s*\d{1,4}\b", str(parent_name or "")))
+
+
+def _parent_names_a_series_run_volume(parent_name, stem):
+    # A western series run may be distributed beneath "Spawn v1 (1992-)" or
+    # "Spider-Man Noir Vol 2", while each child still names an issue.  The
+    # path parser has no target/media context, so this bypass needs positive
+    # evidence from both path components instead of treating every volume
+    # folder plus year-bearing child as a series run.
+    parent_text = str(parent_name or "")
+    stem_text = str(stem or "")
+    volume = re.search(
+        r"(?i)(?:^|[^A-Za-z0-9])(?:v|vol|volume)\.?\s*(\d{1,4})\b",
+        parent_text,
+    )
+    publication_year = re.search(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", stem_text)
+    if not volume or not publication_year:
+        return False
+
+    # These labels name a collected-edition or chapter/part unit, not an
+    # issue.  Falling back to the joined parent+stem parser deliberately keeps
+    # the containing volume identity (the conservative false negative).
+    non_issue_unit = re.search(
+        r"(?i)(?:^|[\s._-])(?:book|chapter|ch|part|vol|volume|omnibus|collection|compendium|tpb|trade[\s._-]+paperback)"
+        r"[\s._-]*(?:#\s*)?\d",
+        stem_text,
+    )
+    if non_issue_unit:
+        return False
+
+    explicit_issue = re.search(
+        r"(?i)(?:^|[\s._-])(?:#\s*|issue[\s._-]*|annual[\s._-]+)0*\d",
+        stem_text,
+    )
+    if explicit_issue:
+        return True
+
+    # A bare child number is ambiguous.  Admit it only when the parent itself
+    # identifies the beginning of a run, carries an open-ended run year, or
+    # uses one of the two observed series-run folder shapes: a leading series
+    # year or a post-year run subtitle.  A closed year after the volume token
+    # alone is publication metadata and must not turn a manga/collected child
+    # into issue identity.
+    open_run_year = re.search(
+        r"[\(\[]\s*(?:19|20)\d{2}\s*-\s*[\)\]]",
+        parent_text,
+    )
+    leading_series_year = re.match(
+        r"^\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]\s+\S",
+        parent_text,
+    )
+    post_year_run_subtitle = re.search(
+        r"(?i)(?:v|vol|volume)\.?\s*\d{1,4}\b"
+        r".*?[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]"
+        r"\s*[-\u2013\u2014:]\s*\S",
+        parent_text,
+    )
+    parent_run_evidence = (
+        int(volume.group(1)) == 1
+        or open_run_year
+        or leading_series_year
+        or post_year_run_subtitle
+    )
+    bare_issue = re.search(
+        r"(?:^|[\s._-])0*\d{1,5}(?:\.\d+)?(?![A-Za-z0-9])",
+        stem_text,
+    )
+    return bool(parent_run_evidence and bare_issue)
+
+
 def extract_issue_number(path):
-    text = " ".join([Path(path).stem, Path(path).parent.name])
+    stem = Path(path).stem
+    parent_name = Path(path).parent.name
+    if _parent_names_a_numeric_span(parent_name) or _parent_names_a_series_run_volume(parent_name, stem):
+        stem_number = _issue_number_from_text(stem)
+        if stem_number is not None:
+            return stem_number
+    text = " ".join([stem, parent_name])
     number = _issue_number_from_text(text)
     # AN UNDERSCORE IS A DELIMITER, AND ONLY THE LEADING SIDE FORGOT IT.
     # The trailing boundary below was already fixed for `_` (no_alnum_after,
@@ -6480,6 +6698,30 @@ def extract_issue_number(path):
         if not filename_has_chapter_token(spaced):
             number = _issue_number_from_text(text.replace("_", " "))
     return number
+
+
+# How many issues the run holds, written after the unit: "#1 (of 12)",
+# "[of 12]", "003 of 60". That number is release metadata, not a unit. Two
+# shapes only, each narrow enough to name in one line:
+#   * a bracketed "(of N)" / "[of N]", anywhere in the name;
+#   * "of N" directly after a number ("003 of 60"), because a unit came first.
+# A bare "of N" with no number before it ("Book of 5", "Hall of 12") is left
+# alone: there the N may be all the name says. N is 1-3 digits, so "(of 2019)"
+# and "Top 10 of 2019" keep their year.
+_ISSUE_TOTAL_MARKER_RE = re.compile(
+    r"(?i)[\(\[]\s*of\s*\d{1,3}(?!\d)\s*[\)\]]"
+    r"|(?<=\d)[\s._\-]+of[\s._\-]+\d{1,3}(?![A-Za-z0-9])"
+)
+
+
+def strip_issue_total_markers(text):
+    """`text` with every "(of N)" / "003 of N" run-length marker blanked.
+
+    For scans that read EVERY number in a filename as a candidate unit: left in
+    place, "Watchmen #1 (of 12).cbr" is also issue 12, and the folder index
+    credited it to the real #12.
+    """
+    return _ISSUE_TOTAL_MARKER_RE.sub(" ", str(text or ""))
 
 
 def _issue_number_from_text(text):
@@ -6553,7 +6795,17 @@ def format_issue_number(number):
 def source_contains_trusted_issue_number(path, expected):
     if not expected:
         return False
-    text = " ".join([Path(path).stem, Path(path).parent.name])
+    # A "(of N)" run length is not a unit: "Watchmen #1 (of 12)" does not
+    # contain issue 12, so it may not clear a trusted-issue mismatch for it.
+    source_path = Path(path)
+    parts = [source_path.stem]
+    # A range parent says which issues the pack contains, not which issue this
+    # leaf is.  Letting "#1-50" supply trusted issue 1 rescued a leaf naming
+    # #18 past the mismatch gate.  Non-range parents keep their existing
+    # fallback for numberless files in single-issue folders.
+    if not _parent_names_a_numeric_span(source_path.parent.name):
+        parts.append(source_path.parent.name)
+    text = " ".join(strip_issue_total_markers(part) for part in parts)
     for match in re.finditer(r"(?<!\d)(\d{1,5}(?:\.\d+)?)(?!\d)", text):
         before = text[: match.start()]
         if re.search(r"(?:^|[\s._\-\(\[])(?:v|vol|volume)[\s._-]*$", before, re.I):
@@ -7201,6 +7453,13 @@ def inkdrop_series_targets(series_filter=None):
             issue_counts[row["series_id"]] = int(row["issue_count"] or 0)
             if issue_counts[row["series_id"]] == 1:
                 single_issue_numbers[row["series_id"]] = str(row["only_issue_number"] or "").strip()
+        # Every series counts, monitored or not: a newer same-title volume the
+        # library merely holds still owns the years of its own era.
+        volumes_by_title = {}
+        for volume in conn.execute("select title, year from series where title is not null"):
+            volumes_by_title.setdefault(normalize(volume["title"]), []).append(
+                {"title": volume["title"], "year": volume["year"]}
+            )
     except sqlite3.Error:
         return []
     finally:
@@ -7255,6 +7514,9 @@ def inkdrop_series_targets(series_filter=None):
                 "aliases": [normalize(alias) for alias in aliases if normalize(alias)],
                 "canonical_issue_count": issue_counts.get(row["id"], 0),
                 "canonical_single_issue_number": single_issue_numbers.get(row["id"]) or None,
+                "newer_volume_years": newer_volume_years(
+                    {"title": title, "year": row["year"]}, volumes_by_title.get(title_norm)
+                ),
             }
         )
     return targets
@@ -7553,7 +7815,7 @@ def existing_file_unit_number(dest_path, unit_number):
     The event is for bytes already in the library, so the unit it names must be the one
     the library copy is named as. The importer's own unit for this file (a queue issue
     or a catalog/filename hint) is claimed only when the library copy's name agrees:
-    a source named 002 whose bytes sit at #001 claims nothing rather than proving #002.
+    a source named 002 whose bytes sit at #001 claims nothing rather than proving issue 002.
     """
     expected = format_issue_number(unit_number) if unit_number not in (None, "") else ""
     if not expected:
@@ -7562,6 +7824,60 @@ def existing_file_unit_number(dest_path, unit_number):
     if present is None or format_issue_number(present) != expected:
         return None
     return expected
+
+
+_EXPLICIT_HASH_ISSUE_RE = re.compile(r"(?:^|[\s._\-\(\[])#\s*0*(\d{1,5}(?:\.\d+)?)(?![A-Za-z0-9])", re.I)
+
+
+def _explicit_hash_issue_number(stem):
+    """The stem's own explicit ``#NNN`` token, or None.
+
+    Deliberately narrower than `extract_issue_number()`: a manga default-template name
+    like "Berserk v03 c072" states its chapter with `c072`, not `#`, and must not be
+    read as an explicit issue claim here -- only the importer's own canonical comic
+    naming (`Title #NNN (Year).cbz`) uses `#`.
+    """
+    match = _EXPLICIT_HASH_ISSUE_RE.search(stem)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def cross_unit_byte_match(source_path, dest_path, trusted_issue):
+    """True only when the SOURCE's own stem explicitly names the trusted unit and the
+    DEST's own stem explicitly names a *different* one via `#NNN`.
+
+    Both sides must make their own explicit claim, read from their own stem alone,
+    never a parent folder:
+    - `source_contains_trusted_issue_number()` lets a pack-range folder token
+      ("#1-29") rescue a wrong queue issue past the earlier name gates, so this
+      function reads only the source's own stem -- a source silent on its own unit,
+      or one that merely agrees with the dest, still credits the dest as it always
+      has.
+    - The dest's own stem must carry `_explicit_hash_issue_number()`. An unnumbered
+      dest (a one-shot, an OGN) or one with only a chapter/volume marker is left
+      alone -- it claims nothing either way, same as `existing_file_unit_number()`.
+
+    Crediting bytes as "already imported" at a dest that explicitly disagrees with
+    a source that explicitly claims the trusted unit, and caching the sha256 against
+    that dest, is what let 26 wanted units keep finding the wrong issue's file on
+    every later download.
+    """
+    if trusted_issue in (None, ""):
+        return False
+    expected = format_issue_number(trusted_issue)
+    if not expected:
+        return False
+    dest_number = _explicit_hash_issue_number(Path(dest_path).stem)
+    if dest_number is None or format_issue_number(dest_number) == expected:
+        return False
+    source_number = _issue_number_from_text(Path(source_path).stem)
+    if source_number is None or format_issue_number(source_number) != expected:
+        return False
+    return True
 
 
 def _existing_file_event(kind, path, dest_path, digest, dry_run, target, collection, unit_number=None):
@@ -8128,10 +8444,29 @@ def media_management_import_destination_decision(target=None, event=None, source
         )
         if gated is not None:
             return gated
+        # The authoritative folder was learned after the first collision
+        # check.  Never redirect around a file discovered only by this
+        # recompute: that would re-split the work we just converged.
+        # Remaining limit: this branch trusts existence alone, so a truncated
+        # or zero-byte file at the recomputed path is still treated as present.
+        if planned.exists():
+            decision.update(
+                {
+                    "selected_dest_path": str(planned),
+                    "skip_existing_destination": True,
+                    "reason": "planned_path_exists",
+                    "conflict_action": str((preview or {}).get("conflict_action") or "skip_existing"),
+                }
+            )
+            preview["planned_path_apply_status"] = "blocked_existing_destination"
+            preview["planned_path_applied"] = False
+            preview["selected_import_dest_path"] = str(planned)
+            preview["legacy_import_dest_path"] = decision["legacy_dest_path"]
+            return planned, preview, decision
     existing_text = str((preview or {}).get("existing_dest_path") or "").strip()
     if existing_text:
         existing_path = Path(existing_text)
-        if existing_path.exists():
+        if matching_existing_file(existing_path, source_path, direct=existing_path == planned):
             decision.update(
                 {
                     "selected_dest_path": str(existing_path),
@@ -8148,7 +8483,7 @@ def media_management_import_destination_decision(target=None, event=None, source
             preview["current_import_dest_path"] = decision["selected_dest_path"]
             preview["current_import_dest_matches_preview"] = False
             return existing_path, preview, decision
-    if planned.exists():
+    if matching_existing_file(planned, source_path, direct=True):
         decision.update(
             {
                 "selected_dest_path": str(planned),
@@ -8165,6 +8500,12 @@ def media_management_import_destination_decision(target=None, event=None, source
         preview["current_import_dest_path"] = decision["selected_dest_path"]
         preview["current_import_dest_matches_preview"] = True
         return planned, preview, decision
+    if planned.exists():
+        planned = unique_dest_name(planned.parent, planned.name)
+        planned_text = str(planned)
+        decision["planned_path"] = planned_text
+        preview["planned_path"] = planned_text
+        preview["conflict_action"] = "preserve_mismatched_existing_and_import_unique"
     decision.update(
         {
             "selected_dest_path": str(planned),
@@ -9029,6 +9370,59 @@ def filename_year_matches(path, target):
     return bool(re.search(rf"(?:^|[^\d]){re.escape(expected)}(?:[^\d]|$)", Path(path).stem))
 
 
+def newer_volume_years(target, volumes):
+    """Start years of other known volumes titled like `target` and begun after it."""
+    title = normalize((target or {}).get("title") or (target or {}).get("series") or "")
+    start = str((target or {}).get("year") or "").strip()
+    if not title or not start.isdigit():
+        return []
+    years = set()
+    for volume in volumes or ():
+        year = str((volume or {}).get("year") or "").strip()
+        if year.isdigit() and int(year) > int(start) and normalize(volume.get("title") or volume.get("series") or "") == title:
+            years.add(int(year))
+    return sorted(years)
+
+
+def filename_other_volume_reason(path, target):
+    """Why this leaf names another volume or series than the target, or "".
+
+    Scoring finds title words anywhere in a name and counts the year only as a
+    bonus, so `Invincible Universe Battle Beast #001` passed as Beast (2009) #1
+    and `Batman 001 (1940)` as Batman (2016) #1 (audit 2026-09-26 H1). Two
+    vetoes, both taking the false negative: a bracketed year before the series
+    began (or one inside a newer same-title volume's era, listed in the target's
+    `newer_volume_years`; a later cover year alone is ordinary), and extra words
+    ahead of the title when no alias starts the name.
+    """
+    if is_manga_target(target):
+        return ""
+    stem = Path(path).stem
+    start_year = str((target or {}).get("year") or "").strip()
+    stated = re.search(r"[(\[]\s*((?:19|20)\d{2})\b", stem)
+    if stated and re.fullmatch(r"(?:19|20)\d{2}", start_year) and int(stated.group(1)) < int(start_year):
+        return f"filename year {stated.group(1)} is before the series began in {start_year}"
+    if stated and start_year.isdigit():
+        for newer in (target or {}).get("newer_volume_years") or ():
+            if int(start_year) < int(newer) <= int(stated.group(1)):
+                return f"filename year {stated.group(1)} falls in the volume that began in {newer}, not {start_year}"
+    aliases = [alias.split() for alias in target_aliases(target) if alias.split()]
+    words = []
+    # Each " - " part may open the name: `Alan Moore - Watchmen #1` is Watchmen.
+    for part in re.split(r"\s+-\s+", re.sub(r"^(?:\s*\[[^\]]*\]\s*)+", "", stem)):
+        part_words = clean_words(part)
+        while part_words and (part_words[0].isdigit() or part_words[0] in LEADING_TITLE_ARTICLES):
+            part_words = part_words[1:]
+        if any(part_words[: len(alias)] == alias for alias in aliases):
+            return ""
+        words = words or part_words
+    for alias in aliases:
+        for index in range(1, len(words) - len(alias) + 1):
+            if words[index : index + len(alias)] == alias:
+                return "extra words before the series title: " + " ".join(words[:index][:5])
+    return ""
+
+
 def comicinfo_unit_matches(info, trusted_issue=None, source_number=None):
     info = info or {}
     number = comicinfo_text(info, "Number") or comicinfo_text(info, "Volume")
@@ -9229,6 +9623,9 @@ def classify_import_filename_safety(
             "wrong_series_or_subseries",
             related_subseries_reason,
         )
+    other_volume_reason = filename_other_volume_reason(path, target)
+    if other_volume_reason:
+        return reject("wrong_series_or_subseries", other_volume_reason)
 
     title_alias = matching_target_alias(stem_words, target)
     parent_alias = matching_target_alias(parent_words, target)
@@ -10323,7 +10720,11 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
             existing = None if dry_run else conn.execute("select dest from imported_files where sha256=?", (digest,)).fetchone()
             if existing:
                 existing_dest = Path(existing[0])
-                if existing_dest.exists() and (not target or existing_dest.parent == target_dir):
+                if (
+                    existing_dest.exists()
+                    and (not target or existing_dest.parent == target_dir)
+                    and not cross_unit_byte_match(path, existing_dest, file_trusted_issue)
+                ):
                     event = _existing_file_event(kind, path, existing_dest, digest, dry_run, target, collection, unit_number=file_trusted_issue)
                     if kind == "comics" and target:
                         _flush_pending_write_before_slow_verification(conn)
@@ -10354,6 +10755,26 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     continue
             if not dry_run:
                 same_file = find_same_file(target_dir, path, digest)
+                if same_file and cross_unit_byte_match(path, same_file, file_trusted_issue):
+                    event = {
+                        "event": "skip_cross_unit_byte_identity",
+                        "kind": kind,
+                        "source": str(path),
+                        "dest": str(same_file),
+                        "size": path.stat().st_size,
+                        "sha256": digest,
+                        "dry_run": dry_run,
+                        "matched_series": target["title"] if target else None,
+                        "matched_series_folder": target["folder"] if target else None,
+                        "matched_kapowarr_id": target["id"] if target else None,
+                        "trusted_issue": file_trusted_issue,
+                        "skip_reason": "byte_identical_to_a_file_naming_another_unit",
+                        "action_needed": "review",
+                    }
+                    event.update(target_identity_fields(target))
+                    log(event)
+                    skipped.append(event)
+                    continue
                 if same_file:
                     event = _existing_file_event(kind, path, same_file, digest, dry_run, target, collection, unit_number=file_trusted_issue)
                     if kind == "comics" and target:
@@ -10421,7 +10842,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                 dest, canonical = unique_dest(target_dir, path), None
             canonical_existing = existing_canonical_dest(target_dir, canonical, path) if kind == "comics" and target and not collection else None
             if not canonical_existing and kind == "comics" and target and not collection:
-                canonical_existing = suffixless_existing_dest(dest)
+                canonical_existing = suffixless_existing_dest(dest, path)
             if canonical_existing and canonical_existing.resolve() != Path(path).resolve():
                 event = {
                     "event": "skip_canonical_already_present",
@@ -10687,7 +11108,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
                     if is_manga_target(target):
                         event["truth_model"] = "kavita_manga"
                         event["normalized_archive"]["truth_model"] = "kavita_manga"
-                post_normalize_existing = suffixless_existing_dest(dest) if target and not collection else None
+                post_normalize_existing = suffixless_existing_dest(dest, path) if target and not collection else None
                 if post_normalize_existing and post_normalize_existing.resolve() != Path(path).resolve():
                     event.update(
                         {
@@ -10851,6 +11272,11 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
     # issues against or queue a rescan for.
     missing_before = {}
     kapowarr_scan_tasks = []
+    cover_injection = (
+        maybe_inject_covers_after_import(kavita_scan_folders)
+        if not dry_run and kind == "comics" and imported
+        else {"changed_folders": [], "renamed_folders": [], "ok": True}
+    )
     frontend_sync = (
         sync_library_frontend_folders(
             kavita_scan_folders,
@@ -10865,6 +11291,7 @@ def import_files(kind, dry_run=False, min_age_seconds=600, ignore_cutoff=False, 
         "kavita": kavita_scan_tasks,
         "komga": komga_scan_tasks,
     }
+    refresh_cover_injection_readers(cover_injection)
     if wait_for_library_scan and not dry_run and (kapowarr_scan_tasks or kavita_scan_tasks or komga_scan_tasks):
         time.sleep(20)
     verification_timeout = SOURCE_FILE_SCAN_TIMEOUT_SECONDS if explicit_sources else MANGA_SCAN_TIMEOUT_SECONDS
@@ -11016,32 +11443,7 @@ def verify_last_status():
         force_library_scan_folders=force_library_scan_folders,
         event_prefix="verify_",
     )
-    # Kavita keeps its cached cover through a scan, even a forced one, so a
-    # rewritten archive needs its metadata refresh on top of the sync above.
-    for folder in cover_injection.get("changed_folders") or []:
-        try:
-            trigger_kavita_cover_refresh_folder(folder)
-        except Exception as exc:
-            log({
-                "event": "cover_injection_kavita_refresh_failed",
-                "folder": folder,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-    # A republished CBR lands under a new .cbz name. Komga soft-deletes the old
-    # book rather than forgetting it, and of two books with the same name the
-    # stale one can still win as the series' first book -- so the rename needs
-    # its trash emptied on top of the scan above. cover injection has always
-    # reported `renamed_folders` for exactly this; nothing consumed it, so the
-    # scan ran and the stale book stayed authoritative.
-    for folder in cover_injection.get("renamed_folders") or []:
-        try:
-            trigger_komga_empty_trash_folder(folder)
-        except Exception as exc:
-            log({
-                "event": "cover_injection_komga_empty_trash_failed",
-                "folder": folder,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+    refresh_cover_injection_readers(cover_injection)
     kavita_scan_tasks = frontend_sync.get("kavita") or []
     komga_scan_tasks = frontend_sync.get("komga") or []
     library_scan_tasks = frontend_sync.get("library_scan_tasks") or {

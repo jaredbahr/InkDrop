@@ -196,7 +196,18 @@ def validate_value(key, value):
             raise ValueError(f"{key} must be a finite number")
         if parsed < schema["min"] or parsed > schema["max"]:
             raise ValueError(f"{key} must be between {schema['min']} and {schema['max']}")
-        return int(parsed) if schema.get("integer") else parsed
+        if schema.get("integer"):
+            # int() here is a truncation, not a conversion: it accepted 1.9
+            # days of backup interval and stored 1, changing what the
+            # operator asked for without ever saying so. An integer field is
+            # integer-valued, so a fractional component is a bad input and
+            # gets a field-specific error. Whole-valued input in any form the
+            # registry already accepted -- 2, 2.0, "2", "2.0" -- still passes,
+            # because none of those carries a fraction to lose.
+            if parsed != int(parsed):
+                raise ValueError(f"{key} must be a whole number")
+            return int(parsed)
+        return parsed
     if kind == "choice":
         parsed = str(value or "").strip().lower()
         if parsed not in schema["choices"]:

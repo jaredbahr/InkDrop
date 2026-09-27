@@ -47,6 +47,17 @@ export function useRowActions(reload: () => void | Promise<void>) {
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(new Set());
   const [doneIds, setDoneIds] = useState<ReadonlyMap<string, string>>(new Map());
   const [failure, setFailure] = useState<ActionFailure | null>(null);
+  // What a screen reader is told when a burst of row actions settles. The
+  // visible row labels and the error banner are both sighted-only feedback:
+  // clicking Search on six rows and having all six succeed produced no
+  // announcement whatsoever. Announced once per burst, not once per row --
+  // six separate utterances for one gesture is noise, not information.
+  //
+  // Only successes come through here. Failures already own a role="alert"
+  // banner, and routing them to a second region would say the same thing
+  // twice.
+  const [actionOutcome, setActionOutcome] = useState<string | null>(null);
+  const succeededLabels = useRef<string[]>([]);
   const reloadTimer = useRef<number>(0);
   const inFlight = useRef(0);
   // Click order, not completion order. Assigned before the request goes out
@@ -66,6 +77,12 @@ export function useRowActions(reload: () => void | Promise<void>) {
     window.clearTimeout(reloadTimer.current);
     reloadTimer.current = window.setTimeout(() => {
       if (inFlight.current === 0) {
+        // The burst is over: everything clicked has settled. This is the
+        // moment that carries one announcement rather than N.
+        const done = succeededLabels.current;
+        succeededLabels.current = [];
+        if (done.length === 1) setActionOutcome(`${done[0]} done.`);
+        else if (done.length > 1) setActionOutcome(`${done.length} actions completed.`);
         setDoneIds(new Map());
         void reloadRef.current();
       } else {
@@ -89,6 +106,7 @@ export function useRowActions(reload: () => void | Promise<void>) {
     try {
       await action();
       setDoneIds((prev) => new Map(prev).set(id, doneLabel));
+      succeededLabels.current.push(`${rowLabel}: ${doneLabel}`);
       // Recorded whether or not there is a failure to retire right now: an
       // older operation may still be in flight and fail later.
       settledSeq.current = Math.max(settledSeq.current, seq);
@@ -121,12 +139,15 @@ export function useRowActions(reload: () => void | Promise<void>) {
   // unconditionally stale -- that reset stays absolute.
   function clearActionError() {
     setFailure(null);
+    // The announced outcome is about the same superseded page of rows.
+    setActionOutcome(null);
   }
 
   return {
     pendingIds,
     doneIds,
     actionError: failure ? failure.message : null,
+    actionOutcome,
     clearActionError,
     runRowAction,
   };

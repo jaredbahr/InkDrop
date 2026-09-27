@@ -404,7 +404,7 @@ body {
   color: var(--m-text-dim);
 }
 
-/* #572 expected-versus-found. A quiet block, not a callout: it is reference
+/* Expected-versus-found. A quiet block, not a callout: it is reference
    the operator reads while deciding, not an alarm. The file name can be long
    and must stay a readable path, so it wraps on any character rather than
    overflowing the card. */

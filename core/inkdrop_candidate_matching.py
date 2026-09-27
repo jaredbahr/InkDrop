@@ -398,7 +398,7 @@ def release_tokens_after_creator_credit(release_title, target_tokens):
     own title contains a dash keeps every token after the first segment.
 
     Both singleton matchers call this, for the same reason both call
-    release_group_suffix_only(): #337 found them answering the trailing-tag
+    release_group_suffix_only(): both matchers were answering the trailing-tag
     question differently and fixed it with one predicate. This is the identical
     asymmetry at the other end of the string -- an irrelevant token tolerated
     after the title and fatal before it -- and it gets the identical treatment.
@@ -2405,7 +2405,7 @@ def candidate_compatibility(candidate, wanted_item=None, settings=None):
             # number proof: an omnibus or deluxe "Vol 3" collects several
             # regular volumes and its 3 is on a different scale from the
             # wanted run's 3. Proven containment composes with the
-            # pack-containment policy (tracker #209, decided 2026-09-16:
+            # pack-containment policy (decided 2026-09-16:
             # admit); unproven contents compose with unidentified_unit, so a
             # release that only claims to hold the unit is shown for review
             # and never admitted on that claim.

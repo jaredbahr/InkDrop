@@ -161,7 +161,15 @@ def main():
                 require(hostile_code == 400 and hostile_payload.get("error"), "strict outer settings envelope accepted duplicate/reserved keys")
             oversized_body = b'{"document_text":"' + (b"x" * (1024 * 1024 + 65536)) + b'"}'
             oversized_code, _, oversized_payload = http_raw_json(browser, "POST", base + "/api/inkdrop-settings/backup/preview", oversized_body, strict_headers)
-            require(oversized_code == 400 and oversized_payload.get("error"), "oversized settings endpoint envelope was accepted")
+            # 413, not 400. The bar this line has always held is "the oversized
+            # body was REFUSED, not accepted" -- the message below says so --
+            # and 400 was only the status that refusal happened to carry while
+            # every body-size failure raised a bare ValueError. The request
+            # envelope now answers a body over the cap as Content Too Large and
+            # keeps 400 for what it actually means: a length or a JSON shape
+            # this server cannot parse. The duplicate/reserved-key arm above
+            # still requires 400, so the two are separated rather than merged.
+            require(oversized_code == 413 and oversized_payload.get("error"), "oversized settings endpoint envelope was accepted")
             with inkdrop_state.connect_read(db) as con:
                 nonfinite_audits_before = con.execute("select count(*) from history_events where event_type='settings_restore'").fetchone()[0]
                 nonfinite_settings_before = [(row["key"], row["value_json"]) for row in con.execute("select key,value_json from app_settings order by key")]

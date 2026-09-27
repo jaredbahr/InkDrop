@@ -525,7 +525,17 @@
     .settings-form-row {
       grid-column: 1 / -1;
       display: grid;
-      grid-template-columns: minmax(150px, 220px) minmax(260px, 520px) auto;
+      /* The actions track is minmax(min-content, auto) rather than auto:
+         .settings-form-actions carries min-width: 0, which makes its automatic
+         minimum size 0, so an `auto` track is free to resolve below the
+         Cancel/Save buttons inside it and let them paint outside their own
+         track. At exactly 900px -- the first width above the two-column band
+         below -- a vertical scrollbar takes the content box to 885px, the
+         actions track resolves to 108.5px against 125.4px of buttons, and Save
+         lands 17px past the right edge of the page. min-content floors the
+         track at the buttons; the flexible control track gives up the
+         difference. */
+      grid-template-columns: minmax(150px, 220px) minmax(260px, 520px) minmax(min-content, auto);
       gap: 10px 14px;
       align-items: start;
       min-width: 0;
@@ -719,8 +729,8 @@
        the background lives here because this is the selector that wins.
 
        Until 2026-08-20 the row was the only chrome on the Settings page
-       (tracker row 546: the masthead and `#inkdropSettings > summary` were
-       both display:none), and the #242424 fill inherited from the shared
+       (the masthead and `#inkdropSettings > summary` were both display:none),
+       and the #242424 fill inherited from the shared
        .workflow-actions card made it read as a raised slab with its left
        half empty -- the "detached floating toolbar" in the report. Settings
        now has a real masthead header above it (15-redesign-shell.css), so

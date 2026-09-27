@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from core import inkdrop_runtime_config
+from core import inkdrop_db
 
 
 def script_path(name: str, remote_path: str | None = None, *, env_var: str | None = None) -> Path:
@@ -359,7 +360,7 @@ def load_owned_external_ids() -> tuple[dict[str, str], dict[str, Any]]:
         diagnostics["unavailable_class"] = "dependency"
         return owned, diagnostics
     try:
-        con = sqlite3.connect(f"file:{STATE_DB_PATH}?mode=ro", uri=True)
+        con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(STATE_DB_PATH), uri=True)
         con.row_factory = sqlite3.Row
         try:
             exists = con.execute(
@@ -821,7 +822,7 @@ def main() -> int:
         return finish(status, skip_exit_code(status, clear_failed or clear_completed))
 
     # The rescue helper is homelab-only and deliberately does not ship in the
-    # public build (#1131). Its absence is the same operator-visible condition
+    # public build. Its absence is the same operator-visible condition
     # as an adapter with no key: there is nothing to clean up with. Both web
     # call sites already answer that way, and load_sab_helper()'s own docstring
     # says a traceback here would be the only place turning it into a crash --

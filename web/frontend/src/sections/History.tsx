@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useState } from "react";
 import { request, InkDropApiError } from "../api";
+import { useLatestOnly } from "../latestOnly";
 import type { HistoryRow, HistoryViewPayload } from "./historyTypes";
+import { seriesNav } from "../shellBridge";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 80, 150] as const;
 const DEFAULT_PAGE_SIZE = 80;
@@ -13,23 +15,31 @@ const DEFAULT_PAGE_SIZE = 80;
 // same shell bridge SeriesDetail.tsx and Wanted.tsx already call through
 // for the same reason: it's the one navigation callback the vanilla shell
 // still owns.
-const shell = window as unknown as {
-  InkDropSeriesNav?: {
-    openDetail?: (row: { series_id?: string; series?: string }) => void;
-  };
-};
+// One declaration, in src/shellBridge.ts. This file used to carry its own
+// `window as unknown as { ... }` describing openDetail differently from the
+// two other files that call it -- the cast went around the global
+// declaration, so nothing checked that the three agreed.
 
 function titleCase(raw: string): string {
   return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-// A reduced version of inkdropHistoryEventLabel's (inkdrop_web.py) regex
-// ladder -- the common event kinds, not every niche one, matching the level
-// of fidelity the Wanted/Queue islands already used for their own stage
-// labels rather than porting every vanilla-JS label rule verbatim. Each
-// class also carries its glyph from the shell's :root --arr-glyph registry.
+// The row arrives carrying event_label/event_icon, computed once in
+// core/inkdrop_history_presentation.py and served to both this island and
+// the vanilla shell, so the two cannot describe the same row differently.
+//
+// The ladder below is the fallback for a row served before those fields
+// existed -- a cached payload, an older instance mid-upgrade. It is
+// deliberately NOT the primary path: it is a second classifier over the same
+// strings, and a second classifier is what let a verification failure render
+// as "Verified" (/verified|verification/ matched before any failure rule)
+// and a booked retry render as "Retried". Failure rules are ordered first
+// here for the same reason they are there.
 function eventInfo(row: HistoryRow): { label: string; icon: string } {
+  if (row.event_label) return { label: row.event_label, icon: row.event_icon || "clock" };
   const raw = (row.event_type || row.history_kind || row.status || "event").toLowerCase();
+  if (/verif\w*[_ -]*fail|fail\w*[_ -]*verif/.test(raw)) return { label: "Verification Failed", icon: "x" };
+  if (/retry.*exhaust|exhaust.*retry/.test(raw)) return { label: "Retries Exhausted", icon: "x" };
   if (/retry/.test(raw)) return { label: "Retry Scheduled", icon: "refresh" };
   if (/search.*fail|fail.*search/.test(raw)) return { label: "Search Failed", icon: "x" };
   if (/search.*complete|complete.*search/.test(raw)) return { label: "Search Completed", icon: "search" };
@@ -58,10 +68,14 @@ function seriesTitle(row: HistoryRow): string {
 // (inkdrop_state.py) uses for the masthead cards, so a row's pill and the
 // card it counts toward can never disagree about what happened.
 function resultPill(row: HistoryRow): { label: string; tone: string } {
+  if (row.result_label) return { label: row.result_label, tone: row.result_tone || "" };
   const phase = (row.display_phase || "").toLowerCase();
   const outcome = (row.outcome || "").toLowerCase();
   if (phase === "manual_review") return { label: "Needs review", tone: "bad" };
-  if (phase === "retry_later") return { label: "Retried", tone: "warn" };
+  // "Retry scheduled", not "Retried": retry_later means the next attempt is
+  // BOOKED. The row's own detail line says "Automatic retry is scheduled",
+  // and the pill beside it used to contradict it in the past tense.
+  if (phase === "retry_later") return { label: "Retry scheduled", tone: "warn" };
   // Blocked beats the generic problem outcome: a blocklist hit IS a problem
   // outcome server-side, but "Blocked" is the specific truth.
   if (/blocked/.test(phase) || /blocked/.test((row.status || "").toLowerCase())) return { label: "Blocked", tone: "warn" };
@@ -205,23 +219,29 @@ export function History({ payload }: { payload: HistoryViewPayload }) {
     setExpandedId(null);
   }, [payload]);
 
+  // Only the newest list request may write to this section's state.
+  const listRequest = useLatestOnly();
+
   async function loadPage(nextOffset: number, nextPageSize?: number) {
     const limit = nextPageSize ?? pageSize;
+    const isCurrent = listRequest.begin();
     setLoading(true);
     setError(null);
     try {
       const data = await request<{ ok: boolean; view: HistoryViewPayload }>(
         buildEndpoint(nextOffset, limit, historyFilter, historySearch),
       );
+      if (!isCurrent()) return;
       const view = data.view;
       setRows(view.rows || []);
       setOffset(view.offset ?? nextOffset);
       setTotalCount(view.total_count || 0);
       setExpandedId(null);
     } catch (cause) {
+      if (!isCurrent()) return;
       setError(cause instanceof InkDropApiError ? cause.message : "Could not load History page.");
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -289,7 +309,7 @@ export function History({ payload }: { payload: HistoryViewPayload }) {
                         className="section-table-series-link"
                         onClick={(event) => {
                           event.stopPropagation();
-                          shell.InkDropSeriesNav?.openDetail?.({ series_id: row.series_id, series: row.series });
+                          seriesNav().openDetail?.({ series_id: row.series_id, series: row.series });
                         }}
                       >
                         <strong>{seriesTitle(row)}</strong>

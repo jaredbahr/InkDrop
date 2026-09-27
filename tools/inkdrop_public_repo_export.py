@@ -261,7 +261,7 @@ CSS_SOURCE_ROOT = Path("web/static/css/src")
 # The README and Compose file that ship publicly are the owner-approved
 # text, not the working tree's own README.md / docker-compose.yml (which
 # stay as the two-service, build-from-source files contributors and internal
-# QA use). The approved README carries a maintainer comment at the top,
+# QA use). The approved README carries a source-only comment at the top,
 # stripped here. Both approved files still carry one open placeholder --
 # the image tag -- surfaced in the result so the publish step can decide,
 # not silently ship it.
@@ -276,6 +276,16 @@ APPROVED_COMPOSE_SOURCE = "docs/inkdrop/public-beta-compose.yml"
 # the file they actually get.
 APPROVED_INSTALL_SOURCE = "docs/inkdrop/public-beta-install.md"
 PUBLISHED_INSTALL_PATH = "docs/inkdrop/docker-first-install.md"
+# CONTRIBUTING.md, for the same reason, in the other direction. The published
+# text explains that this repository is a mirror, that nothing is committed
+# here directly, and that a pull request cannot be merged as-is -- all true
+# where it is read, and all false in the development tree, where that is
+# exactly where work lands. Shipping one file for both told a contributor
+# opening the development checkout that their PR could not be merged.
+# The working tree's CONTRIBUTING.md is now the development entry point and
+# does not ship; this is what the mirror gets.
+APPROVED_CONTRIBUTING_SOURCE = "docs/inkdrop/public-beta-contributing.md"
+PUBLISHED_CONTRIBUTING_PATH = "CONTRIBUTING.md"
 OPEN_PLACEHOLDER_MARKERS = ("inkdrop:TAG", "REPLACE_WITH_YOUR_APPROVED_DIGEST")
 
 
@@ -291,20 +301,20 @@ def public_readme_bytes(root: Path = ROOT):
     if stripped.startswith("<!--"):
         end = stripped.find("-->")
         if end < 0:
-            raise ValueError(f"unterminated maintainer comment in {APPROVED_README_SOURCE}")
+            raise ValueError(f"unterminated source-only comment in {APPROVED_README_SOURCE}")
         stripped = stripped[end + 3 :].lstrip("\n")
     if "<!--" in stripped:
         raise ValueError(f"unexpected comment left in the public README from {APPROVED_README_SOURCE}")
     return stripped.encode("utf-8")
 
 
-def _strip_maintainer_comment(text: str, source: str) -> str:
-    """Drop the leading <!-- ... --> maintainer note, as the README does."""
+def _strip_source_only_comment(text: str, source: str) -> str:
+    """Drop the leading source-only HTML comment, as the README does."""
     stripped = text.lstrip()
     if stripped.startswith("<!--"):
         end = stripped.find("-->")
         if end < 0:
-            raise ValueError(f"unterminated maintainer comment in {source}")
+            raise ValueError(f"unterminated source-only comment in {source}")
         stripped = stripped[end + 3 :].lstrip("\n")
     if "<!--" in stripped:
         raise ValueError(f"unexpected comment left in the public copy from {source}")
@@ -322,8 +332,24 @@ def public_install_doc_bytes(root: Path = ROOT):
         # Same self-consistency fallback as the README and Compose file: an
         # already-exported tree carries only the published copy.
         source = root / PUBLISHED_INSTALL_PATH
-    return _strip_maintainer_comment(
+    return _strip_source_only_comment(
         source.read_text(encoding="utf-8"), APPROVED_INSTALL_SOURCE
+    ).encode("utf-8")
+
+
+def public_contributing_bytes(root: Path = ROOT):
+    """The CONTRIBUTING.md shipped publicly -- the mirror explanation.
+
+    The working tree's own CONTRIBUTING.md describes contributing to the
+    development repository and is deliberately not what the mirror gets.
+    """
+    source = root / APPROVED_CONTRIBUTING_SOURCE
+    if not source.is_file():
+        # Same self-consistency fallback as the README and install guide: an
+        # already-exported tree carries only the published copy.
+        source = root / PUBLISHED_CONTRIBUTING_PATH
+    return _strip_source_only_comment(
+        source.read_text(encoding="utf-8"), APPROVED_CONTRIBUTING_SOURCE
     ).encode("utf-8")
 
 
@@ -398,11 +424,16 @@ def open_placeholders(text_bytes):
     return [marker for marker in OPEN_PLACEHOLDER_MARKERS if marker in text]
 
 
-# Lines in the ignore files that exist for this private working tree's agent
-# tooling. The public repository never contains those files, so shipping the
+# Lines in the ignore files that exist for private development tooling.
+# The public repository never contains those files, so shipping the
 # rules would only document the development environment. Markers are split
 # because this helper ships in the export and must not carry them either.
-PRIVATE_IGNORE_RULE_MARKERS = ("co" + "dex", "agents.md", "north" + "_star")
+PRIVATE_IGNORE_RULE_MARKERS = (
+    "co" + "dex",
+    "agents.md",
+    "inkdrop-" + "agent",
+    "north" + "_star",
+)
 
 
 def public_dockerignore_bytes(root: Path = ROOT):
@@ -492,6 +523,7 @@ def export_content_overrides(root: Path = ROOT, paths=None):
         "docker-compose.yml": public_compose_bytes(root),
         "Dockerfile": public_dockerfile_bytes(root),
         PUBLISHED_INSTALL_PATH: public_install_doc_bytes(root),
+        PUBLISHED_CONTRIBUTING_PATH: public_contributing_bytes(root),
         ".gitignore": PUBLIC_GITIGNORE.encode("utf-8"),
         ".dockerignore": public_dockerignore_bytes(root),
         PUBLIC_WORKFLOW_PATH: public_workflow_bytes(root),

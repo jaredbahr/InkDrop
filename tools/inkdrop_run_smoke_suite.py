@@ -11,6 +11,7 @@ passes is reported so it can be un-skipped.
 
 import atexit
 import argparse
+import fnmatch
 import os
 import secrets
 import string
@@ -25,6 +26,37 @@ from pathlib import Path
 # regardless of where the smoke scripts tracked_smokes() discovers actually
 # live (root or tests/).
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _git_bash_path():
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    roots = [str(Path(git).parent.parent)] if git else []
+    roots.extend(
+        str(Path(value) / "Git") for value in
+        (os.environ.get(name) for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")) if value
+    )
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(str(Path(local) / "Programs" / "Git"))
+    candidates = (
+        candidate for root in roots if root
+        for candidate in (Path(root) / "usr" / "bin" / "bash.exe", Path(root) / "bin" / "bash.exe")
+    )
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def _node_bin_dir():
+    if os.name != "nt":
+        return None
+    roots = [os.environ.get(name) for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")]
+    candidates = [Path(root) / "nodejs" for root in roots if root]
+    node = shutil.which("node")
+    if node:
+        candidates.append(Path(node).parent)
+    return next((str(path) for path in candidates if (path / "node.exe").is_file()
+                 and (path / "npm.cmd").is_file()), None)
 
 
 def subprocess_env():
@@ -46,12 +78,40 @@ def subprocess_env():
     # otherwise fail every test importing it from a branch. The guard's own
     # smoke clears this variable and plants fixtures, so it is still tested.
     resolved.setdefault("INKDROP_ALLOW_DIVERGED_TOOL", "1")
+    if os.name == "nt":
+        node_dir = _node_bin_dir()
+        if node_dir:
+            resolved["PATH"] = os.pathsep.join([node_dir, resolved.get("PATH", "")])
     return resolved
 
 # INKDROP_STATE_DIR and friends default to a real, persistent path
+
+_GIT_BASH_TESTS = frozenset({
+    "inkdrop-ci-guard-trusted-pin-smoke.py",
+    "inkdrop-closed-alpha-packet-exec-smoke.py",
+    "inkdrop-local-qa-deploy-build-smoke.py",
+})
+
+
+def subprocess_env_for(name):
+    """Return the child environment for *name*.
+
+    Git Bash is scoped to the three smokes that explicitly need it. Other
+    children, especially the cron-lock smoke, retain the parent's bash so the
+    requirement probe and the child resolve the same shell.
+    """
+    resolved = subprocess_env()
+    if os.name == "nt" and os.path.basename(name) in _GIT_BASH_TESTS:
+        bash = _git_bash_path()
+        if bash:
+            resolved["PATH"] = os.pathsep.join([
+                str(Path(bash).parent), resolved.get("PATH", "")
+            ])
+    return resolved
+
 # (inkdrop_runtime_config.state_dir()'s own fallback) when unset. CI always
 # sets these explicitly via the workflow, but a local run of this script --
-# by a developer or an agent verifying a fix, exactly the kind of run that
+# while verifying a fix, exactly the kind of run that
 # polluted the real state dir on a dev machine for over a week before this
 # fix -- would otherwise run all ~265 smoke tests against real application
 # state. Default to an isolated temp root unless the caller already set
@@ -349,7 +409,16 @@ def _wslpath_available():
     if os.name != "nt":
         return True
     try:
-        probe = subprocess.run(["bash", "-lc", "wslpath -a /"], capture_output=True, timeout=30)
+        env = subprocess_env()
+        bash = shutil.which("bash", path=env.get("PATH", ""))
+        if not bash:
+            return False
+        probe = subprocess.run(
+            [bash, "-lc", "wslpath -a /"],
+            capture_output=True,
+            timeout=30,
+            env=env,
+        )
         return probe.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -388,6 +457,30 @@ def _proc_process_table_readable():
     except OSError:
         return False
 
+def _frontend_deps_installed():
+    """True when web/frontend's node_modules carry the bundler a test needs.
+
+    api.ts is TypeScript and Node cannot import it before 22. The smoke that
+    drives the shipped client bundles it with rolldown, which vite already
+    brings in -- so the question is not "is there a Node" but "has `npm ci`
+    run in web/frontend". Probed by resolving the package rather than by
+    checking for node_modules, because a partial install has the directory and
+    not the dependency.
+    """
+    path = subprocess_env().get("PATH", "")
+    return bool(shutil.which("node", path=path)) and (
+        ROOT / "web" / "frontend" / "node_modules" / "rolldown"
+    ).is_dir()
+
+
+def _git_bash_available():
+    return bool(_git_bash_path())
+
+
+def _react_bundle_built():
+    return any(path.is_file() for path in (ROOT / "web" / "static" / "dist").glob("*"))
+
+
 REQUIREMENTS = {
     "origin_qa": (
         _origin_qa_available,
@@ -409,6 +502,11 @@ REQUIREMENTS = {
         "Linux bypasses the check, so the EACCES under test cannot be caused here "
         "(Windows CAN cause it: os.chmod moves the read-only attribute there)",
     ),
+    "frontend_deps": (
+        _frontend_deps_installed,
+        "needs web/frontend's node_modules, which carry the bundler that turns the shipped "
+        "TypeScript client into something Node can import -- run `npm ci` in web/frontend",
+    ),
     "proc_table": (
         _proc_process_table_readable,
         "needs /proc to be a readable process table -- without one the status compute "
@@ -429,6 +527,14 @@ REQUIREMENTS = {
     "fcntl": (
         _fcntl_available,
         "needs the fcntl module, which only POSIX Python provides; the staging sweep imports it for flock",
+    ),
+    "git_bash": (
+        _git_bash_available,
+        "needs a native POSIX shell; Windows requires Git Bash rather than the WSL launcher",
+    ),
+    "react_bundle": (
+        _react_bundle_built,
+        "needs the generated web/static/dist React bundle; run the frontend build first",
     ),
 }
 
@@ -465,6 +571,9 @@ REQUIREMENT_OWNERS = {
     "wslpath": "harness",
     "fcntl": "acquisition",
     "proc_table": "web",
+    "frontend_deps": "web",
+    "git_bash": "harness",
+    "react_bundle": "web",
 }
 
 
@@ -505,6 +614,8 @@ REQUIRES = {
     "inkdrop-slskd-staging-sweep-raw-page-folder-smoke.py": "fcntl",
     "inkdrop-slskd-sweep-no-scan-wait-smoke.py": "fcntl",
     "inkdrop-slskd-sweep-trusted-issue-unit-smoke.py": "fcntl",
+    "inkdrop-a-late-answer-is-not-the-current-one-smoke.py": "playwright",
+    "inkdrop-a-malformed-success-is-not-success-smoke.py": "frontend_deps",
     "inkdrop-blocklist-react-island-browser-smoke.py": "playwright",
     "inkdrop-history-react-island-browser-smoke.py": "playwright",
     "inkdrop-manual-review-decision-actions-browser-smoke.py": "playwright",
@@ -549,6 +660,13 @@ REQUIRES = {
     "inkdrop-system-copy-value-browser-smoke.py": "playwright",
     "inkdrop-system-mobile-browser-smoke.py": "playwright",
     "inkdrop-series-poster-title-overflow-smoke.py": "playwright",
+    "inkdrop-ci-guard-trusted-pin-smoke.py": "git_bash",
+    "inkdrop-closed-alpha-packet-exec-smoke.py": "git_bash",
+    "inkdrop-local-qa-deploy-build-smoke.py": "git_bash",
+    "inkdrop-api-client-parity-smoke.py": "frontend_deps",
+    "inkdrop-section-error-boundary-smoke.py": "frontend_deps",
+    "inkdrop-selection-indeterminate-smoke.py": "frontend_deps",
+    "inkdrop-react-bundle-contract-smoke.py": "react_bundle",
 }
 
 
@@ -594,38 +712,14 @@ NON_QUALIFYING = {
     # than no signal because it looks like coverage. Each still RUNS and
     # prints its red. Expiries are staggered by what the failure means:
     # content assertions and unclassified crashes first, harness gaps next,
-    # stale extractions and timeouts last. See tracker row #871.
-    "inkdrop-settings-form-responsive-browser-smoke.py": {
-        "reason": (
-            "ERR_CONNECTION_REFUSED against the same unstarted fixture server on port 8877. HARNESS GAP. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
-        ),
-        "owner": "web",
-        "expires": "2026-09-18",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-system-mobile-browser-smoke.py": {
-        "reason": (
-            "ERR_CONNECTION_REFUSED against the same unstarted fixture server on port 8877. HARNESS GAP. UN-SUPPRESSES WHEN: the suite serves web/tests/fixtures, or the test serves its own fixture"
-        ),
-        "owner": "web",
-        "expires": "2026-09-18",
-        "issue": "tracker row #871",
-    },
-    "inkdrop-mobile-sheet-focus-browser-smoke.py": {
-        "reason": (
-            "ERR_CONNECTION_REFUSED against the application on port 8796, which this test expects to be running and the suite does not start. HARNESS GAP. UN-SUPPRESSES WHEN: the test starts the app it drives, as the passing browser smokes do"
-        ),
-        "owner": "web",
-        "expires": "2026-09-18",
-        "issue": "tracker row #871",
-    },
+    # stale extractions and timeouts last.
     "inkdrop-activity-backend-contract-browser-smoke.py": {
         "reason": (
             "ReferenceError for maybeHydrateSeriesDetailEditionIndifferentAction: the test extracts a function out of core/inkdrop_web.py and evaluates it in a page, and that function now calls a helper the extraction does not carry. STALE TEST following code that moved. UN-SUPPRESSES WHEN: the extraction carries the helpers its subject calls"
         ),
         "owner": "web",
         "expires": "2026-09-25",
-        "issue": "tracker row #871",
+        "issue": "web extraction drift",
     },
     "inkdrop-sampled-history-facet-browser-smoke.py": {
         "reason": (
@@ -633,7 +727,7 @@ NON_QUALIFYING = {
         ),
         "owner": "web",
         "expires": "2026-09-25",
-        "issue": "tracker row #871",
+        "issue": "web extraction drift",
     },
     "inkdrop-series-poster-title-overflow-smoke.py": {
         "reason": (
@@ -641,7 +735,7 @@ NON_QUALIFYING = {
         ),
         "owner": "web",
         "expires": "2026-09-25",
-        "issue": "tracker row #871",
+        "issue": "browser timeout under investigation",
     },
     "inkdrop-settings-backup-browser-smoke.py": {
         "reason": (
@@ -649,7 +743,7 @@ NON_QUALIFYING = {
         ),
         "owner": "web",
         "expires": "2026-09-25",
-        "issue": "tracker row #871",
+        "issue": "browser download expectation under investigation",
     },
 
     # inkdrop-slskd-failover-smoke.py was quarantined here for the 420s CI
@@ -667,22 +761,22 @@ NON_QUALIFYING = {
     # Wiring these three up is what proved they had been dead for weeks. Each
     # needs a judgement this wiring pass deliberately did not make, so each runs
     # and prints its red rather than being hidden. Owner and expiry assigned by
-    # the wiring pass, not by the tracker row -- NON_QUALIFYING requires both.
+    # the wiring pass, not by an external record -- NON_QUALIFYING requires both.
     "inkdrop-activity-queue-blocklist-contract-smoke.py": {
         "reason": (
             "measured 2026-09-08 against qa 2ad80c96 with every assert recorded: 9 of 18 "
             "fail, not the one the old note named. The five-column Blocklist literal "
-            "(five columns confirmed intended, row #158), the Allow & Retry call form (a ternary "
+            "(five columns confirmed intended), the Allow & Retry call form (a ternary "
             "endpoint and a body carrying revision since PR #349), the selection-count "
             "guard (now manual_review only), and six Queue grid contracts the current CSS "
             "contradicts (a source column; a 24px selection track the smoke forbids). "
             "UN-SUPPRESSES WHEN: web re-pins all nine against the shipped tree, or rules "
             "the changed layout contracts intended and re-pins the rest; the measured "
-            "list is on tracker row #158"
+            "list remains available in the measured failure evidence"
         ),
         "owner": "web",
         "expires": "2026-10-06",
-        "issue": "tracker row #158",
+        "issue": "activity and blocklist contract drift",
     },
     "inkdrop-closed-alpha-user-journey-contract-smoke.py": {
         "reason": (
@@ -691,12 +785,12 @@ NON_QUALIFYING = {
             "Series automation heading moved, 'Monitor future releases' and the "
             "'Administration' nav-group label no longer exist anywhere in the tree, and no "
             "Settings entry opens the setup area with the pinned call. UN-SUPPRESSES "
-            "WHEN: web re-pins all 60 against current shipped copy without deleting any "
-            "(row #159's bar); the measured list is on tracker row #159"
+            "WHEN: web re-pins all 60 against current shipped copy without deleting any; "
+            "the measured list remains available in the failure evidence"
         ),
         "owner": "web",
         "expires": "2026-10-06",
-        "issue": "tracker row #159",
+        "issue": "closed-alpha journey contract drift",
     },
 }
 
@@ -779,7 +873,7 @@ def undiscovered_smokes(root=None):
     return sorted(on_disk - tracked)
 
 
-def tracked_smokes():
+def tracked_smokes(ref=None, repo_root=None):
     # Repo-root smoke scripts (inkdrop-*-smoke.py and inkdrop_*_smoke.py) were
     # never included here -- this glob only ever covered tests/. 8 tracked
     # root-level smoke scripts existed and were allowlisted in .gitignore but
@@ -805,14 +899,28 @@ def tracked_smokes():
     # The pattern ends in `_smoke.py` ON PURPOSE. A looser `tools/inkdrop*smoke*.py`
     # also matches THIS FILE -- inkdrop_run_smoke_suite.py -- and the suite would
     # discover and execute itself. Checked before widening rather than after.
+    patterns = (
+        "tests/inkdrop*smoke*.py",
+        "inkdrop*smoke*.py",
+        "tools/inkdrop*_smoke.py",
+    )
+    command = ["git", "ls-files", *patterns]
+    if ref is not None:
+        command = ["git", "ls-tree", "-r", "--name-only", ref]
     out = subprocess.run(
-        ["git", "ls-files", "tests/inkdrop*smoke*.py", "inkdrop*smoke*.py",
-         "tools/inkdrop*_smoke.py"],
+        command,
+        cwd=repo_root,
         capture_output=True,
         text=True,
         check=True,
     )
-    return sorted(name for name in out.stdout.splitlines() if name.strip())
+    names = [name for name in out.stdout.splitlines() if name.strip()]
+    if ref is not None:
+        names = [
+            name for name in names
+            if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+        ]
+    return sorted(names)
 
 
 def main():
@@ -933,7 +1041,7 @@ def main():
                 capture_output=True,
                 text=True,
                 timeout=PER_TEST_TIMEOUT,
-                env=subprocess_env(),
+                env=subprocess_env_for(name),
             )
             outcome = "ok" if proc.returncode == 0 else f"rc={proc.returncode}"
             tail = (proc.stdout + proc.stderr)[-1500:]
@@ -1028,8 +1136,8 @@ def parse_args(argv=None):
 
     The second cost is the one that bites. The process list lied about what was
     happening -- two sessions read `--help` in a process tree as a harmless no-op
-    while a real suite belonging to a third agent was in flight. On a host where
-    several agents contend for one runner, and where a concurrent run is a known
+    while a real suite belonging to another session was in flight. On a host where
+    several sessions contend for one runner, and where a concurrent run is a known
     source of false REDs, a command line that misrepresents the work is a
     coordination hazard.
 

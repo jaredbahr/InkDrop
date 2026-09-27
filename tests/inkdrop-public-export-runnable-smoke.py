@@ -38,7 +38,7 @@ CANARIES = (
     "inkdrop-queue-claim-smoke.py",
     "inkdrop-release-notes-version-smoke.py",
     "inkdrop-db-boundary-smoke.py",
-    # Tracker #141's clause 1 is "the benchmark scorer, corpus fixture and doc
+    # The first contract is "the benchmark scorer, corpus fixture and doc
     # run from a staged public export by someone outside the project". That was
     # answered by hand at closure and again on 2026-08-30, and NOTHING ran it
     # here in between -- the gate is in the export allowlist, so a change that

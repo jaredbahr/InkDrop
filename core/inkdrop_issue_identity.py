@@ -15,6 +15,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
+from core import inkdrop_db
 
 
 CHILD_TABLES = ("wanted_items", "queue_items", "source_attempts", "download_tasks", "import_results", "history_events")
@@ -86,7 +87,7 @@ def reconciliation_plan(db_path, issue_ids):
     ids = [str(value or "").strip() for value in issue_ids if str(value or "").strip()]
     if len(ids) != 2:
         raise ValueError("exactly two issue IDs are required")
-    con = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=5)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     con.execute("pragma query_only=1")
     try:

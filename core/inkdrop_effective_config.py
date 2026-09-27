@@ -10,6 +10,7 @@ import sqlite3
 import contextlib
 from pathlib import Path
 from urllib.parse import urlsplit
+from core import inkdrop_db
 
 
 INTEGRATION_ALIASES = {
@@ -128,7 +129,7 @@ def _stored_provider_rows(db_path):
     path = Path(db_path) if db_path else None
     if not path or not path.exists():
         return []
-    uri = f"file:{path}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as con:
         con.row_factory = sqlite3.Row
         con.execute("pragma query_only=1")
@@ -151,7 +152,7 @@ def _stored_download_client_rows(db_path):
     path = Path(db_path) if db_path else None
     if not path or not path.exists():
         return []
-    uri = f"file:{path}?mode=ro"
+    uri = inkdrop_db.sqlite_readonly_uri(path)
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as con:
         con.row_factory = sqlite3.Row
         con.execute("pragma query_only=1")

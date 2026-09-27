@@ -21,6 +21,29 @@ def _warning(code, message, **details):
     return {"code": code, "message": message, **details}
 
 
+def unit_number(value):
+    match = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+    return float(match.group(0)) if match else None
+
+
+def chapter_behind_volume_lane(chapter, owned_volume_numbers):
+    """Chapter-lane depth rule (decided 2026-09-22): is this chapter the volume lane's?
+
+    A linked pair's chapter lane wants only chapters newer than the newest
+    volume its volume lane owns; inkdrop_state.manga_chapter_lane_owned_volumes()
+    is the one source of that set for every writer of chapter wants, and a
+    volume that is only wanted owns nothing. No reliable volume -> last-chapter map exists
+    for a ComicVine volume lane, so the boundary is MangaDex's own `volume`
+    attribute: a chapter tagged volume <= that newest owned volume is left to
+    the volume lane. A chapter with no volume tag is newer than every volume
+    and stays wanted, as does everything when nothing is owned. Bounds new
+    wants only; the caller still records every chapter as an issue row.
+    """
+    owned = [number for number in map(unit_number, owned_volume_numbers or ()) if number is not None]
+    volume = unit_number((chapter or {}).get("volume"))
+    return bool(owned) and volume is not None and volume <= max(owned)
+
+
 def delivery_limitation(chapter):
     """What one provider cannot deliver about this unit -- never whether to want it.
 

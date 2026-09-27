@@ -58,6 +58,10 @@ export type BlocklistViewPayload = {
   limit: number;
   offset: number;
   source_filter: string;
+  // Opaque position token for the page after this one, present only when this
+  // page is full. Sent back as ?cursor= to step forward without an offset.
+  next_cursor?: string | null;
+  cursor?: string | null;
   filters: StateViewFilter[];
   summary?: BlocklistSummary;
 };

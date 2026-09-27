@@ -47,8 +47,9 @@ guards exist because this rewrites files the library already trusts:
 There are two ways in, and they share one decision. ``sweep_library()`` is the
 backfill: it walks every existing series and brings each one's archives in line,
 reporting what it did and why for every series rather than finishing silently.
-``maybe_inject_for_series()`` is the automatic path, called after an import and
-after a cover changes, and it does nothing at all unless
+The automatic entry points run after completed-import placements and after the
+MangaDex front-cover repair persists through ``update_series_image_metadata``.
+They do nothing at all unless
 ``media_management.cover_injection_enabled`` has been turned on -- off by
 default, because this rewrites files in a real library.
 
@@ -70,6 +71,7 @@ if str(_ROOT) not in _sys.path:
 
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -79,7 +81,9 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -87,6 +91,7 @@ from core import inkdrop_safe_xml
 
 from core import inkdrop_archive_conversion as conversion
 from core import inkdrop_runtime_config
+from core import inkdrop_db
 
 
 COVER_INJECTION_SCHEMA = "inkdrop.cover_injection.v1"
@@ -140,19 +145,104 @@ def default_originals_dir():
     return inkdrop_runtime_config.quarantine_dir() / "cover-injection-originals"
 
 
+_FOLDER_LOCKS_GUARD = threading.Lock()
+_FOLDER_THREAD_LOCKS = {}
+
+
+@contextlib.contextmanager
+def _folder_write_lock(folder, *, db_path=None, wait_seconds=60):
+    """Serialize archive writers for one folder across threads and processes."""
+    key = _folder_identity(folder)
+    with _FOLDER_LOCKS_GUARD:
+        thread_lock = _FOLDER_THREAD_LOCKS.setdefault(key, threading.Lock())
+    if not thread_lock.acquire(timeout=max(0, wait_seconds)):
+        raise TimeoutError(f"cover injection folder lock busy: {folder}")
+    handle = None
+    try:
+        from core import inkdrop_state
+
+        handle, lock = inkdrop_state.series_library_migration_acquire_lock(
+            Path(db_path) if db_path else default_state_db_path(),
+            f"cover_injection:{key}", wait_seconds,
+        )
+        if handle is None:
+            raise TimeoutError(lock.get("reason") or f"cover injection folder lock busy: {folder}")
+        yield
+    finally:
+        if handle is not None:
+            inkdrop_state.series_library_migration_release_lock(handle)
+        thread_lock.release()
+
+
 # ---------------------------------------------------------------------------
 # Reading what is already there
 # ---------------------------------------------------------------------------
 
 
+# What InkDrop writes here is a flat object of a dozen short scalars -- a
+# schema string, a stored name, a hash, a few integers and two timestamps --
+# which is a few hundred bytes. 64KB is far more than that and far less than
+# anything that matters, and the cap has to exist because this member lives
+# inside a media archive that InkDrop did not necessarily write.
+MARKER_MAX_BYTES = 64 * 1024
+
+
 def read_marker(path):
-    """The injection provenance inside an archive, or None."""
+    """The injection provenance inside an archive, or None.
+
+    The read used to be `archive.read(MARKER_NAME)`, which decompresses the
+    whole member into memory and then hands it to json.loads, which builds a
+    second representation of it. Neither step had a size check and neither had
+    a bounded reader, so the only limit on both was whatever the member
+    expanded to. That this member is InkDrop's own is not a reason to trust its
+    size: it is a name inside a file that arrived from somewhere else, and
+    anything can use that name. Measured before this change: an 8,311-byte
+    archive whose marker padded out to 8,388,608 bytes was read without
+    complaint, and the probe stopped at 8MB by choice rather than at a limit.
+
+    Both the declared size and the bytes that actually arrive are capped: the
+    declared size comes from the central directory of the file under
+    suspicion, so it bounds what is attempted rather than what is believed.
+
+    A refusal returns None, which is what every other unreadable marker already
+    returns, so no caller changes shape and no batch aborts. It says so on the
+    way out, because "no marker" and "a marker this refused to read" lead to
+    the same re-injection decision and only one of them is worth knowing about.
+
+    NOT DONE HERE, deliberately: rejecting an unrecognized `schema`. Callers
+    use `read_marker(...) is not None` to mean "this archive has already been
+    injected" (see the sweep's already-injected filter), so refusing an older
+    or unknown marker version would make an injected archive look untouched
+    and inject it a second time. That needs a survey of the markers that exist
+    in real libraries, not a guess made here.
+    """
     try:
         with zipfile.ZipFile(path) as archive:
-            names = {info.filename for info in archive.infolist() if not info.is_dir()}
-            if MARKER_NAME not in names:
+            info = next(
+                (item for item in archive.infolist() if not item.is_dir() and item.filename == MARKER_NAME),
+                None,
+            )
+            if info is None:
                 return None
-            data = archive.read(MARKER_NAME)
+            if int(info.file_size or 0) > MARKER_MAX_BYTES:
+                print(
+                    f"InkDrop cover marker refused: {Path(path).name} declares a "
+                    f"{int(info.file_size or 0)}-byte {MARKER_NAME}, over the {MARKER_MAX_BYTES}-byte cap",
+                    flush=True,
+                )
+                return None
+            with archive.open(info) as member:
+                # One byte past the cap, so a member that understated itself in
+                # the central directory is caught by what it actually produces
+                # rather than by what it claimed.
+                data = member.read(MARKER_MAX_BYTES + 1)
+            if len(data) > MARKER_MAX_BYTES:
+                print(
+                    f"InkDrop cover marker refused: {Path(path).name} expanded {MARKER_NAME} past the "
+                    f"{MARKER_MAX_BYTES}-byte cap, whatever its directory entry claimed",
+                    flush=True,
+                )
+                return None
     except (OSError, zipfile.BadZipFile, KeyError):
         return None
     try:
@@ -465,6 +555,16 @@ def inject_archive(
     if not source.is_file():
         return {**result, "reason": "source_missing"}
 
+    dest = source.with_suffix(".cbz")
+    result["dest"] = str(dest)
+    dest_is_source = dest.resolve() == source.resolve()
+    if not dest_is_source and dest.exists():
+        if dest.is_file() and dest.stat().st_size == 0:
+            # A zero-byte same-stem file is a leftover reservation, not a book.
+            # Nothing is lost by it, but it is not cleared automatically.
+            return {**result, "reason": "stale_placeholder", "detail": f"zero-byte file at {dest}"}
+        return {**result, "reason": "destination_exists", "detail": "preflight"}
+
     existing = read_marker(source)
     if existing:
         result["existing_marker"] = existing
@@ -547,9 +647,7 @@ def inject_archive(
     started = time.time()
     # Always publish as .cbz -- a CBR gets converted on the way through, which
     # is the same direction the library is already being moved in.
-    dest = source.with_suffix(".cbz")
-    tmp_dest = dest.with_suffix(dest.suffix + ".inkdrop-cover.tmp")
-    result["dest"] = str(dest)
+    tmp_dest = dest.parent / f".{dest.name}.{uuid.uuid4().hex}.inkdrop-cover.tmp"
 
     with tempfile.TemporaryDirectory(prefix="inkdrop-cover-inject-") as tmp:
         workdir = Path(tmp) / "extract"
@@ -617,33 +715,73 @@ def inject_archive(
                 },
             }
 
-        if retire_original:
+        try:
+            with tmp_dest.open("r+b") as staged:
+                os.fsync(staged.fileno())
+        except OSError as exc:
+            tmp_dest.unlink(missing_ok=True)
+            return {**result, "reason": "publish_failed", "detail": f"{type(exc).__name__}: {exc}"}
+
+        # Reserve the destination only now, once the staged archive is built,
+        # validated and durable, so a reader never sees a zero-byte book for the
+        # length of a build and a crash cannot strand one.
+        reserved = False
+        if not dest_is_source:
+            try:
+                with dest.open("xb"):
+                    pass
+                reserved = True
+            except FileExistsError:
+                tmp_dest.unlink(missing_ok=True)
+                return {**result, "reason": "destination_exists", "detail": "filled_during_build"}
+            except OSError as exc:
+                tmp_dest.unlink(missing_ok=True)
+                return {**result, "reason": "publish_failed", "detail": f"{type(exc).__name__}: {exc}"}
+
+        # In place, the retire is the only thing that moves the source out of
+        # the way; os.replace overwrites it atomically when it is not retired.
+        retired_here = False
+        if dest_is_source and retire_original:
             try:
                 originals_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(source), str(originals_target))
+                retired_here = True
             except OSError as exc:
                 tmp_dest.unlink(missing_ok=True)
                 return {**result, "reason": "original_retire_failed", "detail": f"{type(exc).__name__}: {exc}"}
-        else:
-            try:
-                source.unlink()
-            except OSError as exc:
-                tmp_dest.unlink(missing_ok=True)
-                return {**result, "reason": "original_delete_failed", "detail": f"{type(exc).__name__}: {exc}"}
 
         try:
-            tmp_dest.replace(dest)
+            os.replace(tmp_dest, dest)
         except OSError as exc:
+            detail = f"{type(exc).__name__}: {exc}"
             # Only put back what this run retired. On a re-injection the
             # retired copy is an earlier run's pristine original and must stay
             # where it is.
-            if retire_original and originals_target is not None and originals_target.exists():
+            if retired_here:
                 try:
                     shutil.move(str(originals_target), str(source))
-                except OSError:
-                    pass
+                except OSError as back:
+                    detail += f"; restore failed: {type(back).__name__}: {back}"
+            if reserved:
+                try:
+                    if dest.stat().st_size == 0:
+                        dest.unlink()
+                except OSError as back:
+                    detail += f"; placeholder cleanup failed: {type(back).__name__}: {back}"
             tmp_dest.unlink(missing_ok=True)
-            return {**result, "reason": "publish_failed", "detail": f"{type(exc).__name__}: {exc}"}
+            return {**result, "reason": "publish_failed", "detail": detail}
+
+        if not dest_is_source:
+            try:
+                if retire_original:
+                    originals_target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source), str(originals_target))
+                else:
+                    source.unlink()
+            except OSError as exc:
+                dest.unlink(missing_ok=True)
+                reason = "original_retire_failed" if retire_original else "original_delete_failed"
+                return {**result, "reason": reason, "detail": f"{type(exc).__name__}: {exc}"}
 
     result.update(
         {
@@ -753,7 +891,9 @@ def _build_injected(source, workdir, stagedir, dest_tmp, cover_bytes, cover_meta
     }
 
 
-def remove_injection(source, *, originals_dir=None, dry_run=False):
+def remove_injection(
+    source, *, originals_dir=None, dry_run=False, reconcile_ledger=True, ledger_db_path=None
+):
     """Undo an injection by restoring the retired original.
 
     Restoring the copy is the honest undo: rebuilding the archive without the
@@ -834,12 +974,27 @@ def remove_injection(source, *, originals_dir=None, dry_run=False):
             if expected_sha and _sha256_file(staged) != expected_sha:
                 staged.unlink(missing_ok=True)
                 return {**result, "reason": "restore_verification_failed"}
-            staged.replace(source.with_suffix(candidate.suffix))
-            if source.suffix.lower() != candidate.suffix.lower() and source.exists():
+            restored_path = source.with_suffix(candidate.suffix)
+            staged.replace(restored_path)
+            renamed = source.name != restored_path.name
+            if renamed and source.exists():
                 source.unlink()
         except OSError as exc:
             return {**result, "reason": "restore_failed", "detail": f"{type(exc).__name__}: {exc}"}
-        return {**result, "restored": True, "ok": True, "reason": "restored"}
+
+        restored = {
+            **result,
+            "restored": True,
+            "ok": True,
+            "reason": "restored",
+            "dest": str(restored_path),
+            "renamed": renamed,
+        }
+        if reconcile_ledger:
+            restored["imported_files"] = reconcile_imported_files(
+                source, restored_path, db_path=ledger_db_path, dry_run=False
+            )
+        return restored
 
     if rejected:
         # Refusing is the correct outcome: a wrong restore silently corrupts a
@@ -956,6 +1111,7 @@ BENIGN_SKIP_REASONS = {
     # A deliberate guard firing, not a fault: the archive would have been
     # reclassified chapter-versus-volume, so it was left alone on purpose.
     "semantic_unit_would_change",
+    "shared_folder_not_owner",
 }
 
 
@@ -1065,7 +1221,7 @@ def _resolve_comicvine_cover(series, provider):
             "filename": url.rsplit("/", 1)[-1], "provider": provider}
 
 
-def apply_series(
+def _apply_series_unlocked(
     series,
     *,
     dry_run=True,
@@ -1197,12 +1353,28 @@ def apply_series(
     # rather than with none and a half-finished move.
     restored = []
     for path in stale:
-        undo = remove_injection(path, originals_dir=originals_dir, dry_run=False)
-        restored.append({"path": str(path), **{k: undo[k] for k in ("reason", "restored") if k in undo}})
+        undo = remove_injection(
+            path,
+            originals_dir=originals_dir,
+            dry_run=False,
+            reconcile_ledger=reconcile_ledger,
+        )
+        restored.append({
+            "path": str(path),
+            **{
+                key: undo[key]
+                for key in ("reason", "restored", "dest", "renamed", "imported_files")
+                if key in undo
+            },
+        })
         if not undo.get("restored"):
             return {**outcome, "reason": "stale_injection_not_removed",
                     "detail": restored, "restored": restored}
     outcome["restored"] = restored
+    restoration = {
+        "changed": bool(restored),
+        "renamed": any(item.get("renamed") for item in restored),
+    }
 
     result = inject_archive(
         target["path"],
@@ -1231,9 +1403,10 @@ def apply_series(
     )
     outcome["injection"] = result
     if not result.get("ok"):
-        return {**outcome, "reason": result.get("reason"), "detail": result.get("detail")}
+        return {**outcome, **restoration, "reason": result.get("reason"),
+                "detail": result.get("detail"), "ok": False}
     if not result.get("injected"):
-        return {**outcome, "reason": result.get("reason"), "ok": True}
+        return {**outcome, **restoration, "reason": result.get("reason"), "ok": True}
 
     # Publication has happened and cannot be taken back from here: the new
     # archive is in place and the original has been retired to quarantine.
@@ -1249,7 +1422,10 @@ def apply_series(
     # the same name leave the stale one able to win as the series' first book --
     # so the caller has to be told a rename happened, not just a rewrite.
     dest = result.get("dest") or str(target["path"])
-    renamed = Path(dest).name != Path(target["path"]).name
+    renamed = (
+        Path(dest).name != Path(target["path"]).name
+        or restoration["renamed"]
+    )
     published = {**outcome, "changed": True, "reason": "injected",
                  "dest": dest, "renamed": renamed}
 
@@ -1270,6 +1446,26 @@ def apply_series(
                     "ledger_reconciled": False}
         return {**published, "ok": True, "ledger_reconciled": True}
     return {**published, "ok": True, "ledger_reconciled": False}
+
+
+def apply_series(series, *, db_path=None, dry_run=True, **kwargs):
+    """Run the shared per-series decision under its physical-folder write lock."""
+    folder = str((series or {}).get("library_path") or "").strip()
+    if dry_run or not folder:
+        return _apply_series_unlocked(series, dry_run=dry_run, **kwargs)
+    try:
+        with _folder_write_lock(folder, db_path=db_path):
+            return _apply_series_unlocked(series, dry_run=False, **kwargs)
+    except TimeoutError as exc:
+        return {
+            "series_id": (series or {}).get("id"),
+            "title": (series or {}).get("title"),
+            "folder": folder,
+            "changed": False,
+            "ok": False,
+            "reason": "folder_write_lock_busy",
+            "detail": str(exc),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1299,7 +1495,7 @@ def series_candidates(db_path=None, series_ids=None):
     db_path = Path(db_path) if db_path else default_state_db_path()
     if not db_path.exists():
         return {"eligible": [], "excluded": []}
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=15)
+    con = sqlite3.connect(inkdrop_db.sqlite_readonly_uri(db_path), uri=True, timeout=15)
     con.row_factory = sqlite3.Row
     try:
         query = (
@@ -1400,16 +1596,20 @@ def sweep_library(
     }
 
     attempted = 0
-    for index, row in enumerate(series, 1):
+    index_by_series_id = {str(row.get("id")): index for index, row in enumerate(series, 1)}
+
+    def apply_owned_row(row):
+        nonlocal attempted
+        index = index_by_series_id[str(row.get("id"))]
         if limit is not None and attempted >= int(limit):
-            summary["skipped"] += 1
-            summary["skipped_reasons"]["limit_reached"] = (
-                summary["skipped_reasons"].get("limit_reached", 0) + 1
-            )
-            summary["results"].append(
-                {"series_id": row.get("id"), "title": row.get("title"), "reason": "limit_reached"}
-            )
-            continue
+            return {
+                "series_id": row.get("id"),
+                "title": row.get("title"),
+                "folder": str(row.get("library_path") or ""),
+                "changed": False,
+                "ok": True,
+                "reason": "limit_reached",
+            }
         attempted += 1
         if progress:
             progress(
@@ -1422,8 +1622,9 @@ def sweep_library(
                 }
             )
         try:
-            result = apply_series(
+            return apply_series(
                 row,
+                db_path=db_path,
                 dry_run=dry_run,
                 keep_original=keep_original,
                 originals_dir=originals_dir,
@@ -1432,20 +1633,46 @@ def sweep_library(
             )
         except Exception as exc:
             # One series' unexpected failure is not the sweep's.
-            result = {
+            return {
                 "series_id": row.get("id"),
                 "title": row.get("title"),
+                "folder": str(row.get("library_path") or ""),
+                "changed": False,
+                "ok": False,
                 "reason": "unhandled_error",
                 "detail": f"{type(exc).__name__}: {exc}",
             }
 
+    ownership_rows = series
+    if series_ids:
+        requested_folders = {_folder_identity(row.get("library_path")) for row in series}
+        ownership_rows = [
+            row for row in series_candidates(db_path=db_path)["eligible"]
+            if _folder_identity(row.get("library_path")) in requested_folders
+        ]
+    owners, shared_refusals = _owned_folder_rows(ownership_rows)
+    requested = {str(row.get("id")) for row in series}
+    owners = [row for row in owners if str(row.get("id")) in requested]
+    shared_refusals = [
+        row for row in shared_refusals if str(row.get("series_id")) in requested
+    ]
+    sweep_results = [apply_owned_row(row) for row in owners] + shared_refusals
+    for result in sweep_results:
         reason = str(result.get("reason") or "")
-        if result.get("changed"):
+        if result.get("changed") and result.get("folder"):
+            summary["changed_folders"].append(result["folder"])
+            if result.get("renamed"):
+                summary["renamed_folders"].append(result["folder"])
+        if result.get("changed") and result.get("ok") is False:
+            # Restoring the stale copy changed the folder, but the new target
+            # was refused: the folder is listed above so readers get told, and
+            # the run is still a failure rather than an injection.
+            summary["failed"] += 1
+            summary["failed_reasons"][reason] = (
+                summary["failed_reasons"].get(reason, 0) + 1
+            )
+        elif result.get("changed") and reason != "already_current":
             summary["injected"] += 1
-            if result.get("folder"):
-                summary["changed_folders"].append(result["folder"])
-                if result.get("renamed"):
-                    summary["renamed_folders"].append(result["folder"])
         elif reason == "already_current":
             summary["already_current"] += 1
         elif reason.startswith("would_"):
@@ -1457,14 +1684,27 @@ def sweep_library(
             # full of series with no files yet, or from a provider whose covers
             # cannot be read, must not make a healthy sweep exit non-zero.
             summary["skipped"] += 1
-            summary["skipped_reasons"][reason] = summary["skipped_reasons"].get(reason, 0) + 1
+            summary["skipped_reasons"][reason] = (
+                summary["skipped_reasons"].get(reason, 0) + 1
+            )
         else:
             summary["failed"] += 1
-            summary["failed_reasons"][reason] = summary["failed_reasons"].get(reason, 0) + 1
+            summary["failed_reasons"][reason] = (
+                summary["failed_reasons"].get(reason, 0) + 1
+            )
 
         summary["results"].append(result)
         if progress:
-            progress({"event": "done", "index": index, "total": len(series), **result})
+            progress({
+                "event": "done",
+                "index": next(
+                    index
+                    for index, row in enumerate(series, 1)
+                    if str(row.get("id")) == str(result.get("series_id"))
+                ),
+                "total": len(series),
+                **result,
+            })
 
     # The rows the provider filter dropped are reported here rather than left
     # out, keyed by reason and provider so the gap is a number someone can act
@@ -1494,6 +1734,129 @@ def sweep_library(
 # ---------------------------------------------------------------------------
 
 
+AUTOMATIC_FAILURE_REASONS = {
+    "cover_fetch_failed",
+    "cover_lookup_failed",
+    "folder_write_lock_busy",
+    "injection_failed",
+    "ledger_reconcile_failed",
+    "original_delete_failed",
+    "original_retire_failed",
+    "publish_failed",
+    "stale_injection_not_removed",
+    "unhandled_error",
+}
+
+
+def _folder_identity(folder):
+    return os.path.normcase(os.path.normpath(str(folder or "").strip()))
+
+
+def _folder_owner_rank(row):
+    """Stable owner for a folder represented by more than one series row."""
+    provider = str(row.get("metadata_provider") or "").strip().lower()
+    media_type = str(row.get("media_type") or "").strip().lower()
+    preferred = "mangadex" if media_type == "manga" else "comicvine"
+    return (
+        0 if provider == preferred else 1,
+        0 if provider == "mangadex" else 1,
+        provider,
+        str(row.get("id") or ""),
+    )
+
+
+def _shared_folder_not_owner(row, owner):
+    return {
+        "series_id": row.get("id"),
+        "title": row.get("title"),
+        "folder": str(row.get("library_path") or ""),
+        "changed": False,
+        "ok": True,
+        "reason": "shared_folder_not_owner",
+        "owner_series_id": owner.get("id"),
+        "owner_provider": owner.get("metadata_provider"),
+    }
+
+
+def _owned_folder_rows(rows):
+    groups = {}
+    for row in rows or []:
+        groups.setdefault(_folder_identity(row.get("library_path")), []).append(row)
+    owners, refused = [], []
+    for folder_key in sorted(groups):
+        group = sorted(groups[folder_key], key=_folder_owner_rank)
+        owner = group[0]
+        owners.append(owner)
+        refused.extend(_shared_folder_not_owner(row, owner) for row in group[1:])
+    return owners, refused
+
+
+def _automatic_outcome_status(outcome):
+    reason = str(outcome.get("reason") or "")
+    if reason == "already_current" and outcome.get("ok") is not False:
+        return "already_current"
+    if outcome.get("changed") and outcome.get("ok") is not False:
+        return "injected"
+    if reason in AUTOMATIC_FAILURE_REASONS or outcome.get("ok") is False:
+        return "failed"
+    return "refused"
+
+
+def _record_automatic_outcome(outcome, *, db_path=None, trigger="import"):
+    """Persist one automatic decision on the existing History surface."""
+    outcome = dict(outcome or {})
+    status = _automatic_outcome_status(outcome)
+    outcome["status"] = status
+    series_id = str(outcome.get("series_id") or "").strip()
+    if not series_id:
+        return outcome
+    raw = {
+        "status": status,
+        "reason": outcome.get("reason"),
+        "trigger": trigger,
+        "series_id": series_id,
+        "title": outcome.get("title"),
+        "folder": outcome.get("folder"),
+        "target": outcome.get("target"),
+        "dest": outcome.get("dest"),
+        "changed": bool(outcome.get("changed")),
+        "renamed": bool(outcome.get("renamed")),
+        "detail": outcome.get("detail"),
+        "owner_series_id": outcome.get("owner_series_id"),
+        "owner_provider": outcome.get("owner_provider"),
+    }
+    try:
+        from core import inkdrop_state
+        history = inkdrop_state.record_history_event(
+            Path(db_path) if db_path else default_state_db_path(),
+            event_type=f"cover_injection_{status}",
+            entity_type="series",
+            entity_id=series_id,
+            series_id=series_id,
+            source="cover_injection",
+            message=(
+                f"{outcome.get('title') or series_id}: cover injection {status}"
+                + (f" ({outcome.get('reason')})" if outcome.get("reason") else "")
+            ),
+            raw=raw,
+        )
+    except Exception as exc:
+        history = {
+            "ok": False,
+            "reason": "history_record_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        print(json.dumps({
+            "event": "cover_injection_history_record_failed",
+            "series_id": series_id,
+            "status": status,
+            "reason": outcome.get("reason"),
+            "error": history["error"],
+        }, sort_keys=True), file=sys.stderr)
+    outcome["history_event"] = history
+    return outcome
+
+
 def automatic_injection_enabled(db_path=None):
     """Whether the user has turned the automatic feature on. Off unless they did.
 
@@ -1521,8 +1884,7 @@ def maybe_inject_for_folders(folders, *, db_path=None, reason="import", refresh=
 
     The import path knows which folders it wrote to, not which series rows those
     belong to, so this maps folders back to series. Reader refresh is off by
-    default here because the caller is the post-import path, which is about to
-    sync the readers anyway -- firing our own scan first would just double it.
+    default here because the caller is about to sync the readers anyway.
     """
     result = {"trigger": reason, "folders": [str(f) for f in (folders or [])],
               "changed_folders": [], "renamed_folders": [], "results": []}
@@ -1531,50 +1893,58 @@ def maybe_inject_for_folders(folders, *, db_path=None, reason="import", refresh=
     if not automatic_injection_enabled(db_path=db_path):
         return {**result, "reason": "cover_injection_disabled", "ok": True}
 
-    wanted = {str(Path(folder)) for folder in folders}
+    wanted = {_folder_identity(folder) for folder in folders}
     candidates = series_candidates(db_path=db_path)
-    rows = [
-        row
-        for row in candidates["eligible"]
-        if str(Path(str(row.get("library_path") or ""))) in wanted
-    ]
-    if not rows:
+    rows = [row for row in candidates["eligible"]
+            if _folder_identity(row.get("library_path")) in wanted]
+    blocked = [row for row in candidates["excluded"]
+               if _folder_identity(row.get("folder")) in wanted]
+    if not rows and not blocked:
         # "No injectable series" and "this series' provider is not supported"
         # are different facts, and the import path only ever saw the first.
         # Naming the second is what stops a folder that will *never* get a
         # cover from looking like one that simply had no series row yet.
-        blocked = [
-            row
-            for row in candidates["excluded"]
-            if str(Path(str(row.get("folder") or ""))) in wanted
-        ]
-        if blocked:
-            return {
-                **result,
-                "reason": "provider_unsupported",
-                "unsupported_providers": sorted({row["provider"] for row in blocked}),
-                "unsupported_series": [row["series_id"] for row in blocked],
-                "ok": True,
-            }
         return {**result, "reason": "no_injectable_series_for_folders", "ok": True}
 
-    for row in rows:
+    for row in blocked:
+        outcome = {
+            "series_id": row.get("series_id"),
+            "title": row.get("title"),
+            "folder": row.get("folder"),
+            "changed": False,
+            "ok": True,
+            "reason": "provider_unsupported",
+            "provider": row.get("provider"),
+        }
+        result["results"].append(
+            _record_automatic_outcome(outcome, db_path=db_path, trigger=reason)
+        )
+
+    def apply_owned_row(row):
         try:
-            outcome = apply_series(row, dry_run=False, **kwargs)
+            return apply_series(row, db_path=db_path, dry_run=False, **kwargs)
         except Exception as exc:
             # apply_series() is responsible for never raising once it has
             # published -- it folds a post-publication failure into a
             # changed/ok=False outcome instead. This stays as the last resort
             # for a failure before publication, and carries the folder so a
             # row can still be attributed to something.
-            outcome = {
+            return {
                 "series_id": row.get("id"),
                 "title": row.get("title"),
                 "folder": str(row.get("library_path") or ""),
+                "changed": False,
                 "ok": False,
                 "reason": "unhandled_error",
                 "detail": f"{type(exc).__name__}: {exc}",
             }
+
+    owners, shared_refusals = _owned_folder_rows(rows)
+    outcomes = shared_refusals + [apply_owned_row(row) for row in owners]
+    for outcome in outcomes:
+        outcome = _record_automatic_outcome(
+            outcome, db_path=db_path, trigger=reason
+        )
         result["results"].append(outcome)
         # Keyed on `changed`, not on success: a series whose archive was
         # republished but whose ledger write failed still needs its readers
@@ -1599,34 +1969,72 @@ def maybe_inject_for_folders(folders, *, db_path=None, reason="import", refresh=
     if failed:
         result["failed"] = len(failed)
         result["reason"] = failed[0].get("reason") or "series_failed"
+    elif blocked and not rows:
+        result["reason"] = "provider_unsupported"
     return result
 
 
 def maybe_inject_for_series(series_id, *, db_path=None, reason="import", **kwargs):
-    """Automatic entry point. Does nothing at all unless the setting is on.
+    """Apply after update_series_image_metadata persists a cover selection.
 
-    Called after an import lands and after a series' cover changes. Both end up
-    in the same place -- ``apply_series`` re-resolves the target and the art
-    every time, so "a lower volume arrived" and "the cover was corrected" do not
-    need to be told apart here.
+    Today that producer is the MangaDex front-cover repair. ComicVine display
+    metadata uses update_series_display_metadata and catches up on a later
+    completed import instead of calling this entry point directly.
     """
     result = {"series_id": series_id, "trigger": reason, "changed": False}
     if not automatic_injection_enabled(db_path=db_path):
         return {**result, "reason": "cover_injection_disabled", "ok": True}
+
     candidates = series_candidates(db_path=db_path, series_ids=[series_id])
     rows = candidates["eligible"]
     if not rows:
         blocked = candidates["excluded"]
-        if blocked:
-            return {**result, "reason": "provider_unsupported",
-                    "provider": blocked[0]["provider"], "ok": True}
-        return {**result, "reason": "series_not_injectable", "ok": True}
-    outcome = apply_series(rows[0], dry_run=False, **kwargs)
+        outcome = {
+            **result,
+            "reason": "provider_unsupported" if blocked else "series_not_injectable",
+            "provider": blocked[0]["provider"] if blocked else None,
+            "ok": True,
+        }
+        return _record_automatic_outcome(outcome, db_path=db_path, trigger=reason)
+
+    requested = rows[0]
+    folder_key = _folder_identity(requested.get("library_path"))
+    folder_rows = [
+        row for row in series_candidates(db_path=db_path)["eligible"]
+        if _folder_identity(row.get("library_path")) == folder_key
+    ]
+    owners, _refused = _owned_folder_rows(folder_rows)
+    owner = owners[0]
+    if str(owner.get("id")) != str(series_id):
+        outcome = {
+            **result,
+            "title": requested.get("title"),
+            "folder": requested.get("library_path"),
+            "reason": "shared_folder_not_owner",
+            "owner_series_id": owner.get("id"),
+            "owner_provider": owner.get("metadata_provider"),
+            "ok": True,
+        }
+        return _record_automatic_outcome(outcome, db_path=db_path, trigger=reason)
+
+    try:
+        outcome = apply_series(requested, db_path=db_path, dry_run=False, **kwargs)
+    except Exception as exc:
+        outcome = {
+            "series_id": requested.get("id"),
+            "title": requested.get("title"),
+            "folder": str(requested.get("library_path") or ""),
+            "changed": False,
+            "ok": False,
+            "reason": "unhandled_error",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
     if outcome.get("changed") and outcome.get("folder"):
         outcome["reader_refresh"] = refresh_readers(
             [outcome["folder"]],
             renamed_folders=[outcome["folder"]] if outcome.get("renamed") else [],
         )
+    outcome = _record_automatic_outcome(outcome, db_path=db_path, trigger=reason)
     return {**result, **outcome, "trigger": reason}
 
 

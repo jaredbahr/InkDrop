@@ -432,7 +432,10 @@ def _in_quiet_hours(settings, now=None):
     now = time.localtime(now) if now is not None else time.localtime()
     days = settings.get("quiet_hours_days") or []
     if days:
-        weekday = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[now.tm_wday]
+        # store.WEEKDAYS is the same vocabulary the settings contract
+        # validates against, so a day name that saved is a day name that
+        # can match here. tm_wday is Monday-based, like the tuple.
+        weekday = store.WEEKDAYS[now.tm_wday]
         if weekday not in days:
             return False
     start = _parse_hhmm(settings.get("quiet_hours_start"))
@@ -575,6 +578,11 @@ def _attempt_send(
         result = SendResult(False, f"send failed ({_failure_type(exc)})", True)
     if result.ok:
         return _finish("sent")
+    # retry_max_attempts counts *total* sends, not retries on top of the
+    # first one: the default of 5 is one initial send plus four retries, and
+    # 0 (the operator switching retries off) still owes the initial send,
+    # which is what max(1, ...) preserves. The store keeps a saved 0 as 0, so
+    # this is the line that has to hold the "no retry" end of that contract.
     if result.retryable and attempt < max(1, max_attempts):
         backoff = settings.get("retry_backoff_seconds", store.DEFAULT_RETRY_BACKOFF_SECONDS)
         delay = result.retry_after or min(3600, backoff * (2 ** (attempt - 1)))
